@@ -1,0 +1,117 @@
+using BoltPreload.Api.Auth;
+using BoltPreload.Application.Ingestion;
+using Npgsql;
+using NpgsqlTypes;
+
+namespace BoltPreload.Api.Endpoints;
+
+/// <summary>
+/// 通道维度的管理接口：列表 + 改名。
+/// 改名变更走 audit_log，绑定/解绑走 channel_binding_history（不在本类，另有 endpoint）。
+/// </summary>
+public static class ChannelEndpoints
+{
+    public static IEndpointRouteBuilder MapChannelEndpoints(this IEndpointRouteBuilder app)
+    {
+        var grp = app.MapGroup("/api/devices/{deviceId:long}/channels")
+            .WithTags("Channels");
+
+        grp.MapGet("/", async (
+            long deviceId,
+            NpgsqlDataSource ds,
+            CancellationToken ct) =>
+        {
+            const string sql = @"
+                SELECT c.id, c.channel_no, c.name, c.state, c.sampling_enabled,
+                       c.hardware_state, c.business_state, c.last_seen_at,
+                       b.id AS bolt_id, b.code AS bolt_code
+                FROM channels c
+                LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE c.device_id = @device_id AND c.deleted_at IS NULL
+                ORDER BY c.channel_no";
+            await using var cmd = ds.CreateCommand(sql);
+            cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
+            var items = new List<object>();
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                items.Add(new
+                {
+                    channelId = r.GetInt64(0),
+                    channelNo = r.GetInt16(1),
+                    name = r.IsDBNull(2) ? null : r.GetString(2),
+                    state = r.GetString(3),
+                    samplingEnabled = r.GetBoolean(4),
+                    hardwareState = r.GetString(5),
+                    businessState = r.GetString(6),
+                    lastSeenAt = r.IsDBNull(7) ? null : (DateTime?)r.GetDateTime(7),
+                    bolt = r.IsDBNull(8) ? null : (object)new
+                    {
+                        id = r.GetInt64(8),
+                        code = r.IsDBNull(9) ? null : r.GetString(9)
+                    }
+                });
+            }
+            return Results.Ok(new { deviceId, count = items.Count, items });
+        })
+        .RequireAuthorization(AuthPolicies.LoggedIn)
+        .WithName("ListDeviceChannels")
+        .WithSummary("设备通道列表（含位置名称、硬件状态、当前绑定）");
+
+        grp.MapPatch("/{channelNo:int}/name", async (
+            long deviceId, int channelNo,
+            ChannelNamePatchRequest? body,
+            NpgsqlDataSource ds,
+            IChannelResolver resolver,
+            ILoggerFactory loggerFactory,
+            CancellationToken ct) =>
+        {
+            if (channelNo < 1 || channelNo > 64)
+                return Results.BadRequest(new { error = "channelNo 超出 1..64 范围" });
+
+            var raw = body?.Name?.Trim();
+            // 空字符串 = 清除名称（恢复成 NULL）
+            string? newName = string.IsNullOrEmpty(raw) ? null : raw;
+            if (newName is not null && newName.Length > 64)
+                return Results.BadRequest(new { error = "name 长度不能超过 64 字符" });
+
+            const string sql = @"
+                UPDATE channels
+                   SET name = @name, updated_at = now()
+                 WHERE device_id = @device_id
+                   AND channel_no = @ch
+                   AND deleted_at IS NULL
+                RETURNING id, channel_no, name";
+            await using var cmd = ds.CreateCommand(sql);
+            cmd.Parameters.AddWithValue("name", NpgsqlDbType.Varchar, (object?)newName ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
+            cmd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channelNo);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (!await r.ReadAsync(ct))
+                return Results.NotFound(new { error = "通道不存在或已删除", deviceId, channelNo });
+
+            var updatedId = r.GetInt64(0);
+            // 关闭 reader 后才能再用同一 connection 做下个 query；
+            // resolver 缓存按 (deviceId, channelNo) 失效一下，下次解析就拿到新 name
+            await r.DisposeAsync();
+            resolver.Invalidate(deviceId, (ushort)channelNo);
+
+            var logger = loggerFactory.CreateLogger("ChannelName");
+            logger.LogInformation(
+                "通道改名 device={DeviceId} ch={Ch} name='{Name}'",
+                deviceId, channelNo, newName ?? "(null)");
+
+            return Results.Ok(new { channelId = updatedId, deviceId, channelNo, name = newName });
+        })
+        .RequireAuthorization(AuthPolicies.WriteAccess)
+        .WithName("PatchChannelName")
+        .WithSummary("修改通道可读名称（物理位置标签）");
+
+        return app;
+    }
+}
+
+public sealed class ChannelNamePatchRequest
+{
+    public string? Name { get; set; }
+}

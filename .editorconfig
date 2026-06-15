@@ -1,0 +1,31 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.{md,yml,yaml,json}]
+indent_size = 2
+
+[*.{cs,csproj,sln,props,targets}]
+indent_size = 4
+
+[*.{ts,tsx,js,jsx,vue}]
+indent_size = 2
+
+[*.sql]
+indent_size = 4
+
+# C# 风格（StyleCop 友好）
+[*.cs]
+dotnet_sort_system_directives_first = true
+csharp_using_directive_placement = outside_namespace
+csharp_prefer_braces = true:warning
+csharp_style_namespace_declarations = file_scoped:warning
+csharp_style_prefer_method_group_conversion = true:silent
+dotnet_diagnostic.CA1822.severity = suggestion
+dotnet_diagnostic.IDE0058.severity = none

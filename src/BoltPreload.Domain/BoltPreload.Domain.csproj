@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>BoltPreload.Domain</RootNamespace>
+    <AssemblyName>BoltPreload.Domain</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Domain 层不依赖任何基础设施 -->
+
+</Project>

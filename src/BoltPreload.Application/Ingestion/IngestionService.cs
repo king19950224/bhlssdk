@@ -1,0 +1,165 @@
+using BoltPreload.Application.Devices;
+using BoltPreload.Application.Realtime;
+using BoltPreload.Fx;
+using BoltPreload.Fx.Models;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+namespace BoltPreload.Application.Ingestion;
+
+/// <summary>
+/// 从 IFxConnector 消费数据，写入数据库。
+/// 一个 IFxConnector 对应一个设备，对应一个 IngestionService 任务。
+/// </summary>
+/// <remarks>
+/// Phase 1 简化版：单连接、同步消费、单条入库。
+/// Phase 2+ 改：批量 + WAL + 多连接管理（按方案 §5.2 ConnectorService）。
+/// </remarks>
+public sealed class IngestionService : BackgroundService
+{
+    private readonly IDeviceConnectorManager _deviceManager;
+    private readonly IMeasurementSink _sink;
+    private readonly IMeasurementPublisher _publisher;
+    private readonly IMeasurementWal _wal;
+    private readonly ILogger<IngestionService> _logger;
+
+    public IngestionService(
+        IDeviceConnectorManager deviceManager,
+        IMeasurementSink sink,
+        IMeasurementPublisher publisher,
+        IMeasurementWal wal,
+        ILogger<IngestionService> logger)
+    {
+        _deviceManager = deviceManager;
+        _sink = sink;
+        _publisher = publisher;
+        _wal = wal;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var runtimes = _deviceManager.Runtimes.ToArray();
+        _logger.LogInformation("IngestionService 启动 runtimes={Count}", runtimes.Length);
+
+        var tasks = runtimes.Select(runtime => RunRuntimeAsync(runtime, stoppingToken)).ToArray();
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task RunRuntimeAsync(DeviceRuntimeContext runtime, CancellationToken stoppingToken)
+    {
+        var connector = runtime.Connector;
+        var runtimeStatus = runtime.RuntimeStatus;
+        _logger.LogInformation("Ingestion runtime 启动 device={DeviceId} name={Name}", runtime.DeviceId, runtime.Name);
+
+        // 首次连接失败不再静默 return — Watchdog 会接管重连，期间继续 ReadAllAsync 等数据；
+        // 否则 runtime task 退出后整个 IngestionService.ExecuteAsync 会"看起来成功"，
+        // Host 当作正常退出，但其实根本没在采集。
+        try
+        {
+            await connector.ConnectAsync(stoppingToken);
+            await WaitConnectedAsync(connector, runtime.DeviceId, stoppingToken);
+            await connector.SetWorkModeAsync(FxWorkMode.MultiMeas, channel: 0, address: runtime.Options.Address, stoppingToken);
+            _logger.LogInformation("已下发 MultiMeas device={DeviceId}", runtime.DeviceId);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ingestion runtime 启动连接 / 下发模式失败 device={DeviceId}，等待 Watchdog 接管", runtime.DeviceId);
+        }
+
+        // 消费循环：哪怕首次连接失败，也进入这里，Watchdog 重连成功后数据会从 Channel 流过来
+        try
+        {
+            await foreach (var envelope in connector.Results.ReadAllAsync(stoppingToken))
+            {
+                runtimeStatus.MarkEnvelope(
+                    DateTimeOffset.UtcNow,
+                    envelope.ResultType is FxResultType.ChannelResult or FxResultType.MultiChannelResult);
+
+                if (envelope.ResultType == FxResultType.DeviceParameter && envelope.DeviceParameter is not null)
+                {
+                    var dp = envelope.DeviceParameter;
+                    _logger.LogInformation(
+                        "收到 DeviceParameter device={DeviceId} addr={Addr} ch={Ch} param={Param} value={Value}",
+                        envelope.DeviceId, dp.Address, dp.Channel, dp.ParamName, dp.ParamValue);
+                }
+
+                try
+                {
+                    await _sink.WriteAsync(envelope, stoppingToken);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    // 不抛出——避免单条坏写拖垮整个采集循环；累计失败计数让丢数可观测
+                    //（经 /api/runtime/devices 暴露）。测量类信封写失败时落 WAL 兜底，
+                    // DB 恢复后由 WalReplayService 重放补写（重放不触发告警）。
+                    runtimeStatus.MarkWriteFailure();
+
+                    var isMeasurement = envelope.ResultType
+                        is FxResultType.ChannelResult or FxResultType.MultiChannelResult;
+
+                    if (isMeasurement && _wal.Enabled)
+                    {
+                        try
+                        {
+                            await _wal.AppendAsync(envelope, stoppingToken);
+                            _logger.LogError(ex,
+                                "入库写失败，已落 WAL 待重放 device={DeviceId} ts={Ts} 累计写失败={Failures} WAL待重放={Pending}",
+                                envelope.DeviceId, envelope.ReceiveTime, runtimeStatus.WriteFailureCount, _wal.PendingCount);
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception walEx)
+                        {
+                            _logger.LogError(walEx,
+                                "入库写失败且 WAL 落盘也失败，measurement 丢失 device={DeviceId} ts={Ts} 累计写失败={Failures}",
+                                envelope.DeviceId, envelope.ReceiveTime, runtimeStatus.WriteFailureCount);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogError(ex,
+                            "入库写失败 device={DeviceId} ts={Ts} 累计写失败={Failures}（非测量信封或 WAL 未启用，不兜底）",
+                            envelope.DeviceId, envelope.ReceiveTime, runtimeStatus.WriteFailureCount);
+                    }
+                }
+
+                // 实时推送（不阻塞入库；publisher 内部应捕获异常）
+                _ = SafePublishAsync(envelope, stoppingToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Ingestion runtime 收到取消请求 device={DeviceId}", runtime.DeviceId);
+        }
+        finally
+        {
+            await connector.DisconnectAsync(CancellationToken.None);
+            _logger.LogInformation("Ingestion runtime 退出 device={DeviceId}", runtime.DeviceId);
+        }
+    }
+
+    /// <summary>
+    /// 轮询等待 connector 进入 Connected 状态，最多等 5 秒。
+    /// 旧版本用 Task.Delay(1s) 硬等，对慢机器不准 / 对快机器浪费。
+    /// </summary>
+    private async Task WaitConnectedAsync(IFxConnector connector, long deviceId, CancellationToken ct)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 5000)
+        {
+            if (connector.State == FxConnectorState.Connected) return;
+            await Task.Delay(50, ct);
+        }
+        _logger.LogWarning("等待 connector Connected 超时 device={DeviceId} state={State}",
+            deviceId, connector.State);
+    }
+
+    private async Task SafePublishAsync(FxDecodedEnvelope envelope, CancellationToken ct)
+    {
+        try { await _publisher.PublishAsync(envelope, ct); }
+        catch (OperationCanceledException) { /* 进程退出 */ }
+        catch (Exception ex) { _logger.LogDebug(ex, "实时推送失败 device={DeviceId}", envelope.DeviceId); }
+    }
+}

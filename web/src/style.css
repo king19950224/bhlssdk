@@ -1,0 +1,188 @@
+/* ============================================================================
+   BoltSense 设计系统 —— 工业科技控制台
+   暗色主调 · 青色辉光 · 玻璃拟态 · 数字仪表感
+   ============================================================================ */
+
+:root {
+  /* 背景层次 */
+  --bg-base: #080b14;
+  --bg-elev-1: #0d1320;
+  --bg-elev-2: #121a2b;
+  --panel: rgba(18, 26, 43, 0.72);
+  --panel-solid: #111829;
+  --panel-border: rgba(56, 189, 248, 0.12);
+  --panel-border-strong: rgba(56, 189, 248, 0.32);
+
+  /* 科技青强调 + 状态色 */
+  --accent: #22d3ee;
+  --accent-2: #38bdf8;
+  --accent-3: #818cf8;
+  --accent-glow: rgba(34, 211, 238, 0.35);
+  --ok: #10b981;
+  --ok-glow: rgba(16, 185, 129, 0.35);
+  --warn: #f59e0b;
+  --warn-glow: rgba(245, 158, 11, 0.35);
+  --crit: #f43f5e;
+  --crit-glow: rgba(244, 63, 94, 0.4);
+  --info: #38bdf8;
+
+  /* 文本 */
+  --text-1: #e8eef8;
+  --text-2: #9fb2cc;
+  --text-3: #61748f;
+
+  /* 线条/网格 */
+  --grid-line: rgba(56, 189, 248, 0.045);
+  --hairline: rgba(148, 163, 184, 0.1);
+
+  --font-sans: 'Inter', system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --radius: 14px;
+  --radius-sm: 9px;
+
+  /* Element Plus 主题对齐 */
+  --el-color-primary: #22d3ee;
+  --el-color-primary-light-3: #5fe0f2;
+  --el-color-primary-light-5: #8fe9f5;
+  --el-color-primary-light-7: #bff2f9;
+  --el-color-primary-light-8: #d6f7fb;
+  --el-color-primary-light-9: #eafcfe;
+  --el-color-primary-dark-2: #1bb6cf;
+  --el-color-success: #10b981;
+  --el-color-warning: #f59e0b;
+  --el-color-danger: #f43f5e;
+  --el-color-error: #f43f5e;
+  --el-color-info: #61748f;
+}
+
+/* Element Plus 暗色变量重写，贴合控制台底色 */
+html.dark {
+  --el-bg-color: #0d1320;
+  --el-bg-color-page: #080b14;
+  --el-bg-color-overlay: #121a2b;
+  --el-fill-color-blank: #0f1623;
+  --el-text-color-primary: #e8eef8;
+  --el-text-color-regular: #9fb2cc;
+  --el-text-color-secondary: #61748f;
+  --el-border-color: rgba(148, 163, 184, 0.14);
+  --el-border-color-light: rgba(148, 163, 184, 0.1);
+  --el-border-color-lighter: rgba(148, 163, 184, 0.08);
+  --el-border-color-extra-light: rgba(148, 163, 184, 0.06);
+  --el-fill-color: rgba(56, 189, 248, 0.06);
+  --el-fill-color-light: rgba(56, 189, 248, 0.05);
+  --el-fill-color-lighter: rgba(56, 189, 248, 0.04);
+  --el-mask-color: rgba(8, 11, 20, 0.8);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--text-1);
+  background-color: var(--bg-base);
+  /* 指挥中心：极淡网格 + 顶部径向辉光 */
+  background-image:
+    radial-gradient(1200px 600px at 80% -10%, rgba(34, 211, 238, 0.08), transparent 60%),
+    radial-gradient(900px 500px at 0% 0%, rgba(129, 140, 248, 0.06), transparent 55%),
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 44px 44px, 44px 44px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 数字/数据用等宽，强化仪表感 */
+.mono,
+.metric {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* 玻璃面板 */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  position: relative;
+}
+.panel--glow {
+  box-shadow: 0 0 0 1px var(--panel-border), 0 18px 50px -22px rgba(0, 0, 0, 0.8),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+.panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+/* 脉冲状态灯 */
+.led {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  position: relative;
+}
+.led::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: inherit;
+  opacity: 0.5;
+  animation: led-pulse 2s ease-out infinite;
+}
+.led--ok { background: var(--ok); box-shadow: 0 0 10px var(--ok-glow); }
+.led--warn { background: var(--warn); box-shadow: 0 0 10px var(--warn-glow); }
+.led--crit { background: var(--crit); box-shadow: 0 0 10px var(--crit-glow); }
+.led--off { background: var(--text-3); }
+@keyframes led-pulse {
+  0% { transform: scale(0.8); opacity: 0.6; }
+  100% { transform: scale(2.4); opacity: 0; }
+}
+
+/* 辉光文字 */
+.glow-accent { color: var(--accent); text-shadow: 0 0 18px var(--accent-glow); }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.18);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(56, 189, 248, 0.32); background-clip: content-box; }
+
+/* 数字滚动入场 */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise { animation: rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+a { color: var(--accent-2); text-decoration: none; }
+
+/* 打印：隐藏外壳，仅留报告内容 */
+@media print {
+  .sidebar, .topbar, .no-print { display: none !important; }
+  .content { padding: 0 !important; overflow: visible !important; }
+  body { background: #fff; color: #000; }
+  .panel { background: #fff !important; border-color: #ccc !important; box-shadow: none !important; backdrop-filter: none !important; }
+}

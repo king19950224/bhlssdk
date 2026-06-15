@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # 用 TimescaleDB 镜像跑 CI（跟开发环境完全一致）
+        image: timescale/timescaledb:2.17.2-pg16
+        env:
+          POSTGRES_DB: boltpreload
+          POSTGRES_USER: boltpreload
+          POSTGRES_PASSWORD: ci_password_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U boltpreload -d boltpreload"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 等待数据库就绪
+        run: |
+          for i in {1..30}; do
+            if pg_isready -h localhost -p 5432 -U boltpreload; then
+              echo "DB ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "DB not ready"; exit 1
+
+      - name: 初始化数据库 schema
+        run: |
+          PGPASSWORD=ci_password_only psql -h localhost -U boltpreload -d boltpreload \
+            -f deploy/sql/0001_initial_schema.sql
+
+      - name: 还原依赖
+        run: dotnet restore BoltPreload.sln
+
+      - name: 编译
+        run: dotnet build BoltPreload.sln --no-restore --configuration Release
+
+      - name: 单元测试
+        run: dotnet test BoltPreload.sln --no-build --configuration Release \
+              --logger "console;verbosity=normal" \
+              --collect:"XPlat Code Coverage"
+        env:
+          ConnectionStrings__Postgres: "Host=localhost;Port=5432;Database=boltpreload;Username=boltpreload;Password=ci_password_only"
+
+      - name: 上传覆盖率
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: '**/coverage.cobertura.xml'

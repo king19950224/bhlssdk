@@ -1,0 +1,16 @@
+<Project>
+
+  <!--
+    厂家 SDK 局部覆盖根级 Directory.Build.props 的严格设置：
+    - 不把警告当错误（SDK 是闭源，我们不应该改 SDK 代码去消警告）
+    - 不强制 .NET 分析器
+    - 保持 SDK 原状，便于将来升级版本
+  -->
+  <PropertyGroup>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <NoWarn>$(NoWarn);CS8600;CS8601;CS8602;CS8603;CS8604;CS8618;CS8625;CA1822</NoWarn>
+  </PropertyGroup>
+
+</Project>

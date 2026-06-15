@@ -1,0 +1,1442 @@
+using BoltPreload.Api.Auth;
+using BoltPreload.Application.Ingestion;
+using BoltPreload.Calibration;
+using Npgsql;
+using NpgsqlTypes;
+
+namespace BoltPreload.Api.Endpoints;
+
+/// <summary>
+/// 标定相关接口。
+/// <para>
+/// Phase 1 提供「快速标定」（quick-calibrate）：
+/// 运维直接传入 k_l / RefTime / RefTemp，等价于"我知道这颗螺栓在已知预紧力下的 TOF"。
+/// 严格的多点最小二乘标定（含 R²、不确定度、双签）放在 Phase 2/3 的标定工作站做。
+/// </para>
+/// <para>
+/// 调用流程：
+/// 1. 通过 channel_id 查到 bolt_id（通道必须已绑定螺栓）；
+/// 2. 把当前生效的 calibration_record 标记 superseded_by = new_id；
+/// 3. 插入新 calibration_record（method='quick'）；
+/// 4. UPDATE channels 把 k_l / ref_time_ns / ref_temp_c / k_l_uncertainty / active_calibration_id 同步过去
+///    （热路径冗余字段，避免预紧力计算时再 JOIN）；
+/// 5. 写 audit_log；
+/// 6. 失效 IChannelResolver 缓存（让下一次解析拿到新参数）。
+/// </para>
+/// </summary>
+public static class CalibrationEndpoints
+{
+    public static IEndpointRouteBuilder MapCalibrationEndpoints(this IEndpointRouteBuilder app)
+    {
+        // 标定签发要 reviewer+ 权限（涉及商用底线 §0：任何对算法、阈值、报警规则的修改都要可追溯）
+        var grp = app.MapGroup("/api/channels/{channelId:long}")
+            .WithTags("Calibration")
+            .RequireAuthorization(AuthPolicies.ReviewerAccess);
+
+        app.MapGet("/api/calibration-center/summary", async (NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            const string sql = @"
+                SELECT
+                    cr.method,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE cr.superseded_by IS NULL) AS active_count,
+                    COUNT(*) FILTER (WHERE cr.expires_at < CURRENT_DATE) AS expired_count,
+                    ROUND(AVG(cr.r_squared), 4) AS avg_r2
+                FROM calibration_records cr
+                GROUP BY cr.method
+                ORDER BY cr.method";
+
+            await using var cmd = ds.CreateCommand(sql);
+            var methods = new List<object>();
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                var method = r.GetString(0);
+                methods.Add(new
+                {
+                    method,
+                    trustLevel = method switch
+                    {
+                        "load_calibrated" => "formal",
+                        "gb_single_wave" => "formal",
+                        "gb_bi_wave" => "formal",
+                        "torque_fit" => "engineering_estimate",
+                        "torque_estimate" => "temporary",
+                        "quick" => "temporary",
+                        _ => "unknown"
+                    },
+                    total = r.GetInt64(1),
+                    active = r.GetInt64(2),
+                    expired = r.GetInt64(3),
+                    avgR2 = r.IsDBNull(4) ? null : (decimal?)r.GetDecimal(4)
+                });
+            }
+
+            return Results.Ok(new
+            {
+                generatedAt = DateTimeOffset.UtcNow,
+                methods,
+                policy = new
+                {
+                    formal = "可用于正式报告和告警阈值依据",
+                    engineering_estimate = "可用于试运行和趋势验证，报告必须标明非载荷标定",
+                    temporary = "仅用于调试或临时演示，不应用于安全结论"
+                }
+            });
+        })
+        .RequireAuthorization(AuthPolicies.LoggedIn)
+        .WithName("CalibrationCenterSummary")
+        .WithSummary("标定中心摘要：按方法和可信等级统计");
+
+        // 快速标定
+        grp.MapPost("/quick-calibrate", async (
+            long channelId, QuickCalibrateRequest req,
+            NpgsqlDataSource ds, IChannelResolver resolver,
+            HttpContext http,
+            ILoggerFactory lf, CancellationToken ct) =>
+        {
+            var logger = lf.CreateLogger("Calibration");
+            var userId = UserContext.Require(http).UserId;  // 操作人/审核人/审计一律取自 JWT，不信任客户端 user_id
+
+            // 1. 找 bolt_id + device_id + channel_no（一并拿出来便于失效缓存）
+            //    顺带取屈服强度/截面/目标预紧力，用于下面的 K_L 量纲护栏
+            long boltId, deviceId;
+            short channelNo;
+            decimal? targetPreloadN, rp02Mpa, crossSectionMm2;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT b.id, c.device_id, c.channel_no,
+                       b.target_preload_n, b.rp02_mpa, b.cross_section_mm2
+                FROM channels c
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE c.id = @cid AND c.deleted_at IS NULL"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct))
+                {
+                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                }
+                boltId = r.GetInt64(0);
+                deviceId = r.GetInt64(1);
+                channelNo = r.GetInt16(2);
+                targetPreloadN = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                rp02Mpa = r.IsDBNull(4) ? null : r.GetDecimal(4);
+                crossSectionMm2 = r.IsDBNull(5) ? null : r.GetDecimal(5);
+            }
+
+            // 1b. K_L 量纲/量级护栏（grounded，纯拒绝非法输入，不改变合法标定的计算）。
+            //     本系统约定 K_L = Δt/F（单位 ns/N，量级 ~1e-4，用法 F = Δt/K_L）；
+            //     最常见事故是误照标定证书 / plan 附录 C 的 1/N 约定（~1e-11，差一个 t₀）填进来。
+            if (req.KL <= 0m)
+                return Results.BadRequest(new { error = "kL 必须 > 0。本系统约定 K_L=Δt/F（单位 ns/N，量级约 1e-4）；勿照标定证书/plan 附录C 的 1/N（约 1e-11）填，那是另一套约定（相差一个 t₀）。", kL = req.KL });
+            if (req.RefTimeNs <= 0m)
+                return Results.BadRequest(new { error = "refTimeNs（基线声时 t₀）必须 > 0。", refTimeNs = req.RefTimeNs });
+            // 上界：在屈服力 F_y = Rp0.2 · A_e 下，声时变化 K_L·F_y 物理上不可能 ≥ 基线 t₀（声弹性 TOF 变化只是 t₀ 的极小比例）。
+            if (rp02Mpa is > 0m && crossSectionMm2 is > 0m)
+            {
+                var yieldForceN = rp02Mpa.Value * crossSectionMm2.Value;   // MPa·mm² = N
+                if (req.KL * yieldForceN >= req.RefTimeNs)
+                    return Results.BadRequest(new
+                    {
+                        error = "kL 量级过大：屈服力下推得的声时变化 ≥ 基线 t₀，物理上不可能。请确认 kL 用 ns/N 约定（约 1e-4），而非 1/N（约 1e-11）。",
+                        kL = req.KL, yieldForceN, refTimeNs = req.RefTimeNs
+                    });
+            }
+            // 下界：在目标预紧力 F_target 下，声时变化 K_L·F_target 必须高于 1 ns 测量噪声
+            //（与 GbSingleWaveCalculator 不确定度评定的 1 ns 噪声底一致），否则标定信号不可分辨或量纲填错。
+            if (targetPreloadN is > 0m)
+            {
+                var deltaAtTargetNs = req.KL * targetPreloadN.Value;
+                if (deltaAtTargetNs <= 1m)
+                    return Results.BadRequest(new
+                    {
+                        error = "kL 量级过小：目标预紧力下推得的声时变化 ≤ 1 ns（低于测量噪声）。请确认 kL 用 ns/N 约定（约 1e-4），而非 1/N（约 1e-11）。",
+                        kL = req.KL, targetPreloadN, deltaAtTargetNs
+                    });
+            }
+
+            // 2. 一个事务里：superseded 旧记录 + INSERT 新 + UPDATE channels + audit_log
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            try
+            {
+                var newCalibId = Guid.NewGuid();
+
+                // 先 INSERT 新记录（superseded_by=NULL），再 UPDATE 旧记录指向它
+                // 注意：FK calibration_records.superseded_by → calibration_records.id 是 immediate，
+                // 所以必须新记录先存在，旧记录的 superseded_by 才能成立
+                await using (var cmd = new NpgsqlCommand(@"
+                    INSERT INTO calibration_records (
+                        id, bolt_id, method,
+                        operator_user_id, reviewer_user_id,
+                        loading_device, loading_device_cert,
+                        env_temp_c, env_humidity,
+                        points_jsonb, k_l, k_l_uncertainty, r_squared, outliers_removed,
+                        uncertainty_breakdown, fitter_version,
+                        ref_time_ns, ref_temp_c,
+                        passed, notes,
+                        operator_signature_at, reviewer_signature_at, expires_at, created_at
+                    ) VALUES (
+                        @id, @bolt_id, 'quick',
+                        @op, @rev,
+                        @ld, @ldc,
+                        @et, @eh,
+                        @pts::jsonb, @kl, @klu, 0, 0,
+                        NULL, 'quick:v1',
+                        @rt, @rtemp,
+                        true, @note,
+                        now(), now(), @exp, now()
+                    )", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
+                    cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                    cmd.Parameters.AddWithValue("op", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, userId);  // quick 模式自审
+                    cmd.Parameters.AddWithValue("ld", NpgsqlDbType.Varchar, (object?)req.LoadingDevice ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("ldc", NpgsqlDbType.Varchar, (object?)req.LoadingDeviceCert ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("et", NpgsqlDbType.Numeric, (object?)req.EnvTempC ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("eh", NpgsqlDbType.Numeric, (object?)req.EnvHumidity ?? DBNull.Value);
+                    // points_jsonb 必填，quick 模式给一个空数组 + 说明
+                    var pointsJson = req.Points is null
+                        ? """[{"_note":"quick calibration, no multi-point data"}]"""
+                        : System.Text.Json.JsonSerializer.Serialize(req.Points);
+                    cmd.Parameters.AddWithValue("pts", NpgsqlDbType.Jsonb, pointsJson);
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, req.KL);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, req.KLUncertainty ?? 0m);
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, req.RefTimeNs);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, req.RefTempC);
+                    cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                        (object?)(req.Note ?? "quick calibration via API") ?? DBNull.Value);
+                    // 默认 30 天过期（GB/T 43232 推荐≤180 天，quick 模式更保守）
+                    cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date,
+                        DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? 30)));
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                // 新记录已存在 → 把同 bolt 的旧 active 记录标 superseded_by=新 id
+                await SupersedeActiveCalibrationsAsync(conn, tx, boltId, newCalibId, ct);
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE channels SET
+                        k_l = @kl,
+                        k_l_uncertainty = @klu,
+                        ref_time_ns = @rt,
+                        ref_temp_c = @rtemp,
+                        active_calibration_id = @cid,
+                        updated_at = now()
+                    WHERE id = @id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, req.KL);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, req.KLUncertainty ?? 0m);
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, req.RefTimeNs);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, req.RefTempC);
+                    cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Uuid, newCalibId);
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, channelId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                // audit_log
+                var afterJson = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    channelId,
+                    boltId,
+                    calibrationId = newCalibId,
+                    req.KL,
+                    req.RefTimeNs,
+                    req.RefTempC
+                });
+                await WriteChannelAuditAsync(conn, tx, userId, "quick_calibrate", channelId,
+                    afterJson, $"quick calibration for bolt {boltId}", ct);
+
+                await tx.CommitAsync(ct);
+
+                // 失效缓存（让下一次 ChannelResult 解析走新参数）
+                resolver.Invalidate(deviceId, (ushort)channelNo);
+
+                logger.LogWarning("通道 {Ch} 快速标定完成 KL={KL} RefTime={Rt} RefTemp={Rtemp} calibId={Id}",
+                    channelId, req.KL, req.RefTimeNs, req.RefTempC, newCalibId);
+
+                return Results.Ok(new
+                {
+                    channelId,
+                    boltId,
+                    calibrationId = newCalibId,
+                    appliedAt = DateTime.UtcNow,
+                    activeCalibration = new { req.KL, req.RefTimeNs, req.RefTempC, req.KLUncertainty },
+                    note = "已生效，下一条 ChannelResult 将基于新基线计算预紧力"
+                });
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync(ct);
+                logger.LogError(ex, "快速标定失败 channelId={Ch}", channelId);
+                return Results.Problem(detail: ex.Message, statusCode: 500);
+            }
+        })
+        .WithName("QuickCalibrate")
+        .WithSummary("快速标定（写 k_l / RefTime / RefTemp）")
+        .WithDescription(@"
+**场景**：现场知道螺栓在某一预紧力下的 TOF，直接写参数让系统能开始计算。
+
+请求示例：
+```json
+{
+  ""kL"": 0.000123,
+  ""refTimeNs"": 32240,
+  ""refTempC"": 23.4,
+  ""kLUncertainty"": 0.0000045,
+  ""note"": ""现场快速标定，目标预紧力 80 kN""
+}
+```
+
+注意：
+- **kL 量纲约定**：本系统用 `K_L = Δt/F`（单位 **ns/N**，量级约 **1e-4**，用法 `F = Δt/K_L`）。
+  标定证书 / plan 附录 C 用的是 `K_L = Δt/(F·t₀)`（单位 1/N，量级约 1e-11），二者相差一个 t₀；
+  **切勿直接把证书上的 1e-11 填进来**。入参会做量级护栏校验（屈服力/目标预紧力下的声时变化合理性），明显不符会被拒绝。
+- 严格按 GB/T 43232-2023 / JJF 1059.1-2012 的多点最小二乘标定走标定工作站流程；
+- quick 模式 expires_at 默认 30 天（短）；
+- 触发后旧 calibration_record 自动 superseded，channels 表冗余字段同步更新，缓存自动失效。");
+
+        // 扭矩法临时标定：输入扭矩，按 T = K F d 估算预紧力，再用最近真实 EchoTime 反推 K_L
+        grp.MapPost("/torque-calibrate", async (
+            long channelId, TorqueCalibrateRequest req,
+            NpgsqlDataSource ds, IChannelResolver resolver,
+            HttpContext http,
+            ILoggerFactory lf, CancellationToken ct) =>
+        {
+            var logger = lf.CreateLogger("Calibration");
+            var userId = UserContext.Require(http).UserId;  // 操作人/审核人/审计一律取自 JWT，不信任客户端 user_id
+            const decimal sdkDefaultTempCoeff = 0.00010269m;
+
+            long boltId, deviceId;
+            short channelNo;
+            string nominalDiam;
+            decimal? existingRefTime, existingRefTemp;
+            decimal? currentTarget;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT b.id, c.device_id, c.channel_no, b.nominal_diam,
+                       c.ref_time_ns, c.ref_temp_c, b.target_preload_n
+                FROM channels c
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE c.id = @cid AND c.deleted_at IS NULL"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct))
+                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+
+                boltId = r.GetInt64(0);
+                deviceId = r.GetInt64(1);
+                channelNo = r.GetInt16(2);
+                nominalDiam = r.GetString(3);
+                existingRefTime = r.IsDBNull(4) ? null : r.GetDecimal(4);
+                existingRefTemp = r.IsDBNull(5) ? null : r.GetDecimal(5);
+                currentTarget = r.IsDBNull(6) ? null : r.GetDecimal(6);
+            }
+
+            var diameterMm = req.NominalDiameterMm ?? ParseNominalDiameterMm(nominalDiam);
+            if (diameterMm <= 0)
+                return Results.BadRequest(new { error = "无法确定螺栓公称直径，请传 nominalDiameterMm，例如 M20 传 20" });
+
+            var nutFactor = req.NutFactor ?? 0.20m;
+            if (nutFactor <= 0)
+                return Results.BadRequest(new { error = "nutFactor 必须大于 0" });
+
+            // T = K F d，其中 d 用 m
+            var estimatedPreloadN = req.TorqueNm / (nutFactor * (diameterMm / 1000m));
+            if (estimatedPreloadN <= 0)
+                return Results.BadRequest(new { error = "估算预紧力 <= 0，请检查 torqueNm / nutFactor / diameter" });
+
+            var sampleWindowSeconds = Math.Clamp(req.SampleWindowSeconds ?? 60, 5, 600);
+            decimal avgEcho, avgTemp;
+            long sampleCount;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT ROUND(AVG(echo_time_ns), 6), ROUND(AVG(sp_temp_c), 6), COUNT(*)
+                FROM measurements
+                WHERE bolt_id = @bolt_id
+                  AND ts > now() - (@seconds || ' seconds')::interval
+                  AND echo_time_ns IS NOT NULL"))
+            {
+                cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                cmd.Parameters.AddWithValue("seconds", NpgsqlDbType.Integer, sampleWindowSeconds);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                await r.ReadAsync(ct);
+                if (r.IsDBNull(0) || r.GetInt64(2) < (req.MinSamples ?? 20))
+                    return Results.BadRequest(new { error = "最近窗口内有效 EchoTime 样本不足", sampleWindowSeconds, minSamples = req.MinSamples ?? 20, actual = r.GetInt64(2) });
+                avgEcho = r.GetDecimal(0);
+                avgTemp = r.GetDecimal(1);
+                sampleCount = r.GetInt64(2);
+            }
+
+            var refTime = req.RefTimeNs ?? existingRefTime;
+            var refTemp = req.RefTempC ?? existingRefTemp;
+            if (refTime is null || refTemp is null)
+                return Results.BadRequest(new { error = "缺少 RefTime/RefTemp，请先同步通道配置或在请求里传 refTimeNs/refTempC" });
+
+            var normalizedEcho = avgEcho / (1m + sdkDefaultTempCoeff * (avgTemp - refTemp.Value));
+            var deltaTof = normalizedEcho - refTime.Value;
+            var kL = deltaTof / estimatedPreloadN;
+            if (kL <= 0)
+                return Results.BadRequest(new { error = "计算得到 K_L <= 0，请检查 RefTime/当前 EchoTime/扭矩输入", avgEcho, normalizedEcho, refTime, deltaTof });
+
+            var uncertaintyRatio = req.UncertaintyRatio ?? 0.30m;
+            var kLUncertainty = kL * uncertaintyRatio;
+            var newCalibId = Guid.NewGuid();
+            var note = req.Note ??
+                $"扭矩法临时标定：T={req.TorqueNm}N·m, K={nutFactor}, d={diameterMm}mm, F≈{estimatedPreloadN:F1}N；正式验收需多点载荷标定替换。";
+
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            try
+            {
+                var pointsJson = System.Text.Json.JsonSerializer.Serialize(new[]
+                {
+                    new
+                    {
+                        type = "torque_estimate",
+                        torqueNm = req.TorqueNm,
+                        nutFactor,
+                        nominalDiameterMm = diameterMm,
+                        estimatedPreloadN,
+                        avgEchoNs = avgEcho,
+                        avgTempC = avgTemp,
+                        normalizedEchoNs = normalizedEcho,
+                        deltaTofNs = deltaTof,
+                        sampleCount,
+                        sampleWindowSeconds,
+                        warning = "temporary torque estimate, not load-cell calibration"
+                    }
+                });
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    INSERT INTO calibration_records (
+                        id, bolt_id, method, operator_user_id, reviewer_user_id,
+                        loading_device, loading_device_cert, env_temp_c, env_humidity,
+                        points_jsonb, k_l, k_l_uncertainty, r_squared, outliers_removed,
+                        uncertainty_breakdown, fitter_version, ref_time_ns, ref_temp_c,
+                        passed, notes, operator_signature_at, reviewer_signature_at, expires_at, created_at
+                    ) VALUES (
+                        @id, @bolt_id, 'torque_estimate', @op, @rev,
+                        @ld, NULL, @env_temp, NULL,
+                        @points::jsonb, @kl, @klu, 0, 0,
+                        @unc::jsonb, 'torque:v1', @rt, @rtemp,
+                        true, @note, now(), now(), @exp, now()
+                    )", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
+                    cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                    cmd.Parameters.AddWithValue("op", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("ld", NpgsqlDbType.Varchar, req.LoadingDevice ?? "torque wrench");
+                    cmd.Parameters.AddWithValue("env_temp", NpgsqlDbType.Numeric, avgTemp);
+                    cmd.Parameters.AddWithValue("points", NpgsqlDbType.Jsonb, pointsJson);
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, kL);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, kLUncertainty);
+                    cmd.Parameters.AddWithValue("unc", NpgsqlDbType.Jsonb,
+                        System.Text.Json.JsonSerializer.Serialize(new { uncertaintyRatio, source = "torque coefficient uncertainty" }));
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime.Value);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp.Value);
+                    cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+                    cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date,
+                        DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? 7)));
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await SupersedeActiveCalibrationsAsync(conn, tx, boltId, newCalibId, ct);
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE bolts SET
+                        install_torque_nm = @torque,
+                        target_preload_n = @target,
+                        nominal_diam = @nominal,
+                        effective_length_mm = COALESCE(@effective_len, effective_length_mm),
+                        total_length_mm = COALESCE(@total_len, total_length_mm),
+                        cross_section_mm2 = COALESCE(@area, cross_section_mm2),
+                        updated_at = now()
+                    WHERE id = @bolt_id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("torque", NpgsqlDbType.Numeric, req.TorqueNm);
+                    cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, estimatedPreloadN);
+                    cmd.Parameters.AddWithValue("nominal", NpgsqlDbType.Varchar, $"M{diameterMm:0}");
+                    cmd.Parameters.AddWithValue("effective_len", NpgsqlDbType.Numeric, (object?)req.EffectiveLengthMm ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("total_len", NpgsqlDbType.Numeric, (object?)req.TotalLengthMm ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("area", NpgsqlDbType.Numeric, (object?)req.CrossSectionMm2 ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE channels SET
+                        k_l = @kl,
+                        k_l_uncertainty = @klu,
+                        ref_time_ns = @rt,
+                        ref_temp_c = @rtemp,
+                        active_calibration_id = @cid,
+                        updated_at = now()
+                    WHERE id = @channel_id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, kL);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, kLUncertainty);
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime.Value);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp.Value);
+                    cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Uuid, newCalibId);
+                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                var afterJson = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    channelId,
+                    boltId,
+                    calibrationId = newCalibId,
+                    req.TorqueNm,
+                    nutFactor,
+                    diameterMm,
+                    estimatedPreloadN,
+                    kL,
+                    kLUncertainty,
+                    refTime,
+                    refTemp,
+                    sampleCount
+                });
+                await WriteChannelAuditAsync(conn, tx, userId, "torque_calibrate", channelId, afterJson, note, ct);
+
+                await tx.CommitAsync(ct);
+                resolver.Invalidate(deviceId, (ushort)channelNo);
+
+                logger.LogWarning("扭矩法临时标定完成 channel={ChannelId} torque={Torque}Nm preload≈{Preload}N KL={KL}",
+                    channelId, req.TorqueNm, estimatedPreloadN, kL);
+
+                return Results.Ok(new
+                {
+                    channelId,
+                    boltId,
+                    calibrationId = newCalibId,
+                    appliedAt = DateTime.UtcNow,
+                    torque = new { req.TorqueNm, nutFactor, nominalDiameterMm = diameterMm, estimatedPreloadN },
+                    measurement = new { avgEchoNs = avgEcho, avgTempC = avgTemp, normalizedEchoNs = normalizedEcho, deltaTofNs = deltaTof, sampleCount },
+                    activeCalibration = new { kL, kLUncertainty, refTimeNs = refTime, refTempC = refTemp },
+                    warning = "扭矩法临时估算，非载荷标定；正式验收需多点加载标定替换。"
+                });
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync(ct);
+                logger.LogError(ex, "扭矩法临时标定失败 channelId={ChannelId}", channelId);
+                return Results.Problem(detail: ex.Message, statusCode: 500);
+            }
+        })
+        .WithName("TorqueCalibrate")
+        .WithSummary("扭矩法临时标定（T=KFd，自动从最近 EchoTime 反推 K_L）");
+
+        // 记录一个扭矩阶梯实验点（不改变当前 active calibration）
+        grp.MapPost("/torque-test-points", async (
+            long channelId, TorqueTestPointRequest req,
+            NpgsqlDataSource ds, HttpContext http, CancellationToken ct) =>
+        {
+            var userId = UserContext.Require(http).UserId;  // 记录是谁加的载荷点，取自 JWT
+            const decimal sdkDefaultTempCoeff = 0.00010269m;
+
+            long boltId;
+            string nominalDiam;
+            decimal? refTime, refTemp;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT b.id, b.nominal_diam, c.ref_time_ns, c.ref_temp_c
+                FROM channels c
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE c.id = @cid AND c.deleted_at IS NULL"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct))
+                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+
+                boltId = r.GetInt64(0);
+                nominalDiam = r.GetString(1);
+                refTime = r.IsDBNull(2) ? null : r.GetDecimal(2);
+                refTemp = r.IsDBNull(3) ? null : r.GetDecimal(3);
+            }
+
+            if (refTime is null || refTemp is null)
+                return Results.BadRequest(new { error = "缺少 ref_time_ns/ref_temp_c，请先同步通道配置或做一次临时标定" });
+
+            var diameterMm = req.NominalDiameterMm ?? ParseNominalDiameterMm(nominalDiam);
+            if (diameterMm <= 0)
+                return Results.BadRequest(new { error = "无法确定螺栓公称直径，请传 nominalDiameterMm" });
+
+            var nutFactor = req.NutFactor ?? 0.20m;
+            if (nutFactor <= 0)
+                return Results.BadRequest(new { error = "nutFactor 必须大于 0" });
+
+            var estimatedPreloadN = req.TorqueNm / (nutFactor * (diameterMm / 1000m));
+            var seconds = Math.Clamp(req.SampleWindowSeconds ?? 60, 5, 600);
+            var minSamples = Math.Clamp(req.MinSamples ?? 20, 1, 10_000);
+
+            decimal avgEcho, avgTemp, normalizedEcho, deltaTof;
+            decimal? stddevEcho, minEcho, maxEcho;
+            long sampleCount;
+            DateTime windowStart, windowEnd;
+
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT
+                    ROUND(AVG(echo_time_ns), 6),
+                    ROUND(STDDEV_POP(echo_time_ns), 6),
+                    ROUND(MIN(echo_time_ns), 6),
+                    ROUND(MAX(echo_time_ns), 6),
+                    ROUND(AVG(sp_temp_c), 6),
+                    COUNT(*),
+                    MIN(ts),
+                    MAX(ts)
+                FROM measurements
+                WHERE bolt_id = @bolt_id
+                  AND ts > now() - (@seconds || ' seconds')::interval
+                  AND echo_time_ns IS NOT NULL"))
+            {
+                cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                cmd.Parameters.AddWithValue("seconds", NpgsqlDbType.Integer, seconds);
+
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                await r.ReadAsync(ct);
+                sampleCount = r.GetInt64(5);
+                if (r.IsDBNull(0) || sampleCount < minSamples)
+                    return Results.BadRequest(new { error = "最近窗口内有效 EchoTime 样本不足", seconds, minSamples, actual = sampleCount });
+
+                avgEcho = r.GetDecimal(0);
+                stddevEcho = r.IsDBNull(1) ? null : r.GetDecimal(1);
+                minEcho = r.IsDBNull(2) ? null : r.GetDecimal(2);
+                maxEcho = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                avgTemp = r.GetDecimal(4);
+                windowStart = r.GetDateTime(6);
+                windowEnd = r.GetDateTime(7);
+            }
+
+            normalizedEcho = avgEcho / (1m + sdkDefaultTempCoeff * (avgTemp - refTemp.Value));
+            deltaTof = normalizedEcho - refTime.Value;
+
+            long pointId;
+            await using (var cmd = ds.CreateCommand(@"
+                INSERT INTO torque_test_points (
+                    bolt_id, channel_id, torque_nm, nut_factor, nominal_diameter_mm,
+                    estimated_preload_n, sample_window_seconds, sample_count,
+                    window_start, window_end,
+                    avg_echo_time_ns, stddev_echo_time_ns, min_echo_time_ns, max_echo_time_ns,
+                    avg_temp_c, ref_time_ns, ref_temp_c, temp_coefficient,
+                    normalized_echo_time_ns, delta_tof_ns,
+                    operator_user_id, note
+                ) VALUES (
+                    @bolt_id, @channel_id, @torque, @nut_factor, @diameter,
+                    @preload, @seconds, @count,
+                    @window_start, @window_end,
+                    @avg_echo, @stddev_echo, @min_echo, @max_echo,
+                    @avg_temp, @ref_time, @ref_temp, @tc,
+                    @normalized_echo, @delta_tof,
+                    @user_id, @note
+                )
+                RETURNING id"))
+            {
+                cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                cmd.Parameters.AddWithValue("torque", NpgsqlDbType.Numeric, req.TorqueNm);
+                cmd.Parameters.AddWithValue("nut_factor", NpgsqlDbType.Numeric, nutFactor);
+                cmd.Parameters.AddWithValue("diameter", NpgsqlDbType.Numeric, diameterMm);
+                cmd.Parameters.AddWithValue("preload", NpgsqlDbType.Numeric, estimatedPreloadN);
+                cmd.Parameters.AddWithValue("seconds", NpgsqlDbType.Integer, seconds);
+                cmd.Parameters.AddWithValue("count", NpgsqlDbType.Integer, (int)sampleCount);
+                cmd.Parameters.AddWithValue("window_start", NpgsqlDbType.TimestampTz, windowStart);
+                cmd.Parameters.AddWithValue("window_end", NpgsqlDbType.TimestampTz, windowEnd);
+                cmd.Parameters.AddWithValue("avg_echo", NpgsqlDbType.Numeric, avgEcho);
+                cmd.Parameters.AddWithValue("stddev_echo", NpgsqlDbType.Numeric, (object?)stddevEcho ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("min_echo", NpgsqlDbType.Numeric, (object?)minEcho ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("max_echo", NpgsqlDbType.Numeric, (object?)maxEcho ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("avg_temp", NpgsqlDbType.Numeric, avgTemp);
+                cmd.Parameters.AddWithValue("ref_time", NpgsqlDbType.Numeric, refTime.Value);
+                cmd.Parameters.AddWithValue("ref_temp", NpgsqlDbType.Numeric, refTemp.Value);
+                cmd.Parameters.AddWithValue("tc", NpgsqlDbType.Numeric, sdkDefaultTempCoeff);
+                cmd.Parameters.AddWithValue("normalized_echo", NpgsqlDbType.Numeric, normalizedEcho);
+                cmd.Parameters.AddWithValue("delta_tof", NpgsqlDbType.Numeric, deltaTof);
+                cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
+                cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, (object?)req.Note ?? DBNull.Value);
+
+                pointId = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
+            }
+
+            return Results.Ok(new
+            {
+                id = pointId,
+                channelId,
+                boltId,
+                torqueNm = req.TorqueNm,
+                nutFactor,
+                nominalDiameterMm = diameterMm,
+                estimatedPreloadN,
+                sampleWindowSeconds = seconds,
+                sampleCount,
+                windowStart,
+                windowEnd,
+                avgEchoTimeNs = avgEcho,
+                stddevEchoTimeNs = stddevEcho,
+                avgTempC = avgTemp,
+                refTimeNs = refTime,
+                refTempC = refTemp,
+                normalizedEchoTimeNs = normalizedEcho,
+                deltaTofNs = deltaTof,
+                note = "扭矩实验点已记录。继续按 50/100/150/200 N·m 采点后可看 summary 拟合线性。"
+            });
+        })
+        .WithName("CaptureTorqueTestPoint")
+        .WithSummary("采集一个扭矩阶梯实验点（不改变标定）");
+
+        grp.MapGet("/torque-test-points", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            const string sql = @"
+                SELECT id, torque_nm, nut_factor, nominal_diameter_mm, estimated_preload_n,
+                       sample_count, window_start, window_end,
+                       avg_echo_time_ns, stddev_echo_time_ns, avg_temp_c,
+                       normalized_echo_time_ns, delta_tof_ns, note, created_at,
+                       excluded, exclude_reason
+                FROM torque_test_points
+                WHERE channel_id = @channel_id
+                ORDER BY created_at DESC";
+
+            await using var cmd = ds.CreateCommand(sql);
+            cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+
+            var items = new List<object>();
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                items.Add(new
+                {
+                    id = r.GetInt64(0),
+                    torqueNm = r.GetDecimal(1),
+                    nutFactor = r.GetDecimal(2),
+                    nominalDiameterMm = r.GetDecimal(3),
+                    estimatedPreloadN = r.GetDecimal(4),
+                    sampleCount = r.GetInt32(5),
+                    windowStart = r.GetDateTime(6),
+                    windowEnd = r.GetDateTime(7),
+                    avgEchoTimeNs = r.GetDecimal(8),
+                    stddevEchoTimeNs = r.IsDBNull(9) ? null : (decimal?)r.GetDecimal(9),
+                    avgTempC = r.GetDecimal(10),
+                    normalizedEchoTimeNs = r.GetDecimal(11),
+                    deltaTofNs = r.GetDecimal(12),
+                    note = r.IsDBNull(13) ? null : r.GetString(13),
+                    createdAt = r.GetDateTime(14),
+                    excluded = r.GetBoolean(15),
+                    excludeReason = r.IsDBNull(16) ? null : r.GetString(16)
+                });
+            }
+
+            return Results.Ok(new { channelId, count = items.Count, items });
+        })
+        .WithName("ListTorqueTestPoints")
+        .WithSummary("查询扭矩实验点");
+
+        grp.MapGet("/torque-test-points/summary", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            const string sql = @"
+                SELECT
+                    COUNT(*) AS n,
+                    regr_slope(delta_tof_ns::double precision, estimated_preload_n::double precision) AS kl_slope,
+                    regr_intercept(delta_tof_ns::double precision, estimated_preload_n::double precision) AS intercept_ns,
+                    regr_r2(delta_tof_ns::double precision, estimated_preload_n::double precision) AS r_squared,
+                    MIN(torque_nm) AS min_torque,
+                    MAX(torque_nm) AS max_torque,
+                    MIN(delta_tof_ns) AS min_delta,
+                    MAX(delta_tof_ns) AS max_delta
+                FROM torque_test_points
+                WHERE channel_id = @channel_id AND excluded = false";
+
+            await using var cmd = ds.CreateCommand(sql);
+            cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            await r.ReadAsync(ct);
+            var n = r.GetInt64(0);
+
+            return Results.Ok(new
+            {
+                channelId,
+                pointCount = n,
+                kLByLinearFitNsPerN = r.IsDBNull(1) ? null : (double?)r.GetDouble(1),
+                interceptNs = r.IsDBNull(2) ? null : (double?)r.GetDouble(2),
+                rSquared = r.IsDBNull(3) ? null : (double?)r.GetDouble(3),
+                minTorqueNm = r.IsDBNull(4) ? null : (decimal?)r.GetDecimal(4),
+                maxTorqueNm = r.IsDBNull(5) ? null : (decimal?)r.GetDecimal(5),
+                minDeltaTofNs = r.IsDBNull(6) ? null : (decimal?)r.GetDecimal(6),
+                maxDeltaTofNs = r.IsDBNull(7) ? null : (decimal?)r.GetDecimal(7),
+                note = n < 3
+                    ? "少于 3 个点，只能记录，不能判断线性。建议采 50/100/150/200 N·m。"
+                    : "rSquared 越接近 1，扭矩-超声响应越线性；正式标定仍需已知载荷。"
+            });
+        })
+        .WithName("TorqueTestPointSummary")
+        .WithSummary("扭矩实验点线性拟合摘要");
+
+        grp.MapPost("/apply-torque-fit", async (
+            long channelId, ApplyTorqueFitRequest? req,
+            NpgsqlDataSource ds, IChannelResolver resolver,
+            HttpContext http,
+            ILoggerFactory lf, CancellationToken ct) =>
+        {
+            var logger = lf.CreateLogger("Calibration");
+            var userId = UserContext.Require(http).UserId;  // 操作人/审核人/审计一律取自 JWT，不信任客户端 user_id
+
+            long boltId, deviceId;
+            short channelNo;
+            decimal refTime, refTemp;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT b.id, c.device_id, c.channel_no, c.ref_time_ns, c.ref_temp_c
+                FROM channels c
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE c.id = @cid AND c.deleted_at IS NULL"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct))
+                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                if (r.IsDBNull(3) || r.IsDBNull(4))
+                    return Results.BadRequest(new { error = "缺少 RefTime/RefTemp，无法应用拟合标定" });
+
+                boltId = r.GetInt64(0);
+                deviceId = r.GetInt64(1);
+                channelNo = r.GetInt16(2);
+                refTime = r.GetDecimal(3);
+                refTemp = r.GetDecimal(4);
+            }
+
+            var minPoints = req?.MinPoints ?? 3;
+            decimal slope, intercept, rSquared;
+            long pointCount;
+            string pointsJson;
+            await using (var cmd = ds.CreateCommand(@"
+                WITH valid AS (
+                    SELECT *
+                    FROM torque_test_points
+                    WHERE channel_id = @channel_id AND excluded = false
+                ),
+                fit AS (
+                    SELECT
+                        COUNT(*) AS n,
+                        regr_slope(delta_tof_ns::double precision, estimated_preload_n::double precision) AS slope,
+                        regr_intercept(delta_tof_ns::double precision, estimated_preload_n::double precision) AS intercept,
+                        regr_r2(delta_tof_ns::double precision, estimated_preload_n::double precision) AS r2
+                    FROM valid
+                ),
+                pts AS (
+                    SELECT jsonb_agg(jsonb_build_object(
+                        'id', id,
+                        'torqueNm', torque_nm,
+                        'estimatedPreloadN', estimated_preload_n,
+                        'avgEchoTimeNs', avg_echo_time_ns,
+                        'stddevEchoTimeNs', stddev_echo_time_ns,
+                        'avgTempC', avg_temp_c,
+                        'deltaTofNs', delta_tof_ns,
+                        'sampleCount', sample_count
+                    ) ORDER BY torque_nm, id) AS points_jsonb
+                    FROM valid
+                )
+                SELECT fit.n, fit.slope, fit.intercept, fit.r2, pts.points_jsonb
+                FROM fit CROSS JOIN pts"))
+            {
+                cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                await r.ReadAsync(ct);
+
+                pointCount = r.GetInt64(0);
+                if (pointCount < minPoints || r.IsDBNull(1) || r.IsDBNull(2) || r.IsDBNull(3))
+                    return Results.BadRequest(new { error = "有效扭矩实验点不足，无法应用拟合", pointCount, minPoints });
+
+                slope = Convert.ToDecimal(r.GetDouble(1));
+                intercept = Convert.ToDecimal(r.GetDouble(2));
+                rSquared = Convert.ToDecimal(r.GetDouble(3));
+                pointsJson = r.GetString(4);
+            }
+
+            if (slope <= 0)
+                return Results.BadRequest(new { error = "拟合 K_L <= 0，拒绝应用", slope });
+
+            // R² 拟合优度门槛（plan §8.5 / 附录 B 步骤 5）。
+            // 0.98（合格）/ 0.95（拒绝下限）为工程经验阈值——GB/T 43232 对拟合 R² 无规定，
+            // 取值依据程芳玲 2024 实测（纵波 R²=0.9998）+ 通用测量学经验（见 plan §8.5）。
+            //   R² ≥ 0.98          → 通过（passed=true）
+            //   0.95 ≤ R² < 0.98   → 警告：作为"现场临时"标定可用，但 passed=false（建议补采载荷点重拟合）
+            //   R² < 0.95          → 拒绝：线性度不达标，必须补点或全部重做
+            const decimal R2PassThreshold = 0.98m;
+            const decimal R2RejectThreshold = 0.95m;
+            if (rSquared < R2RejectThreshold)
+                return Results.BadRequest(new
+                {
+                    error = $"拟合优度 R² = {rSquared} 低于拒绝下限 {R2RejectThreshold}，线性度不达标，拒绝应用为标定。请补采载荷点或全部重做（plan §8.5 / 附录 B）。",
+                    rSquared, pointCount, slope, intercept
+                });
+            var passed = rSquared >= R2PassThreshold;
+
+            var newCalibId = Guid.NewGuid();
+            var uncertaintyRatio = req?.UncertaintyRatio ?? 0.30m;
+            var kLUncertainty = slope * uncertaintyRatio;
+            var note = req?.Note ??
+                $"应用扭矩阶梯拟合：有效点 {pointCount} 个，K_L={slope}, intercept={intercept}ns, R²={rSquared}。临时扭矩法拟合，非正式载荷标定。";
+
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            try
+            {
+                await using (var cmd = new NpgsqlCommand(@"
+                    INSERT INTO calibration_records (
+                        id, bolt_id, method, operator_user_id, reviewer_user_id,
+                        loading_device, loading_device_cert, env_temp_c, env_humidity,
+                        points_jsonb, k_l, k_l_uncertainty, k_l_intercept_ns,
+                        r_squared, outliers_removed, uncertainty_breakdown, fitter_version,
+                        ref_time_ns, ref_temp_c, passed, notes,
+                        operator_signature_at, reviewer_signature_at, expires_at, created_at
+                    ) VALUES (
+                        @id, @bolt_id, 'torque_fit', @op, @rev,
+                        'torque wrench', NULL, NULL, NULL,
+                        @points::jsonb, @kl, @klu, @intercept,
+                        @r2, 0, @unc::jsonb, 'torque-fit:v1',
+                        @rt, @rtemp, @passed, @note,
+                        now(), now(), @exp, now()
+                    )", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
+                    cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                    cmd.Parameters.AddWithValue("op", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("points", NpgsqlDbType.Jsonb, pointsJson);
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, slope);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, kLUncertainty);
+                    cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, intercept);
+                    cmd.Parameters.AddWithValue("r2", NpgsqlDbType.Numeric, rSquared);
+                    cmd.Parameters.AddWithValue("unc", NpgsqlDbType.Jsonb,
+                        System.Text.Json.JsonSerializer.Serialize(new { uncertaintyRatio, source = "torque fit temporary estimate" }));
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp);
+                    cmd.Parameters.AddWithValue("passed", NpgsqlDbType.Boolean, passed);
+                    cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+                    cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date,
+                        DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req?.ExpiresDays ?? 7)));
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await SupersedeActiveCalibrationsAsync(conn, tx, boltId, newCalibId, ct);
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE channels SET
+                        k_l = @kl,
+                        k_l_uncertainty = @klu,
+                        k_l_intercept_ns = @intercept,
+                        ref_time_ns = @rt,
+                        ref_temp_c = @rtemp,
+                        active_calibration_id = @cid,
+                        updated_at = now()
+                    WHERE id = @channel_id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, slope);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, kLUncertainty);
+                    cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, intercept);
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp);
+                    cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Uuid, newCalibId);
+                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                var afterJson = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    channelId,
+                    boltId,
+                    calibrationId = newCalibId,
+                    method = "torque_fit",
+                    pointCount,
+                    kL = slope,
+                    kLInterceptNs = intercept,
+                    rSquared,
+                    passed
+                });
+                await WriteChannelAuditAsync(conn, tx, userId, "apply_torque_fit", channelId, afterJson, note, ct);
+
+                await tx.CommitAsync(ct);
+                resolver.Invalidate(deviceId, (ushort)channelNo);
+
+                logger.LogWarning("已应用 torque_fit channel={ChannelId} KL={KL} intercept={Intercept} R2={R2}",
+                    channelId, slope, intercept, rSquared);
+
+                return Results.Ok(new
+                {
+                    channelId,
+                    boltId,
+                    calibrationId = newCalibId,
+                    pointCount,
+                    kL = slope,
+                    kLInterceptNs = intercept,
+                    kLUncertainty,
+                    rSquared,
+                    passed,
+                    formula = "F = (Δt - kLInterceptNs) / kL",
+                    warning = passed
+                        ? "torque_fit 仍是扭矩法临时拟合，非正式载荷标定。"
+                        : $"R²={rSquared} 介于 [{R2RejectThreshold}, {R2PassThreshold})，未达 0.98 合格线，已记为 passed=false（现场临时可用，建议补采载荷点重拟合）。torque_fit 仍是扭矩法临时拟合，非正式载荷标定。"
+                });
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync(ct);
+                logger.LogError(ex, "应用 torque_fit 失败 channelId={ChannelId}", channelId);
+                return Results.Problem(detail: ex.Message, statusCode: 500);
+            }
+        })
+        .WithName("ApplyTorqueFit")
+        .WithSummary("应用扭矩阶梯拟合为当前 active calibration（含截距）");
+
+        // ========== 正式多点载荷标定（GB/T 43232 路径 B/C + JJF 1059.1 + 两人会签）==========
+        // 与 quick/torque 临时标定不同：用真实已知载荷点做最小二乘拟合，强制 R²≥0.98 + 评定扩展不确定度，
+        // 且必须"操作人提交 → 另一名 reviewer 会签"才激活（不允许自签自用）。
+        grp.MapPost("/load-calibrate", async (
+            long channelId, LoadCalibrateRequest req,
+            NpgsqlDataSource ds, HttpContext http,
+            ILoggerFactory lf, CancellationToken ct) =>
+        {
+            var logger = lf.CreateLogger("Calibration");
+            var userId = UserContext.Require(http).UserId;
+
+            if (req?.Points is null || req.Points.Count < 4)
+                return Results.BadRequest(new { error = "正式载荷标定至少需要 4 个已知载荷点（plan §7 路径 B/C）。" });
+            if (req.RefTimeNs <= 0m)
+                return Results.BadRequest(new { error = "refTimeNs（基线声时 t₀）必须 > 0。" });
+
+            // 提交阶段不激活、不失效缓存（会签时才失效），只需 bolt id
+            long boltId;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT b.id
+                FROM channels c
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE c.id = @cid AND c.deleted_at IS NULL"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct))
+                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                boltId = r.GetInt64(0);
+            }
+
+            // 1. 最小二乘拟合（Δt = K_L·F + b，K_L 单位 ns/N）
+            var points = req.Points.Select(p => new CalibrationPoint(p.ForceN, p.DeltaTofNs)).ToList();
+            LinearFitResult fit;
+            try
+            {
+                fit = new LeastSquaresFitter().Fit(points, useWeights: false, applyGrubbs: true);
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            if (fit.KL <= 0)
+                return Results.BadRequest(new { error = "拟合 K_L ≤ 0（方向/数据异常），拒绝。", kL = fit.KL });
+
+            // 2. 正式载荷标定强制 R²≥0.98（不走 [0.95,0.98) 临时层，plan §8.5）
+            const decimal r2PassThreshold = 0.98m;
+            var rSquared = (decimal)fit.RSquared;
+            if (rSquared < r2PassThreshold)
+                return Results.BadRequest(new
+                {
+                    error = $"拟合优度 R²={rSquared} 低于正式载荷标定合格线 {r2PassThreshold}，请补采载荷点或重做（plan §8.5）。",
+                    rSquared, pointCount = fit.PointCount, kL = fit.KL
+                });
+
+            // 3. JJF 1059.1 不确定度：A 类=拟合斜率标准误（ν=n-2）；可选 B 类=系统相对不确定度（载荷装置等，由计量输入）
+            var components = new List<UncertaintyComponent>
+            {
+                new("u_A(fit_slope)", UncertaintyType.A, fit.KLStdError, 1.0, Math.Max(fit.PointCount - 2, 1)),
+            };
+            if (req.SystematicRelativeUncertainty is > 0m)
+            {
+                var uB = (double)req.SystematicRelativeUncertainty.Value * Math.Abs(fit.KL);
+                components.Add(UncertaintyComponent.TypeB("u_B(systematic_rel)", uB));
+            }
+            var budget = UncertaintyEvaluator.Evaluate(components);
+
+            var newCalibId = Guid.NewGuid();
+            var pointsJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                method = "load_calibrated",
+                points = req.Points,
+                fit = new { kL = fit.KL, interceptNs = fit.InterceptNs, rSquared = fit.RSquared, klStdError = fit.KLStdError, fit.PointCount, removed = fit.RemovedIndices },
+            });
+            var uncJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                combinedStandardUncertainty = budget.CombinedStandardUncertainty,
+                effectiveDof = double.IsInfinity(budget.EffectiveDegreesOfFreedom) ? (double?)null : budget.EffectiveDegreesOfFreedom,
+                coverageFactor = budget.CoverageFactor,
+                expandedUncertainty = budget.ExpandedUncertainty,
+                confidence = budget.ConfidenceLevel,
+                components = budget.Components.Select(c => new { c.Name, type = c.Type.ToString(), c.StandardUncertainty, c.Sensitivity }),
+            });
+
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            try
+            {
+                await using (var cmd = new NpgsqlCommand(@"
+                    INSERT INTO calibration_records (
+                        id, bolt_id, method, operator_user_id, reviewer_user_id,
+                        loading_device, loading_device_cert, env_temp_c, env_humidity,
+                        points_jsonb, k_l, k_l_uncertainty, k_l_intercept_ns,
+                        r_squared, outliers_removed, uncertainty_breakdown, fitter_version,
+                        ref_time_ns, ref_temp_c, passed, notes, review_state,
+                        operator_signature_at, reviewer_signature_at, expires_at, created_at
+                    ) VALUES (
+                        @id, @bolt_id, 'load_calibrated', @op, NULL,
+                        @ld, @ldc, @et, @eh,
+                        @pts::jsonb, @kl, @klu, @intercept,
+                        @r2, @outliers, @unc::jsonb, 'lsq:v1',
+                        @rt, @rtemp, true, @note, 'pending',
+                        now(), NULL, @exp, now()
+                    )", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
+                    cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                    cmd.Parameters.AddWithValue("op", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("ld", NpgsqlDbType.Varchar, (object?)req.LoadingDevice ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("ldc", NpgsqlDbType.Varchar, (object?)req.LoadingDeviceCert ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("et", NpgsqlDbType.Numeric, (object?)req.EnvTempC ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("eh", NpgsqlDbType.Numeric, (object?)req.EnvHumidity ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("pts", NpgsqlDbType.Jsonb, pointsJson);
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, (decimal)fit.KL);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, (decimal)budget.ExpandedUncertainty);
+                    cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, (decimal)fit.InterceptNs);
+                    cmd.Parameters.AddWithValue("r2", NpgsqlDbType.Numeric, rSquared);
+                    cmd.Parameters.AddWithValue("outliers", NpgsqlDbType.Smallint, (short)fit.RemovedIndices.Count);
+                    cmd.Parameters.AddWithValue("unc", NpgsqlDbType.Jsonb, uncJson);
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, req.RefTimeNs);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, req.RefTempC);
+                    cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, (object?)req.Note ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date, DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? 180)));
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await WriteChannelAuditAsync(conn, tx, userId, "load_calibrate_submit", channelId,
+                    System.Text.Json.JsonSerializer.Serialize(new { calibrationId = newCalibId, kL = fit.KL, rSquared = fit.RSquared, expandedUncertainty = budget.ExpandedUncertainty }),
+                    $"提交正式载荷标定（待会签）bolt={boltId}", ct);
+
+                await tx.CommitAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync(ct);
+                logger.LogError(ex, "提交正式载荷标定失败 channel={Ch}", channelId);
+                return Results.Problem(detail: ex.Message, statusCode: 500);
+            }
+
+            logger.LogWarning("提交正式载荷标定 channel={Ch} calibId={Id} KL={KL} R²={R2} U={U}（待会签）",
+                channelId, newCalibId, fit.KL, fit.RSquared, budget.ExpandedUncertainty);
+
+            return Results.Ok(new
+            {
+                calibrationId = newCalibId,
+                channelId, boltId,
+                kL = fit.KL, interceptNs = fit.InterceptNs, rSquared = fit.RSquared,
+                expandedUncertainty = budget.ExpandedUncertainty, coverageFactor = budget.CoverageFactor,
+                pointCount = fit.PointCount, outliersRemoved = fit.RemovedIndices.Count,
+                reviewState = "pending",
+                note = "已提交，待会签。需【另一名】reviewer 调用 countersign 才激活生效（两人复核，不可自签）。"
+            });
+        })
+        .WithName("LoadCalibrate")
+        .WithSummary("正式多点载荷标定（最小二乘+R²≥0.98+JJF 不确定度，提交后待双签）");
+
+        // 会签：必须由不同于提交人的 reviewer 复核，激活 pending 正式标定
+        grp.MapPost("/calibrations/{calibrationId:guid}/countersign", async (
+            long channelId, Guid calibrationId, HttpContext http,
+            NpgsqlDataSource ds, IChannelResolver resolver,
+            ILoggerFactory lf, CancellationToken ct) =>
+        {
+            var logger = lf.CreateLogger("Calibration");
+            var reviewerId = UserContext.Require(http).UserId;
+
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            try
+            {
+                long boltId, deviceId;
+                short channelNo;
+                await using (var cmd = new NpgsqlCommand(@"
+                    SELECT b.id, c.device_id, c.channel_no
+                    FROM channels c
+                    JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                    WHERE c.id = @cid AND c.deleted_at IS NULL", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    if (!await r.ReadAsync(ct))
+                    {
+                        await tx.RollbackAsync(ct);
+                        return Results.NotFound(new { error = "通道不存在或未绑定 bolt", channelId });
+                    }
+                    boltId = r.GetInt64(0);
+                    deviceId = r.GetInt64(1);
+                    channelNo = r.GetInt16(2);
+                }
+
+                long operatorId, calibBoltId;
+                string reviewState;
+                decimal kl, klu, refTime, refTemp;
+                decimal? intercept;
+                await using (var cmd = new NpgsqlCommand(@"
+                    SELECT operator_user_id, review_state, bolt_id, k_l, k_l_uncertainty, k_l_intercept_ns, ref_time_ns, ref_temp_c
+                    FROM calibration_records WHERE id = @id FOR UPDATE", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, calibrationId);
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    if (!await r.ReadAsync(ct))
+                    {
+                        await tx.RollbackAsync(ct);
+                        return Results.NotFound(new { error = "标定档案不存在", calibrationId });
+                    }
+                    operatorId = r.GetInt64(0);
+                    reviewState = r.GetString(1);
+                    calibBoltId = r.GetInt64(2);
+                    kl = r.GetDecimal(3);
+                    klu = r.GetDecimal(4);
+                    intercept = r.IsDBNull(5) ? null : r.GetDecimal(5);
+                    refTime = r.GetDecimal(6);
+                    refTemp = r.GetDecimal(7);
+                }
+
+                if (calibBoltId != boltId)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new { error = "该标定不属于此通道绑定的螺栓", calibrationId, channelId });
+                }
+                if (reviewState != "pending")
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.Conflict(new { error = $"标定当前状态为 {reviewState}，仅 pending 可会签", calibrationId });
+                }
+                if (reviewerId == operatorId)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new { error = "会签人必须与提交人不同（两人复核底线）。", operatorUserId = operatorId });
+                }
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE calibration_records
+                       SET reviewer_user_id = @rev, reviewer_signature_at = now(), review_state = 'approved'
+                     WHERE id = @id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, reviewerId);
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, calibrationId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                // supersede 同 bolt 旧的已生效标定
+                await SupersedeActiveCalibrationsAsync(conn, tx, boltId, calibrationId, ct);
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE channels SET k_l=@kl, k_l_uncertainty=@klu, k_l_intercept_ns=@intercept,
+                           ref_time_ns=@rt, ref_temp_c=@rtemp, active_calibration_id=@id, updated_at=now()
+                     WHERE id=@channel_id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, kl);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, klu);
+                    cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, (object?)intercept ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp);
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, calibrationId);
+                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await WriteChannelAuditAsync(conn, tx, reviewerId, "load_calibrate_countersign", channelId,
+                    System.Text.Json.JsonSerializer.Serialize(new { calibrationId, operatorUserId = operatorId, reviewerUserId = reviewerId, kL = kl }),
+                    $"会签激活正式载荷标定 bolt={boltId}", ct);
+
+                await tx.CommitAsync(ct);
+                resolver.Invalidate(deviceId, (ushort)channelNo);
+
+                logger.LogWarning("会签激活正式载荷标定 channel={Ch} calibId={Id} operator={Op} reviewer={Rev}",
+                    channelId, calibrationId, operatorId, reviewerId);
+
+                return Results.Ok(new
+                {
+                    activated = true,
+                    calibrationId, channelId, boltId,
+                    operatorUserId = operatorId, reviewerUserId = reviewerId,
+                    reviewState = "approved"
+                });
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync(ct);
+                logger.LogError(ex, "会签失败 channel={Ch} calibId={Id}", channelId, calibrationId);
+                return Results.Problem(detail: ex.Message, statusCode: 500);
+            }
+        })
+        .WithName("CountersignCalibration")
+        .WithSummary("会签激活正式载荷标定（必须由不同于提交人的 reviewer 执行）");
+
+        // 查通道标定历史
+        grp.MapGet("/calibrations", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            const string sql = @"
+                SELECT cr.id, cr.method, cr.k_l, cr.k_l_uncertainty, cr.k_l_intercept_ns, cr.r_squared,
+                       cr.ref_time_ns, cr.ref_temp_c, cr.passed,
+                       cr.created_at, cr.expires_at, cr.superseded_by, cr.notes
+                FROM calibration_records cr
+                JOIN bolts b ON b.id = cr.bolt_id
+                JOIN channels c ON c.id = b.channel_id
+                WHERE c.id = @cid
+                ORDER BY cr.created_at DESC";
+
+            await using var cmd = ds.CreateCommand(sql);
+            cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+
+            var items = new List<object>();
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                items.Add(new
+                {
+                    id = r.GetGuid(0),
+                    method = r.GetString(1),
+                    kL = r.GetDecimal(2),
+                    kLUncertainty = r.GetDecimal(3),
+                    kLInterceptNs = r.IsDBNull(4) ? null : (decimal?)r.GetDecimal(4),
+                    rSquared = r.GetDecimal(5),
+                    refTimeNs = r.GetDecimal(6),
+                    refTempC = r.GetDecimal(7),
+                    passed = r.GetBoolean(8),
+                    createdAt = r.GetDateTime(9),
+                    expiresAt = r.GetDateTime(10),
+                    supersededBy = r.IsDBNull(11) ? null : (Guid?)r.GetGuid(11),
+                    isActive = r.IsDBNull(11),
+                    notes = r.IsDBNull(12) ? null : r.GetString(12)
+                });
+            }
+            return Results.Ok(new { channelId, count = items.Count, items });
+        })
+        .WithName("GetCalibrationHistory")
+        .WithSummary("通道标定历史（按时间倒序，含 superseded 关系）");
+
+        return app;
+    }
+
+    private static decimal ParseNominalDiameterMm(string nominalDiam)
+    {
+        var chars = nominalDiam.Where(c => char.IsDigit(c) || c == '.').ToArray();
+        return decimal.TryParse(new string(chars), System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? value
+            : 0m;
+    }
+
+    /// <summary>
+    /// 统一写 audit_log（target_type='channel'）。CalibrationEndpoints 内多处标定操作复用，
+    /// 消除重复的 INSERT 样板；调用方在事务内传入 conn/tx + 具体 action/after/note。
+    /// </summary>
+    private static async Task WriteChannelAuditAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx,
+        long userId, string action, long channelId, string afterJson, string note, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            INSERT INTO audit_log (user_id, action, target_type, target_id, after_jsonb, note, at)
+            VALUES (@uid, @action, 'channel', @cid, @after::jsonb, @note, now())", conn, tx);
+        cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
+        cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
+        cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+        cmd.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, afterJson);
+        cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// 把同一 bolt 下【已生效(approved) 且未被取代】的旧标定标记为被 <paramref name="newCalibId"/> superseded。
+    /// 必须过滤 review_state='approved'：否则自签标定(quick/torque/apply) 会误把一条"待会签(pending)"
+    /// 的正式载荷标定也标成 superseded，导致它永远无法被会签激活。
+    /// </summary>
+    private static async Task SupersedeActiveCalibrationsAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, long boltId, Guid newCalibId, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE calibration_records SET superseded_by = @new_id
+             WHERE bolt_id = @bolt_id AND superseded_by IS NULL AND id <> @new_id AND review_state = 'approved'", conn, tx);
+        cmd.Parameters.AddWithValue("new_id", NpgsqlDbType.Uuid, newCalibId);
+        cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+}
+
+/// <summary>快速标定请求体</summary>
+public sealed record QuickCalibrateRequest(
+    decimal KL,
+    decimal RefTimeNs,
+    decimal RefTempC,
+    decimal? KLUncertainty = null,
+    string? LoadingDevice = null,
+    string? LoadingDeviceCert = null,
+    decimal? EnvTempC = null,
+    decimal? EnvHumidity = null,
+    object? Points = null,
+    string? Note = null,
+    int? ExpiresDays = null);
+
+/// <summary>扭矩法临时标定请求体</summary>
+public sealed record TorqueCalibrateRequest(
+    decimal TorqueNm,
+    decimal? NutFactor = null,
+    decimal? NominalDiameterMm = null,
+    decimal? EffectiveLengthMm = null,
+    decimal? TotalLengthMm = null,
+    decimal? CrossSectionMm2 = null,
+    decimal? RefTimeNs = null,
+    decimal? RefTempC = null,
+    int? SampleWindowSeconds = null,
+    int? MinSamples = null,
+    decimal? UncertaintyRatio = null,
+    string? LoadingDevice = null,
+    string? Note = null,
+    int? ExpiresDays = null);
+
+/// <summary>扭矩阶梯实验点采集请求体</summary>
+public sealed record TorqueTestPointRequest(
+    decimal TorqueNm,
+    decimal? NutFactor = null,
+    decimal? NominalDiameterMm = null,
+    int? SampleWindowSeconds = null,
+    int? MinSamples = null,
+    string? Note = null);
+
+/// <summary>应用扭矩拟合请求体</summary>
+public sealed record ApplyTorqueFitRequest(
+    int? MinPoints = null,
+    decimal? UncertaintyRatio = null,
+    string? Note = null,
+    int? ExpiresDays = null);
+
+/// <summary>正式载荷标定的一个数据点：已知载荷 F(N) + 温补后声时差 Δt(ns)。</summary>
+public sealed record LoadCalibratePoint(double ForceN, double DeltaTofNs);
+
+/// <summary>正式多点载荷标定请求体。</summary>
+/// <param name="Points">已知载荷点（≥4），由拉伸机/测力垫圈给出 F，配套实测温补后 Δt</param>
+/// <param name="RefTimeNs">基线声时 t₀（ns），存档用</param>
+/// <param name="RefTempC">基线温度（°C），存档用</param>
+/// <param name="SystematicRelativeUncertainty">可选：系统性相对不确定度（如载荷装置相对精度 0.005=0.5%），作为 JJF B 类分量；不传则只用拟合 A 类</param>
+/// <param name="LoadingDevice">加载装置名称</param>
+/// <param name="LoadingDeviceCert">加载装置检定证书号</param>
+/// <param name="EnvTempC">环境温度</param>
+/// <param name="EnvHumidity">环境湿度</param>
+/// <param name="Note">备注</param>
+/// <param name="ExpiresDays">有效期天数（默认 180，plan 建议 ≤180）</param>
+public sealed record LoadCalibrateRequest(
+    IReadOnlyList<LoadCalibratePoint> Points,
+    decimal RefTimeNs,
+    decimal RefTempC,
+    decimal? SystematicRelativeUncertainty = null,
+    string? LoadingDevice = null,
+    string? LoadingDeviceCert = null,
+    decimal? EnvTempC = null,
+    decimal? EnvHumidity = null,
+    string? Note = null,
+    int? ExpiresDays = null);
+

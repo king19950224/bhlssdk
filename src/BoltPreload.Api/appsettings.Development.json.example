@@ -1,0 +1,22 @@
+{
+  "//": "把本文件拷贝成 appsettings.Development.json（已 gitignore），按需修改。",
+  "ConnectionStrings": {
+    "Postgres": "Host=localhost;Port=5432;Database=boltpreload;Username=boltpreload;Password=dev_only_NOT_for_production;Include Error Detail=true"
+  },
+  "Fx": {
+    "Mode": "Simulated",
+    "DeveloperMode": true
+  },
+  "License": {
+    "AllowMissingLicenseInDevelopment": true,
+    "PublicKeyPem": ""
+  },
+  "Jwt": {
+    "SigningKey": "dev_only_jwt_signing_key_at_least_64_bytes_long_replace_me_in_production_xxxxxxxxxxxxxxx"
+  },
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Debug"
+    }
+  }
+}

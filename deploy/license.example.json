@@ -1,0 +1,15 @@
+{
+  "licenseId": "trial-lab-001",
+  "licensedTo": "实验室试用客户",
+  "machineCode": "REPLACE_WITH_/api/license/machine-code",
+  "expiresAt": "2026-12-31",
+  "maxDevices": 1,
+  "maxChannels": 16,
+  "modules": [
+    "realtime-monitoring",
+    "torque-fit",
+    "wave-diagnostics",
+    "reports"
+  ],
+  "signature": "PHASE1-DEMO-SIGNATURE"
+}

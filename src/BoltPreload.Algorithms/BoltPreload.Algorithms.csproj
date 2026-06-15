@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>BoltPreload.Algorithms</RootNamespace>
+    <AssemblyName>BoltPreload.Algorithms</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BoltPreload.Domain\BoltPreload.Domain.csproj" />
+  </ItemGroup>
+
+</Project>

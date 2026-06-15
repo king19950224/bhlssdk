@@ -1,0 +1,76 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.userprefs
+.vs/
+.vscode/
+*.dll
+*.exe
+*.pdb
+project.lock.json
+
+# Rider / VS Code
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Logs
+*.log
+logs/
+nlog.log
+serilog-*
+
+# Local secrets (don't commit)
+appsettings.Development.json
+appsettings.Local.json
+appsettings.json.bak*
+secrets.json
+*.pfx
+*.pem
+license.json
+!license.example.json
+!deploy/license.example.json
+
+# Build artifacts
+publish/
+out/
+artifacts/
+
+# Test results
+TestResults/
+coverage.xml
+*.coverage
+*.coveragexml
+
+# Node (前端)
+node_modules/
+dist/
+.cache/
+.nuxt/
+.vite/
+
+# Docker volumes (本地数据)
+.docker-data/
+postgres-data/
+minio-data/
+
+# Runtime data (波形文件、现场采集运行数据，不进 git)
+data/
+src/BoltPreload.Api/data/
+
+# 厂家原始 SDK 资料（含 C#/Java 双语言、docx 文档）— 不进 git
+# 已经把 C# 1.4 源码净化拷到 external/FxSDK/（见 external/FxSDK/README.md）
+# Java SDK 暂不使用
+FxSDK C#+Java源码+使用示例/
+FxSDK C#+Java源码+使用示例.zip
+
+# 软著申请等业务/法务材料（非代码，不进 git）
+软著申请材料/
+软著申请表.docx

@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <RootNamespace>BoltPreload.Api</RootNamespace>
+    <AssemblyName>BoltPreload.Api</AssemblyName>
+    <UserSecretsId>boltpreload-api-dev</UserSecretsId>
+    <!-- 运行时数据目录（波形/报告落地、日志）不要参与 SDK 默认 glob。
+         否则 Microsoft.NET.Sdk.Web 会把 data/ 下成千上万个波形文件枚举成 Content/None item，
+         导致 MSBuild/构建在“分配风暴”里卡死（实测 data/ 长到 5.9GB 时 dotnet build 卡 20+ 分钟）。 -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);data/**;logs/**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 注：不要装 Microsoft.AspNetCore.SignalR 包；
+         SignalR 在 ASP.NET Core 8（Microsoft.NET.Sdk.Web）已内置，单独装会冲突 -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Identity.Core" Version="8.0.10" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.10">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <!-- Npgsql 显式引用，避免依赖 Infrastructure 的传递（Program.cs 直接用 NpgsqlDataSourceBuilder） -->
+    <PackageReference Include="Npgsql" Version="8.0.6" />
+    <PackageReference Include="Serilog.AspNetCore" Version="8.0.3" />
+    <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="7.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- NLog.config 复制到输出目录，否则 NLog 找不到 -->
+    <None Update="NLog.config">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BoltPreload.Domain\BoltPreload.Domain.csproj" />
+    <ProjectReference Include="..\BoltPreload.Algorithms\BoltPreload.Algorithms.csproj" />
+    <ProjectReference Include="..\BoltPreload.Application\BoltPreload.Application.csproj" />
+    <ProjectReference Include="..\BoltPreload.Infrastructure\BoltPreload.Infrastructure.csproj" />
+    <ProjectReference Include="..\BoltPreload.Calibration\BoltPreload.Calibration.csproj" />
+    <ProjectReference Include="..\BoltPreload.Fx\BoltPreload.Fx.csproj" />
+  </ItemGroup>
+
+</Project>

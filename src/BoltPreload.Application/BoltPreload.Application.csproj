@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>BoltPreload.Application</RootNamespace>
+    <AssemblyName>BoltPreload.Application</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BoltPreload.Domain\BoltPreload.Domain.csproj" />
+    <ProjectReference Include="..\BoltPreload.Algorithms\BoltPreload.Algorithms.csproj" />
+    <ProjectReference Include="..\BoltPreload.Calibration\BoltPreload.Calibration.csproj" />
+    <ProjectReference Include="..\BoltPreload.Fx\BoltPreload.Fx.csproj" />
+  </ItemGroup>
+
+</Project>

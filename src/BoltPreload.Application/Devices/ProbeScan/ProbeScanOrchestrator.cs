@@ -1,0 +1,250 @@
+using BoltPreload.Fx;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+
+namespace BoltPreload.Application.Devices.ProbeScan;
+
+/// <summary>
+/// 通道自动检测主流程。
+/// 关键不变量：
+/// 1. 必须 try/finally 包扫描循环；finally 用 CancellationToken.None 恢复 MultiMeas，
+///    不能因为用户 abort 把恢复也取消掉。
+/// 2. 整个过程独占设备工作模式：Watchdog 与其他写 WorkMode 的接口必须通过 ProbeScanState 检查跳过。
+/// 3. 不直接消费 connector.Results — 那会与 IngestionService 抢消费；
+///    采样数据由 IngestionService → MeasurementSink/WaveStore 落库，扫描器只查 DB 窗口。
+/// </summary>
+public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
+{
+    private readonly IDeviceConnectorManager _deviceManager;
+    private readonly IProbeScanRepository _repo;
+    private readonly ProbeScanState _state;
+    private readonly ProbeScanOptions _options;
+    private readonly ILogger<ProbeScanOrchestrator> _logger;
+
+    public ProbeScanOrchestrator(
+        IDeviceConnectorManager deviceManager,
+        IProbeScanRepository repo,
+        ProbeScanState state,
+        IOptions<ProbeScanOptions> options,
+        ILogger<ProbeScanOrchestrator> logger)
+    {
+        _deviceManager = deviceManager;
+        _repo = repo;
+        _state = state;
+        _options = options.Value;
+        _logger = logger;
+    }
+
+    public async Task<ProbeScanRunView> StartAsync(ProbeScanRequest req, long? requestedByUserId, CancellationToken ct)
+    {
+        var runtime = _deviceManager.Find(req.DeviceId)
+            ?? throw new InvalidOperationException($"设备未在运行时管理器中找到：{req.DeviceId}");
+
+        if (runtime.Connector.State != FxConnectorState.Connected)
+            throw new InvalidOperationException($"设备未连接，无法启动扫描：state={runtime.Connector.State}");
+
+        var existingOpenId = await _repo.FindOpenRunAsync(req.DeviceId, ct);
+        if (existingOpenId is not null)
+            throw new ProbeScanConflictException(
+                $"设备 {req.DeviceId} 已有进行中的扫描 scanRunId={existingOpenId.Value}",
+                existingOpenId.Value);
+
+        var runId = await _repo.CreatePendingAsync(req, requestedByUserId, ct);
+
+        var handle = _state.TryBegin(req.DeviceId, runId);
+        if (handle is null)
+        {
+            // DB 里检查通过但进程里被其他线程抢了 — 把 DB 记录置 failed，让 API 409
+            await _repo.MarkFailedAsync(runId, "ProbeScanState 占位失败：另一线程已开始扫描",
+                DateTimeOffset.UtcNow, ct);
+            throw new ProbeScanConflictException("ProbeScanState 占位失败", runId);
+        }
+
+        // Task.Run 跑主流程；不要让 HTTP 请求 hold 几分钟
+        // 显式传 handle.Cts.Token：扫描的"主取消令牌"是 ProbeScanState 里的 Cts，
+        // 不能跟着 HTTP 请求的 ct 走（请求一返回，ct 就被释放，扫描会被立刻取消）
+        var scanCt = handle.Cts.Token;
+        _ = Task.Run(() => RunInternalAsync(req, runId, scanCt), scanCt);
+
+        return await _repo.LoadRunAsync(runId, ct)
+               ?? throw new InvalidOperationException("插入后查询不到 scan run");
+    }
+
+    public Task<ProbeScanRunView?> GetAsync(long scanRunId, CancellationToken ct)
+        => _repo.LoadRunAsync(scanRunId, ct);
+
+    public Task<ProbeScanRunView?> GetLatestAsync(long deviceId, CancellationToken ct)
+        => _repo.LoadLatestRunAsync(deviceId, ct);
+
+    public bool TryAbort(long deviceId, long scanRunId)
+        => _state.TryAbort(deviceId, scanRunId);
+
+    private async Task RunInternalAsync(ProbeScanRequest req, long runId, CancellationToken ct)
+    {
+        var runtime = _deviceManager.Find(req.DeviceId)!;
+        var connector = runtime.Connector;
+        var address = runtime.Options.Address;
+        const FxWorkMode originalMode = FxWorkMode.MultiMeas;
+
+        // 扫描开始前快照"业务期启用通道集"。mcr_single 策略每次只把单个通道写进 MCR，
+        // 扫描完成后必须把这份快照恢复回去，否则业务监测会只跑最后扫描的那个通道。
+        IReadOnlyList<ushort> originalEnabledChannels = Array.Empty<ushort>();
+        try
+        {
+            originalEnabledChannels = await _repo.LoadEnabledChannelsAsync(req.DeviceId, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "扫描启动：读取原始 MCR 通道快照失败 device={DeviceId}（mcr_single 策略下恢复可能不准）",
+                req.DeviceId);
+        }
+
+        var summary = new SummaryAccumulator();
+        Exception? failure = null;
+        bool aborted = false;
+        var startedAt = DateTimeOffset.UtcNow;
+
+        try
+        {
+            await _repo.MarkRunningAsync(runId, startedAt, ct);
+            _logger.LogInformation(
+                "开始通道扫描 device={DeviceId} run={RunId} channels={ChCount} strategy={Strategy} originalMCR={Mcr}",
+                req.DeviceId, runId, req.Channels.Count, req.Strategy, originalEnabledChannels.Count);
+
+            foreach (var ch in req.Channels)
+            {
+                if (ct.IsCancellationRequested) { aborted = true; break; }
+
+                var slot = await ScanOneChannelAsync(connector, address, req, ch, ct);
+                summary.Add(slot.Verdict);
+
+                // 写结果用 CancellationToken.None：哪怕用户在最后一刻 abort，
+                // 已扫到的数据也要落库，不能丢
+                await _repo.SaveResultAsync(runId, req.DeviceId, slot, CancellationToken.None);
+                await _repo.UpdateChannelHardwareStateAsync(
+                    req.DeviceId, ch, slot.Verdict, slot.FinishedAt, CancellationToken.None);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            aborted = true;
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+            _logger.LogError(ex, "通道扫描异常 device={DeviceId} run={RunId}", req.DeviceId, runId);
+        }
+        finally
+        {
+            var finishedAt = DateTimeOffset.UtcNow;
+
+            // 关键：恢复 MultiMeas 必须用 CancellationToken.None，不能跟着上游 ct 一起取消
+            // mcr_single 策略每次只把单个通道写进 MCR，必须先恢复 MCR 通道集，再切回 MultiMeas
+            try
+            {
+                if (req.Strategy == "mcr_single" && originalEnabledChannels.Count > 0)
+                {
+                    await connector.ConfigureMultiChannelPollingAsync(
+                        originalEnabledChannels,
+                        singleCount: 1, dailyCount: 0, startSeconds: null,
+                        cancellationToken: CancellationToken.None);
+                    _logger.LogInformation(
+                        "扫描完成，已恢复 MCR 通道集 device={DeviceId} channels={Count}",
+                        req.DeviceId, originalEnabledChannels.Count);
+                }
+
+                await connector.SetWorkModeAsync(originalMode, channel: 0, address: address, CancellationToken.None);
+                _logger.LogInformation("扫描完成，已恢复 {Mode} device={DeviceId} run={RunId}",
+                    originalMode, req.DeviceId, runId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "扫描完成后恢复 MultiMeas / MCR 失败 device={DeviceId} — Watchdog 会接管重连",
+                    req.DeviceId);
+            }
+
+            _state.End(req.DeviceId);
+
+            try
+            {
+                if (failure is not null)
+                    await _repo.MarkFailedAsync(runId, failure.Message, finishedAt, CancellationToken.None);
+                else if (aborted)
+                    await _repo.MarkAbortedAsync(runId, finishedAt, CancellationToken.None);
+                else
+                    await _repo.MarkCompletedAsync(runId, summary.ToSummary(), finishedAt, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "标记扫描结束状态失败 run={RunId}（状态可能停在 running，启动时会清理）", runId);
+            }
+        }
+    }
+
+    private async Task<ProbeScanResultSlot> ScanOneChannelAsync(
+        IFxConnector connector, ushort address, ProbeScanRequest req, ushort channel, CancellationToken ct)
+    {
+        // 切到目标通道
+        if (req.Strategy == "mcr_single")
+        {
+            await connector.ConfigureMultiChannelPollingAsync(
+                enabledChannels: new[] { channel },
+                singleCount: 1, dailyCount: 0, startSeconds: null, cancellationToken: ct);
+            await connector.SetWorkModeAsync(FxWorkMode.MultiMeas, channel: 0, address: address, ct);
+        }
+        else
+        {
+            await connector.SetWorkModeAsync(FxWorkMode.SingleMeas, channel: channel, address: address, ct);
+        }
+
+        // 稳定期（避免抓到上一个通道的尾巴）
+        await Task.Delay(TimeSpan.FromSeconds(req.SettleSeconds), ct);
+
+        // 采样窗口：仅记录起止时间，数据由 IngestionService 正常路径落库
+        var sampleStart = DateTimeOffset.UtcNow;
+        await Task.Delay(TimeSpan.FromSeconds(req.SampleSeconds), ct);
+        var sampleEnd = DateTimeOffset.UtcNow;
+
+        var stats = await _repo.LoadWindowStatsAsync(req.DeviceId, channel, sampleStart, sampleEnd, ct);
+        var verdict = ProbeScanResultJudge.Judge(stats, req.Thresholds);
+
+        _logger.LogInformation(
+            "通道扫描结果 device={DeviceId} ch={Ch} verdict={Verdict} samples={N} echoRate={Echo} snr={Snr} pp={PP}",
+            req.DeviceId, channel, ProbeScanVerdictNames.Format(verdict),
+            stats.Samples,
+            stats.Samples > 0 ? (decimal)stats.SamplesWithEcho * 100 / stats.Samples : 0m,
+            stats.SnrAvgDb, stats.PeakToPeakAvg);
+
+        return new ProbeScanResultSlot(channel, verdict, stats, sampleStart, sampleEnd);
+    }
+
+    private sealed class SummaryAccumulator
+    {
+        private int _good, _weak, _noEcho, _notReporting, _inconclusive;
+
+        public void Add(ProbeScanVerdict v)
+        {
+            switch (v)
+            {
+                case ProbeScanVerdict.ActiveGood: _good++; break;
+                case ProbeScanVerdict.ActiveWeak: _weak++; break;
+                case ProbeScanVerdict.ActiveNoEcho: _noEcho++; break;
+                case ProbeScanVerdict.NotReporting: _notReporting++; break;
+                default: _inconclusive++; break;
+            }
+        }
+
+        public ProbeScanSummary ToSummary() =>
+            new(_good, _weak, _noEcho, _notReporting, _inconclusive);
+    }
+}
+
+public sealed class ProbeScanConflictException : InvalidOperationException
+{
+    public long ExistingScanRunId { get; }
+
+    public ProbeScanConflictException(string message, long existingScanRunId) : base(message)
+    {
+        ExistingScanRunId = existingScanRunId;
+    }
+}

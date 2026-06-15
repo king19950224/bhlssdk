@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>螺栓预紧力监测 - MVP</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --card: #fff;
+      --border: #dcdfe6;
+      --text: #1f2d3d;
+      --muted: #6b7280;
+      --green: #16a34a;
+      --red: #dc2626;
+      --orange: #f97316;
+      --blue: #2563eb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+    header {
+      height: 56px;
+      padding: 0 20px;
+      background: #111827;
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 1px 6px rgba(0,0,0,.2);
+    }
+    header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+    header .sub { color: #cbd5e1; font-size: 13px; }
+    main { padding: 18px; max-width: 1440px; margin: 0 auto; }
+    .grid { display: grid; gap: 14px; }
+    .grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .grid.cols-2 { grid-template-columns: 1.2fr .8fr; margin-top: 14px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.04);
+    }
+    .card h2 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .metric-title { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    .metric-value { font-size: 26px; font-weight: 700; line-height: 1.1; }
+    .metric-unit { font-size: 12px; color: var(--muted); margin-left: 4px; font-weight: 500; }
+    .metric-foot { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .good { color: var(--green); }
+    .bad { color: var(--red); }
+    .warn { color: var(--orange); }
+    .blue { color: var(--blue); }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 12px;
+      background: #e5e7eb;
+      color: #374151;
+    }
+    .badge.good { color: #166534; background: #dcfce7; }
+    .badge.bad { color: #991b1b; background: #fee2e2; }
+    .badge.warn { color: #9a3412; background: #ffedd5; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    button {
+      border: 1px solid var(--border);
+      background: white;
+      border-radius: 7px;
+      padding: 7px 10px;
+      cursor: pointer;
+      color: var(--text);
+    }
+    button.primary { background: #2563eb; color: white; border-color: #2563eb; }
+    button:hover { filter: brightness(.98); }
+    #trendChart { height: 420px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 7px; border-bottom: 1px solid #eef0f3; text-align: left; vertical-align: top; }
+    th { background: #f9fafb; color: #4b5563; font-weight: 650; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .log {
+      height: 170px;
+      overflow: auto;
+      background: #0b1220;
+      color: #d1d5db;
+      border-radius: 8px;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .small { font-size: 12px; color: var(--muted); }
+    @media (max-width: 1000px) {
+      .grid.cols-4, .grid.cols-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>螺栓预紧力在线监测</h1>
+    <div class="sub">实验室 M20×80 · 扭矩法临时标定 · 真实设备 192.168.0.7:23</div>
+  </div>
+  <div class="toolbar">
+    <span id="signalrBadge" class="badge">SignalR 未连接</span>
+    <button onclick="refreshAll()">刷新</button>
+  </div>
+</header>
+
+<main>
+  <section class="grid cols-4">
+    <div class="card">
+      <div class="metric-title">设备状态</div>
+      <div id="deviceState" class="metric-value">--</div>
+      <div id="deviceFoot" class="metric-foot">等待数据</div>
+    </div>
+    <div class="card">
+      <div class="metric-title">EchoTime 接受率</div>
+      <div class="metric-value"><span id="echoRate">--</span><span class="metric-unit">%</span></div>
+      <div id="echoFoot" class="metric-foot">最近 1 分钟</div>
+    </div>
+    <div class="card">
+      <div class="metric-title">当前预紧力</div>
+      <div class="metric-value"><span id="preloadNow">--</span><span class="metric-unit">kN</span></div>
+      <div id="preloadFoot" class="metric-foot">目标 50.0 kN（扭矩法估算）</div>
+    </div>
+    <div class="card">
+      <div class="metric-title">预紧力比例</div>
+      <div class="metric-value"><span id="ratioNow">--</span><span class="metric-unit">ratio</span></div>
+      <div id="ratioFoot" class="metric-foot">0.70 以下触发低预紧告警</div>
+    </div>
+  </section>
+
+  <section class="grid cols-2">
+    <div class="card">
+      <h2>
+        预紧力趋势
+        <span class="toolbar">
+          <button onclick="setTrendWindow('10min')">10分钟</button>
+          <button onclick="setTrendWindow('1h')">1小时</button>
+          <button onclick="setTrendWindow('6h')">6小时</button>
+          <button class="primary" onclick="refreshTrend()">刷新趋势</button>
+        </span>
+      </h2>
+      <div id="trendChart"></div>
+      <div class="small">说明：当前 `preload_n` 是扭矩法临时估算标定值，正式验收需多点加载标定替换。</div>
+    </div>
+
+    <div class="card">
+      <h2>设备健康</h2>
+      <table>
+        <tbody id="healthTable">
+        <tr><td>状态</td><td>--</td></tr>
+        </tbody>
+      </table>
+      <h2 style="margin-top:14px;">最近实时事件</h2>
+      <div id="eventLog" class="log"></div>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top:14px;">
+    <h2>
+      告警
+      <span class="toolbar">
+        <button onclick="refreshAlarms()">刷新告警</button>
+      </span>
+    </h2>
+    <table>
+      <thead>
+      <tr>
+        <th>ID</th><th>螺栓</th><th>类型</th><th>级别</th><th>触发时间</th><th>预紧力</th><th>比例</th><th>消息</th><th>状态</th><th>操作</th>
+      </tr>
+      </thead>
+      <tbody id="alarmRows">
+      <tr><td colspan="10">暂无数据</td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
+<script>
+  const boltId = 1;
+  const deviceId = 1;
+  const channelNo = 9;
+  let trendWindow = '10min';
+  const chart = echarts.init(document.getElementById('trendChart'));
+
+  const fmt = (v, digits = 2) => v === null || v === undefined || Number.isNaN(Number(v)) ? '--' : Number(v).toFixed(digits);
+  const fmtTime = v => v ? new Date(v).toLocaleString('zh-CN', { hour12: false }) : '--';
+
+  async function api(url, options) {
+    const res = await fetch(url, options);
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    return await res.json();
+  }
+
+  function logEvent(text) {
+    const el = document.getElementById('eventLog');
+    const line = `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${text}`;
+    el.textContent = `${line}\n${el.textContent}`.slice(0, 5000);
+  }
+
+  async function refreshHealth() {
+    const h = await api(`/api/devices/${deviceId}/diagnostic/real-health?channel=${channelNo}&minutes=1`);
+    const m = h.measurement;
+    document.getElementById('deviceState').textContent = m.healthy ? '正常' : '异常';
+    document.getElementById('deviceState').className = `metric-value ${m.healthy ? 'good' : 'bad'}`;
+    document.getElementById('deviceFoot').textContent = `${h.connectorState} · 最近 ${m.total} 条 · ${fmtTime(m.lastTs)}`;
+    document.getElementById('echoRate').textContent = fmt(m.echoRatePct, 1);
+    document.getElementById('echoRate').className = m.echoRatePct >= 95 ? 'good' : 'bad';
+    document.getElementById('echoFoot').textContent = `Echo ${m.withEcho}/${m.total} · 温度 ${fmt(m.avgTempC, 2)} °C`;
+
+    const cfg = h.sdkSession.sessionConfig || {};
+    document.getElementById('healthTable').innerHTML = `
+      <tr><td>连接状态</td><td>${h.connectorState}</td></tr>
+      <tr><td>ChannelConfig</td><td>${h.sdkSession.hasChannelConfig ? '<span class="good">已注入</span>' : '<span class="bad">缺失</span>'}</td></tr>
+      <tr><td>通道</td><td class="mono">${cfg.channel ?? '--'}</td></tr>
+      <tr><td>ProbeFreq</td><td class="mono">${cfg.probeFreqMhz ?? '--'} MHz</td></tr>
+      <tr><td>MeasMode</td><td class="mono">${cfg.measMode ?? '--'}</td></tr>
+      <tr><td>Threshold</td><td class="mono">${cfg.threshold ?? '--'}</td></tr>
+      <tr><td>RefTime</td><td class="mono">${cfg.refTimeNs ?? '--'} ns</td></tr>
+      <tr><td>RefTemp</td><td class="mono">${cfg.refTempC ?? '--'} °C</td></tr>
+      <tr><td>最近温度</td><td class="mono">${fmt(m.avgTempC, 2)} °C</td></tr>
+    `;
+  }
+
+  function sinceForWindow() {
+    const now = new Date();
+    const d = new Date(now);
+    if (trendWindow === '10min') d.setMinutes(d.getMinutes() - 10);
+    else if (trendWindow === '1h') d.setHours(d.getHours() - 1);
+    else d.setHours(d.getHours() - 6);
+    return d.toISOString();
+  }
+
+  function setTrendWindow(v) {
+    trendWindow = v;
+    refreshTrend();
+  }
+
+  async function refreshTrend() {
+    const data = await api(`/api/bolts/${boltId}/preload-trend?since=${encodeURIComponent(sinceForWindow())}&bucket=auto&maxPoints=800`);
+    const items = data.items || [];
+    const xs = items.map(x => fmtTime(x.ts));
+    const preload = items.map(x => x.avgPreloadN === null ? null : Number(x.avgPreloadN) / 1000);
+    const ratio = items.map(x => x.avgRatio === null ? null : Number(x.avgRatio));
+    const latest = [...items].reverse().find(x => x.avgPreloadN !== null);
+    if (latest) {
+      document.getElementById('preloadNow').textContent = fmt(Number(latest.avgPreloadN) / 1000, 2);
+      document.getElementById('ratioNow').textContent = fmt(latest.avgRatio, 3);
+      document.getElementById('ratioNow').className = latest.avgRatio < 0.7 || latest.avgRatio > 1.1 ? 'bad' : 'good';
+      document.getElementById('preloadFoot').textContent = `最近 bucket: ${fmtTime(latest.ts)} · 样本 ${latest.nValid}/${latest.n}`;
+    }
+
+    chart.setOption({
+      tooltip: { trigger: 'axis' },
+      legend: { data: ['预紧力(kN)', '比例'] },
+      grid: { left: 50, right: 50, top: 40, bottom: 50 },
+      xAxis: { type: 'category', data: xs, axisLabel: { hideOverlap: true } },
+      yAxis: [
+        { type: 'value', name: 'kN', min: v => Math.max(0, Math.floor(v.min - 5)) },
+        { type: 'value', name: 'ratio', min: 0, max: 1.3 }
+      ],
+      series: [
+        { name: '预紧力(kN)', type: 'line', smooth: true, showSymbol: false, data: preload, markLine: { data: [{ yAxis: 50, name: '目标 50kN' }] } },
+        { name: '比例', type: 'line', yAxisIndex: 1, smooth: true, showSymbol: false, data: ratio, markLine: { data: [{ yAxis: 0.7, name: '低限' }, { yAxis: 1.1, name: '高限' }] } }
+      ]
+    });
+  }
+
+  async function refreshAlarms() {
+    const data = await api('/api/alarms/?includeCleared=true&limit=20');
+    const rows = document.getElementById('alarmRows');
+    const items = data.items || [];
+    if (items.length === 0) {
+      rows.innerHTML = '<tr><td colspan="10">暂无告警</td></tr>';
+      return;
+    }
+    rows.innerHTML = items.map(a => `
+      <tr>
+        <td>${a.id}</td>
+        <td>${a.boltCode || a.boltId}</td>
+        <td>${a.type}</td>
+        <td><span class="badge ${a.severity === 'warn' ? 'warn' : a.severity === 'critical' ? 'bad' : ''}">${a.severity}</span></td>
+        <td>${fmtTime(a.triggeredAt)}</td>
+        <td class="mono">${a.preloadN === null ? '--' : fmt(Number(a.preloadN) / 1000, 2) + ' kN'}</td>
+        <td class="mono">${fmt(a.preloadRatio, 3)}</td>
+        <td>${a.message || ''}</td>
+        <td>${a.isOpen ? '<span class="badge bad">开启</span>' : '<span class="badge good">已恢复</span>'}</td>
+        <td>${a.isOpen && !a.isAcked ? `<button onclick="ackAlarm(${a.id})">确认</button>` : '--'}</td>
+      </tr>
+    `).join('');
+  }
+
+  async function ackAlarm(id) {
+    await api(`/api/alarms/${id}/ack`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: 'dashboard ack' }) });
+    await refreshAlarms();
+  }
+
+  async function refreshAll() {
+    try {
+      await Promise.all([refreshHealth(), refreshTrend(), refreshAlarms()]);
+      logEvent('页面刷新完成');
+    } catch (err) {
+      logEvent(`刷新失败: ${err.message}`);
+    }
+  }
+
+  function startSignalR() {
+    const badge = document.getElementById('signalrBadge');
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl('/hubs/measurements')
+      .withAutomaticReconnect()
+      .build();
+
+    connection.on('OnMeasurement', m => {
+      if (Number(m.channel) !== channelNo) return;
+      const echo = m.echoTimeNs === null ? '--' : fmt(m.echoTimeNs, 2);
+      const temp = fmt(m.spTempC, 2);
+      logEvent(`测量 ch=${m.channel} echo=${echo}ns temp=${temp}°C`);
+    });
+    connection.on('OnAlarm', a => {
+      logEvent(`告警 ${a.action}: ${a.message}`);
+      refreshAlarms();
+    });
+    connection.onreconnecting(() => { badge.className = 'badge warn'; badge.textContent = 'SignalR 重连中'; });
+    connection.onreconnected(() => { badge.className = 'badge good'; badge.textContent = 'SignalR 已连接'; });
+    connection.onclose(() => { badge.className = 'badge bad'; badge.textContent = 'SignalR 已断开'; });
+    connection.start()
+      .then(() => { badge.className = 'badge good'; badge.textContent = 'SignalR 已连接'; logEvent('SignalR 已连接'); })
+      .catch(err => { badge.className = 'badge bad'; badge.textContent = 'SignalR 连接失败'; logEvent(`SignalR 失败: ${err.message}`); });
+  }
+
+  window.addEventListener('resize', () => chart.resize());
+  refreshAll();
+  startSignalR();
+  setInterval(refreshHealth, 5000);
+  setInterval(refreshTrend, 15000);
+</script>
+</body>
+</html>

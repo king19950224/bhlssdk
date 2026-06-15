@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>BoltPreload.Calibration</RootNamespace>
+    <AssemblyName>BoltPreload.Calibration</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BoltPreload.Domain\BoltPreload.Domain.csproj" />
+    <ProjectReference Include="..\BoltPreload.Algorithms\BoltPreload.Algorithms.csproj" />
+  </ItemGroup>
+
+</Project>
