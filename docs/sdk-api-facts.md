@@ -258,4 +258,4 @@ public enum WorkMode
 - **plan 文档的两处问题（已知，按本节为准）**：
   1. §8.3 第 310 行 `P = Δt/(t₀/K_L)`（= `Δt·K_L/t₀`）是 **1/N 约定下的错误反解**，正确应为 `F = Δt/(K_L·t₀)`；
   2. §8.5 第 1213 行 `K_L = a/t₀` 属 1/N 约定。
-- **操作红线**：`quick-calibrate` 入参的 `kL` 必须按 ns/N（~1e-4）填写，**切勿照标定证书的 1e-11（1/N）填**——已在 `CalibrationEndpoints` 入参护栏拦截量级异常。
+- **操作红线**：`quick-calibrate` 入参的 `kL` 必须按 ns/N（~1e-4）填写，**切勿照标定证书的 1e-11（1/N）填**。`CalibrationEndpoints` 的 `ValidateKLMagnitude` 量级护栏覆盖**全部标定写入路径**——`quick-calibrate`（入参 kL）、`torque-calibrate` / `apply-torque-fit` / `load-calibrate`（计算得到的 kL）——用「屈服力下 Δt 不应 ≥ t₀」「目标预紧力下 Δt 应 > 1ns 噪声底」两道物理边界拦截量级异常。

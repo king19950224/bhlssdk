@@ -257,7 +257,7 @@ IngestionService（BackgroundService 常驻）
 | REST API | HTTP + JSON | `/api/*` | 增删改查与操作命令；JWT 认证，`POST /api/auth/login` 获取 token 后以 Bearer 头携带 |
 | 实时推送 | SignalR（WebSocket） | `/hubs/measurements` | 服务器到客户端单向推送 |
 
-除 `/api/health` 与 license 状态接口外，所有接口均要求登录。
+匿名（无需登录）的端点仅限：`/api/health`、`POST /api/auth/login`、以及整个 `/api/license/*`（机器码 `GET /api/license/machine-code` 与授权状态）。其余所有接口均要求登录（JWT），敏感写操作另按角色（operator/reviewer/admin）授权。
 
 SignalR 推送事件：
 
@@ -286,13 +286,23 @@ SignalR 推送事件：
 | 标定 | `/api/channels/{id}/...` | 快速标定、力矩标定、力矩台阶测点、拟合应用、载荷标定、复核会签 |
 | 设备诊断 | `/api/devices/{id}/diagnostic` | 设备/通道参数读写、轮询配置、工作模式切换、真机健康检查 |
 | 通道自动发现 | `/api/devices/{id}/channels/probe-scan` | 发起扫描、查询结果、中止 |
-| 配置变更审批 | `/api/config-changes` | 申请、审批、执行、验证（两人四眼流程） |
-| 报告 | `/api/reports` | 力矩台阶报告、法兰验收报告、下载、签字 |
+| 配置变更审批 | `/api/config-changes` | 审批、执行、验证、查询（两人四眼）；变更【申请】入口为 `POST /api/devices/{id}/diagnostic/configure-channel/{ch}` |
+| 报告 | `/api/reports` | 力矩台阶报告（`/torque-step/{channelId}`）、法兰验收报告、下载、签字 |
 | 资产 | `/api/projects` 等 | 项目→风机→监测组→螺栓 四级资产树 |
 | 审计日志 | `/api/audit-log` | 查询、CSV 导出 |
-| 授权许可 | `/api/license` | 机器码、license 状态 |
-| 仪表盘 | `/api/dashboard` | 全场预紧力健康度 |
+| 授权许可 | `/api/license` | 机器码、license 状态（匿名可访问） |
+| 仪表盘 | `/api/dashboard/preload-health` | 全场预紧力健康度 |
+| 运行时 | `/api/runtime/devices` | 设备运行时状态、WAL 积压、授权容量 |
 | 健康检查 | `/api/health` | 匿名可访问 |
+
+> 注：上表为分组概览，`recalibrate`（重标定）实际路由在 `POST /api/devices/{id}/channels/{ch}/recalibrate`（设备诊断组）。完整、权威的端点清单以运行时 Swagger 为准。
+
+> **标定信任分级与两人四眼（商用底线 §0）**：标定分两类，靠 `calibration_records.review_state` 区分是否真有第二人签字——
+> - `load-calibrate`（正式多点载荷标定）：提交后置 `pending`，**必须由另一名 reviewer** 调 `countersign` 才激活，`review_state='approved'`，是真正的两人会签，可作为正式验收依据；
+> - `quick-calibrate` / `torque-calibrate` / `apply-torque-fit`：现场自签的临时/工程估算标定，立即生效但 `review_state='self_signed'`（单人，非会签），有效期短，**不得作为安全验收结论**（trust 等级 temporary/engineering_estimate，见 `/api/calibration-center/summary`）；
+> - `recalibrate`（写设备 RefTime/RefTemp 基线）：需 reviewer+ 权限，全程写审计。
+>
+> 故 `review_state='approved'` 严格等价于「已通过两人会签」，报告与审计可直接信任该字段。
 
 ### 5.2 设备适配层接口（IFxConnector）
 
@@ -307,6 +317,8 @@ SignalR 推送事件：
 | `ConfigureChannelAsync` | 写通道参数（增益、阈值、RefTime 等；null 字段不更新） |
 | `ConfigureMultiChannelPollingAsync` | 配置多通道轮询启用通道 |
 | `RecalibrateChannelAsync` | 在线重标定，将当前 TOF/温度写为新基线 RefTime/RefTemp |
+| `State` / `DeviceId` | 连接器当前状态（`FxConnectorState`）/ 所属设备 id（多设备路由用） |
+| `GetSessionChannelConfigs()` | 读取 SDK 本地会话已注入的通道配置（诊断/运行时展示用） |
 
 ### 5.3 测量结果（ChannelResult）
 

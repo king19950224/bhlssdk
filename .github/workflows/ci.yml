@@ -52,8 +52,12 @@ jobs:
 
       - name: 初始化数据库 schema
         run: |
-          PGPASSWORD=ci_password_only psql -h localhost -U boltpreload -d boltpreload \
-            -f deploy/sql/0001_initial_schema.sql
+          # 按文件名序号顺序执行全部迁移（与 docker-compose initdb / 工控机 Inno Setup 同一套脚本），
+          # 不止 0001：否则 CI 库缺 0002~00NN 的表，集成测试与真实 schema 不一致。
+          for f in $(ls deploy/sql/0*.sql | sort); do
+            echo "applying $f"
+            PGPASSWORD=ci_password_only psql -h localhost -U boltpreload -d boltpreload -v ON_ERROR_STOP=1 -f "$f"
+          done
 
       - name: 还原依赖
         run: dotnet restore BoltPreload.sln
