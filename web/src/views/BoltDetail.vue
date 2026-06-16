@@ -65,6 +65,11 @@ const STATUS: Record<string, { label: string; color: string; cls: string }> = {
   uncalibrated: { label: '未标定', color: '#61748f', cls: 'led--off' },
   nodata: { label: '无数据', color: '#3b4659', cls: 'led--off' },
 }
+// 标定方法枚举的中文映射（与标定中心/标定弹窗保持一致，未知值回退原值）
+const METHOD_LABEL: Record<string, string> = {
+  load_calibrated: '正式载荷标定', gb_single_wave: 'GB 单波法', gb_bi_wave: 'GB 双波法',
+  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定',
+}
 const num = (v: number | string | null | undefined) => (v == null ? null : Number(v))
 
 // 统一的"状态 + 变化程度"模型（与服务端 bolt_status 口径一致）
@@ -405,7 +410,7 @@ function openSettings() {
 }
 async function saveSettings() {
   if (form.minPreloadN != null && form.targetPreloadN != null && form.minPreloadN > form.targetPreloadN)
-    return ElMessage.warning('报警下限不能大于目标预紧力')
+    return ElMessage.warning('告警下限不能大于目标预紧力')
   settings.saving = true
   try {
     await boltApi.updateSettings(boltId, {
@@ -722,10 +727,11 @@ function ratioStr(r: number | null | undefined) {
               <span class="led" :class="c.isActive && c.passed ? 'led--ok' : c.passed ? 'led--off' : 'led--crit'" />
               <div>
                 <div class="cl-method">
-                  {{ c.method }}
+                  {{ METHOD_LABEL[c.method] || c.method }}
                   <span v-if="c.isActive" class="cl-active">生效中</span>
                   <span v-if="c.reviewState === 'pending'" class="cl-pending">待会签</span>
                   <span v-else-if="c.countersigned" class="cl-signed">两人会签</span>
+                  <span v-else-if="c.reviewState === 'self_signed'" class="cl-self">自签</span>
                 </div>
                 <div class="cl-meta mono">K_L={{ Number(c.kL).toExponential(3) }} · R²={{ Number(c.rSquared).toFixed(3) }}</div>
               </div>
@@ -762,7 +768,7 @@ function ratioStr(r: number | null | undefined) {
       <el-form label-width="110px" label-position="left">
         <div class="form-sec">预紧力阈值（驱动状态判定与告警）</div>
         <el-form-item label="目标预紧力 N"><el-input-number v-model="form.targetPreloadN" :step="1000" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
-        <el-form-item label="报警下限 N"><el-input-number v-model="form.minPreloadN" :step="1000" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
+        <el-form-item label="告警下限 N"><el-input-number v-model="form.minPreloadN" :step="1000" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
         <el-form-item label="安装扭矩 N·m"><el-input-number v-model="form.installTorqueNm" :step="10" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
         <el-form-item label="位置标签"><el-input v-model="form.positionLabel" placeholder="如 12点钟方向" /></el-form-item>
 
@@ -887,6 +893,7 @@ function ratioStr(r: number | null | undefined) {
 .cl-active { font-size: 10px; color: var(--accent); border: 1px solid var(--panel-border-strong); border-radius: 8px; padding: 1px 6px; margin-left: 6px; }
 .cl-pending { font-size: 10px; color: var(--warn); border: 1px solid var(--warn); border-radius: 8px; padding: 1px 6px; margin-left: 6px; }
 .cl-signed { font-size: 10px; color: var(--ok); border: 1px solid rgba(16, 185, 129, 0.5); border-radius: 8px; padding: 1px 6px; margin-left: 6px; }
+.cl-self { font-size: 10px; color: var(--text-3); border: 1px solid var(--panel-border-strong); border-radius: 8px; padding: 1px 6px; margin-left: 6px; }
 .cl-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 .cl-right { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .cl-pass { font-size: 11px; font-weight: 600; }

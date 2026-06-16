@@ -137,7 +137,7 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
 
       <!-- 底：松动 Top + 即将到限 -->
       <section class="bs-card bs-wide">
-        <h3>松动 / 预警 Top</h3>
+        <h3>松动 / 预警排行</h3>
         <div class="row-list">
           <div v-for="b in topLoose.slice(0, 6)" :key="b.boltId" class="rl">
             <span class="led" :class="STATUS[b.status]?.cls || 'led--off'" />

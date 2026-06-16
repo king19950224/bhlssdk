@@ -92,7 +92,7 @@ function doPrint() {
     <div class="rd-toolbar no-print">
       <span class="back" @click="router.back()"><el-icon><ArrowLeft /></el-icon> 返回</span>
       <div class="tb-right">
-        <span class="status-badge" :class="status === 'signed' ? 'signed' : 'draft'">{{ status === 'signed' ? '已签发 · 已锁定' : '草稿' }}</span>
+        <span class="status-badge" :class="status === 'signed' ? 'signed' : 'draft'">{{ status === 'signed' ? '已签发 · 已锁定' : '已生成 · 待签发' }}</span>
         <el-button v-if="canSign" :loading="signing" @click="sign"><el-icon><Select /></el-icon> 审核签发</el-button>
         <el-button type="primary" @click="doPrint"><el-icon><Printer /></el-icon> 打印 / 导出 PDF</el-button>
       </div>

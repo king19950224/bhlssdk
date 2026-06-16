@@ -149,11 +149,26 @@ async function unbind(c: ChannelRow) {
   } catch { /* 取消 */ }
 }
 
+// 通道自动检测判定（probe-scan verdict）→ 中文 + 颜色
 const VERDICT: Record<string, { label: string; color: string }> = {
-  good: { label: '良好', color: '#10b981' }, ok: { label: '可用', color: '#22d3ee' },
-  weak: { label: '弱', color: '#f59e0b' }, noisy: { label: '噪声', color: '#fb923c' },
-  no_signal: { label: '无信号', color: '#61748f' }, inconclusive: { label: '不确定', color: '#61748f' },
+  active_good: { label: '良好', color: '#10b981' },
+  active_weak: { label: '弱信号', color: '#f59e0b' },
+  active_no_echo: { label: '无回波', color: '#fb923c' },
+  not_reporting: { label: '未上报', color: '#61748f' },
+  inconclusive: { label: '不确定', color: '#61748f' },
 }
+// 通道链路硬件状态（channels.hardware_state）→ 中文 + 颜色
+const HW_STATE: Record<string, { label: string; color: string }> = {
+  healthy: { label: '健康', color: '#10b981' },
+  noisy: { label: '噪声', color: '#f59e0b' },
+  suspect: { label: '可疑', color: '#fb923c' },
+  no_data: { label: '无数据', color: '#61748f' },
+  unknown: { label: '未知', color: '#61748f' },
+}
+// 设备/扫描/通道状态枚举的中文映射（后端返回英文枚举，UI 统一汉化，未知值回退原值）
+const DEV_STATE: Record<string, string> = { Connected: '在线', Connecting: '连接中', Reconnecting: '重连中', Disconnected: '离线', Faulted: '故障' }
+const SCAN_STATUS: Record<string, string> = { pending: '排队中', running: '检测中', completed: '已完成', failed: '失败', aborted: '已中止' }
+const CH_STATE: Record<string, string> = { manual: '手动', auto_discovered: '自动发现', auto: '自动' }
 function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n) }
 </script>
 
@@ -166,7 +181,7 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
           <span class="dc-name">{{ d.name }}</span>
           <el-tag v-if="d.isPrimary" size="small" effect="dark" class="ptag">主</el-tag>
         </div>
-        <div class="dc-state mono">{{ d.state }}</div>
+        <div class="dc-state mono">{{ DEV_STATE[d.state] || d.state }}</div>
         <div class="dc-metrics">
           <div><b class="mono">{{ d.sessionChannels?.length ?? 0 }}</b><span>通道</span></div>
           <div><b class="mono">{{ fmt(d.channelResultCount ?? 0) }}</b><span>测量</span></div>
@@ -191,11 +206,11 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
             <span class="mb-hint">扫描进行中不可切换</span>
           </div>
           <div class="tbl">
-            <div class="tr th"><span>CH</span><span>螺栓</span><span>链路</span><span>测量</span><span>EchoTime</span><span>温度</span><span>SNR</span><span>峰峰</span><span>操作</span></div>
+            <div class="tr th"><span>CH</span><span>螺栓</span><span>链路</span><span>测量</span><span>回波声时</span><span>温度</span><span>SNR</span><span>峰峰</span><span>操作</span></div>
             <div v-for="c in channels" :key="c.channelId" class="tr">
               <span class="mono">{{ c.channelNo }}</span>
               <span class="mono">{{ c.bolt?.code || '未绑定' }}</span>
-              <span class="hw"><span class="led" :class="c.measurement.healthy ? 'led--ok' : (c.measurement.total > 0 ? 'led--warn' : 'led--off')" />{{ c.hardwareState }}</span>
+              <span class="hw"><span class="led" :class="c.measurement.healthy ? 'led--ok' : (c.measurement.total > 0 ? 'led--warn' : 'led--off')" />{{ HW_STATE[c.hardwareState]?.label || c.hardwareState }}</span>
               <span class="mono">{{ c.measurement.total }} <i class="dim">/ {{ c.measurement.echoRatePct }}%</i></span>
               <span class="mono">{{ c.measurement.avgEchoNs != null ? Number(c.measurement.avgEchoNs).toFixed(0) : '—' }}</span>
               <span class="mono">{{ c.measurement.avgTempC != null ? Number(c.measurement.avgTempC).toFixed(1) + '°C' : '—' }}</span>
@@ -213,7 +228,7 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
             <el-button type="primary" :disabled="scanning" @click="startScan">发起自动检测</el-button>
             <el-button v-if="scanning" type="danger" @click="abortScan">中止</el-button>
             <span v-if="scan" class="scan-st">
-              状态 <b :class="scanning ? 'st-run' : ''">{{ scan.status }}</b>
+              状态 <b :class="scanning ? 'st-run' : ''">{{ SCAN_STATUS[scan.status] || scan.status }}</b>
               <template v-if="scan.results?.length"> · 已判定 {{ scan.results.length }} 通道</template>
             </span>
             <span class="mb-hint">扫描期间设备业务监测会短暂中断</span>
@@ -243,7 +258,7 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
             <div class="tr th binds"><span>CH</span><span>状态</span><span>螺栓</span><span>K_L</span><span>参考声时</span><span>操作</span></div>
             <div v-for="c in chanRows" :key="c.id" class="tr binds">
               <span class="mono">{{ c.channelNo }}</span>
-              <span class="mono dim">{{ c.state }}</span>
+              <span class="mono dim">{{ CH_STATE[c.state] || c.state }}</span>
               <span class="mono">{{ c.boltCode || '未绑定' }}</span>
               <span class="mono">{{ c.kL != null ? Number(c.kL).toExponential(2) : '—' }}</span>
               <span class="mono">{{ c.refTimeNs != null ? Number(c.refTimeNs).toFixed(0) + 'ns' : '—' }}</span>

@@ -175,7 +175,7 @@ function openBolt(b: { boltId: number }) {
 
       <div class="panel panel--glow loose">
         <div class="panel-hd">
-          <span class="panel-title">松动 / 预警 Top</span>
+          <span class="panel-title">松动 / 预警排行</span>
           <router-link :to="{ name: 'assets' }" class="hd-link">资产监测 →</router-link>
         </div>
         <ul class="loose-list">
@@ -271,7 +271,7 @@ function openBolt(b: { boltId: number }) {
       <span class="panel-title">系统状态</span>
       <div class="sys-chip"><span class="led" :class="sys.online > 0 ? 'led--ok' : 'led--off'" /> 设备在线 <b class="mono">{{ sys.online }}/{{ sys.total }}</b></div>
       <div class="sys-chip">采集速率 <b class="mono glow-accent">{{ sys.rate }}</b> 条/秒</div>
-      <div class="sys-chip" :class="{ warn: sys.walPending > 0 }">WAL 兜底 <b class="mono">{{ sys.walPending > 0 ? sys.walPending + ' 待重放' : '正常' }}</b></div>
+      <div class="sys-chip" :class="{ warn: sys.walPending > 0 }">断网续传 <b class="mono">{{ sys.walPending > 0 ? sys.walPending + ' 条待补传' : '正常' }}</b></div>
     </div>
   </div>
 </template>

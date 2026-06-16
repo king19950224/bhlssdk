@@ -55,6 +55,8 @@ const STATUS: Record<string, { label: string; color: string }> = {
   signed: { label: '已签发', color: '#10b981' },
   archived: { label: '已归档', color: '#61748f' },
 }
+// 报告对象类型的中文映射（与审计页 targetType 口径一致，未知值回退原值）
+const SUBJECT_LABEL: Record<string, string> = { channel: '通道', monitor_group: '部位', group: '部位', channel_group: '部位', bolt: '螺栓', turbine: '风机' }
 
 async function load() {
   loading.value = true
@@ -107,7 +109,7 @@ function fmt(iso: string) {
         <div v-for="r in items" :key="r.id" class="tr">
           <span class="title link" @click="router.push({ name: 'reportDetail', params: { reportId: r.id } })">{{ r.title }}</span>
           <span><span class="type-tag">{{ TYPE_LABEL[r.reportType] || r.reportType }}</span></span>
-          <span class="mono dim">{{ r.subjectType ? r.subjectType + '#' + r.subjectId : '—' }}</span>
+          <span class="mono dim">{{ r.subjectType ? (SUBJECT_LABEL[r.subjectType] || r.subjectType) + '#' + r.subjectId : '—' }}</span>
           <span><span class="st" :style="`color:${STATUS[r.status]?.color || '#61748f'}`">{{ STATUS[r.status]?.label || r.status }}</span></span>
           <span class="mono dim">{{ fmt(r.generatedAt) }}</span>
           <span>

@@ -274,7 +274,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
         <span v-if="curStats.thr != null" class="lg"><i class="lg-line" style="background:#f59e0b" />阈值带 ±{{ curStats.thr }}</span>
       </div>
       <div v-if="metrics && hasRef" class="diag-note">
-        参考口径：§8.6 经验阈值（相似度&lt;0.85、健康度&lt;50 提示耦合/探头劣化）<b>仅作诊断展示，未驱动告警</b>。
+        参考口径：经验阈值（相似度&lt;0.85、健康度&lt;50 提示耦合/探头劣化）<b>仅作诊断展示，未驱动告警</b>。
       </div>
     </div>
 

@@ -59,7 +59,7 @@ async function submit() {
         </div>
       </div>
 
-      <div class="hero-foot mono">GB/T 43232 · JJF 1059.1 · 双人复核 · WAL 兜底</div>
+      <div class="hero-foot mono">GB/T 43232 · JJF 1059.1 · 双人复核 · 断网续传</div>
     </section>
 
     <!-- 右：登录卡 -->

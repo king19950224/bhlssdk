@@ -175,7 +175,7 @@ async function logout() {
             <span class="chip-v mono">{{ openAlarms }}</span>
           </div>
         <div class="stat-chip alert" v-if="walPending > 0">
-          <span class="chip-k">WAL 待重放</span>
+          <span class="chip-k">断网待补传</span>
           <span class="chip-v mono">{{ walPending }}</span>
         </div>
         <div class="stat-chip stat-chip--btn" @click="router.push({ name: 'board' })" title="打开态势大屏">
