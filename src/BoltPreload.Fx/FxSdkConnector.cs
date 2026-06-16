@@ -14,7 +14,8 @@ namespace BoltPreload.Fx;
 /// </summary>
 /// <remarks>
 /// <para>本类只做"事件 → 通道"的桥接，不做业务计算。业务计算在 Application 层。</para>
-/// <para>重连逻辑见 <c>BoltPreload.Application.Connector.ReconnectService</c>（按方案 §5.2 厂家重连示例落地）。</para>
+/// <para>断线重连由 <c>BoltPreload.Application.Ingestion.IngestionWatchdogService</c> 看门狗驱动，
+/// 调用 <see cref="ReconnectAsync"/> 重连并重发工作模式（按方案 §5.2 厂家重连示例落地）。</para>
 /// </remarks>
 public sealed class FxSdkConnector : IFxConnector
 {

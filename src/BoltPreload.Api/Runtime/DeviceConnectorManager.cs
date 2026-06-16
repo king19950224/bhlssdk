@@ -2,10 +2,8 @@ using BoltPreload.Application.Devices;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Fx;
 using BoltPreload.Fx.Simulator;
-using FxSDK.Models;
 using Microsoft.Extensions.Logging;
 using Npgsql;
-using FxDeviceConfig = FxSDK.Models.DeviceConfig;
 
 namespace BoltPreload.Api.Runtime;
 
@@ -94,25 +92,20 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager
         bool isPrimary)
     {
         var logger = loggerFactory.GetRequiredLogger<FxSdkConnector>();
-        var fxConfig = new FxDeviceConfig
-        {
-            Model = (ushort)row.Model,
-            CommunicationType = (byte)row.CommType,
-            CommunicationParameters = row.CommParams,
-            Address = (ushort)row.Address,
-            TransferMode = (ushort)row.TransferMode,
-            UsChannelCount = (ushort)Math.Clamp((int)row.ChannelCount, 1, 48)
-        };
+        var spec = new FxRealDeviceSpec(
+            DeviceId: row.Id,
+            Model: (ushort)row.Model,
+            CommType: (byte)row.CommType,
+            CommParams: row.CommParams,
+            Address: (ushort)row.Address,
+            TransferMode: (ushort)row.TransferMode,
+            ChannelCount: (ushort)Math.Clamp((int)row.ChannelCount, 1, 48));
 
         // 多设备严格按 channels 表加载每设备通道，不用单设备 appsettings 兜底
         var initialChannels = FxInitialChannelConfigLoader.Load(
-            dataSource, configuration, fxConfig, row.Id, logger, includeAppSettingsFallback: false);
-        fxConfig.MCRConfig = new MCRConfig
-        {
-            EnabledChannels = initialChannels.Select(c => c.Channel).Distinct().OrderBy(c => c).ToList()
-        };
+            dataSource, configuration, spec.Address, row.Id, logger, includeAppSettingsFallback: false);
+        var connector = FxConnectorFactory.CreateReal(spec, initialChannels, logger);
 
-        var connector = new FxSdkConnector(row.Id, fxConfig, logger, initialChannels);
         return new DeviceRuntimeContext(
             DeviceId: row.Id,
             Name: string.IsNullOrWhiteSpace(row.Code) ? $"Device-{row.Id}" : row.Code,
@@ -121,10 +114,10 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager
             RuntimeStatus: new IngestionRuntimeStatus(),
             Options: new DeviceRuntimeOptions(
                 Mode: "Real",
-                CommunicationParameters: fxConfig.CommunicationParameters,
-                Address: fxConfig.Address,
-                TransferMode: fxConfig.TransferMode,
-                Model: fxConfig.Model));
+                CommunicationParameters: spec.CommParams,
+                Address: spec.Address,
+                TransferMode: spec.TransferMode,
+                Model: spec.Model));
     }
 
     private static DeviceRuntimeContext BuildRealRuntimeFromConfig(
@@ -134,35 +127,22 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager
     {
         var logger = loggerFactory.GetRequiredLogger<FxSdkConnector>();
         var deviceId = configuration.GetValue<long>("Fx:Real:DeviceId", 1);
-        var fxConfig = new FxDeviceConfig
-        {
-            Model = configuration.GetValue<ushort>("Fx:Real:Model", 3),
-            CommunicationType = configuration.GetValue<byte>("Fx:Real:CommType", 1),
-            CommunicationParameters = configuration["Fx:Real:CommParams"]
+        var spec = new FxRealDeviceSpec(
+            DeviceId: deviceId,
+            Model: configuration.GetValue<ushort>("Fx:Real:Model", 3),
+            CommType: configuration.GetValue<byte>("Fx:Real:CommType", 1),
+            CommParams: configuration["Fx:Real:CommParams"]
                 ?? throw new InvalidOperationException("缺少 Fx:Real:CommParams 配置"),
-            Address = configuration.GetValue<ushort>("Fx:Real:Address", 1),
-            TransferMode = configuration.GetValue<ushort>("Fx:Real:TransferMode", 1),
-            UsChannelCount = configuration.GetValue<ushort>(
+            Address: configuration.GetValue<ushort>("Fx:Real:Address", 1),
+            TransferMode: configuration.GetValue<ushort>("Fx:Real:TransferMode", 1),
+            ChannelCount: configuration.GetValue<ushort>(
                 "Fx:Real:ChannelCount",
-                LoadDeviceChannelCount(dataSource, deviceId, fallback: 40))
-        };
+                LoadDeviceChannelCount(dataSource, deviceId, fallback: 40)));
 
         var initialChannels = FxInitialChannelConfigLoader.Load(
-            dataSource,
-            configuration,
-            fxConfig,
-            deviceId,
-            logger);
-        fxConfig.MCRConfig = new MCRConfig
-        {
-            EnabledChannels = initialChannels
-                .Select(c => c.Channel)
-                .Distinct()
-                .OrderBy(c => c)
-                .ToList()
-        };
+            dataSource, configuration, spec.Address, deviceId, logger);
+        var connector = FxConnectorFactory.CreateReal(spec, initialChannels, logger);
 
-        var connector = new FxSdkConnector(deviceId, fxConfig, logger, initialChannels);
         return new DeviceRuntimeContext(
             DeviceId: deviceId,
             Name: configuration["Fx:Real:Name"] ?? $"Device-{deviceId}",
@@ -171,10 +151,10 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager
             RuntimeStatus: new IngestionRuntimeStatus(),
             Options: new DeviceRuntimeOptions(
                 Mode: "Real",
-                CommunicationParameters: fxConfig.CommunicationParameters,
-                Address: fxConfig.Address,
-                TransferMode: fxConfig.TransferMode,
-                Model: fxConfig.Model));
+                CommunicationParameters: spec.CommParams,
+                Address: spec.Address,
+                TransferMode: spec.TransferMode,
+                Model: spec.Model));
     }
 
     private static List<DeviceRow> LoadEnabledDevices(NpgsqlDataSource dataSource, ILogger log)

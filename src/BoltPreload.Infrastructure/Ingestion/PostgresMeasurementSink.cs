@@ -1,4 +1,5 @@
 using BoltPreload.Algorithms.Preload;
+using BoltPreload.Algorithms.Waveform;
 using BoltPreload.Application.Alarm;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Application.Realtime;
@@ -22,6 +23,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     private readonly IAlarmEvaluator? _alarmEvaluator;
     private readonly IAlarmSink? _alarmSink;
     private readonly IAlarmPublisher? _alarmPublisher;
+    private readonly IPreloadCalculatorFactory _calculatorFactory;
 
     private static readonly System.Text.Json.JsonSerializerOptions JsonOpts = new()
     {
@@ -36,7 +38,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         IWaveStore? waveStore = null,
         IAlarmEvaluator? alarmEvaluator = null,
         IAlarmSink? alarmSink = null,
-        IAlarmPublisher? alarmPublisher = null)
+        IAlarmPublisher? alarmPublisher = null,
+        IPreloadCalculatorFactory? calculatorFactory = null)
     {
         _dataSource = dataSource;
         _resolver = resolver;
@@ -45,6 +48,9 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         _alarmEvaluator = alarmEvaluator;
         _alarmSink = alarmSink;
         _alarmPublisher = alarmPublisher;
+        // 未注入工厂时（如单测直接 new）退化为默认工厂，保持原单波法行为
+        _calculatorFactory = calculatorFactory ?? new PreloadCalculatorFactory(
+            new SimplifiedCalculator(), new GbSingleWaveCalculator(), new GbBiWaveCalculator());
         _logger.LogInformation("PostgresMeasurementSink 启动，WaveStore={Wave} Alarm={Alarm}",
             waveStore is not null ? "已注入" : "未注入",
             alarmEvaluator is not null ? "已启用" : "未启用");
@@ -116,7 +122,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     /// 算不出（缺标定 / 缺规格 / EchoTime 空 / 超出 GB 适用范围 / 算出负值）就 NULL，
     /// 由 AlgoVersion 字段记录原因，方便后续审计回放。
     /// </summary>
-    private static (decimal? PreloadN, decimal? PreloadRatio, decimal? UncertaintyN, decimal DeltaTofNs, string AlgoVersion, Guid? CalibrationId)
+    private (decimal? PreloadN, decimal? PreloadRatio, decimal? UncertaintyN, decimal DeltaTofNs, string AlgoVersion, Guid? CalibrationId)
         TryComputePreload(ChannelRoute route, FxChannelResultDto cr)
     {
         if (cr.EchoTimeNs is null || cr.SpTempC is null)
@@ -206,7 +212,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                     ExpiresAt: DateTimeOffset.UtcNow.AddDays(30),
                     Method: "quick"));
 
-            var calc = new GbSingleWaveCalculator();
+            // 经工厂按螺栓规格/标定状态选择计算器（≥M5 标定齐全 → 单波法；≥M12 且双波法可用 → 双波法）。
+            var calc = _calculatorFactory.Pick(boltSpec, input.Calibration, DateTimeOffset.UtcNow);
             var result = calc.Calculate(input);
 
             // GB 范围外不出 preload_n —— calculator 标 WithinGbRange=false 但仍返回 preload_n，
@@ -251,6 +258,22 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             }
         }
 
+        // 2b. 测量级信号健康字段（参考无关、热路径廉价计算），不再恒为 NULL：
+        //     snr_db = 峰峰 / 噪声段 RMS；main_freq_mhz = FFT 谱峰；health_score = §8.6.4 的 SNR 分项映射。
+        //     similarity 需与参考波形做互相关（O(n²)），不适合逐条测量算，留给波形对比诊断路径，这里保持 NULL。
+        //     feature_vector（机器学习特征）同样属诊断/离线路径，保持 NULL。
+        decimal? snrDb = null, mainFreqMhz = null;
+        short? healthScore = null;
+        if (cr.EchoWave is not null && cr.EchoWave.WaveData.Length > 0)
+        {
+            var stats = ComputeWaveStats(cr.EchoWave);
+            snrDb = stats.SnrDb;
+            var mf = ToDecimalSafe(WaveDiagnostics.MainFrequencyMhz(cr.EchoWave.WaveData, cr.EchoWave.ClockInt));
+            mainFreqMhz = mf is { } v ? Math.Clamp(v, 0m, 999.99m) : null;   // numeric(5,2) 量程
+            if (stats.SnrDb is { } snr)
+                healthScore = (short)WaveDiagnostics.SnrOnlyHealthScore((double)snr);
+        }
+
         // 3. INSERT 一次性带上所有计算结果（preload_n / preload_ratio / uncertainty / delta_tof / algo_version / calibration_id）
         const string sql = @"
             INSERT INTO measurements (
@@ -263,7 +286,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 @bolt_id, @channel_id, @ts, @ingested_at,
                 @echo_time_ns, @delta_tof_ns, @sp_temp_c, @gain, @status_code,
                 @preload_n, @preload_ratio, @preload_unc,
-                NULL, NULL, NULL, NULL,
+                @health_score, @snr_db, NULL, @main_freq,
                 NULL, @wave_url, @algo_version, @calib_id
             )
             ON CONFLICT (channel_id, ts) DO NOTHING";
@@ -293,6 +316,9 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 rawRatio, route.BoltId);
         cmd.Parameters.AddWithValue("preload_ratio", NpgsqlDbType.Numeric, (object?)preloadRatioClamped ?? DBNull.Value);
         cmd.Parameters.AddWithValue("preload_unc", NpgsqlDbType.Numeric, (object?)pre.UncertaintyN ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("health_score", NpgsqlDbType.Smallint, (object?)healthScore ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("snr_db", NpgsqlDbType.Numeric, (object?)snrDb ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("main_freq", NpgsqlDbType.Numeric, (object?)mainFreqMhz ?? DBNull.Value);
         cmd.Parameters.AddWithValue("wave_url", NpgsqlDbType.Varchar, (object?)waveUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("algo_version", NpgsqlDbType.Varchar, pre.AlgoVersion);
         cmd.Parameters.AddWithValue("calib_id", NpgsqlDbType.Uuid, (object?)pre.CalibrationId ?? DBNull.Value);
@@ -322,46 +348,15 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     {
         if (wave.WaveData.Length == 0) return;
 
-        var data = wave.WaveData;
-        var pointCount = data.Length;
-        var noiseSamples = Math.Min(Math.Max(30, pointCount / 10), pointCount);
-
-        // 单遍历同时算 min/max/sum/sumSq；前 noiseSamples 个点单独累加噪声段。
-        // 旧版本对同一数组 5 次 LINQ 遍历 + Math.Pow(x, 2) → 50Hz × N 通道下浪费 CPU。
-        int peakPositive = short.MinValue, peakNegative = short.MaxValue;
-        long sum = 0, noiseSum = 0;
-        double sumSq = 0;
-        long noiseSumSq = 0;
-        for (int i = 0; i < pointCount; i++)
-        {
-            int v = data[i];
-            if (v > peakPositive) peakPositive = v;
-            if (v < peakNegative) peakNegative = v;
-            sum += v;
-            sumSq += (double)v * v;
-            if (i < noiseSamples)
-            {
-                noiseSum += v;
-                noiseSumSq += (long)v * v;
-            }
-        }
-        var peakToPeak = peakPositive - peakNegative;
-        var mean = (double)sum / pointCount;
-        // Var(X) = E[X²] - E[X]²；可能因浮点误差为负的极小数 → Clamp 到 0
-        var variance = Math.Max(0, sumSq / pointCount - mean * mean);
-        var rms = Math.Sqrt(variance);
-
-        double? noiseRms = null;
-        if (noiseSamples > 0)
-        {
-            var noiseMean = (double)noiseSum / noiseSamples;
-            var noiseVar = Math.Max(0, (double)noiseSumSq / noiseSamples - noiseMean * noiseMean);
-            noiseRms = Math.Sqrt(noiseVar);
-        }
-
-        decimal? snrDb = (noiseRms is null || noiseRms <= 0)
-            ? null
-            : ToDecimalSafe(20.0 * Math.Log10(Math.Max(1.0, peakToPeak / 2.0) / noiseRms.Value));
+        var stats = ComputeWaveStats(wave);
+        var pointCount = stats.PointCount;
+        var peakPositive = stats.PeakPositive;
+        var peakNegative = stats.PeakNegative;
+        var peakToPeak = stats.PeakToPeak;
+        var mean = stats.Mean;
+        var rms = stats.Rms;
+        var noiseRms = stats.NoiseRms;
+        var snrDb = stats.SnrDb;
 
         const string sql = @"
             INSERT INTO wave_features (
@@ -400,6 +395,59 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         {
             _logger.LogDebug(ex, "写入 wave_features 失败 channel_id={ChannelId}", channelId);
         }
+    }
+
+    /// <summary>单条波形的基础统计量（单遍历计算），供 measurements 健康字段与 wave_features 共用。</summary>
+    private readonly record struct WaveStats(
+        int PointCount, int PeakPositive, int PeakNegative, int PeakToPeak,
+        double Mean, double Rms, double? NoiseRms, decimal? SnrDb);
+
+    /// <summary>
+    /// 单遍历算 min/max/sum/sumSq + 噪声段 RMS → 峰峰值/RMS/SNR。
+    /// 提取为公共方法：measurements 的 snr_db/health_score 与 wave_features 复用同一套，避免重复实现与口径不一致。
+    /// </summary>
+    private static WaveStats ComputeWaveStats(FxEchoWaveDto wave)
+    {
+        var data = wave.WaveData;
+        var pointCount = data.Length;
+        var noiseSamples = Math.Min(Math.Max(30, pointCount / 10), pointCount);
+
+        int peakPositive = short.MinValue, peakNegative = short.MaxValue;
+        long sum = 0, noiseSum = 0;
+        double sumSq = 0;
+        long noiseSumSq = 0;
+        for (int i = 0; i < pointCount; i++)
+        {
+            int v = data[i];
+            if (v > peakPositive) peakPositive = v;
+            if (v < peakNegative) peakNegative = v;
+            sum += v;
+            sumSq += (double)v * v;
+            if (i < noiseSamples)
+            {
+                noiseSum += v;
+                noiseSumSq += (long)v * v;
+            }
+        }
+        var peakToPeak = pointCount == 0 ? 0 : peakPositive - peakNegative;
+        var mean = pointCount > 0 ? (double)sum / pointCount : 0;
+        // Var(X) = E[X²] - E[X]²；可能因浮点误差为负的极小数 → Clamp 到 0
+        var variance = pointCount > 0 ? Math.Max(0, sumSq / pointCount - mean * mean) : 0;
+        var rms = Math.Sqrt(variance);
+
+        double? noiseRms = null;
+        if (noiseSamples > 0)
+        {
+            var noiseMean = (double)noiseSum / noiseSamples;
+            var noiseVar = Math.Max(0, (double)noiseSumSq / noiseSamples - noiseMean * noiseMean);
+            noiseRms = Math.Sqrt(noiseVar);
+        }
+
+        decimal? snrDb = (noiseRms is null || noiseRms <= 0)
+            ? null
+            : ToDecimalSafe(20.0 * Math.Log10(Math.Max(1.0, peakToPeak / 2.0) / noiseRms.Value));
+
+        return new WaveStats(pointCount, peakPositive, peakNegative, peakToPeak, mean, rms, noiseRms, snrDb);
     }
 
     /// <summary>

@@ -5,8 +5,10 @@
     <AssemblyName>BoltPreload.Tests</AssemblyName>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
-    <!-- 测试项目豁免：CA1861（常量数组参数偏好 static readonly）是生产热路径的微性能规则，对单测内联数据无意义 -->
-    <NoWarn>$(NoWarn);CA1861</NoWarn>
+    <!-- 测试项目豁免：
+         CA1861 常量数组参数偏好 static readonly（生产热路径微性能规则，单测内联数据无意义）
+         CA1711 类型名不得以 Collection 结尾（与 xUnit [CollectionDefinition] 约定冲突，PostgresCollection 是其标记类） -->
+    <NoWarn>$(NoWarn);CA1861;CA1711</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

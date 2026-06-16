@@ -127,33 +127,8 @@ public static class CalibrationEndpoints
             // 1b. K_L 量纲/量级护栏（grounded，纯拒绝非法输入，不改变合法标定的计算）。
             //     本系统约定 K_L = Δt/F（单位 ns/N，量级 ~1e-4，用法 F = Δt/K_L）；
             //     最常见事故是误照标定证书 / plan 附录 C 的 1/N 约定（~1e-11，差一个 t₀）填进来。
-            if (req.KL <= 0m)
-                return Results.BadRequest(new { error = "kL 必须 > 0。本系统约定 K_L=Δt/F（单位 ns/N，量级约 1e-4）；勿照标定证书/plan 附录C 的 1/N（约 1e-11）填，那是另一套约定（相差一个 t₀）。", kL = req.KL });
-            if (req.RefTimeNs <= 0m)
-                return Results.BadRequest(new { error = "refTimeNs（基线声时 t₀）必须 > 0。", refTimeNs = req.RefTimeNs });
-            // 上界：在屈服力 F_y = Rp0.2 · A_e 下，声时变化 K_L·F_y 物理上不可能 ≥ 基线 t₀（声弹性 TOF 变化只是 t₀ 的极小比例）。
-            if (rp02Mpa is > 0m && crossSectionMm2 is > 0m)
-            {
-                var yieldForceN = rp02Mpa.Value * crossSectionMm2.Value;   // MPa·mm² = N
-                if (req.KL * yieldForceN >= req.RefTimeNs)
-                    return Results.BadRequest(new
-                    {
-                        error = "kL 量级过大：屈服力下推得的声时变化 ≥ 基线 t₀，物理上不可能。请确认 kL 用 ns/N 约定（约 1e-4），而非 1/N（约 1e-11）。",
-                        kL = req.KL, yieldForceN, refTimeNs = req.RefTimeNs
-                    });
-            }
-            // 下界：在目标预紧力 F_target 下，声时变化 K_L·F_target 必须高于 1 ns 测量噪声
-            //（与 GbSingleWaveCalculator 不确定度评定的 1 ns 噪声底一致），否则标定信号不可分辨或量纲填错。
-            if (targetPreloadN is > 0m)
-            {
-                var deltaAtTargetNs = req.KL * targetPreloadN.Value;
-                if (deltaAtTargetNs <= 1m)
-                    return Results.BadRequest(new
-                    {
-                        error = "kL 量级过小：目标预紧力下推得的声时变化 ≤ 1 ns（低于测量噪声）。请确认 kL 用 ns/N 约定（约 1e-4），而非 1/N（约 1e-11）。",
-                        kL = req.KL, targetPreloadN, deltaAtTargetNs
-                    });
-            }
+            if (ValidateKLMagnitude(req.KL, req.RefTimeNs, YieldForceN(rp02Mpa, crossSectionMm2), targetPreloadN) is { } klReject)
+                return klReject;
 
             // 2. 一个事务里：superseded 旧记录 + INSERT 新 + UPDATE channels + audit_log
             await using var conn = await ds.OpenConnectionAsync(ct);
@@ -175,7 +150,7 @@ public static class CalibrationEndpoints
                         points_jsonb, k_l, k_l_uncertainty, r_squared, outliers_removed,
                         uncertainty_breakdown, fitter_version,
                         ref_time_ns, ref_temp_c,
-                        passed, notes,
+                        passed, notes, review_state,
                         operator_signature_at, reviewer_signature_at, expires_at, created_at
                     ) VALUES (
                         @id, @bolt_id, 'quick',
@@ -185,14 +160,14 @@ public static class CalibrationEndpoints
                         @pts::jsonb, @kl, @klu, 0, 0,
                         NULL, 'quick:v1',
                         @rt, @rtemp,
-                        true, @note,
+                        true, @note, 'self_signed',
                         now(), now(), @exp, now()
                     )", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
                     cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
                     cmd.Parameters.AddWithValue("op", NpgsqlDbType.Bigint, userId);
-                    cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, userId);  // quick 模式自审
+                    cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, userId);  // quick 模式自签（review_state='self_signed'，非两人会签）
                     cmd.Parameters.AddWithValue("ld", NpgsqlDbType.Varchar, (object?)req.LoadingDevice ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("ldc", NpgsqlDbType.Varchar, (object?)req.LoadingDeviceCert ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("et", NpgsqlDbType.Numeric, (object?)req.EnvTempC ?? DBNull.Value);
@@ -313,10 +288,11 @@ public static class CalibrationEndpoints
             short channelNo;
             string nominalDiam;
             decimal? existingRefTime, existingRefTemp;
-            decimal? currentTarget;
+            decimal? currentTarget, rp02Mpa, crossSectionMm2;
             await using (var cmd = ds.CreateCommand(@"
                 SELECT b.id, c.device_id, c.channel_no, b.nominal_diam,
-                       c.ref_time_ns, c.ref_temp_c, b.target_preload_n
+                       c.ref_time_ns, c.ref_temp_c, b.target_preload_n,
+                       b.rp02_mpa, b.cross_section_mm2
                 FROM channels c
                 JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE c.id = @cid AND c.deleted_at IS NULL"))
@@ -333,6 +309,8 @@ public static class CalibrationEndpoints
                 existingRefTime = r.IsDBNull(4) ? null : r.GetDecimal(4);
                 existingRefTemp = r.IsDBNull(5) ? null : r.GetDecimal(5);
                 currentTarget = r.IsDBNull(6) ? null : r.GetDecimal(6);
+                rp02Mpa = r.IsDBNull(7) ? null : r.GetDecimal(7);
+                crossSectionMm2 = r.IsDBNull(8) ? null : r.GetDecimal(8);
             }
 
             var diameterMm = req.NominalDiameterMm ?? ParseNominalDiameterMm(nominalDiam);
@@ -379,6 +357,9 @@ public static class CalibrationEndpoints
             var kL = deltaTof / estimatedPreloadN;
             if (kL <= 0)
                 return Results.BadRequest(new { error = "计算得到 K_L <= 0，请检查 RefTime/当前 EchoTime/扭矩输入", avgEcho, normalizedEcho, refTime, deltaTof });
+            // 计算得到的 kL 也过一遍量级护栏（卡 RefTime/Δt/载荷异常导致的非物理 kL）
+            if (ValidateKLMagnitude(kL, refTime.Value, YieldForceN(rp02Mpa, crossSectionMm2), currentTarget) is { } klReject)
+                return klReject;
 
             var uncertaintyRatio = req.UncertaintyRatio ?? 0.30m;
             var kLUncertainty = kL * uncertaintyRatio;
@@ -415,13 +396,13 @@ public static class CalibrationEndpoints
                         loading_device, loading_device_cert, env_temp_c, env_humidity,
                         points_jsonb, k_l, k_l_uncertainty, r_squared, outliers_removed,
                         uncertainty_breakdown, fitter_version, ref_time_ns, ref_temp_c,
-                        passed, notes, operator_signature_at, reviewer_signature_at, expires_at, created_at
+                        passed, notes, review_state, operator_signature_at, reviewer_signature_at, expires_at, created_at
                     ) VALUES (
                         @id, @bolt_id, 'torque_estimate', @op, @rev,
                         @ld, NULL, @env_temp, NULL,
                         @points::jsonb, @kl, @klu, 0, 0,
                         @unc::jsonb, 'torque:v1', @rt, @rtemp,
-                        true, @note, now(), now(), @exp, now()
+                        true, @note, 'self_signed', now(), now(), @exp, now()
                     )", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
@@ -786,8 +767,10 @@ public static class CalibrationEndpoints
             long boltId, deviceId;
             short channelNo;
             decimal refTime, refTemp;
+            decimal? rp02Mpa, crossSectionMm2, targetPreloadN;
             await using (var cmd = ds.CreateCommand(@"
-                SELECT b.id, c.device_id, c.channel_no, c.ref_time_ns, c.ref_temp_c
+                SELECT b.id, c.device_id, c.channel_no, c.ref_time_ns, c.ref_temp_c,
+                       b.rp02_mpa, b.cross_section_mm2, b.target_preload_n
                 FROM channels c
                 JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE c.id = @cid AND c.deleted_at IS NULL"))
@@ -804,6 +787,9 @@ public static class CalibrationEndpoints
                 channelNo = r.GetInt16(2);
                 refTime = r.GetDecimal(3);
                 refTemp = r.GetDecimal(4);
+                rp02Mpa = r.IsDBNull(5) ? null : r.GetDecimal(5);
+                crossSectionMm2 = r.IsDBNull(6) ? null : r.GetDecimal(6);
+                targetPreloadN = r.IsDBNull(7) ? null : r.GetDecimal(7);
             }
 
             var minPoints = req?.MinPoints ?? 3;
@@ -856,6 +842,9 @@ public static class CalibrationEndpoints
 
             if (slope <= 0)
                 return Results.BadRequest(new { error = "拟合 K_L <= 0，拒绝应用", slope });
+            // 拟合得到的 kL 过量级护栏（ns/N，~1e-4）
+            if (ValidateKLMagnitude(slope, refTime, YieldForceN(rp02Mpa, crossSectionMm2), targetPreloadN) is { } klReject)
+                return klReject;
 
             // R² 拟合优度门槛（plan §8.5 / 附录 B 步骤 5）。
             // 0.98（合格）/ 0.95（拒绝下限）为工程经验阈值——GB/T 43232 对拟合 R² 无规定，
@@ -889,14 +878,14 @@ public static class CalibrationEndpoints
                         loading_device, loading_device_cert, env_temp_c, env_humidity,
                         points_jsonb, k_l, k_l_uncertainty, k_l_intercept_ns,
                         r_squared, outliers_removed, uncertainty_breakdown, fitter_version,
-                        ref_time_ns, ref_temp_c, passed, notes,
+                        ref_time_ns, ref_temp_c, passed, notes, review_state,
                         operator_signature_at, reviewer_signature_at, expires_at, created_at
                     ) VALUES (
                         @id, @bolt_id, 'torque_fit', @op, @rev,
                         'torque wrench', NULL, NULL, NULL,
                         @points::jsonb, @kl, @klu, @intercept,
                         @r2, 0, @unc::jsonb, 'torque-fit:v1',
-                        @rt, @rtemp, @passed, @note,
+                        @rt, @rtemp, @passed, @note, 'self_signed',
                         now(), now(), @exp, now()
                     )", conn, tx))
                 {
@@ -1006,10 +995,11 @@ public static class CalibrationEndpoints
             if (req.RefTimeNs <= 0m)
                 return Results.BadRequest(new { error = "refTimeNs（基线声时 t₀）必须 > 0。" });
 
-            // 提交阶段不激活、不失效缓存（会签时才失效），只需 bolt id
+            // 提交阶段不激活、不失效缓存（会签时才失效），只需 bolt id + 护栏所需物性
             long boltId;
+            decimal? rp02Mpa, crossSectionMm2, targetPreloadN;
             await using (var cmd = ds.CreateCommand(@"
-                SELECT b.id
+                SELECT b.id, b.rp02_mpa, b.cross_section_mm2, b.target_preload_n
                 FROM channels c
                 JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE c.id = @cid AND c.deleted_at IS NULL"))
@@ -1019,6 +1009,9 @@ public static class CalibrationEndpoints
                 if (!await r.ReadAsync(ct))
                     return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
                 boltId = r.GetInt64(0);
+                rp02Mpa = r.IsDBNull(1) ? null : r.GetDecimal(1);
+                crossSectionMm2 = r.IsDBNull(2) ? null : r.GetDecimal(2);
+                targetPreloadN = r.IsDBNull(3) ? null : r.GetDecimal(3);
             }
 
             // 1. 最小二乘拟合（Δt = K_L·F + b，K_L 单位 ns/N）
@@ -1034,6 +1027,9 @@ public static class CalibrationEndpoints
             }
             if (fit.KL <= 0)
                 return Results.BadRequest(new { error = "拟合 K_L ≤ 0（方向/数据异常），拒绝。", kL = fit.KL });
+            // 正式载荷标定的拟合 kL 也过量级护栏（卡 Δt 单位填错等）
+            if (ValidateKLMagnitude((decimal)fit.KL, req.RefTimeNs, YieldForceN(rp02Mpa, crossSectionMm2), targetPreloadN) is { } klReject)
+                return klReject;
 
             // 2. 正式载荷标定强制 R²≥0.98（不走 [0.95,0.98) 临时层，plan §8.5）
             const decimal r2PassThreshold = 0.98m;
@@ -1282,7 +1278,7 @@ public static class CalibrationEndpoints
             const string sql = @"
                 SELECT cr.id, cr.method, cr.k_l, cr.k_l_uncertainty, cr.k_l_intercept_ns, cr.r_squared,
                        cr.ref_time_ns, cr.ref_temp_c, cr.passed,
-                       cr.created_at, cr.expires_at, cr.superseded_by, cr.notes
+                       cr.created_at, cr.expires_at, cr.superseded_by, cr.notes, cr.review_state
                 FROM calibration_records cr
                 JOIN bolts b ON b.id = cr.bolt_id
                 JOIN channels c ON c.id = b.channel_id
@@ -1311,7 +1307,10 @@ public static class CalibrationEndpoints
                     expiresAt = r.GetDateTime(10),
                     supersededBy = r.IsDBNull(11) ? null : (Guid?)r.GetGuid(11),
                     isActive = r.IsDBNull(11),
-                    notes = r.IsDBNull(12) ? null : r.GetString(12)
+                    notes = r.IsDBNull(12) ? null : r.GetString(12),
+                    reviewState = r.GetString(13),
+                    // 两人四眼：仅 approved 表示经【另一名】reviewer 会签；self_signed 为操作人自签的临时标定
+                    countersigned = r.GetString(13) == "approved"
                 });
             }
             return Results.Ok(new { channelId, count = items.Count, items });
@@ -1330,6 +1329,45 @@ public static class CalibrationEndpoints
             ? value
             : 0m;
     }
+
+    /// <summary>
+    /// K_L 量纲/量级护栏（全系统约定 K_L = Δt/F，单位 ns/N，量级约 1e-4）。
+    /// 通过返回 null，不通过返回可直接当响应用的 <see cref="Results.BadRequest(object?)"/>。
+    /// <para>
+    /// 不只用于 quick（入参 kL），也用于 torque / apply-torque-fit / load 等【计算得到 kL】的路径——
+    /// 这些路径虽然不会出现照证书填 1/N(~1e-11) 的错误，但仍可能因 RefTime/Δt/载荷异常算出
+    /// 物理上不可能的 kL，统一卡一道护栏（plan §0 / sdk-api-facts §12）。
+    /// </para>
+    /// 两道物理边界（任一所需螺栓参数缺失则跳过该道，best-effort）：
+    /// <list type="bullet">
+    /// <item>上界：屈服力 F_y 下推得的声时变化 K_L·F_y 不应 ≥ 基线 t₀（声弹性 TOF 变化只是 t₀ 极小比例）。</item>
+    /// <item>下界：目标预紧力 F_target 下推得的声时变化 K_L·F_target 必须 > 1 ns 测量噪声底。</item>
+    /// </list>
+    /// </summary>
+    private static IResult? ValidateKLMagnitude(decimal kL, decimal refTimeNs, decimal? yieldForceN, decimal? targetPreloadN)
+    {
+        if (kL <= 0m)
+            return Results.BadRequest(new { error = "kL 必须 > 0。本系统约定 K_L=Δt/F（单位 ns/N，量级约 1e-4）；勿照标定证书/plan 附录C 的 1/N（约 1e-11）填，那是另一套约定（相差一个 t₀）。", kL });
+        if (refTimeNs <= 0m)
+            return Results.BadRequest(new { error = "refTimeNs（基线声时 t₀）必须 > 0。", refTimeNs });
+        if (yieldForceN is > 0m && kL * yieldForceN.Value >= refTimeNs)
+            return Results.BadRequest(new
+            {
+                error = "kL 量级过大：屈服力下推得的声时变化 ≥ 基线 t₀，物理上不可能。请确认 kL 用 ns/N 约定（约 1e-4），而非 1/N（约 1e-11）。",
+                kL, yieldForceN, refTimeNs
+            });
+        if (targetPreloadN is > 0m && kL * targetPreloadN.Value <= 1m)
+            return Results.BadRequest(new
+            {
+                error = "kL 量级过小：目标预紧力下推得的声时变化 ≤ 1 ns（低于测量噪声）。请确认 kL 用 ns/N 约定（约 1e-4），而非 1/N（约 1e-11）。",
+                kL, targetPreloadN, deltaAtTargetNs = kL * targetPreloadN.Value
+            });
+        return null;
+    }
+
+    /// <summary>屈服力 F_y = Rp0.2 · A_e（MPa·mm² = N）；缺任一参数返回 null（护栏跳过上界）。</summary>
+    private static decimal? YieldForceN(decimal? rp02Mpa, decimal? crossSectionMm2)
+        => rp02Mpa is > 0m && crossSectionMm2 is > 0m ? rp02Mpa.Value * crossSectionMm2.Value : null;
 
     /// <summary>
     /// 统一写 audit_log（target_type='channel'）。CalibrationEndpoints 内多处标定操作复用，
@@ -1351,16 +1389,18 @@ public static class CalibrationEndpoints
     }
 
     /// <summary>
-    /// 把同一 bolt 下【已生效(approved) 且未被取代】的旧标定标记为被 <paramref name="newCalibId"/> superseded。
-    /// 必须过滤 review_state='approved'：否则自签标定(quick/torque/apply) 会误把一条"待会签(pending)"
-    /// 的正式载荷标定也标成 superseded，导致它永远无法被会签激活。
+    /// 把同一 bolt 下【已生效（approved 两人会签 或 self_signed 自签）且未被取代】的旧标定
+    /// 标记为被 <paramref name="newCalibId"/> superseded。
+    /// 过滤 review_state IN ('approved','self_signed')，刻意排除 'pending'：否则新标定会误把一条
+    /// "待会签(pending)"的正式载荷标定也标成 superseded，导致它永远无法被会签激活。
     /// </summary>
     private static async Task SupersedeActiveCalibrationsAsync(
         NpgsqlConnection conn, NpgsqlTransaction tx, long boltId, Guid newCalibId, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(@"
             UPDATE calibration_records SET superseded_by = @new_id
-             WHERE bolt_id = @bolt_id AND superseded_by IS NULL AND id <> @new_id AND review_state = 'approved'", conn, tx);
+             WHERE bolt_id = @bolt_id AND superseded_by IS NULL AND id <> @new_id
+               AND review_state IN ('approved', 'self_signed')", conn, tx);
         cmd.Parameters.AddWithValue("new_id", NpgsqlDbType.Uuid, newCalibId);
         cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
         await cmd.ExecuteNonQueryAsync(ct);

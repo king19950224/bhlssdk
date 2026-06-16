@@ -1,3 +1,4 @@
+using BoltPreload.Algorithms.Preload;
 using BoltPreload.Api.Auth;
 using BoltPreload.Api.Endpoints;
 using BoltPreload.Api.Hubs;
@@ -16,8 +17,6 @@ using BoltPreload.Infrastructure.Devices.ProbeScan;
 using BoltPreload.Infrastructure.Ingestion;
 using BoltPreload.Infrastructure.Licensing;
 using BoltPreload.Infrastructure.Persistence;
-using FxSDK.Models;
-using FxSDK.Utility;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -64,8 +63,10 @@ builder.Services.AddSingleton(_ =>
     return dsBuilder.Build();
 });
 
-// EF Core（用于业务表 CRUD）
-// 列名 → snake_case 在 DbContext OnModelCreating 手动 HasColumnName，不用 NamingConventions 包
+// EF Core（业务表 CRUD 的预留入口 + EF 模型↔手写 schema 漂移测试基线）。
+// 采集热路径走原生 NpgsqlDataSource（绕开 change tracking）；此 DbContext 当前不在热路径注入，
+// 保留它是为了 (1) 后续业务 CRUD 改用 EF；(2) BoltPreload.Tests 用它校验 EF 映射与 deploy/sql schema 不漂移。
+// 列名 → snake_case 在 DbContext OnModelCreating 手动 HasColumnName，不用 NamingConventions 包。
 builder.Services.AddDbContext<BoltPreloadDbContext>(opt =>
 {
     opt.UseNpgsql(connectionString);
@@ -80,6 +81,13 @@ builder.Services.AddMemoryCache(options =>
 
 // 通道解析（带缓存）
 builder.Services.AddSingleton<IChannelResolver, CachedChannelResolver>();
+
+// 预紧力计算器 + 工厂（按螺栓规格 / 标定状态选最高精度可用算法；采集热路径用）。
+// 之前 PostgresMeasurementSink 直接 new GbSingleWaveCalculator()，工厂从未接线 → 现改为经工厂注入。
+builder.Services.AddSingleton<SimplifiedCalculator>();
+builder.Services.AddSingleton<GbSingleWaveCalculator>();
+builder.Services.AddSingleton<GbBiWaveCalculator>();
+builder.Services.AddSingleton<IPreloadCalculatorFactory, PreloadCalculatorFactory>();
 
 // 时序数据落地
 builder.Services.AddSingleton<IMeasurementSink, PostgresMeasurementSink>();
@@ -100,8 +108,9 @@ else
 builder.Services.Configure<LocalFileWaveStoreOptions>(builder.Configuration.GetSection("WaveStore"));
 builder.Services.AddSingleton<IWaveStore, LocalFileWaveStore>();
 
-// 开发期间：SDK 协议帧打日志（Phase 2 真机调试用，Phase 3 上线前关掉）
-FxUtility.DeveloperMode = builder.Configuration.GetValue<bool>("Fx:DeveloperMode", false);
+// 开发期间：SDK 协议帧打日志（Phase 2 真机调试用，Phase 3 上线前关掉）。
+// 经 BoltPreload.Fx 适配层封装，Api 不直接依赖 FxSDK.Utility。
+FxConnectorFactory.DeveloperMode = builder.Configuration.GetValue<bool>("Fx:DeveloperMode", false);
 
 // 多设备运行时管理：从 devices 表加载 N 个设备运行时。
 // 注意：不再把任何单例 IFxConnector 注册进 DI —— 业务/诊断服务必须经
@@ -133,9 +142,16 @@ builder.Services.Configure<LocalFileLicenseOptions>(builder.Configuration.GetSec
 // 防止该开关被误配到生产导致无 license 也"有效"。
 builder.Services.PostConfigure<LocalFileLicenseOptions>(o => o.IsDevelopmentEnvironment = isDevelopment);
 builder.Services.AddSingleton<ILicenseService, LocalFileLicenseService>();
+// 授权容量限额的运行时强制状态（启动时按实际设备/通道数评估，LicenseGate 据此拦截写操作）
+builder.Services.AddSingleton<LicenseEnforcementState>();
 
 // 鉴权（JWT bearer）+ 授权策略 + 用户密码哈希
 builder.Services.AddBoltPreloadAuth(builder.Configuration, isDevelopment);
+
+// 后台服务异常行为：单个 HostedService 抛未捕获异常时【不拖停整个进程】。
+// 采集 / 看门狗 / WAL 重放 / 信号健康各自独立，一个崩不应让整机停摆（默认 StopHost 对监测系统太脆）。
+builder.Services.Configure<HostOptions>(o =>
+    o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore);
 
 // IngestionService 作为 BackgroundService 跑
 builder.Services.AddHostedService<IngestionService>();
@@ -191,12 +207,13 @@ app.MapGet("/api/health", () => new
 .AllowAnonymous()
 .WithTags("Health");
 
-app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseService licenseService, IMeasurementWal wal) =>
+app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseService licenseService, LicenseEnforcementState enforcement, IMeasurementWal wal) =>
 {
     var license = licenseService.GetStatus();
+    // 多设备下按 (deviceId, address, channel) 去重，避免不同设备同 address/channel 互相抵消
     var channelCount = manager.Runtimes
-        .SelectMany(runtime => runtime.Connector.GetSessionChannelConfigs())
-        .Select(c => (c.Address, c.Channel))
+        .SelectMany(runtime => runtime.Connector.GetSessionChannelConfigs()
+            .Select(c => (runtime.DeviceId, c.Address, c.Channel)))
         .Distinct()
         .Count();
 
@@ -217,6 +234,9 @@ app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseSer
             currentChannels = channelCount,
             overDeviceLimit = license.MaxDevices.HasValue && manager.Runtimes.Count > license.MaxDevices.Value,
             overChannelLimit = license.MaxChannels.HasValue && channelCount > license.MaxChannels.Value,
+            // 强制结果：超限时写操作被 LicenseGate 拦截（监测不停）
+            withinLimits = enforcement.WithinLimits,
+            capacityViolation = enforcement.Violation,
             license.Warning
         },
         items = manager.Runtimes.Select(runtime => new
@@ -312,6 +332,33 @@ if (licenseStatus.Valid)
 else
     Log.Warning("授权无效或缺失：{Warning}（机器码 {MachineCode}）。写操作将被拒绝；请安装有效 license.json。",
         licenseStatus.Warning, licenseStatus.MachineCode);
+
+// 容量限额强制：按实际加载的设备 / 通道数评估 MaxDevices / MaxChannels。
+// 超限【不停采集】（避免授权问题导致安全监测静默失效），但 LicenseGate 会拦截所有写操作。
+try
+{
+    var manager = app.Services.GetRequiredService<IDeviceConnectorManager>();
+    var enforcement = app.Services.GetRequiredService<LicenseEnforcementState>();
+    var currentDevices = manager.Runtimes.Count;
+    var currentChannels = manager.Runtimes
+        .SelectMany(rt => rt.Connector.GetSessionChannelConfigs()
+            .Select(c => (rt.DeviceId, c.Address, c.Channel)))
+        .Distinct()
+        .Count();
+    enforcement.Set(currentDevices, currentChannels, licenseStatus.MaxDevices, licenseStatus.MaxChannels);
+    if (!enforcement.WithinLimits)
+        Log.Error("授权容量超限：{Violation}（当前 设备={Dev}/通道={Ch}，授权 设备={MD}/通道={MC}）。" +
+                  "监测继续运行，但所有写操作（配置/标定/下发）将被拒绝，请补足正确授权。",
+            enforcement.Violation, currentDevices, currentChannels, licenseStatus.MaxDevices, licenseStatus.MaxChannels);
+    else
+        Log.Information("授权容量校验通过：设备 {Dev}/{MD}，通道 {Ch}/{MC}",
+            currentDevices, licenseStatus.MaxDevices, currentChannels, licenseStatus.MaxChannels);
+}
+catch (Exception ex)
+{
+    // 设备运行时构造失败等：记录但不阻塞启动（DeviceConnectorManager 构造异常会在别处 rethrow）。
+    Log.Error(ex, "评估授权容量限额失败；写操作闸门将按签名有效性单独判定。");
+}
 
 // 启动 — 启动失败一律 rethrow 让进程退出码非 0，systemd / Windows 服务 / docker 才会重启
 try

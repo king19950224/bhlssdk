@@ -85,9 +85,11 @@ public sealed class IngestionService : BackgroundService
                         envelope.DeviceId, dp.Address, dp.Channel, dp.ParamName, dp.ParamValue);
                 }
 
+                var persisted = false;
                 try
                 {
                     await _sink.WriteAsync(envelope, stoppingToken);
+                    persisted = true;
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -125,8 +127,11 @@ public sealed class IngestionService : BackgroundService
                     }
                 }
 
-                // 实时推送（不阻塞入库；publisher 内部应捕获异常）
-                _ = SafePublishAsync(envelope, stoppingToken);
+                // 实时推送：仅在【成功落库】后推送，避免前端展示从未持久化的数据（数据完整性）。
+                // 入库失败已落 WAL 的数据，由 WalReplayService 重放补写（重放不推送）；
+                // 宁可实时通道短暂缺一条（前端 REST 轮询/历史仍可见），也不推未入库的数据。
+                if (persisted)
+                    _ = SafePublishAsync(envelope, stoppingToken);
             }
         }
         catch (OperationCanceledException)

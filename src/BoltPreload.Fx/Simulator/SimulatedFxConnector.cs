@@ -34,8 +34,9 @@ public sealed class SimulatedFxConnector : IFxConnector
     {
         _options = options;
         _logger = logger;
+        // 容量与真机 FxSdkConnector 对齐（8192, DropOldest），与开发文档 §4.3 一致
         _channel = System.Threading.Channels.Channel.CreateBounded<FxDecodedEnvelope>(
-            new BoundedChannelOptions(capacity: 4096)
+            new BoundedChannelOptions(capacity: 8192)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = false,

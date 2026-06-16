@@ -1,13 +1,13 @@
 using System.Globalization;
-using FxSDK.Models;
+using BoltPreload.Fx;
 using Npgsql;
 using NpgsqlTypes;
-using FxDeviceConfig = FxSDK.Models.DeviceConfig;
 
 namespace BoltPreload.Api;
 
 /// <summary>
-/// 启动时加载 SDK 本地 SessionContext 所需的通道配置。
+/// 启动时加载 SDK 本地 SessionContext 所需的通道配置（返回 plain 的 <see cref="FxChannelInit"/>，
+/// 由 <see cref="FxConnectorFactory"/> 在适配层映射回厂家 SDK 的 ChannelConfig——上层不直接 using FxSDK.*）。
 /// <para>
 /// 关键事实：厂家 SDK 的 <c>MultiChIotProtocolHandler.ProcessResult</c>
 /// 只有在 SessionContext 里有 <c>ChannelConfig</c> 且 <c>ProbeFreq &gt; 0</c> 时，
@@ -18,17 +18,17 @@ namespace BoltPreload.Api;
 /// </summary>
 public static class FxInitialChannelConfigLoader
 {
-    public static IReadOnlyList<ChannelConfig> Load(
+    public static IReadOnlyList<FxChannelInit> Load(
         NpgsqlDataSource dataSource,
         IConfiguration configuration,
-        FxDeviceConfig deviceConfig,
+        ushort defaultAddress,
         long deviceId,
         ILogger logger,
         bool includeAppSettingsFallback = true)
     {
-        var configs = new Dictionary<ushort, ChannelConfig>();
+        var configs = new Dictionary<ushort, FxChannelInit>();
 
-        foreach (var cfg in LoadFromDatabase(dataSource, deviceId, deviceConfig.Address, logger))
+        foreach (var cfg in LoadFromDatabase(dataSource, deviceId, defaultAddress, logger))
             configs[cfg.Channel] = cfg;
 
         // appsettings 兜底仅适用于"单设备配置"路径（Fx:Real:Channels 是单设备约定）。
@@ -36,7 +36,7 @@ public static class FxInitialChannelConfigLoader
         // 否则会把同一组兜底通道错误套到所有设备上。
         if (includeAppSettingsFallback)
         {
-            foreach (var fallback in LoadFromAppSettings(configuration, deviceConfig.Address))
+            foreach (var fallback in LoadFromAppSettings(configuration, defaultAddress))
             {
                 if (!configs.TryGetValue(fallback.Channel, out var existing))
                 {
@@ -64,13 +64,13 @@ public static class FxInitialChannelConfigLoader
         return configs.Values.OrderBy(c => c.Channel).ToArray();
     }
 
-    private static List<ChannelConfig> LoadFromDatabase(
+    private static List<FxChannelInit> LoadFromDatabase(
         NpgsqlDataSource dataSource,
         long deviceId,
         ushort defaultAddress,
         ILogger logger)
     {
-        var configs = new Dictionary<ushort, ChannelConfig>();
+        var configs = new Dictionary<ushort, FxChannelInit>();
 
         try
         {
@@ -87,7 +87,7 @@ public static class FxInitialChannelConfigLoader
             while (reader.Read())
             {
                 var channelNo = (ushort)reader.GetInt16(0);
-                configs[channelNo] = new ChannelConfig
+                configs[channelNo] = new FxChannelInit
                 {
                     Address = defaultAddress,
                     Channel = channelNo,
@@ -117,7 +117,7 @@ public static class FxInitialChannelConfigLoader
     private static void OverlayLatestDeviceParameters(
         NpgsqlDataSource dataSource,
         long deviceId,
-        Dictionary<ushort, ChannelConfig> configs,
+        Dictionary<ushort, FxChannelInit> configs,
         ILogger logger)
     {
         try
@@ -159,12 +159,12 @@ public static class FxInitialChannelConfigLoader
         }
     }
 
-    private static IEnumerable<ChannelConfig> LoadFromAppSettings(IConfiguration configuration, ushort defaultAddress)
+    private static IEnumerable<FxChannelInit> LoadFromAppSettings(IConfiguration configuration, ushort defaultAddress)
     {
         return configuration
             .GetSection("Fx:Real:Channels")
             .GetChildren()
-            .Select(section => new ChannelConfig
+            .Select(section => new FxChannelInit
             {
                 Address = section.GetValue<ushort>("Address", defaultAddress),
                 Channel = section.GetValue<ushort>("Channel", 1),
@@ -179,7 +179,7 @@ public static class FxInitialChannelConfigLoader
             });
     }
 
-    private static void MergeMissing(ChannelConfig target, ChannelConfig fallback)
+    private static void MergeMissing(FxChannelInit target, FxChannelInit fallback)
     {
         if (target.ProbeFreq <= 0m) target.ProbeFreq = fallback.ProbeFreq;
         if (target.Gain <= 0m) target.Gain = fallback.Gain;
@@ -190,7 +190,7 @@ public static class FxInitialChannelConfigLoader
         if (target.TempCoefficient is null) target.TempCoefficient = fallback.TempCoefficient;
     }
 
-    private static void ApplyParam(ChannelConfig cfg, string param, string value)
+    private static void ApplyParam(FxChannelInit cfg, string param, string value)
     {
         switch (param)
         {

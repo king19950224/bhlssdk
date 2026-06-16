@@ -284,7 +284,7 @@ public static class ReportEndpoints
 
         // 生成法兰螺栓预紧力验收报告（按监测组/法兰），保存数据快照供前端渲染与归档。reviewer+ 签发。
         group.MapPost("/flange-acceptance/{groupId:long}", async (
-            long groupId, HttpContext http, NpgsqlDataSource ds, FlangeReportRequest? req, CancellationToken ct) =>
+            long groupId, HttpContext http, NpgsqlDataSource ds, IWebHostEnvironment env, FlangeReportRequest? req, CancellationToken ct) =>
         {
             var user = UserContext.Require(http);
 
@@ -309,7 +309,7 @@ public static class ReportEndpoints
                 project = r.GetString(5);
             }
 
-            var bolts = new List<object>();
+            var bolts = new List<FlangeLine>();
             int total = 0, calibrated = 0, passed = 0;
             await using (var cmd = ds.CreateCommand(@"
                 SELECT b.code, b.nominal_diam, b.grade, b.position_label, b.target_preload_n, b.min_preload_n, b.state,
@@ -353,23 +353,21 @@ public static class ReportEndpoints
                         _ => "—",
                     };
 
-                    bolts.Add(new
-                    {
-                        code = r.GetString(0),
-                        spec = $"{r.GetString(1)}·{r.GetString(2)}",
-                        position = r.IsDBNull(3) ? null : r.GetString(3),
-                        channelNo = r.GetInt16(7),
-                        targetN = r.IsDBNull(4) ? (decimal?)null : r.GetDecimal(4),
-                        minN = min,
-                        preloadN = pre,
-                        ratio = r.IsDBNull(10) ? (decimal?)null : r.GetDecimal(10),
-                        lastTs = r.IsDBNull(11) ? (DateTime?)null : r.GetDateTime(11),
-                        calibMethod = method,
-                        trust,
-                        rSquared = r.IsDBNull(13) ? (decimal?)null : r.GetDecimal(13),
-                        uncertaintyN = r.IsDBNull(14) ? (decimal?)null : r.GetDecimal(14),
-                        result,
-                    });
+                    bolts.Add(new FlangeLine(
+                        Code: r.GetString(0),
+                        Spec: $"{r.GetString(1)}·{r.GetString(2)}",
+                        Position: r.IsDBNull(3) ? null : r.GetString(3),
+                        ChannelNo: r.GetInt16(7),
+                        TargetN: r.IsDBNull(4) ? (decimal?)null : r.GetDecimal(4),
+                        MinN: min,
+                        PreloadN: pre,
+                        Ratio: r.IsDBNull(10) ? (decimal?)null : r.GetDecimal(10),
+                        LastTs: r.IsDBNull(11) ? (DateTime?)null : r.GetDateTime(11),
+                        CalibMethod: method,
+                        Trust: trust,
+                        RSquared: r.IsDBNull(13) ? (decimal?)null : r.GetDecimal(13),
+                        UncertaintyN: r.IsDBNull(14) ? (decimal?)null : r.GetDecimal(14),
+                        Result: result));
                 }
             }
 
@@ -387,17 +385,34 @@ public static class ReportEndpoints
             };
             var title = req?.Title ?? $"{turbine} {flangeName} 螺栓预紧力验收报告";
 
+            // 生成可下载的归档 HTML（与扭矩阶梯报告同一套：原子写 + sha256 防篡改），不再只存 JSON 快照。
+            var html = RenderFlangeHtml(title, project, turbine, flangeName, flangeCode, groupTarget, total, calibrated, passed, overall, bolts);
+            var reportDir = Path.Combine(env.ContentRootPath, "data", "reports", "flange");
+            Directory.CreateDirectory(reportDir);
+            var fileName = $"flange-group-{groupId}-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}.html";
+            var relativePath = $"reports/flange/{fileName}";
+            var absolutePath = Path.Combine(reportDir, fileName);
+            var tmp = absolutePath + ".tmp";
+            var bytes = Encoding.UTF8.GetBytes(html);
+            await File.WriteAllBytesAsync(tmp, bytes, ct);
+            File.Move(tmp, absolutePath, overwrite: true);
+            var sha = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+            var size = (long)bytes.Length;
+
             long reportId;
             await using var conn = await ds.OpenConnectionAsync(ct);
             await using var tx = await conn.BeginTransactionAsync(ct);
             try
             {
                 await using (var cmd = new NpgsqlCommand(@"
-                    INSERT INTO reports (report_type, title, subject_type, subject_id, generated_by, notes)
-                    VALUES ('flange_acceptance', @title, 'monitor_group', @gid, @uid, @notes) RETURNING id", conn, tx))
+                    INSERT INTO reports (report_type, title, subject_type, subject_id, file_url, file_sha256, file_bytes, generated_by, notes)
+                    VALUES ('flange_acceptance', @title, 'monitor_group', @gid, @file_url, @sha, @bytes, @uid, @notes) RETURNING id", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("title", NpgsqlDbType.Varchar, title);
                     cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                    cmd.Parameters.AddWithValue("file_url", NpgsqlDbType.Varchar, relativePath);
+                    cmd.Parameters.AddWithValue("sha", NpgsqlDbType.Char, sha);
+                    cmd.Parameters.AddWithValue("bytes", NpgsqlDbType.Bigint, size);
                     cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                     cmd.Parameters.AddWithValue("notes", NpgsqlDbType.Text, (object?)req?.Notes ?? DBNull.Value);
                     reportId = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
@@ -417,7 +432,7 @@ public static class ReportEndpoints
                 throw;
             }
 
-            return Results.Ok(new { reportId, title, overall, total, passed, calibrated });
+            return Results.Ok(new { reportId, title, overall, total, passed, calibrated, fileUrl = relativePath, downloadUrl = $"/api/reports/{reportId}/download" });
         })
         .RequireAuthorization(AuthPolicies.ReviewerAccess)
         .WithName("GenerateFlangeAcceptanceReport")
@@ -576,10 +591,68 @@ public static class ReportEndpoints
         </html>
         """;
     }
+
+    private static string RenderFlangeHtml(
+        string title, string project, string turbine, string flangeName, string flangeCode,
+        decimal? groupTarget, int total, int calibrated, int passed, string overall, List<FlangeLine> bolts)
+    {
+        static string H(string? v) => WebUtility.HtmlEncode(v ?? "");
+        static string N(decimal? v) => v.HasValue ? v.Value.ToString("F0") : "—";
+        static string R(decimal? v) => v.HasValue ? (v.Value * 100).ToString("F1") + "%" : "—";
+        var rows = string.Join("\n", bolts.Select((b, i) => $"""
+            <tr><td>{i + 1}</td><td>{H(b.Code)}</td><td>{H(b.Spec)}</td><td>{H(b.Position)}</td>
+            <td>{N(b.TargetN)}</td><td>{N(b.MinN)}</td><td>{N(b.PreloadN)}</td><td>{R(b.Ratio)}</td>
+            <td>{H(b.CalibMethod)}</td><td>{H(b.Trust)}</td><td>{(b.RSquared.HasValue ? b.RSquared.Value.ToString("F3") : "—")}</td>
+            <td>{H(b.Result)}</td></tr>
+            """));
+        var verdictClass = overall == "合格" ? "ok" : "warn";
+        return $$"""
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8" />
+          <title>{{H(title)}}</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 32px; color: #111827; }
+            h1 { margin-bottom: 4px; }
+            .muted { color: #6b7280; }
+            table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13px; }
+            th, td { border: 1px solid #d1d5db; padding: 7px 8px; text-align: left; }
+            th { background: #f3f4f6; }
+            .warn { border-left: 4px solid #f59e0b; padding: 10px 12px; background: #fffbeb; }
+            .ok { border-left: 4px solid #16a34a; padding: 10px 12px; background: #f0fdf4; }
+          </style>
+        </head>
+        <body>
+          <h1>{{H(title)}}</h1>
+          <div class="muted">标准依据：GB/T 43232 · JJF 1059.1 · 生成时间 {{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss zzz}}</div>
+          <h2>对象</h2>
+          <table>
+            <tr><th>风场</th><td>{{H(project)}}</td><th>风机</th><td>{{H(turbine)}}</td></tr>
+            <tr><th>监测部位</th><td>{{H(flangeName)}}（{{H(flangeCode)}}）</td><th>组目标预紧力</th><td>{{N(groupTarget)}} N</td></tr>
+          </table>
+          <h2>验收结论</h2>
+          <div class="{{verdictClass}}">总体：{{H(overall)}}；螺栓总数 {{total}}，已标定 {{calibrated}}，合格 {{passed}}，不合格 {{total - passed}}。</div>
+          <h2>逐螺栓结果</h2>
+          <table>
+            <thead><tr><th>#</th><th>螺栓</th><th>规格</th><th>位置</th><th>目标 N</th><th>下限 N</th><th>当前 N</th><th>比值</th><th>标定方法</th><th>可信</th><th>R²</th><th>结论</th></tr></thead>
+            <tbody>{{rows}}</tbody>
+          </table>
+          <p class="muted">本报告由系统自动生成，数据快照已归档可追溯。标定可信等级为"临时/工程估算"的螺栓不作为正式安全验收依据。</p>
+        </body>
+        </html>
+        """;
+    }
 }
 
 public sealed record TorqueStepReportRequest(string? Title = null, string? Notes = null);
 public sealed record FlangeReportRequest(string? Title = null, string? Notes = null);
+
+/// <summary>法兰验收报告中的一行螺栓结果（既用于 JSON 快照，也用于渲染归档 HTML）。</summary>
+public sealed record FlangeLine(
+    string Code, string Spec, string? Position, short ChannelNo,
+    decimal? TargetN, decimal? MinN, decimal? PreloadN, decimal? Ratio,
+    DateTime? LastTs, string? CalibMethod, string Trust, decimal? RSquared, decimal? UncertaintyN, string Result);
 
 public sealed record TorqueStepReportSnapshot(
     DateTimeOffset GeneratedAt,

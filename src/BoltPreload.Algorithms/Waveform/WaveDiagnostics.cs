@@ -148,6 +148,14 @@ public static class WaveDiagnostics
             ScoreFreq: scoreFreq);
     }
 
+    /// <summary>
+    /// 仅基于 SNR 的【参考无关】健康度（0~100）。用于采集热路径：没有参考波形基线、
+    /// 且互相关 O(n²) 不适合逐条测量计算时，给一个 §8.6.4 SNR 分项映射的轻量健康度。
+    /// 完整含相似度/衰减/主频的综合健康度由 <see cref="Compare"/> 在诊断路径计算。
+    /// </summary>
+    public static int SnrOnlyHealthScore(double snrDb)
+        => (int)Math.Round(100.0 * Clamp01((snrDb - SnrLowDb) / (SnrHighDb - SnrLowDb)));
+
     /// <summary>把序列从 srcClock 间隔线性重采样到 dstClock 间隔（起点对齐到第 0 点）。</summary>
     private static double[] Resample(IReadOnlyList<short> data, double srcClock, double dstClock)
     {

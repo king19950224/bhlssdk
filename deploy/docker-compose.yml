@@ -36,6 +36,7 @@ services:
       - ./sql/0016_channel_config_change_approval.sql:/docker-entrypoint-initdb.d/16_0016_channel_config_change_approval.sql:ro
       - ./sql/0017_alarm_cleared_by.sql:/docker-entrypoint-initdb.d/17_0017_alarm_cleared_by.sql:ro
       - ./sql/0018_turbines.sql:/docker-entrypoint-initdb.d/18_0018_turbines.sql:ro
+      - ./sql/0019_calibration_self_signed_state.sql:/docker-entrypoint-initdb.d/19_0019_calibration_self_signed_state.sql:ro
       - ./sql/dev/0001_dev_seed.sql:/docker-entrypoint-initdb.d/99_dev_seed.sql:ro
       - ./sql/dev/0002_dev_seed_assets.sql:/docker-entrypoint-initdb.d/99b_dev_seed_assets.sql:ro
       - ./sql/dev/0003_dev_seed_real_probes.sql:/docker-entrypoint-initdb.d/99c_dev_seed_real_probes.sql:ro
