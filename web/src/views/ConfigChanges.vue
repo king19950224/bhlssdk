@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { configChangeApi, type ConfigChange } from '../api'
 import { useAuth } from '../stores/auth'
@@ -9,6 +9,21 @@ const items = ref<ConfigChange[]>([])
 const statusFilter = ref<'pending' | 'all'>('pending')
 const loading = ref(false)
 let timer: number | undefined
+
+const detail = reactive({ visible: false, item: null as ConfigChange | null })
+function openDetail(c: ConfigChange) {
+  detail.item = c
+  detail.visible = true
+}
+function paramPairs(c: ConfigChange | null): [string, unknown][] {
+  if (!c?.requested) return []
+  try {
+    const o = JSON.parse(c.requested) as Record<string, unknown>
+    return Object.entries(o).filter(([, v]) => v != null)
+  } catch {
+    return []
+  }
+}
 
 const ST: Record<string, { label: string; color: string }> = {
   requested: { label: '待审批', color: '#f59e0b' },
@@ -95,13 +110,13 @@ function fmt(iso: string | null) {
           <span class="who">用户{{ c.requestedBy ?? '—' }}<br /><span class="dim mono">{{ fmt(c.requestedAt) }}</span></span>
           <span class="who">{{ c.approvedBy ? '用户' + c.approvedBy : '—' }}</span>
           <span class="ops">
+            <el-button size="small" text @click="openDetail(c)">详情</el-button>
             <template v-if="c.status === 'requested'">
               <el-button size="small" type="primary" text :disabled="!auth.isReviewer" @click="approve(c)">审批</el-button>
               <el-button size="small" type="danger" text :disabled="!auth.isReviewer" @click="reject(c)">驳回</el-button>
             </template>
             <el-button v-else-if="c.status === 'approved'" size="small" type="primary" text @click="execute(c)">执行</el-button>
             <el-button v-else-if="c.status === 'executed'" size="small" text @click="verify(c)">验证</el-button>
-            <span v-else class="dim">—</span>
           </span>
         </div>
         <div v-if="!loading && !items.length" class="tbl-empty"><span class="led led--ok" /> {{ statusFilter === 'pending' ? '无待办变更' : '无变更记录' }}</div>
@@ -117,6 +132,26 @@ function fmt(iso: string | null) {
         <span class="fl">验证<i>读回比对</i></span>
       </div>
     </div>
+
+    <el-dialog v-model="detail.visible" :title="detail.item ? `变更请求 #${detail.item.id}` : '变更详情'" width="540px">
+      <div v-if="detail.item" class="dd">
+        <div class="dd-row"><span class="dd-k">设备 / 通道</span><b class="mono">dev{{ detail.item.deviceId }} · CH{{ detail.item.channelNo }}</b></div>
+        <div class="dd-row"><span class="dd-k">状态</span><span class="st" :style="`color:${ST[detail.item.status]?.color};border-color:${ST[detail.item.status]?.color}`">{{ ST[detail.item.status]?.label || detail.item.status }}</span></div>
+        <div class="dd-sec">变更参数</div>
+        <div v-if="paramPairs(detail.item).length" class="dd-params">
+          <div v-for="[k, v] in paramPairs(detail.item)" :key="k" class="dd-param"><span class="mono dd-pk">{{ k }}</span><b class="mono">{{ v }}</b></div>
+        </div>
+        <div v-else class="dd-empty">无参数</div>
+        <div class="dd-sec">流程时间线</div>
+        <div class="dd-row"><span class="dd-k">提交</span><span>用户{{ detail.item.requestedBy ?? '—' }} · <span class="mono dim">{{ fmt(detail.item.requestedAt) }}</span></span></div>
+        <div class="dd-row"><span class="dd-k">审批</span><span>{{ detail.item.approvedBy ? '用户' + detail.item.approvedBy : '—' }} · <span class="mono dim">{{ fmt(detail.item.approvedAt) }}</span></span></div>
+        <div class="dd-row"><span class="dd-k">执行</span><span>{{ detail.item.executedBy ? '用户' + detail.item.executedBy : '—' }} · <span class="mono dim">{{ fmt(detail.item.executedAt) }}</span></span></div>
+        <div class="dd-row"><span class="dd-k">验证</span><span class="mono dim">{{ fmt(detail.item.verifiedAt) }}</span></div>
+        <div v-if="detail.item.failureReason" class="dd-row dd-fail"><span class="dd-k">失败原因</span><span>{{ detail.item.failureReason }}</span></div>
+        <div v-if="detail.item.note" class="dd-row"><span class="dd-k">备注</span><span>{{ detail.item.note }}</span></div>
+      </div>
+      <template #footer><el-button @click="detail.visible = false">关闭</el-button></template>
+    </el-dialog>
   </div>
 </template>
 
@@ -137,6 +172,16 @@ function fmt(iso: string | null) {
 .dim { color: var(--text-3); font-size: 11px; }
 .ops { display: flex; gap: 2px; }
 .tbl-empty { display: flex; align-items: center; gap: 8px; justify-content: center; padding: 30px; color: var(--text-3); }
+
+.dd { display: flex; flex-direction: column; gap: 10px; }
+.dd-row { display: flex; gap: 14px; align-items: baseline; font-size: 13px; }
+.dd-k { width: 80px; color: var(--text-3); flex-shrink: 0; }
+.dd-sec { font-size: 12px; color: var(--accent-2); letter-spacing: 0.06em; margin: 8px 0 2px; padding-bottom: 5px; border-bottom: 1px solid var(--hairline); }
+.dd-params { display: flex; flex-direction: column; gap: 6px; }
+.dd-param { display: flex; justify-content: space-between; padding: 4px 0; }
+.dd-pk { color: var(--text-3); }
+.dd-empty { color: var(--text-3); font-size: 13px; }
+.dd-fail { color: var(--crit); }
 
 .flow-note { padding: 16px 22px; }
 .flow { display: flex; align-items: center; gap: 14px; margin-top: 12px; color: var(--text-3); }

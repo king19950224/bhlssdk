@@ -3,7 +3,7 @@ import { onMounted, ref } from 'vue'
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { reportApi, type FlangeSnapshot } from '../api'
+import { reportApi, type FlangeSnapshot, type TorqueStepSnapshot } from '../api'
 import { useAuth } from '../stores/auth'
 
 const route = useRoute()
@@ -12,17 +12,28 @@ const auth = useAuth()
 const id = Number(route.params.reportId)
 
 const title = ref('')
+const reportType = ref('')
 const generatedAt = ref('')
 const status = ref('')
 const generatedBy = ref<number | null>(null)
 const generatedByName = ref<string | null>(null)
 const signedAt = ref<string | null>(null)
 const signedByName = ref<string | null>(null)
-const snap = ref<FlangeSnapshot | null>(null)
+const snap = ref<FlangeSnapshot | TorqueStepSnapshot | null>(null)
 const loading = ref(true)
 const signing = ref(false)
 
 const canSign = computed(() => status.value === 'generated' && auth.isReviewer && auth.userId !== generatedBy.value)
+
+// 按快照结构区分报告类型，分别渲染（法兰验收 vs 扭矩阶梯）
+const flange = computed<FlangeSnapshot | null>(() => {
+  const s = snap.value as Record<string, unknown> | null
+  return s && 'bolts' in s && 'flange' in s ? (snap.value as FlangeSnapshot) : null
+})
+const torque = computed<TorqueStepSnapshot | null>(() => {
+  const s = snap.value as Record<string, unknown> | null
+  return s && 'points' in s && 'channel' in s ? (snap.value as TorqueStepSnapshot) : null
+})
 
 const RESULT: Record<string, string> = { 合格: '#10b981', 不合格: '#f43f5e', 未标定: '#61748f', 无数据: '#3b4659' }
 const METHOD: Record<string, string> = {
@@ -33,6 +44,7 @@ const METHOD: Record<string, string> = {
 async function load() {
   const d = await reportApi.get(id)
   title.value = d.title
+  reportType.value = d.reportType
   generatedAt.value = d.generatedAt
   status.value = d.status
   generatedBy.value = d.generatedBy
@@ -86,35 +98,35 @@ function doPrint() {
       </div>
     </div>
 
-    <div v-if="snap" class="sheet panel panel--glow">
+    <div v-if="flange" class="sheet panel panel--glow">
       <header class="rh">
         <div class="rh-logo">
           <svg viewBox="0 0 32 32" width="30" height="30"><polygon points="16,3 27,9 27,23 16,29 5,23 5,9" fill="none" stroke="var(--accent)" stroke-width="1.6" /><circle cx="16" cy="16" r="4.5" fill="var(--accent)" /></svg>
           <span>螺栓预紧力在线监测系统</span>
         </div>
         <h1>{{ title }}</h1>
-        <div class="rh-std">{{ snap.standard }}</div>
+        <div class="rh-std">{{ flange.standard }}</div>
       </header>
 
       <div class="meta-grid">
-        <div><span>风场</span><b>{{ snap.project }}</b></div>
-        <div><span>风机</span><b>{{ snap.turbine }}</b></div>
-        <div><span>监测部位</span><b>{{ snap.flange.name }}（{{ snap.flange.code }}）</b></div>
-        <div><span>组目标预紧力</span><b>{{ snap.flange.targetPreloadN ? n(snap.flange.targetPreloadN) + ' N' : '—' }}</b></div>
+        <div><span>风场</span><b>{{ flange.project }}</b></div>
+        <div><span>风机</span><b>{{ flange.turbine }}</b></div>
+        <div><span>监测部位</span><b>{{ flange.flange.name }}（{{ flange.flange.code }}）</b></div>
+        <div><span>组目标预紧力</span><b>{{ flange.flange.targetPreloadN ? n(flange.flange.targetPreloadN) + ' N' : '—' }}</b></div>
         <div><span>生成时间</span><b>{{ fmt(generatedAt) }}</b></div>
         <div><span>报告编号</span><b>FR-{{ String(id).padStart(6, '0') }}</b></div>
       </div>
 
-      <div class="verdict" :class="snap.summary.overall === '合格' ? 'ok' : 'no'">
+      <div class="verdict" :class="flange.summary.overall === '合格' ? 'ok' : 'no'">
         <div class="v-main">
           <span class="v-label">验收结论</span>
-          <span class="v-result">{{ snap.summary.overall }}</span>
+          <span class="v-result">{{ flange.summary.overall }}</span>
         </div>
         <div class="v-stats">
-          <div><b>{{ snap.summary.total }}</b><span>螺栓总数</span></div>
-          <div><b>{{ snap.summary.calibrated }}</b><span>已标定</span></div>
-          <div><b style="color:var(--ok)">{{ snap.summary.passed }}</b><span>合格</span></div>
-          <div><b :style="snap.summary.failed > 0 ? 'color:var(--crit)' : ''">{{ snap.summary.failed }}</b><span>不合格</span></div>
+          <div><b>{{ flange.summary.total }}</b><span>螺栓总数</span></div>
+          <div><b>{{ flange.summary.calibrated }}</b><span>已标定</span></div>
+          <div><b style="color:var(--ok)">{{ flange.summary.passed }}</b><span>合格</span></div>
+          <div><b :style="flange.summary.failed > 0 ? 'color:var(--crit)' : ''">{{ flange.summary.failed }}</b><span>不合格</span></div>
         </div>
       </div>
 
@@ -123,7 +135,7 @@ function doPrint() {
           <tr><th>#</th><th>螺栓编号</th><th>规格</th><th>位置</th><th>目标 N</th><th>下限 N</th><th>当前预紧力 N</th><th>比值</th><th>标定方法</th><th>可信</th><th>R²</th><th>结论</th></tr>
         </thead>
         <tbody>
-          <tr v-for="(b, i) in snap.bolts" :key="i">
+          <tr v-for="(b, i) in flange.bolts" :key="i">
             <td>{{ i + 1 }}</td>
             <td class="mono">{{ b.code }}</td>
             <td>{{ b.spec }}</td>
@@ -154,6 +166,73 @@ function doPrint() {
         </div>
       </footer>
       <div class="rd-note">本报告由螺栓预紧力在线监测系统自动生成，数据快照已归档，可追溯复现。标定可信等级为"临时/工程估算"的螺栓不作为正式安全验收依据。</div>
+    </div>
+
+    <!-- 扭矩阶梯验证报告（report_type=torque_step） -->
+    <div v-else-if="torque" class="sheet panel panel--glow">
+      <header class="rh">
+        <div class="rh-logo">
+          <svg viewBox="0 0 32 32" width="30" height="30"><polygon points="16,3 27,9 27,23 16,29 5,23 5,9" fill="none" stroke="var(--accent)" stroke-width="1.6" /><circle cx="16" cy="16" r="4.5" fill="var(--accent)" /></svg>
+          <span>螺栓预紧力在线监测系统</span>
+        </div>
+        <h1>{{ title }}</h1>
+        <div class="rh-std">GB/T 43232-2023 扭矩阶梯线性度验证（扭矩法临时拟合，非正式载荷标定）</div>
+      </header>
+
+      <div class="meta-grid">
+        <div><span>螺栓编号</span><b>{{ torque.bolt.code }}</b></div>
+        <div><span>规格</span><b>{{ torque.bolt.nominalDiameter }}</b></div>
+        <div><span>设备/通道</span><b class="mono">{{ torque.channel.deviceId }} / CH{{ torque.channel.channelNo }}</b></div>
+        <div><span>安装扭矩</span><b>{{ torque.bolt.installTorqueNm != null ? torque.bolt.installTorqueNm + ' N·m' : '—' }}</b></div>
+        <div><span>目标预紧力</span><b>{{ torque.bolt.targetPreloadN ? n(torque.bolt.targetPreloadN) + ' N' : '—' }}</b></div>
+        <div><span>报告编号</span><b>TS-{{ String(id).padStart(6, '0') }}</b></div>
+      </div>
+
+      <div class="verdict" :class="torque.fit && torque.fit.rSquared >= 0.98 ? 'ok' : 'no'">
+        <div class="v-main">
+          <span class="v-label">线性拟合结论</span>
+          <span class="v-result" style="font-size:20px">{{ torque.conclusion }}</span>
+        </div>
+        <div class="v-stats" v-if="torque.fit">
+          <div><b>{{ torque.fit.pointCount }}</b><span>有效点</span></div>
+          <div><b class="mono">{{ torque.fit.kL.toExponential(3) }}</b><span>K_L (ns/N)</span></div>
+          <div><b class="mono">{{ torque.fit.interceptNs.toFixed(1) }}</b><span>截距 (ns)</span></div>
+          <div><b :style="torque.fit.rSquared >= 0.98 ? 'color:var(--ok)' : 'color:var(--warn)'">{{ torque.fit.rSquared.toFixed(4) }}</b><span>R²</span></div>
+        </div>
+      </div>
+
+      <table class="rt">
+        <thead>
+          <tr><th>#</th><th>扭矩 N·m</th><th>估算预紧力 N</th><th>样本数</th><th>平均声时 ns</th><th>声时差 Δt ns</th><th>平均温度 ℃</th><th>纳入拟合</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="(p, i) in torque.points" :key="p.id" :class="{ excluded: p.excluded }">
+            <td>{{ i + 1 }}</td>
+            <td class="mono">{{ p.torqueNm }}</td>
+            <td class="mono">{{ n(p.estimatedPreloadN) }}</td>
+            <td class="mono">{{ p.sampleCount }}</td>
+            <td class="mono">{{ Number(p.avgEchoTimeNs).toFixed(2) }}</td>
+            <td class="mono">{{ Number(p.deltaTofNs).toFixed(2) }}</td>
+            <td class="mono">{{ Number(p.avgTempC).toFixed(1) }}</td>
+            <td><span class="res" :style="`color:${p.excluded ? RESULT['不合格'] : RESULT['合格']}`">{{ p.excluded ? '剔除' : '是' }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <footer class="sign">
+        <div class="sig">
+          <span class="sig-name">{{ generatedByName || '—' }}</span>
+          <span class="sig-cap">编制</span>
+        </div>
+        <div class="sig">
+          <span class="sig-name" :class="{ pending: !signedByName }">{{ signedByName || '（待审核签发）' }}</span>
+          <span class="sig-cap">审核签发</span>
+        </div>
+        <div class="sig-date">
+          {{ status === 'signed' && signedAt ? '签发日期：' + new Date(signedAt).toLocaleDateString('zh-CN') : '日期：__________' }}
+        </div>
+      </footer>
+      <div class="rd-note">本报告为扭矩法临时拟合的线性度验证，<b>非正式载荷标定</b>，不作为安全验收依据；正式验收须用已知载荷多点标定（load-calibrate + 双人会签）。数据快照已归档，可追溯复现。</div>
     </div>
 
     <div v-else-if="!loading" class="empty panel">报告不存在或快照为空</div>
@@ -197,6 +276,7 @@ function doPrint() {
 .rt { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-bottom: 26px; }
 .rt th { text-align: left; padding: 10px 8px; color: var(--text-3); font-weight: 600; border-bottom: 1px solid var(--panel-border-strong); font-size: 11px; }
 .rt td { padding: 9px 8px; border-bottom: 1px solid var(--hairline); }
+.rt tr.excluded { opacity: 0.5; }
 .res { font-weight: 600; }
 
 .sign { display: flex; gap: 50px; align-items: flex-end; margin-top: 30px; flex-wrap: wrap; }

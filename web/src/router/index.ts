@@ -4,6 +4,8 @@ import AppShell from '../layouts/AppShell.vue'
 
 const routes: RouteRecordRaw[] = [
   { path: '/login', name: 'login', component: () => import('../views/Login.vue'), meta: { public: true } },
+  // 大屏 HMI 态势看板：全屏、无外壳导航，需登录
+  { path: '/board', name: 'board', component: () => import('../views/BigScreen.vue') },
   {
     path: '/',
     component: AppShell,
@@ -21,9 +23,10 @@ const routes: RouteRecordRaw[] = [
       { path: 'reports', name: 'reports', component: () => import('../views/Reports.vue') },
       { path: 'reports/:reportId', name: 'reportDetail', component: () => import('../views/ReportDetail.vue') },
       { path: 'users', name: 'users', component: () => import('../views/Users.vue') },
+      // 已登录下的未知路径 → 在外壳内渲染 404（保留导航），而非静默跳首页
+      { path: ':pathMatch(.*)*', name: 'notFound', component: () => import('../views/NotFound.vue') },
     ],
   },
-  { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 
 const router = createRouter({ history: createWebHistory(), routes })

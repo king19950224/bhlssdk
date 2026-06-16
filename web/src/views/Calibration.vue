@@ -2,11 +2,21 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { calibrationApi, boltApi, type CalibMethod, type BoltListItem } from '../api'
+import { useAuth } from '../stores/auth'
+import CalibrationDialog from '../components/CalibrationDialog.vue'
 
 const router = useRouter()
+const auth = useAuth()
 const methods = ref<CalibMethod[]>([])
 const bolts = ref<BoltListItem[]>([])
 const loading = ref(false)
+
+const dialogOpen = ref(false)
+const sel = ref<{ channelId: number; boltId: number; code: string } | null>(null)
+function openCalib(b: BoltListItem) {
+  sel.value = { channelId: b.channelId, boltId: b.id, code: b.code }
+  dialogOpen.value = true
+}
 
 const TRUST: Record<string, { label: string; color: string }> = {
   formal: { label: '正式', color: '#10b981' },
@@ -66,7 +76,7 @@ onMounted(load)
     <div class="panel panel--glow">
       <div class="panel-hd"><span class="panel-title">螺栓标定状态</span></div>
       <div class="tbl">
-        <div class="tr th"><span>螺栓</span><span>规格</span><span>状态</span><span>K_L</span><span>参考声时</span><span>参考温度</span><span></span></div>
+        <div class="tr th"><span>螺栓</span><span>规格</span><span>状态</span><span>K_L</span><span>参考声时</span><span>参考温度</span><span>操作</span></div>
         <div v-for="b in bolts" :key="b.id" class="tr" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
           <span class="mono">{{ b.code }}</span>
           <span>{{ b.nominalDiam }}·{{ b.grade }}</span>
@@ -74,11 +84,22 @@ onMounted(load)
           <span class="mono">{{ b.kL != null ? Number(b.kL).toExponential(2) : '—' }}</span>
           <span class="mono">{{ b.refTimeNs != null ? Number(b.refTimeNs).toFixed(0) + 'ns' : '—' }}</span>
           <span class="mono">{{ b.refTempC != null ? Number(b.refTempC).toFixed(1) + '°C' : '—' }}</span>
-          <span class="go"><el-icon><ArrowRight /></el-icon></span>
+          <span class="ops" @click.stop>
+            <el-button v-if="auth.isReviewer" size="small" type="primary" text @click="openCalib(b)">标定</el-button>
+            <el-icon class="go" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })"><ArrowRight /></el-icon>
+          </span>
         </div>
         <div v-if="!loading && !bolts.length" class="tbl-empty">暂无螺栓</div>
       </div>
     </div>
+
+    <CalibrationDialog
+      v-model="dialogOpen"
+      :channel-id="sel?.channelId ?? null"
+      :bolt-id="sel?.boltId ?? null"
+      :bolt-code="sel?.code ?? ''"
+      @done="load"
+    />
   </div>
 </template>
 
@@ -101,7 +122,8 @@ onMounted(load)
 
 .panel-hd { padding: 16px 20px 4px; }
 .tbl { padding: 4px 18px 16px; }
-.tr { display: grid; grid-template-columns: 120px 100px 110px 1fr 110px 100px 30px; align-items: center; padding: 11px 6px; border-bottom: 1px solid var(--hairline); font-size: 13px; cursor: pointer; }
+.tr { display: grid; grid-template-columns: 120px 100px 110px 1fr 110px 100px 120px; align-items: center; padding: 11px 6px; border-bottom: 1px solid var(--hairline); font-size: 13px; cursor: pointer; }
+.ops { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
 .tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; cursor: default; }
 .tr.th:hover { background: none; }

@@ -5,15 +5,19 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import EChart from '../components/EChart.vue'
 import PreloadScale from '../components/PreloadScale.vue'
 import { computePreloadHealth, pct, signedN } from '../utils/preload'
-import { boltApi, alarmApi, auditApi, waveApi, configChangeApi, deviceApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction } from '../api'
+import { boltApi, alarmApi, auditApi, waveApi, configChangeApi, deviceApi, calibrationApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction } from '../api'
+import { onRealtime } from '../api/realtime'
+import { useAuth } from '../stores/auth'
 
 const route = useRoute()
 const router = useRouter()
+const auth = useAuth()
 const boltId = Number(route.params.boltId)
 
 // 实时波形 + 松紧状态
 const live = ref(true)
 let liveTimer: number | undefined
+let unsubMeas: (() => void) | undefined
 const liveEchoNs = ref<number | null>(null)
 const liveTempC = ref<number | null>(null)
 const baselining = ref(false)
@@ -112,22 +116,28 @@ async function loadWave() {
   }
 }
 
-// 实时刷新：拉最新一条测量(声时/温度)+ 最新波形,驱动 A-Scan 与松紧状态实时更新
+// 应用一条最新测量（声时/温度）→ 更新实时显示与滚动序列；SignalR 推送与轮询兜底共用。
+function applyLiveMeasurement(tsIso: string, echoNs: number | null, tempC: number | null) {
+  if (echoNs != null) {
+    liveEchoNs.value = Number(echoNs)
+    liveTempC.value = tempC != null ? Number(tempC) : liveTempC.value
+  }
+  // 新测量到达 → 推入滚动序列（livePreloadN 已随 liveEchoNs 重算；按 ts 去重避免重复累计）
+  if (tsIso && tsIso !== lastLiveTs) {
+    lastLiveTs = tsIso
+    if (livePreloadN.value != null) {
+      liveSeries.value.push({ t: new Date(tsIso).getTime(), v: livePreloadN.value })
+      if (liveSeries.value.length > 90) liveSeries.value.shift()
+    }
+  }
+}
+
+// 波形 + 兜底刷新：A-Scan 波形不走 SignalR（推送不含波形），仍需周期性拉取；
+// 同时拉一条最新测量作为 SignalR 断线时的兜底（echo/温度由 applyLiveMeasurement 去重合并）。
 async function loadLive() {
   try {
     const m = (await boltApi.measurements(boltId, 1)).items[0]
-    if (m?.echoTimeNs != null) {
-      liveEchoNs.value = Number(m.echoTimeNs)
-      liveTempC.value = m.spTempC != null ? Number(m.spTempC) : null
-    }
-    // 新测量到达 → 推入滚动序列（livePreloadN 已随 liveEchoNs 重算；避免同一条重复累计）
-    if (m && m.ts !== lastLiveTs) {
-      lastLiveTs = m.ts
-      if (livePreloadN.value != null) {
-        liveSeries.value.push({ t: new Date(m.ts).getTime(), v: livePreloadN.value })
-        if (liveSeries.value.length > 90) liveSeries.value.shift()
-      }
-    }
+    if (m) applyLiveMeasurement(m.ts, m.echoTimeNs, m.spTempC)
   } catch {
     /* ignore */
   }
@@ -136,7 +146,8 @@ async function loadLive() {
 function startLive() {
   stopLive()
   if (!live.value) return
-  liveTimer = window.setInterval(loadLive, 1500)
+  // SignalR 实时驱动 echo/温度；轮询降到 4s 仅用于波形刷新与断线兜底
+  liveTimer = window.setInterval(loadLive, 4000)
 }
 function stopLive() {
   if (liveTimer) {
@@ -223,6 +234,28 @@ async function setBaseline() {
   }
 }
 
+// 会签激活待复核的正式载荷标定（必须由不同于提交人的复核员执行 → 两人四眼）
+const countersigning = ref<string | null>(null)
+async function countersign(c: CalibRecord) {
+  if (!bolt.value) return
+  try {
+    await ElMessageBox.confirm(
+      `会签激活该正式载荷标定（K_L=${Number(c.kL).toExponential(3)}，R²=${Number(c.rSquared).toFixed(3)}）。会签人须与提交人不同（两人四眼）。`,
+      '会签激活标定', { confirmButtonText: '会签激活', cancelButtonText: '取消', type: 'warning' })
+  } catch { return }
+  countersigning.value = c.id
+  try {
+    await calibrationApi.countersign(bolt.value.channelId, c.id)
+    ElMessage.success('已会签激活，标定生效')
+    calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items
+    chCfg.value = await boltApi.channelConfig(boltId)
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '会签失败（需复核员权限，且不能与提交人相同）')
+  } finally {
+    countersigning.value = null
+  }
+}
+
 onMounted(async () => {
   try {
     bolt.value = (await boltApi.list()).items.find((b) => b.id === boltId) ?? null
@@ -254,13 +287,22 @@ onMounted(async () => {
       liveEchoNs.value = measurements.value[0]?.echoTimeNs != null ? Number(measurements.value[0].echoTimeNs) : null
       liveTempC.value = measurements.value[0]?.spTempC != null ? Number(measurements.value[0].spTempC) : null
       startLive()
+      // SignalR 实时：仅处理本通道的测量，立即更新 echo/温度/实时预紧力（替代纯轮询）
+      unsubMeas = onRealtime('OnMeasurement', (m) => {
+        if (!live.value || !chCfg.value) return
+        if (m.deviceId === chCfg.value.deviceId && m.channel === chCfg.value.channelNo)
+          applyLiveMeasurement(m.ts, m.echoTimeNs, m.spTempC)
+      })
     }
   } finally {
     loading.value = false
   }
 })
 
-onUnmounted(stopLive)
+onUnmounted(() => {
+  stopLive()
+  unsubMeas?.()
+})
 
 // A-Scan 解析：绝对时间轴(echoStart + i·clockInt)、检出点、零交叉、RefTime/ΔTOF、闸门
 const waveStats = computed(() => {
@@ -405,7 +447,7 @@ async function submitAdjust() {
     ElMessage.success(`已提交变更请求 #${res.requestId}，待审批下发`)
     ElMessageBox.confirm('参数变更已进入审批队列（需另一名复核人审批→执行→读回验证）。是否前往参数审批页面？', '已提交待审批', {
       confirmButtonText: '前往审批', cancelButtonText: '留在本页', type: 'info',
-    }).then(() => router.push({ name: 'config-changes' })).catch(() => {})
+    }).then(() => router.push({ name: 'configChanges' })).catch(() => {})
   } catch (e) {
     ElMessage.error((e as Error)?.message || '提交失败')
   } finally {
@@ -679,11 +721,18 @@ function ratioStr(r: number | null | undefined) {
             <div class="cl-left">
               <span class="led" :class="c.isActive && c.passed ? 'led--ok' : c.passed ? 'led--off' : 'led--crit'" />
               <div>
-                <div class="cl-method">{{ c.method }} <span v-if="c.isActive" class="cl-active">生效中</span></div>
+                <div class="cl-method">
+                  {{ c.method }}
+                  <span v-if="c.isActive" class="cl-active">生效中</span>
+                  <span v-if="c.reviewState === 'pending'" class="cl-pending">待会签</span>
+                  <span v-else-if="c.countersigned" class="cl-signed">两人会签</span>
+                </div>
                 <div class="cl-meta mono">K_L={{ Number(c.kL).toExponential(3) }} · R²={{ Number(c.rSquared).toFixed(3) }}</div>
               </div>
             </div>
             <div class="cl-right">
+              <el-button v-if="c.reviewState === 'pending' && auth.isReviewer" size="small" type="primary" text
+                :loading="countersigning === c.id" @click="countersign(c)">会签</el-button>
               <span class="cl-pass" :class="c.passed ? 'ok' : 'no'">{{ c.passed ? '通过' : '未过' }}</span>
               <span class="cl-date mono">{{ new Date(c.createdAt).toLocaleDateString('zh-CN') }}</span>
             </div>
@@ -836,6 +885,8 @@ function ratioStr(r: number | null | undefined) {
 .cl-left { display: flex; align-items: center; gap: 11px; }
 .cl-method { font-size: 13px; font-weight: 600; }
 .cl-active { font-size: 10px; color: var(--accent); border: 1px solid var(--panel-border-strong); border-radius: 8px; padding: 1px 6px; margin-left: 6px; }
+.cl-pending { font-size: 10px; color: var(--warn); border: 1px solid var(--warn); border-radius: 8px; padding: 1px 6px; margin-left: 6px; }
+.cl-signed { font-size: 10px; color: var(--ok); border: 1px solid rgba(16, 185, 129, 0.5); border-radius: 8px; padding: 1px 6px; margin-left: 6px; }
 .cl-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 .cl-right { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .cl-pass { font-size: 11px; font-weight: 600; }

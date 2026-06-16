@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import HealthBar from '../components/HealthBar.vue'
@@ -8,11 +8,14 @@ import GroupTrend from '../components/GroupTrend.vue'
 import PreloadScale from '../components/PreloadScale.vue'
 import { computePreloadHealth, pct } from '../utils/preload'
 import { assetApi, reportApi, type ProjectNode, type TurbineNode, type GroupNode, type GroupBolt } from '../api'
+import { onRealtime } from '../api/realtime'
 import { useAuth } from '../stores/auth'
 
 const router = useRouter()
 const auth = useAuth()
 const reporting = ref(false)
+const search = ref('')
+const boltSort = ref<'pos' | 'worst'>('pos')
 
 async function genReport() {
   if (!sel.value.group) return
@@ -59,6 +62,20 @@ const marginStyle = (m: number | null) => (m == null ? '' : `color:${m < 0.1 ? '
 
 const projectName = () => projects.value.find((p) => p.id === projectId.value)?.name ?? '风场'
 
+// 搜索过滤（风机/部位按名称或编号）
+function matchQ(...parts: (string | null | undefined)[]) {
+  const q = search.value.trim().toLowerCase()
+  return !q || parts.filter(Boolean).join(' ').toLowerCase().includes(q)
+}
+const filteredTurbines = computed(() => turbines.value.filter((t) => matchQ(t.name, t.code, t.model)))
+const filteredGroups = computed(() => groups.value.filter((g) => matchQ(g.name, g.code, g.structureType)))
+// 螺栓排序：worst 把残余率最低（最危险）排前，便于一眼抓问题
+const sortedBoltCells = computed(() => {
+  const cells = boltCells.value.filter((c) => matchQ(c.b.code, c.b.positionLabel))
+  if (boltSort.value !== 'worst') return cells
+  return [...cells].sort((a, b) => (a.b.preloadRatio ?? 99) - (b.b.preloadRatio ?? 99))
+})
+
 async function loadTurbines() {
   if (projectId.value == null) return
   loading.value = true
@@ -94,11 +111,38 @@ function backTo(l: 'turbines' | 'groups') {
   else sel.value = { turbine: sel.value.turbine }
 }
 
+// 实时刷新：告警变化即时刷新当前层；测量仅在螺栓层做去抖刷新（避免高频抖动）
+async function refreshCurrent() {
+  try {
+    if (level.value === 'turbines') await loadTurbines()
+    else if (level.value === 'groups' && sel.value.turbine) groups.value = (await assetApi.groups(sel.value.turbine.id)).items
+    else if (level.value === 'bolts' && sel.value.group) bolts.value = (await assetApi.groupBolts(sel.value.group.id)).items
+  } catch { /* 尽力刷新 */ }
+}
+let debounceTimer: number | undefined
+function scheduleRefresh() {
+  if (debounceTimer) clearTimeout(debounceTimer)
+  debounceTimer = window.setTimeout(refreshCurrent, 2500)
+}
+let unsubAlarm: (() => void) | undefined
+let unsubMeas: (() => void) | undefined
+
 onMounted(async () => {
   projects.value = (await assetApi.projects()).items
   projectId.value = projects.value[0]?.id ?? null
   await loadTurbines()
+  unsubAlarm = onRealtime('OnAlarm', scheduleRefresh)
+  unsubMeas = onRealtime('OnMeasurement', () => { if (level.value === 'bolts') scheduleRefresh() })
 })
+onUnmounted(() => {
+  if (debounceTimer) clearTimeout(debounceTimer)
+  unsubAlarm?.()
+  unsubMeas?.()
+})
+
+function goAlarms() {
+  router.push({ name: 'alarms' })
+}
 
 function ratioStr(r: number | null) {
   return r == null ? '—' : (r * 100).toFixed(0) + '%'
@@ -126,18 +170,24 @@ function onProjectChange() {
         <el-icon class="crumb-sep"><ArrowRight /></el-icon>
         <span class="crumb-link active">{{ sel.group.name }}</span>
       </template>
+      <div class="crumb-right">
+        <el-input v-model="search" size="small" placeholder="搜索名称 / 编号" clearable style="width: 190px">
+          <template #prefix><el-icon><Search /></el-icon></template>
+        </el-input>
+        <router-link :to="{ name: 'devices' }" class="crumb-link unbound-link">未绑定通道 →</router-link>
+      </div>
     </div>
 
     <!-- 风机 -->
     <div v-if="level === 'turbines'" class="grid">
-      <div v-for="t in turbines" :key="t.id" class="card panel" @click="openTurbine(t)">
+      <div v-for="t in filteredTurbines" :key="t.id" class="card panel" @click="openTurbine(t)">
         <div class="card-hd">
           <el-icon class="card-ic"><Cpu /></el-icon>
           <div class="card-titles">
             <div class="card-name">{{ t.name }}</div>
             <div class="card-sub mono">{{ t.code }} · {{ t.model || '—' }}</div>
           </div>
-          <span v-if="t.openAlarms > 0" class="alarm-pill">{{ t.openAlarms }}</span>
+          <span v-if="t.openAlarms > 0" class="alarm-pill" title="查看告警中心" @click.stop="goAlarms">{{ t.openAlarms }}</span>
         </div>
         <HealthBar :health="t.health" />
         <div class="card-foot">
@@ -145,19 +195,19 @@ function onProjectChange() {
           <span class="loose-hint" v-if="t.health.loose > 0"><span class="led led--crit" />{{ t.health.loose }} 松动</span>
         </div>
       </div>
-      <div v-if="!loading && !turbines.length" class="empty panel">该项目暂无风机</div>
+      <div v-if="!loading && !filteredTurbines.length" class="empty panel">{{ search ? '无匹配风机' : '该项目暂无风机' }}</div>
     </div>
 
     <!-- 部位 -->
     <div v-else-if="level === 'groups'" class="grid">
-      <div v-for="g in groups" :key="g.id" class="card panel" @click="openGroup(g)">
+      <div v-for="g in filteredGroups" :key="g.id" class="card panel" @click="openGroup(g)">
         <div class="card-hd">
           <el-icon class="card-ic"><Connection /></el-icon>
           <div class="card-titles">
             <div class="card-name">{{ g.name }}</div>
             <div class="card-sub mono">{{ g.structureType || '部位' }} · 目标 {{ g.targetPreloadN ? (g.targetPreloadN / 1000).toFixed(0) + 'kN' : '—' }}</div>
           </div>
-          <span v-if="g.openAlarms > 0" class="alarm-pill">{{ g.openAlarms }}</span>
+          <span v-if="g.openAlarms > 0" class="alarm-pill" title="查看告警中心" @click.stop="goAlarms">{{ g.openAlarms }}</span>
         </div>
         <HealthBar :health="g.health" />
         <div class="card-foot">
@@ -165,7 +215,7 @@ function onProjectChange() {
           <span class="loose-hint" v-if="g.health.loose > 0"><span class="led led--crit" />{{ g.health.loose }} 松动</span>
         </div>
       </div>
-      <div v-if="!loading && !groups.length" class="empty panel">该风机暂无监测部位</div>
+      <div v-if="!loading && !filteredGroups.length" class="empty panel">{{ search ? '无匹配部位' : '该风机暂无监测部位' }}</div>
     </div>
 
     <!-- 螺栓层：法兰圈 / 网格 -->
@@ -176,9 +226,15 @@ function onProjectChange() {
           <span class="bv-tab" :class="{ active: boltView === 'trend' }" @click="boltView = 'trend'"><el-icon><TrendCharts /></el-icon> 趋势对比</span>
           <span class="bv-tab" :class="{ active: boltView === 'grid' }" @click="boltView = 'grid'"><el-icon><Grid /></el-icon> 网格</span>
         </div>
-        <el-button v-if="auth.isReviewer && bolts.length" size="small" type="primary" :loading="reporting" @click="genReport">
-          <el-icon><Document /></el-icon> 生成验收报告
-        </el-button>
+        <div class="bolt-bar-right">
+          <div v-if="boltView === 'grid'" class="sort-toggle">
+            <span class="bv-tab" :class="{ active: boltSort === 'pos' }" @click="boltSort = 'pos'">默认</span>
+            <span class="bv-tab" :class="{ active: boltSort === 'worst' }" @click="boltSort = 'worst'">最危险优先</span>
+          </div>
+          <el-button v-if="auth.isReviewer && bolts.length" size="small" type="primary" :loading="reporting" @click="genReport">
+            <el-icon><Document /></el-icon> 生成验收报告
+          </el-button>
+        </div>
       </div>
 
       <div v-if="boltView === 'radar'" class="panel panel--glow ring-panel">
@@ -192,7 +248,7 @@ function onProjectChange() {
       </div>
 
       <div v-else class="grid grid--bolts">
-        <div v-for="{ b, h } in boltCells" :key="b.id" class="bolt panel" :class="`bolt--${b.status}`" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
+        <div v-for="{ b, h } in sortedBoltCells" :key="b.id" class="bolt panel" :class="`bolt--${b.status}`" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
           <div class="bolt-hd">
             <span class="led" :class="STATUS[b.status]?.cls" />
             <span class="bolt-code">{{ b.code }}</span>
@@ -209,7 +265,7 @@ function onProjectChange() {
           </div>
           <div class="bolt-foot mono">{{ b.nominalDiam }}·{{ b.grade }} · CH{{ b.channelNo }}</div>
         </div>
-        <div v-if="!loading && !boltCells.length" class="empty panel">该部位暂无螺栓</div>
+        <div v-if="!loading && !sortedBoltCells.length" class="empty panel">{{ search ? '无匹配螺栓' : '该部位暂无螺栓' }}</div>
       </div>
     </template>
   </div>
@@ -259,4 +315,11 @@ function onProjectChange() {
 .bv-tab.active { color: #04121a; background: linear-gradient(135deg, var(--accent), var(--accent-2)); font-weight: 600; }
 .ring-panel { padding: 26px 20px; display: flex; justify-content: center; }
 .trend-panel { padding: 18px 20px; }
+
+.crumb-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+.unbound-link { font-size: 12px; white-space: nowrap; }
+.alarm-pill { cursor: pointer; }
+.bolt-bar-right { display: flex; align-items: center; gap: 12px; }
+.sort-toggle { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px; padding: 3px; }
+.sort-toggle .bv-tab { padding: 5px 12px; font-size: 12px; border-radius: 6px; }
 </style>

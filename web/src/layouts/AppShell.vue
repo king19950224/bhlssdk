@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { useAuth } from '../stores/auth'
 import { runtimeApi, alarmApi } from '../api'
+import { startRealtime, stopRealtime, onRealtime, realtimeState } from '../api/realtime'
 
 const route = useRoute()
 const router = useRouter()
@@ -79,15 +80,28 @@ async function refresh() {
     /* 顶栏状态尽力刷新 */
   }
 }
+let unsubAlarm: (() => void) | undefined
+const realtimeLabel = computed(() =>
+  realtimeState.value === 'connected' ? '实时已连' : realtimeState.value === 'connecting' ? '实时连接中' : '实时断开',
+)
+
 onMounted(() => {
   refresh()
-  timer = window.setInterval(refresh, 8000)
+  // 轮询频率降到 30s 作为 SignalR 的兜底（实时推送为主，断线时仍能慢刷新）
+  timer = window.setInterval(refresh, 30000)
+  // 实时推送：连上 Hub；收到告警立即刷新顶栏角标与设备状态，不再纯靠轮询
+  startRealtime()
+  unsubAlarm = onRealtime('OnAlarm', () => { refresh() })
 })
-onUnmounted(() => timer && clearInterval(timer))
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+  unsubAlarm?.()
+})
 
 async function logout() {
   try {
     await ElMessageBox.confirm('确认退出登录？', '退出', { type: 'warning', confirmButtonText: '退出', cancelButtonText: '取消' })
+    await stopRealtime()
     auth.logout()
     router.replace({ name: 'login' })
   } catch {
@@ -135,7 +149,10 @@ async function logout() {
           <span class="led" :class="licenseValid ? 'led--ok' : 'led--crit'" />
           <span>{{ licenseValid ? '授权有效' : '授权异常' }}</span>
         </div>
-        <div class="sys-line mono">v1.0 · 实时</div>
+        <div class="sys-line">
+          <span class="led" :class="realtimeState === 'connected' ? 'led--ok' : realtimeState === 'connecting' ? 'led--warn' : 'led--off'" />
+          <span>{{ realtimeLabel }}</span>
+        </div>
       </div>
     </aside>
 
@@ -157,11 +174,15 @@ async function logout() {
             <span class="chip-k">未闭合告警</span>
             <span class="chip-v mono">{{ openAlarms }}</span>
           </div>
-          <div class="stat-chip alert" v-if="walPending > 0">
-            <span class="chip-k">WAL 待重放</span>
-            <span class="chip-v mono">{{ walPending }}</span>
-          </div>
+        <div class="stat-chip alert" v-if="walPending > 0">
+          <span class="chip-k">WAL 待重放</span>
+          <span class="chip-v mono">{{ walPending }}</span>
         </div>
+        <div class="stat-chip stat-chip--btn" @click="router.push({ name: 'board' })" title="打开态势大屏">
+          <el-icon><FullScreen /></el-icon>
+          <span class="chip-k">大屏</span>
+        </div>
+      </div>
 
         <el-dropdown trigger="click" @command="(c: string) => c === 'logout' && logout()">
           <div class="user-chip">
@@ -258,6 +279,8 @@ async function logout() {
   background: var(--panel); border: 1px solid var(--panel-border); font-size: 13px; color: var(--text-2);
 }
 .stat-chip.alert { border-color: var(--crit); color: #fff; box-shadow: 0 0 18px -6px var(--crit-glow); }
+.stat-chip--btn { cursor: pointer; transition: border-color 0.18s, color 0.18s; }
+.stat-chip--btn:hover { border-color: var(--accent); color: var(--accent); }
 .stat-chip .chip-v { color: var(--text-1); font-weight: 600; }
 .user-chip {
   display: flex; align-items: center; gap: 10px; height: 42px; padding: 0 10px 0 6px;

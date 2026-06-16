@@ -53,8 +53,8 @@ async function submit() {
         <h1>螺栓预紧力<br />在线监测系统</h1>
         <p>实时声时测量 · 标定可溯源 · 全程可审计 · 7×24 安全守护</p>
         <div class="kpis">
-          <div><b class="mono glow-accent">±1%</b><span>预紧力精度</span></div>
-          <div><b class="mono glow-accent">24/7</b><span>在线监测</span></div>
+          <div><b class="mono glow-accent">GB/T</b><span>43232 标准方法</span></div>
+          <div><b class="mono glow-accent">7×24</b><span>在线监测</span></div>
           <div><b class="mono glow-accent">JJF</b><span>不确定度评定</span></div>
         </div>
       </div>

@@ -12,7 +12,12 @@ const topLoose = ref<LooseBolt[]>([])
 const residualDist = ref<ResidualDist>({ b100: 0, b90: 0, b80: 0, b70: 0, b70d: 0 })
 const approaching = ref<ApproachingBolt[]>([])
 const openAlarms = ref(0)
+const alarmsBySeverity = ref<{ severity: string; count: number }[]>([])
 const loaded = ref(false)
+
+const SEV_LABEL: Record<string, string> = { critical: '严重', crit: '严重', warn: '预警', warning: '预警', info: '提示' }
+const alarmBreakdown = computed(() =>
+  alarmsBySeverity.value.filter((s) => s.count > 0).map((s) => `${SEV_LABEL[s.severity] || s.severity} ${s.count}`).join(' · '))
 
 const sys = ref({ online: 0, total: 0, walPending: 0, rate: 0 })
 let lastTotal = 0
@@ -41,6 +46,7 @@ async function refresh() {
     residualDist.value = d.residualDist
     approaching.value = d.approachingLimit
     openAlarms.value = d.openAlarms
+    alarmsBySeverity.value = d.alarmsBySeverity ?? []
 
     const rt = await runtimeApi.devices()
     const now = Date.now()
@@ -137,10 +143,10 @@ function openBolt(b: { boltId: number }) {
         <div class="kpi-val metric" :style="needAttention > 0 ? `color:${health.loose > 0 ? 'var(--crit)' : 'var(--warn)'}` : ''">{{ needAttention }}</div>
         <div class="kpi-foot">预警 {{ health.warn }} · 松动 {{ health.loose }}</div>
       </div>
-      <div class="kpi panel" :class="{ 'kpi--alert': openAlarms > 0 }">
+      <div class="kpi panel kpi--click" :class="{ 'kpi--alert': openAlarms > 0 }" @click="router.push({ name: 'alarms' })" title="查看告警中心">
         <div class="kpi-top"><span class="panel-title">未闭合告警</span><el-icon class="kpi-ic"><BellFilled /></el-icon></div>
         <div class="kpi-val metric" :style="openAlarms > 0 ? 'color:var(--crit)' : ''">{{ openAlarms }}</div>
-        <div class="kpi-foot">{{ openAlarms > 0 ? '需运维处置' : '运行正常' }}</div>
+        <div class="kpi-foot">{{ openAlarms > 0 ? (alarmBreakdown || '需运维处置') : '运行正常' }}</div>
       </div>
     </div>
 
@@ -280,6 +286,8 @@ function openBolt(b: { boltId: number }) {
 .kpi-val { font-size: 38px; font-weight: 700; line-height: 1.1; margin: 12px 0 8px; }
 .kpi-foot { font-size: 12px; color: var(--text-3); }
 .kpi--alert { border-color: var(--crit); box-shadow: 0 0 26px -10px var(--crit-glow); }
+.kpi--click { cursor: pointer; transition: border-color 0.18s; }
+.kpi--click:hover { border-color: var(--accent); }
 
 .main-row { display: grid; grid-template-columns: 1.5fr 1fr; gap: 16px; }
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 8px; }

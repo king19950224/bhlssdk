@@ -55,9 +55,14 @@ async function poll() {
 onMounted(async () => {
   try {
     const rt = await runtimeApi.devices()
-    deviceId.value = rt.items.find((x) => x.isPrimary)?.deviceId ?? rt.items[0]?.deviceId ?? 1
+    // 取主设备/第一个设备；无设备则留空（不再硬编码 deviceId=1 误轮询不存在的设备）
+    deviceId.value = rt.items.find((x) => x.isPrimary)?.deviceId ?? rt.items[0]?.deviceId ?? null
   } catch {
-    deviceId.value = 1
+    deviceId.value = null
+  }
+  if (deviceId.value == null) {
+    loading.value = false
+    return
   }
   await poll()
   timer = window.setInterval(poll, 1000)

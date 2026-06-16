@@ -76,6 +76,9 @@ export const alarmApi = {
   summary: () => http.get<{ items: AlarmSummaryRow[] }>('/api/alarms/summary'),
   ack: (id: number, note?: string) => http.post(`/api/alarms/${id}/ack`, { note }),
   clear: (id: number, reason?: string) => http.post(`/api/alarms/${id}/clear`, { reason }),
+  // 维护时段抑制某 bolt+type 的告警（hours 1..168，reason ≥5 字）
+  shelve: (body: { boltId?: number; alarmType?: string; hours: number; reason: string }) =>
+    http.post<{ shelvingId: number; expiresAt: string }>('/api/alarms/shelve', body),
 }
 
 // ---- 参数变更审批 ----
@@ -208,6 +211,8 @@ export interface CalibRecord {
   id: string; method: string; kL: number; kLUncertainty: number; kLInterceptNs: number | null
   rSquared: number; refTimeNs: number; refTempC: number; passed: boolean
   createdAt: string; expiresAt: string; supersededBy: string | null; isActive: boolean; notes: string | null
+  // 复核状态：pending=待会签 / self_signed=自签临时 / approved=两人会签 / rejected
+  reviewState: string; countersigned: boolean
 }
 export const boltApi = {
   list: () => http.get<{ count: number; items: BoltListItem[] }>('/api/bolts'),
@@ -251,6 +256,35 @@ export const deviceApi = {
   // 实时通道识别：各通道最新回波 + 信号强度（敲击识别法）
   channelsLive: (deviceId: number) =>
     http.get<{ deviceId: number; count: number; items: ChannelLive[] }>(`/api/devices/${deviceId}/channels/live`),
+  // 下发设备工作模式（Standby / MultiMeas / Reboot ...；扫描期间会被拒绝）
+  setMode: (deviceId: number, mode: string, opts: { channel?: number; address?: number } = {}) => {
+    const qs = new URLSearchParams()
+    if (opts.channel != null) qs.set('channel', String(opts.channel))
+    if (opts.address != null) qs.set('address', String(opts.address))
+    const q = qs.toString()
+    return http.post<{ triggered: boolean; deviceId: number; mode: string }>(
+      `/api/devices/${deviceId}/diagnostic/set-mode/${mode}${q ? `?${q}` : ''}`)
+  },
+}
+
+// ---- 通道清单 / 绑定 ----
+export interface ChannelRow {
+  id: number; deviceId: number; channelNo: number; state: string
+  firstSeenAt: string | null; lastSeenAt: string | null
+  kL: number | null; refTimeNs: number | null; refTempC: number | null
+  boltId: number | null; boltCode: string | null
+}
+export interface UnboundSummaryRow {
+  deviceId: number; channelId: number; channelNo: number; channelState: string
+  count: number; firstTs: string; lastTs: string; validEchoCount: number
+}
+export const channelApi = {
+  list: (state?: string) => http.get<{ count: number; items: ChannelRow[] }>(`/api/channels${state ? `?state=${state}` : ''}`),
+  unboundSummary: () => http.get<{ items: UnboundSummaryRow[] }>('/api/channels/unbound/summary'),
+  bind: (channelId: number, body: { boltId: number; calibrationAction?: string; backfillUnbound?: boolean; note?: string }) =>
+    http.post<{ bound?: boolean; moved?: boolean }>(`/api/channels/${channelId}/bind-bolt`, body),
+  unbind: (channelId: number, note?: string) =>
+    http.post<{ unbound: boolean; channelId: number; boltId: number }>(`/api/channels/${channelId}/unbind-bolt`, { note }),
 }
 export interface ChannelLive {
   channelNo: number; boltId: number | null; boltCode: string | null; positionLabel: string | null
@@ -307,27 +341,99 @@ export interface FlangeSnapshot {
   summary: { total: number; calibrated: number; passed: number; failed: number; overall: string }
   bolts: FlangeBoltRow[]
 }
+// 扭矩阶梯报告快照（report_type='torque_step'）
+export interface TorquePointSnapshot {
+  id: number; torqueNm: number; estimatedPreloadN: number; sampleCount: number
+  avgEchoTimeNs: number; stddevEchoTimeNs: number | null; avgTempC: number
+  normalizedEchoTimeNs: number; deltaTofNs: number; excluded: boolean; excludeReason: string | null; note: string | null
+}
+export interface TorqueStepSnapshot {
+  generatedAt: string
+  channel: { channelId: number; deviceId: number; channelNo: number; kL: number | null; kLInterceptNs: number | null; activeCalibrationId: string | null }
+  bolt: { boltId: number; code: string; nominalDiameter: string; targetPreloadN: number | null; installTorqueNm: number | null }
+  points: TorquePointSnapshot[]
+  fit: { pointCount: number; kL: number; interceptNs: number; rSquared: number } | null
+  conclusion: string
+}
+export interface ReportDetail {
+  id: number; title: string; reportType: string; status: string; generatedAt: string; notes: string | null
+  subjectType: string | null; subjectId: number | null; fileUrl: string | null
+  generatedBy: number | null; generatedByName: string | null
+  signedAt: string | null; signedBy: number | null; signedByName: string | null
+  // 快照按 reportType 区分：flange_acceptance → FlangeSnapshot；torque_step → TorqueStepSnapshot
+  snapshot: FlangeSnapshot | TorqueStepSnapshot | null
+}
 export const reportApi = {
   list: (type = '') => http.get<{ count: number; items: ReportItem[] }>(`/api/reports${type ? `?type=${type}` : ''}`),
-  get: (id: number) =>
-    http.get<{
-      id: number; title: string; reportType: string; status: string; generatedAt: string; notes: string | null
-      generatedBy: number | null; generatedByName: string | null
-      signedAt: string | null; signedBy: number | null; signedByName: string | null
-      snapshot: FlangeSnapshot
-    }>(`/api/reports/${id}`),
+  get: (id: number) => http.get<ReportDetail>(`/api/reports/${id}`),
   generateFlange: (groupId: number) =>
     http.post<{ reportId: number; title: string; overall: string; total: number; passed: number; calibrated: number }>(
       `/api/reports/flange-acceptance/${groupId}`),
+  // 扭矩阶梯报告：基于通道已采集的扭矩实验点生成 HTML 报告（reviewer+）
+  generateTorqueStep: (channelId: number, body: { title?: string; notes?: string } = {}) =>
+    http.post<{ reportId: number; title: string; fileUrl: string; downloadUrl: string }>(
+      `/api/reports/torque-step/${channelId}`, body),
   sign: (id: number) => http.post<{ reportId: number; status: string; signedBy: number }>(`/api/reports/${id}/sign`),
+  // 报告下载（HTML）地址，供 <a> 直接打开/下载
+  downloadUrl: (id: number) => `/api/reports/${id}/download`,
 }
 
 // ---- 标定中心 ----
 export interface CalibMethod {
   method: string; trustLevel: string; total: number; active: number; expired: number; avgR2: number | null
 }
+export interface TorqueTestPoint {
+  id: number; torqueNm: number; nutFactor: number; nominalDiameterMm: number; estimatedPreloadN: number
+  sampleCount: number; avgEchoTimeNs: number; stddevEchoTimeNs: number | null; avgTempC: number
+  normalizedEchoTimeNs: number; deltaTofNs: number; note: string | null; createdAt: string
+  excluded: boolean; excludeReason: string | null
+}
+export interface TorqueFitSummary {
+  channelId: number; pointCount: number; kLByLinearFitNsPerN: number | null; interceptNs: number | null
+  rSquared: number | null; minTorqueNm: number | null; maxTorqueNm: number | null
+}
+export interface LoadCalibratePoint { forceN: number; deltaTofNs: number }
 export const calibrationApi = {
   summary: () => http.get<{ methods: CalibMethod[]; policy: Record<string, string> }>('/api/calibration-center/summary'),
+  // 标定写入工作流（均要求 reviewer+）。channelId 为通道 id。
+  // quick / torque / apply-torque-fit 为自签临时标定（review_state=self_signed，立即生效）。
+  quickCalibrate: (channelId: number, body: { kL: number; refTimeNs: number; refTempC: number; kLUncertainty?: number; note?: string; expiresDays?: number }) =>
+    http.post<{ channelId: number; calibrationId: string }>(`/api/channels/${channelId}/quick-calibrate`, body),
+  torqueCalibrate: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; note?: string }) =>
+    http.post<{ channelId: number; calibrationId: string; activeCalibration: { kL: number } }>(`/api/channels/${channelId}/torque-calibrate`, body),
+  // 扭矩阶梯实验点：采集 / 列表 / 线性拟合摘要 / 应用拟合（含截距）为当前标定
+  torquePoints: (channelId: number) => http.get<{ channelId: number; count: number; items: TorqueTestPoint[] }>(`/api/channels/${channelId}/torque-test-points`),
+  captureTorquePoint: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; note?: string }) =>
+    http.post<{ id: number; channelId: number; estimatedPreloadN: number }>(`/api/channels/${channelId}/torque-test-points`, body),
+  torquePointSummary: (channelId: number) => http.get<TorqueFitSummary>(`/api/channels/${channelId}/torque-test-points/summary`),
+  applyTorqueFit: (channelId: number, body: { minPoints?: number; note?: string } = {}) =>
+    http.post<{ channelId: number; calibrationId: string; kL: number; rSquared: number; passed: boolean }>(`/api/channels/${channelId}/apply-torque-fit`, body),
+  // 正式多点载荷标定（提交后 pending，需异人会签 countersign 才激活，review_state=approved）
+  loadCalibrate: (channelId: number, body: { points: LoadCalibratePoint[]; refTimeNs: number; refTempC: number; systematicRelativeUncertainty?: number; loadingDevice?: string; loadingDeviceCert?: string; note?: string }) =>
+    http.post<{ calibrationId: string; channelId: number; kL: number; rSquared: number; reviewState: string }>(`/api/channels/${channelId}/load-calibrate`, body),
+  countersign: (channelId: number, calibrationId: string) =>
+    http.post<{ activated: boolean; calibrationId: string; reviewState: string }>(`/api/channels/${channelId}/calibrations/${calibrationId}/countersign`),
+}
+
+// ---- 通道自动检测（probe-scan） ----
+export interface ProbeScanChannelResult {
+  channelNo: number; verdict: string; snrDb: number | null; echoStdNs: number | null
+  peakToPeak: number | null; sampleCount: number; reason: string | null
+}
+export interface ProbeScanView {
+  scanRunId: number; deviceId: number; status: string; strategy: string
+  requestedChannels: number[]; settleSeconds: number; sampleSeconds: number
+  requestedAt: string; startedAt: string | null; finishedAt: string | null
+  results: ProbeScanChannelResult[]
+}
+export const probeScanApi = {
+  start: (deviceId: number, body: { channels?: number[]; settleSeconds?: number; sampleSeconds?: number; strategy?: string } = {}) =>
+    http.post<{ scanRunId: number; deviceId: number; status: string; estimatedSeconds: number; warning: string }>(
+      `/api/devices/${deviceId}/channels/probe-scan/`, body),
+  latest: (deviceId: number) => http.get<ProbeScanView>(`/api/devices/${deviceId}/channels/probe-scan/latest`),
+  get: (deviceId: number, scanRunId: number) => http.get<ProbeScanView>(`/api/devices/${deviceId}/channels/probe-scan/${scanRunId}`),
+  abort: (deviceId: number, scanRunId: number) =>
+    http.post<{ aborted: boolean; scanRunId: number }>(`/api/devices/${deviceId}/channels/probe-scan/${scanRunId}/abort`),
 }
 
 // ---- 审计日志 ----
