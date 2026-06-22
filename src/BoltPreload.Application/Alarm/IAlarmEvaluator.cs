@@ -18,6 +18,22 @@ public interface IAlarmEvaluator
     /// 实现必须线程安全（多个 ingestion task 可能并发调用）。
     /// </summary>
     IReadOnlyList<AlarmEvent> Evaluate(AlarmInput input);
+
+    /// <summary>
+    /// 无状态安全评估（C1）：仅判断当前样本是否处于"立即危险"的 critical 档（预紧力脱落 / 严重越限），
+    /// <b>不读写内部状态机</b>。用于 WAL 重放等"不能喂有状态状态机"的场景做兜底补判——
+    /// DB 故障窗口内落 WAL 的测量在补写时若处于危险态，必须仍能补发告警，否则会永久漏报。
+    /// 返回 <c>null</c> 表示当前样本未达 critical 危险档。
+    /// </summary>
+    AlarmEvent? EvaluateCriticalStateless(AlarmInput input);
+
+    /// <summary>
+    /// 回滚最近一次 <see cref="Evaluate"/> 产生的状态转移（C2）。
+    /// 当告警<b>持久化失败</b>时由调用方触发：使状态机回到"差一格即可重新触发/恢复"的保守态，
+    /// 让后续测量能立即重试，杜绝"状态机已置 active 但 DB 无对应告警行"导致的永久漏报。
+    /// 实现必须线程安全。
+    /// </summary>
+    void RollbackTransition(AlarmEvent ev);
 }
 
 /// <summary>评估器输入</summary>

@@ -3,7 +3,8 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { useAuth } from '../stores/auth'
-import { runtimeApi, alarmApi } from '../api'
+import { alarmApi } from '../api'
+import { useRuntime } from '../stores/runtime'
 import { startRealtime, stopRealtime, onRealtime, realtimeState } from '../api/realtime'
 
 const route = useRoute()
@@ -60,24 +61,21 @@ function isActive(name: string) {
   return false
 }
 
-const devicesOnline = ref(0)
-const devicesTotal = ref(0)
+// 设备遥测改由共享 runtime store 提供（与 Dashboard 共用一次轮询，避免重复请求）
+const runtime = useRuntime()
+const devicesOnline = computed(() => runtime.online)
+const devicesTotal = computed(() => runtime.total)
+const walPending = computed(() => runtime.walPending)
+const licenseValid = computed(() => runtime.license?.valid ?? true)
 const openAlarms = ref(0)
-const walPending = ref(0)
-const licenseValid = ref(true)
 let timer: number | undefined
 
 async function refresh() {
   try {
-    const rt = await runtimeApi.devices()
-    devicesTotal.value = rt.count
-    devicesOnline.value = rt.items.filter((d) => d.state === 'Connected').length
-    walPending.value = rt.wal?.pending ?? 0
-    licenseValid.value = rt.license?.valid ?? true
     const sum = await alarmApi.summary()
     openAlarms.value = sum.items.reduce((a, r) => a + r.open, 0)
   } catch {
-    /* 顶栏状态尽力刷新 */
+    /* 顶栏告警角标尽力刷新 */
   }
 }
 let unsubAlarm: (() => void) | undefined
@@ -86,16 +84,19 @@ const realtimeLabel = computed(() =>
 )
 
 onMounted(() => {
+  // 设备状态轮询由 runtime store 统一负责（含可见性暂停与实时刷新）
+  runtime.start()
   refresh()
-  // 轮询频率降到 30s 作为 SignalR 的兜底（实时推送为主，断线时仍能慢刷新）
+  // 告警角标 30s 轮询作为 SignalR 的兜底（实时推送为主，断线时仍能慢刷新）
   timer = window.setInterval(refresh, 30000)
-  // 实时推送：连上 Hub；收到告警立即刷新顶栏角标与设备状态，不再纯靠轮询
+  // 实时推送：连上 Hub；收到告警立即刷新顶栏角标，不再纯靠轮询
   startRealtime()
   unsubAlarm = onRealtime('OnAlarm', () => { refresh() })
 })
 onUnmounted(() => {
   if (timer) clearInterval(timer)
   unsubAlarm?.()
+  runtime.stop()
 })
 
 async function logout() {
@@ -178,7 +179,15 @@ async function logout() {
           <span class="chip-k">断网待补传</span>
           <span class="chip-v mono">{{ walPending }}</span>
         </div>
-        <div class="stat-chip stat-chip--btn" @click="router.push({ name: 'board' })" title="打开态势大屏">
+        <div
+          class="stat-chip stat-chip--btn"
+          role="button"
+          tabindex="0"
+          @click="router.push({ name: 'board' })"
+          @keydown.enter="router.push({ name: 'board' })"
+          @keydown.space.prevent="router.push({ name: 'board' })"
+          title="打开态势大屏"
+        >
           <el-icon><FullScreen /></el-icon>
           <span class="chip-k">大屏</span>
         </div>
@@ -281,6 +290,7 @@ async function logout() {
 .stat-chip.alert { border-color: var(--crit); color: #fff; box-shadow: 0 0 18px -6px var(--crit-glow); }
 .stat-chip--btn { cursor: pointer; transition: border-color 0.18s, color 0.18s; }
 .stat-chip--btn:hover { border-color: var(--accent); color: var(--accent); }
+.stat-chip--btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .stat-chip .chip-v { color: var(--text-1); font-weight: 600; }
 .user-chip {
   display: flex; align-items: center; gap: 10px; height: 42px; padding: 0 10px 0 6px;

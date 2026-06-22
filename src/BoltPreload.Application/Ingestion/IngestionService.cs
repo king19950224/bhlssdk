@@ -48,6 +48,42 @@ public sealed class IngestionService : BackgroundService
 
     private async Task RunRuntimeAsync(DeviceRuntimeContext runtime, CancellationToken stoppingToken)
     {
+        // H3：把背压溢出（通道满被挤掉的最旧测量）接到 WAL 兜底——由 WalReplayService 重放补写，不再静默丢失。
+        // WAL 未启用时保持 null（仅计数丢弃，经 connector.DroppedCount 与 /api/runtime/devices 暴露）。
+        if (_wal.Enabled)
+            runtime.Connector.OverflowSink = envelope => _wal.AppendAsync(envelope, stoppingToken);
+
+        // M1：兜底重启循环。单设备的连接 / 消费循环抛意外异常时退避后重启该设备的采集，
+        // 既不拖垮其它设备（Task.WhenAll 不因单 task 失败而整体失败），也不让 IngestionService 静默退出。
+        // 旧实现：消费循环外的代码（MarkEnvelope / 日志）一旦抛异常会冒泡到 WhenAll → ExecuteAsync 退出
+        // = 全部设备停采，而 BackgroundServiceExceptionBehavior.Ignore 让进程"看起来还活着" → 静默全局停采。
+        var attempt = 0;
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await RunRuntimeOnceAsync(runtime, stoppingToken);
+                return; // 正常结束（通常是 stoppingToken 取消令 ReadAllAsync 收尾）
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                attempt++;
+                var delay = TimeSpan.FromSeconds(Math.Min(30, 3 * attempt));
+                _logger.LogError(ex,
+                    "Ingestion runtime 异常退出 device={DeviceId}，{Delay}s 后兜底重启（第 {Attempt} 次）—— 其它设备不受影响",
+                    runtime.DeviceId, delay.TotalSeconds, attempt);
+                try { await Task.Delay(delay, stoppingToken); }
+                catch (OperationCanceledException) { return; }
+            }
+        }
+    }
+
+    private async Task RunRuntimeOnceAsync(DeviceRuntimeContext runtime, CancellationToken stoppingToken)
+    {
         var connector = runtime.Connector;
         var runtimeStatus = runtime.RuntimeStatus;
         _logger.LogInformation("Ingestion runtime 启动 device={DeviceId} name={Name}", runtime.DeviceId, runtime.Name);

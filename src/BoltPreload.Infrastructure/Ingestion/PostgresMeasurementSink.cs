@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using BoltPreload.Algorithms.Preload;
 using BoltPreload.Algorithms.Waveform;
 using BoltPreload.Application.Alarm;
@@ -30,6 +31,25 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         WriteIndented = false,
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
     };
+
+    // 未路由通道（未接探头 / 已软删的"墓碑"通道，按设计不自动复活）的丢弃日志：按【设备】聚合 + 节流。
+    // 真机常有几十路空通道持续上报，若逐通道 WARN，开机即刷几十条、之后每 5 分钟再刷几十条，淹没业务日志。
+    // 改为：每设备首次出现立即记一条提示，之后每 UnroutedLogInterval 汇总成一条（列出全部受影响通道 + 自启动累计丢弃数）。
+    private readonly ConcurrentDictionary<long, UnroutedDeviceState> _unroutedByDevice = new();
+    private static readonly TimeSpan UnroutedLogInterval = TimeSpan.FromMinutes(5);
+
+    // wave_features 写失败日志节流（按 channelId）：首条带完整异常含堆栈便于定位根因；
+    // 之后同一通道持续失败仅每 WaveFeatureFailLogInterval 记一条摘要（不重复整段堆栈），既保留可观测性又不刷屏。
+    private readonly ConcurrentDictionary<long, (DateTimeOffset LastLog, long Count)> _waveFailThrottle = new();
+    private static readonly TimeSpan WaveFeatureFailLogInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>单设备的未路由通道丢弃聚合状态（每通道累计计数 + 节流时间戳）。</summary>
+    private sealed class UnroutedDeviceState
+    {
+        public long FirstNoticeLogged;   // 0=未记首条提示，1=已记（Interlocked CAS）
+        public long LastSummaryTicks;     // 上次汇总时间 UtcTicks（Interlocked）
+        public readonly ConcurrentDictionary<ushort, long> DropCounts = new();  // 每通道自启动累计丢弃数
+    }
 
     public PostgresMeasurementSink(
         NpgsqlDataSource dataSource,
@@ -111,9 +131,46 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 break;
 
             default:
-                _logger.LogWarning("无法解析也无法发现通道 device={DeviceId} channel={Channel}，真丢失",
-                    envelope.DeviceId, cr.Channel);
+                LogUnroutedThrottled(envelope.DeviceId, cr.Channel);
                 break;
+        }
+    }
+
+    /// <summary>
+    /// 未路由通道（未接探头 / 已软删的"墓碑"通道，按设计不自动复活）的丢弃日志：按设备聚合 + 节流。
+    /// 每设备首次出现立即记一条提示，之后每 <see cref="UnroutedLogInterval"/> 汇总成一条
+    /// （列出全部受影响通道 + 自启动累计丢弃数）。真机几十路空通道持续上报时，避免逐通道 WARN 刷屏。
+    /// </summary>
+    private void LogUnroutedThrottled(long deviceId, ushort channel)
+    {
+        var st = _unroutedByDevice.GetOrAdd(
+            deviceId,
+            _ => new UnroutedDeviceState { LastSummaryTicks = DateTimeOffset.UtcNow.UtcTicks });
+        st.DropCounts.AddOrUpdate(channel, 1L, (_, c) => c + 1);
+
+        // 该设备首次出现无法路由通道：立即记一条，避免静默等到首个汇总周期
+        if (Interlocked.CompareExchange(ref st.FirstNoticeLogged, 1, 0) == 0)
+        {
+            _logger.LogWarning(
+                "device={DeviceId} 出现无法路由的通道（未接探头 / 已软删的墓碑通道？），数据将被丢弃；" +
+                "后续每 {Min} 分钟汇总一次受影响通道清单",
+                deviceId, (int)UnroutedLogInterval.TotalMinutes);
+            return;
+        }
+
+        // 周期汇总：每设备每 UnroutedLogInterval 一条，列出全部受影响通道 + 自启动累计丢弃数
+        var now = DateTimeOffset.UtcNow.UtcTicks;
+        var last = Interlocked.Read(ref st.LastSummaryTicks);
+        if (now - last >= UnroutedLogInterval.Ticks &&
+            Interlocked.CompareExchange(ref st.LastSummaryTicks, now, last) == last)
+        {
+            var snapshot = st.DropCounts.ToArray();
+            var channels = string.Join(",", snapshot.Select(p => p.Key).OrderBy(c => c));
+            var total = snapshot.Sum(p => p.Value);
+            _logger.LogWarning(
+                "device={DeviceId} 无法路由通道丢弃汇总：通道=[{Channels}] 自启动累计 {Total} 条" +
+                "（这些通道未接探头或为已软删的墓碑通道）",
+                deviceId, channels, total);
         }
     }
 
@@ -208,8 +265,13 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                     CalibrationId: route.Calibration.CalibrationId,
                     KL: route.Calibration.KL,
                     KLUncertainty: route.Calibration.KLUncertainty,
-                    CalibratedAt: DateTimeOffset.UtcNow,  // 简化：实际可从 calibration_records 带过来
-                    ExpiresAt: DateTimeOffset.UtcNow.AddDays(30),
+                    CalibratedAt: DateTimeOffset.UtcNow,  // CachedCalibration 未带 calibrated_at；calculator 不依赖此字段
+                    // M4：透传真实有效期，使 PreloadCalculatorFactory.Pick 的 IsExpired 基于真实值（消除"恒 false 的死代码"脆弱性）。
+                    // 注：sink 在调用前已用 route.Calibration.IsExpiredAsOf 拦截过期标定，这里是防御性一致；
+                    //     active_calibration_id 必对应 NOT NULL 的 expires_at，null 仅作理论兜底。
+                    ExpiresAt: route.Calibration.ExpiresAt is { } exp
+                        ? new DateTimeOffset(exp, TimeSpan.Zero)
+                        : DateTimeOffset.UtcNow.AddYears(1),
                     Method: "quick"));
 
             // 经工厂按螺栓规格/标定状态选择计算器（≥M5 标定齐全 → 单波法；≥M12 且双波法可用 → 双波法）。
@@ -325,20 +387,34 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
 
         // 4. 写库（一次往返），随后做告警评估
         // 注意：先写 measurement 再评估告警，让"告警时对应的 measurement 已经入库可查"
-        await cmd.ExecuteNonQueryAsync(ct);
-        if (waveUrl is not null && cr.EchoWave is not null)
+        var rowsAffected = await cmd.ExecuteNonQueryAsync(ct);
+        if (rowsAffected == 0)
+        {
+            // ON CONFLICT (channel_id, ts) 命中：该测量已存在、本次未插入。此时先前落盘的波形成了孤儿
+            // （没有对应本次 measurement），删掉它并跳过 wave_features，避免磁盘垃圾与 wave_features 指向错位。
+            if (waveUrl is not null)
+            {
+                try { await _waveStore!.DeleteAsync(waveUrl, ct); }
+                catch (Exception ex) { _logger.LogWarning(ex, "删除冲突孤儿波形失败 url={Url}", waveUrl); }
+            }
+        }
+        else if (waveUrl is not null && cr.EchoWave is not null)
         {
             await WriteWaveFeaturesAsync(route.BoltId, route.ChannelId, envelope, cr.EchoWave!, waveUrl, ct);
         }
 
-        // WAL 重放（evaluateAlarms=false）跳过告警评估：重放的是历史/乱序数据，
-        // 喂给有状态的告警状态机会用过期数据误触发或误恢复告警。数据照常补写入库。
+        // WAL 重放（evaluateAlarms=false）不喂有状态告警状态机：重放的是历史/乱序数据，
+        // 喂状态机会用过期数据误触发或误恢复。但 DB 故障窗口内真实发生的脱落 / 严重越限不能漏报，
+        // 故重放路径改走无状态 critical 安全网（C1）补判一次。数据照常补写入库。
         if (evaluateAlarms)
             await EvaluateAndDispatchAlarmsAsync(route, envelope, cr, pre, ct);
+        else
+            await EvaluateReplayCriticalSafetyNetAsync(route, envelope, cr, pre, ct);
     }
 
     // 接收 FxEchoWaveDto（而非整条 cr），让随测量上报的波形与主动读回的 LEchoWave 共用同一套特征提取。
-    private async Task WriteWaveFeaturesAsync(
+    // 返回是否真正插入了一行：ON CONFLICT (channel_id, ts) 命中时返回 false，调用方据此清理孤儿波形文件。
+    private async Task<bool> WriteWaveFeaturesAsync(
         long? boltId,
         long channelId,
         FxDecodedEnvelope envelope,
@@ -346,7 +422,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         string waveUrl,
         CancellationToken ct)
     {
-        if (wave.WaveData.Length == 0) return;
+        if (wave.WaveData.Length == 0) return false;
 
         var stats = ComputeWaveStats(wave);
         var pointCount = stats.PointCount;
@@ -369,7 +445,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 @echo_start, @clock_int, @threshold,
                 @peak_pos, @peak_neg, @peak_to_peak,
                 @mean, @rms, @noise_rms, @snr
-            )";
+            )
+            ON CONFLICT (channel_id, ts) DO NOTHING";
 
         try
         {
@@ -389,11 +466,48 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             cmd.Parameters.AddWithValue("rms", NpgsqlDbType.Numeric, (object?)ToDecimalSafe(rms) ?? DBNull.Value);
             cmd.Parameters.AddWithValue("noise_rms", NpgsqlDbType.Numeric, (object?)ToDecimalSafe(noiseRms ?? 0) ?? DBNull.Value);
             cmd.Parameters.AddWithValue("snr", NpgsqlDbType.Numeric, (object?)snrDb ?? DBNull.Value);
-            await cmd.ExecuteNonQueryAsync(ct);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            return rows > 0;  // 0 = ON CONFLICT 命中（同 channel+ts 已有特征）
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "写入 wave_features 失败 channel_id={ChannelId}", channelId);
+            // 提为 Warning：measurement 已带 wave_blob_url，但 wave_features 缺失会让 /compare 与"设为参考"
+            // 找不到当前特征、A-Scan 不显示却无报错——属于需要被运维看见的静默劣化，不能埋在 Debug 里。
+            // 但持续失败（如约束缺失 / DB 故障）会逐条刷整段堆栈淹没日志，故按 channelId 节流：首条带堆栈，后续只记摘要。
+            LogWaveFeatureFailureThrottled(channelId, ex);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// wave_features 写失败日志节流（按 channelId）：首条带完整异常（含堆栈）便于定位根因；
+    /// 之后同一通道持续失败仅每 <see cref="WaveFeatureFailLogInterval"/> 记一条摘要（不重复整段堆栈）。
+    /// </summary>
+    private void LogWaveFeatureFailureThrottled(long channelId, Exception ex)
+    {
+        var detail = ex is PostgresException pg ? $"{pg.SqlState} {pg.MessageText}" : ex.Message;
+        var now = DateTimeOffset.UtcNow;
+        var isNew = false;
+        _waveFailThrottle.AddOrUpdate(
+            channelId,
+            _ => { isNew = true; return (now, 1L); },
+            (_, prev) => (prev.LastLog, prev.Count + 1));
+
+        if (isNew)
+        {
+            // 首条：带完整异常（含堆栈），便于定位根因（如约束缺失 / 类型不匹配 / DB 故障）
+            _logger.LogWarning(ex, "写入 wave_features 失败 channel_id={ChannelId}：{Detail}", channelId, detail);
+            return;
+        }
+
+        var cur = _waveFailThrottle[channelId];
+        if (now - cur.LastLog >= WaveFeatureFailLogInterval &&
+            _waveFailThrottle.TryUpdate(channelId, (now, 0L), cur))
+        {
+            // 后续：只记摘要（不重复整段堆栈），保留可观测性
+            _logger.LogWarning(
+                "写入 wave_features 持续失败 channel_id={ChannelId}（近 {Min} 分钟≈{Count} 次）：{Detail}",
+                channelId, (int)WaveFeatureFailLogInterval.TotalMinutes, cur.Count, detail);
         }
     }
 
@@ -484,15 +598,65 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
 
         foreach (var ev in events)
         {
+            var persisted = true;
             if (_alarmSink is not null)
             {
-                try { await _alarmSink.PersistAsync(ev, ct); }
-                catch (Exception ex) { _logger.LogError(ex, "持久化告警失败 bolt={Bolt} type={Type}", ev.BoltId, ev.Type); }
+                try
+                {
+                    await _alarmSink.PersistAsync(ev, ct);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    // 持久化失败：回滚状态机，让后续测量能重新触发/恢复——杜绝"状态机已 active 但 DB
+                    // 无对应告警行"导致的永久漏报（C2）。宁可后续重复，绝不漏报。
+                    persisted = false;
+                    _logger.LogError(ex, "持久化告警失败，已回滚告警状态机以便后续测量重试 bolt={Bolt} type={Type}", ev.BoltId, ev.Type);
+                    _alarmEvaluator.RollbackTransition(ev);
+                }
             }
-            if (_alarmPublisher is not null)
+            // 仅在成功落库后推送，避免把未持久化的告警推给前端（与 measurement 推送策略一致）。
+            if (persisted && _alarmPublisher is not null)
             {
                 _ = SafePublishAlarmAsync(ev, ct);
             }
+        }
+    }
+
+    /// <summary>
+    /// WAL 重放兜底（C1）：重放数据不喂有状态状态机（避免乱序误触发 / 误恢复），但若样本处于
+    /// "立即危险"的 critical 档（脱落 / 严重越限），仍补发一条<b>去重</b>的 critical 告警，
+    /// 否则 DB 故障窗口内真实发生的预紧力失效会永久漏报。
+    /// </summary>
+    private async Task EvaluateReplayCriticalSafetyNetAsync(
+        ChannelRoute route, FxDecodedEnvelope envelope, FxChannelResultDto cr,
+        (decimal? PreloadN, decimal? PreloadRatio, decimal? UncertaintyN, decimal DeltaTofNs, string AlgoVersion, Guid? CalibrationId) pre,
+        CancellationToken ct)
+    {
+        if (_alarmEvaluator is null || _alarmSink is null) return;
+
+        var input = new AlarmInput(
+            BoltId: route.BoltId,
+            ChannelId: route.ChannelId,
+            Ts: envelope.ReceiveTime,
+            PreloadN: pre.PreloadN,
+            PreloadRatio: pre.PreloadRatio,
+            TargetPreloadN: route.TargetPreloadN,
+            SdkStatusCode: cr.StatusCode);
+
+        var critical = _alarmEvaluator.EvaluateCriticalStateless(input);
+        if (critical is null) return;
+
+        try
+        {
+            var inserted = await _alarmSink.PersistCriticalIfAbsentAsync(critical, ct);
+            if (inserted && _alarmPublisher is not null)
+                _ = SafePublishAlarmAsync(critical, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "WAL 重放兜底补发 critical 告警失败 bolt={Bolt} type={Type}", critical.BoltId, critical.Type);
         }
     }
 
@@ -671,9 +835,19 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         {
             var waveUrl = await _waveStore!.SaveAsync(envelope.DeviceId, channel, envelope.ReceiveTime, wave, ct);
             long? boltId = route.BoltId > 0 ? route.BoltId : null;
-            await WriteWaveFeaturesAsync(boltId, route.ChannelId, envelope, wave, waveUrl, ct);
-            _logger.LogInformation("主动读取的 LEchoWave 已入 wave_features device={Dev} ch={Ch} pts={Pts}",
-                envelope.DeviceId, channel, wave.WaveData.Length);
+            var inserted = await WriteWaveFeaturesAsync(boltId, route.ChannelId, envelope, wave, waveUrl, ct);
+            if (!inserted)
+            {
+                // 同 channel+ts 已有 wave_features（重复主动读 / 重放）：刚落盘的文件成了孤儿，删掉避免磁盘垃圾。
+                // 注意：随测量上报的波形由 measurement.wave_blob_url 引用，不走此路径，不会被误删。
+                try { await _waveStore.DeleteAsync(waveUrl, ct); }
+                catch (Exception ex) { _logger.LogWarning(ex, "删除重复 LEchoWave 孤儿波形失败 url={Url}", waveUrl); }
+            }
+            else
+            {
+                _logger.LogInformation("主动读取的 LEchoWave 已入 wave_features device={Dev} ch={Ch} pts={Pts}",
+                    envelope.DeviceId, channel, wave.WaveData.Length);
+            }
         }
         catch (Exception ex)
         {

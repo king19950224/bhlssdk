@@ -89,22 +89,32 @@ public sealed class SignalHealthService : BackgroundService
 
         foreach (var (boltId, channelId, code, idle) in rows)
         {
-            var silent = idle > _opt.NoSignalSeconds;
-            var isOpen = open.Contains(boltId);
-            if (silent && !isOpen)
+            // 单个螺栓的告警持久化失败不应中断本轮其它螺栓的检查。PersistAsync 失败现在会抛（不再静默吞），
+            // 这里捕获并记录；下一轮重新查询 open 集合后会自动重试（signal_lost 未入库则仍判 silent）。
+            try
             {
-                var ev = MakeEvent(AlarmAction.Trigger, boltId, channelId, "warn",
-                    $"通道信号丢失：{code} 已 {(int)idle}s 无回波数据（探头脱落 / 接头松动 / 设备异常?）");
-                await _sink.PersistAsync(ev, ct);
-                try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
-                _logger.LogWarning("信号丢失告警：bolt={Bolt} ch={Ch} 已 {Idle}s 无回波", code, channelId, (int)idle);
+                var silent = idle > _opt.NoSignalSeconds;
+                var isOpen = open.Contains(boltId);
+                if (silent && !isOpen)
+                {
+                    var ev = MakeEvent(AlarmAction.Trigger, boltId, channelId, "warn",
+                        $"通道信号丢失：{code} 已 {(int)idle}s 无回波数据（探头脱落 / 接头松动 / 设备异常?）");
+                    await _sink.PersistAsync(ev, ct);
+                    try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
+                    _logger.LogWarning("信号丢失告警：bolt={Bolt} ch={Ch} 已 {Idle}s 无回波", code, channelId, (int)idle);
+                }
+                else if (!silent && isOpen)
+                {
+                    var ev = MakeEvent(AlarmAction.Clear, boltId, channelId, "info", $"信号已恢复：{code} 回波重新上报");
+                    await _sink.PersistAsync(ev, ct);
+                    try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
+                    _logger.LogInformation("信号恢复，闭合 signal_lost：bolt={Bolt} ch={Ch}", code, channelId);
+                }
             }
-            else if (!silent && isOpen)
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
             {
-                var ev = MakeEvent(AlarmAction.Clear, boltId, channelId, "info", $"信号已恢复：{code} 回波重新上报");
-                await _sink.PersistAsync(ev, ct);
-                try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
-                _logger.LogInformation("信号恢复，闭合 signal_lost：bolt={Bolt} ch={Ch}", code, channelId);
+                _logger.LogError(ex, "signal_lost 告警写入失败 bolt={Bolt} ch={Ch}（下一轮重试）", code, channelId);
             }
         }
     }

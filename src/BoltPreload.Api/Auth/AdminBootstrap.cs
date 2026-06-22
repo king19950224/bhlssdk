@@ -53,7 +53,8 @@ public static class AdminBootstrap
                     role          = 'admin',
                     enabled       = true,
                     failed_attempts = 0,
-                    locked_until = NULL";
+                    locked_until = NULL,
+                    token_version = users.token_version + 1";
         await using var cmd = ds.CreateCommand(sql);
         cmd.Parameters.AddWithValue("u", NpgsqlDbType.Varchar, username);
         cmd.Parameters.AddWithValue("full", NpgsqlDbType.Varchar, fullName);

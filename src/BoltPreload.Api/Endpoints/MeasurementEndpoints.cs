@@ -2,6 +2,7 @@ using System.Text.Json;
 using BoltPreload.Algorithms.Waveform;
 using BoltPreload.Api.Auth;
 using BoltPreload.Application.Ingestion;
+using Microsoft.Extensions.Caching.Memory;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -348,7 +349,7 @@ public static class MeasurementEndpoints
         // 波形对比诊断（§8.6）：当前波形 vs 通道 active 参考波形 → 相似度 / 衰减 / 健康度。
         // 只做诊断计算与返回，不触发告警（阈值是否驱动告警须由可追溯的告警规则单独决定）。
         waveGroup.MapGet("/compare/{channelId:long}", async (
-            long channelId, NpgsqlDataSource ds, IWaveStore store, CancellationToken ct) =>
+            long channelId, NpgsqlDataSource ds, IWaveStore store, IMemoryCache cache, CancellationToken ct) =>
         {
             // 1. 当前（最新）波形特征
             string? curUrl = null; DateTime curTs = default; decimal? curSnr = null; int? curPp = null; long curId = 0;
@@ -389,6 +390,12 @@ public static class MeasurementEndpoints
                 }
             }
 
+            // 重计算成本（载入双波形 + FFT + O(n²) 互相关）只取决于 当前特征 id + 参考特征 id；
+            // 前端 1.5s 轮询会反复请求同一通道，这里按 (cur,ref) 做短 TTL 缓存，避免重复重算打爆 CPU。
+            var cacheKey = $"wavecmp:{channelId}:{curId}:{refFeatureId?.ToString() ?? "0"}";
+            if (cache.TryGetValue(cacheKey, out object? cachedCmp) && cachedCmp is not null)
+                return Results.Ok(cachedCmp);
+
             var cur = await LoadWaveAsync(store, curUrl, ct);
             if (cur is null)
                 return Results.Ok(new { channelId, hasCurrent = false, hasReference = false });
@@ -415,7 +422,7 @@ public static class MeasurementEndpoints
                 new WaveSeries(rf.Wave, rf.EchoStart, rf.ClockInt),
                 snrDb: curSnr.HasValue ? (double)curSnr.Value : null);
 
-            return Results.Ok(new
+            var result = new
             {
                 channelId,
                 hasCurrent = true,
@@ -439,7 +446,14 @@ public static class MeasurementEndpoints
                     scoreSimilarity = Math.Round(cmp.ScoreSimilarity, 3),
                     scoreAttenuation = Math.Round(cmp.ScoreAttenuation, 3)
                 }
+            };
+            // 缓存计算结果：key 含 cur/ref 特征 id，新测量或换参考会自然换 key；TTL 仅作内存兜底上限。
+            cache.Set(cacheKey, result, new MemoryCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(30),
+                Size = 1
             });
+            return Results.Ok(result);
         })
         .WithName("CompareWave")
         .WithSummary("波形对比诊断：当前波形 vs 通道参考波形（相似度/衰减/健康度，§8.6）");

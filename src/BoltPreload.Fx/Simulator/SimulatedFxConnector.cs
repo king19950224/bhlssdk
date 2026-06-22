@@ -25,20 +25,23 @@ public sealed class SimulatedFxConnector : IFxConnector
     // 新 Task.Run 一启动就 OperationCanceled 立即停掉，模拟器再也不出数据。
     private CancellationTokenSource? _internalCts;
     private Task? _samplingLoop;
+    private long _dropped;  // H3：背压丢弃计数
 
     public long DeviceId => _options.DeviceId;
     public FxConnectorState State { get; private set; } = FxConnectorState.Idle;
     public ChannelReader<FxDecodedEnvelope> Results => _channel.Reader;
+    public long DroppedCount => Interlocked.Read(ref _dropped);
+    public Func<FxDecodedEnvelope, ValueTask>? OverflowSink { get; set; }
 
     public SimulatedFxConnector(SimulatorOptions options, ILogger<SimulatedFxConnector> logger)
     {
         _options = options;
         _logger = logger;
-        // 容量与真机 FxSdkConnector 对齐（8192, DropOldest），与开发文档 §4.3 一致
+        // 容量与真机 FxSdkConnector 对齐（8192）。FullMode=Wait 让 TryWrite 满时可检测（H3 背压可观测）。
         _channel = System.Threading.Channels.Channel.CreateBounded<FxDecodedEnvelope>(
             new BoundedChannelOptions(capacity: 8192)
             {
-                FullMode = BoundedChannelFullMode.DropOldest,
+                FullMode = BoundedChannelFullMode.Wait,
                 SingleReader = false,
                 SingleWriter = true
             });
@@ -239,8 +242,8 @@ public sealed class SimulatedFxConnector : IFxConnector
                     ResultType: FxResultType.ChannelResult,
                     ChannelResult: result);
 
-                // 不阻塞 — Bounded channel 满了会 drop oldest
-                _channel.Writer.TryWrite(envelope);
+                // H3：背压可观测 + 丢弃前兜底（与真机 connector 一致），满时丢最旧并计数。
+                BackpressureWriter.WriteWithBackpressure(_channel, envelope, ref _dropped, OverflowSink);
             }
 
             period++;

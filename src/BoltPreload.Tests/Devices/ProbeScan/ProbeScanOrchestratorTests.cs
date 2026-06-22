@@ -208,6 +208,8 @@ public class ProbeScanOrchestratorTests
         public FxConnectorState State => FxConnectorState.Connected;
         public long DeviceId { get; }
         public ChannelReader<FxDecodedEnvelope> Results => _channel.Reader;
+        public long DroppedCount => 0;
+        public Func<FxDecodedEnvelope, ValueTask>? OverflowSink { get; set; }
 
         public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task DisconnectAsync(CancellationToken ct = default) => Task.CompletedTask;

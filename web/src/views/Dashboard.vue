@@ -2,9 +2,12 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'
-import { dashboardApi, runtimeApi, type PreloadHealth, type LooseBolt, type ResidualDist, type ApproachingBolt } from '../api'
+import { dashboardApi, type PreloadHealth, type LooseBolt, type ResidualDist, type ApproachingBolt } from '../api'
+import { useRuntime } from '../stores/runtime'
+import { onRealtime } from '../api/realtime'
 
 const router = useRouter()
+const runtime = useRuntime()
 
 const health = ref<PreloadHealth>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0 })
 const byGroup = ref<{ turbine: string; group: string; health: PreloadHealth }[]>([])
@@ -14,15 +17,24 @@ const approaching = ref<ApproachingBolt[]>([])
 const openAlarms = ref(0)
 const alarmsBySeverity = ref<{ severity: string; count: number }[]>([])
 const loaded = ref(false)
+const firstLoad = ref(true)
+const error = ref<string | null>(null)
 
 const SEV_LABEL: Record<string, string> = { critical: '严重', crit: '严重', warn: '预警', warning: '预警', info: '提示' }
 const alarmBreakdown = computed(() =>
   alarmsBySeverity.value.filter((s) => s.count > 0).map((s) => `${SEV_LABEL[s.severity] || s.severity} ${s.count}`).join(' · '))
 
-const sys = ref({ online: 0, total: 0, walPending: 0, rate: 0 })
-let lastTotal = 0
-let lastTs = 0
+// 设备遥测改由共享 runtime store 提供（与 AppShell 顶栏共用一次轮询，避免重复请求）
+const sys = computed(() => ({
+  online: runtime.online,
+  total: runtime.total,
+  walPending: runtime.walPending,
+  rate: runtime.rate,
+}))
 let timer: number | undefined
+let debounce: number | undefined
+let disposed = false
+const unsubs: (() => void)[] = []
 
 const STATUS: Record<string, { label: string; color: string; cls: string }> = {
   normal: { label: '正常', color: '#10b981', cls: 'led--ok' },
@@ -40,6 +52,7 @@ const needAttention = computed(() => health.value.warn + health.value.loose)
 async function refresh() {
   try {
     const d = await dashboardApi.preloadHealth()
+    if (disposed) return
     health.value = d.global
     byGroup.value = d.byGroup
     topLoose.value = d.topLoose
@@ -47,29 +60,47 @@ async function refresh() {
     approaching.value = d.approachingLimit
     openAlarms.value = d.openAlarms
     alarmsBySeverity.value = d.alarmsBySeverity ?? []
-
-    const rt = await runtimeApi.devices()
-    const now = Date.now()
-    const total = rt.items.reduce((a, x) => a + (x.channelResultCount ?? 0), 0)
-    sys.value = {
-      online: rt.items.filter((x) => x.state === 'Connected').length,
-      total: rt.count,
-      walPending: rt.wal?.pending ?? 0,
-      rate: lastTs ? Math.max(0, Math.round(((total - lastTotal) / ((now - lastTs) / 1000)) * 10) / 10) : 0,
-    }
-    lastTotal = total
-    lastTs = now
-  } catch {
-    /* 尽力刷新 */
+    error.value = null
+  } catch (e) {
+    if (disposed) return
+    error.value = e instanceof Error ? e.message : '加载失败'
   } finally {
-    loaded.value = true
+    if (!disposed) {
+      loaded.value = true
+      firstLoad.value = false
+    }
   }
 }
+
+// 实时推送去抖刷新：preload-health 是较重的聚合查询，收到密集测量/告警后 5s 内合并为一次刷新
+function scheduleRefresh() {
+  if (debounce) return
+  debounce = window.setTimeout(() => {
+    debounce = undefined
+    if (!document.hidden) refresh()
+  }, 5000)
+}
+function onVisibility() {
+  if (!document.hidden) refresh()
+}
+
 onMounted(() => {
+  runtime.start()
   refresh()
-  timer = window.setInterval(refresh, 5000)
+  // 30s 轮询兜底；实时推送为主，标签页隐藏时跳过
+  timer = window.setInterval(() => { if (!document.hidden) refresh() }, 30000)
+  document.addEventListener('visibilitychange', onVisibility)
+  unsubs.push(onRealtime('OnAlarm', scheduleRefresh))
+  unsubs.push(onRealtime('OnMeasurement', scheduleRefresh))
 })
-onUnmounted(() => timer && clearInterval(timer))
+onUnmounted(() => {
+  disposed = true
+  if (timer) clearInterval(timer)
+  if (debounce) clearTimeout(debounce)
+  document.removeEventListener('visibilitychange', onVisibility)
+  unsubs.forEach((u) => u())
+  runtime.stop()
+})
 
 const donutOption = computed(() => {
   const data = ORDER.filter((k) => health.value[k] > 0).map((k) => ({
@@ -125,7 +156,14 @@ function openBolt(b: { boltId: number }) {
 </script>
 
 <template>
-  <div class="dash rise">
+  <div class="dash rise" v-loading="firstLoad" element-loading-text="加载中…">
+    <!-- 加载失败横幅：把「请求失败」与「无数据空态」明确区分开，并提供重试 -->
+    <div v-if="error" class="dash-error">
+      <el-icon><WarningFilled /></el-icon>
+      <span class="dash-error-msg">加载失败：{{ error }}</span>
+      <el-button size="small" type="danger" plain @click="refresh">重试</el-button>
+    </div>
+
     <!-- KPI -->
     <div class="kpi-row">
       <div class="kpi panel">
@@ -143,7 +181,16 @@ function openBolt(b: { boltId: number }) {
         <div class="kpi-val metric" :style="needAttention > 0 ? `color:${health.loose > 0 ? 'var(--crit)' : 'var(--warn)'}` : ''">{{ needAttention }}</div>
         <div class="kpi-foot">预警 {{ health.warn }} · 松动 {{ health.loose }}</div>
       </div>
-      <div class="kpi panel kpi--click" :class="{ 'kpi--alert': openAlarms > 0 }" @click="router.push({ name: 'alarms' })" title="查看告警中心">
+      <div
+        class="kpi panel kpi--click"
+        :class="{ 'kpi--alert': openAlarms > 0 }"
+        role="button"
+        tabindex="0"
+        @click="router.push({ name: 'alarms' })"
+        @keydown.enter="router.push({ name: 'alarms' })"
+        @keydown.space.prevent="router.push({ name: 'alarms' })"
+        title="查看告警中心"
+      >
         <div class="kpi-top"><span class="panel-title">未闭合告警</span><el-icon class="kpi-ic"><BellFilled /></el-icon></div>
         <div class="kpi-val metric" :style="openAlarms > 0 ? 'color:var(--crit)' : ''">{{ openAlarms }}</div>
         <div class="kpi-foot">{{ openAlarms > 0 ? (alarmBreakdown || '需运维处置') : '运行正常' }}</div>
@@ -158,7 +205,7 @@ function openBolt(b: { boltId: number }) {
           <div class="donut-wrap">
             <EChart :option="donutOption" height="220px" />
             <div class="donut-center">
-              <b class="metric">{{ health.total }}</b>
+              <b class="metric">{{ health.total || '—' }}</b>
               <span>监测螺栓</span>
             </div>
           </div>
@@ -179,7 +226,15 @@ function openBolt(b: { boltId: number }) {
           <router-link :to="{ name: 'assets' }" class="hd-link">资产监测 →</router-link>
         </div>
         <ul class="loose-list">
-          <li v-for="b in topLoose" :key="b.boltId" @click="openBolt(b)">
+          <li
+            v-for="b in topLoose"
+            :key="b.boltId"
+            role="button"
+            tabindex="0"
+            @click="openBolt(b)"
+            @keydown.enter="openBolt(b)"
+            @keydown.space.prevent="openBolt(b)"
+          >
             <span class="led" :class="STATUS[b.status]?.cls || 'led--off'" />
             <div class="lb-main">
               <div class="lb-code">{{ b.boltCode }}</div>
@@ -190,7 +245,7 @@ function openBolt(b: { boltId: number }) {
               <span class="lb-tag">{{ STATUS[b.status]?.label }}</span>
             </div>
           </li>
-          <li v-if="loaded && !topLoose.length" class="loose-empty">
+          <li v-if="loaded && !error && !topLoose.length" class="loose-empty">
             <span class="led led--ok" /> 无松动 / 预警,预紧力健康
           </li>
         </ul>
@@ -212,7 +267,7 @@ function openBolt(b: { boltId: number }) {
             </div>
             <span class="dist-count mono" :style="`color:${b.color}`">{{ b.count }}</span>
           </div>
-          <div v-if="loaded && !distBuckets.total" class="dist-empty">暂无在测螺栓</div>
+          <div v-if="loaded && !error && !distBuckets.total" class="dist-empty">暂无在测螺栓</div>
         </div>
       </div>
 
@@ -222,13 +277,21 @@ function openBolt(b: { boltId: number }) {
           <span class="hd-sub">近 7 天回归 · 预计触及下限</span>
         </div>
         <ul class="appr-list">
-          <li v-for="b in approaching" :key="b.boltId" @click="openBolt(b)">
+          <li
+            v-for="b in approaching"
+            :key="b.boltId"
+            role="button"
+            tabindex="0"
+            @click="openBolt(b)"
+            @keydown.enter="openBolt(b)"
+            @keydown.space.prevent="openBolt(b)"
+          >
             <div class="appr-main">
               <div class="appr-code">{{ b.boltCode }}</div>
               <div class="appr-loc">{{ b.turbine }} · {{ b.group }}</div>
             </div>
             <div class="appr-rate mono">
-              {{ b.ratePerDay != null ? Math.round(b.ratePerDay) + ' N/天' : '—' }}
+              {{ b.ratePerDay != null ? '↓' + Math.abs(Math.round(b.ratePerDay)) + ' N/天' : '—' }}
               <span v-if="b.r2 != null" class="appr-r2">R² {{ b.r2.toFixed(2) }}</span>
             </div>
             <div class="appr-days" :style="`color:${daysColor(b.daysToLimit)}`">
@@ -236,7 +299,7 @@ function openBolt(b: { boltId: number }) {
               <span>到下限</span>
             </div>
           </li>
-          <li v-if="loaded && !approaching.length" class="appr-empty"><span class="led led--ok" /> 无下降趋势螺栓,预紧力稳定</li>
+          <li v-if="loaded && !error && !approaching.length" class="appr-empty"><span class="led led--ok" /> 无下降趋势螺栓,预紧力稳定</li>
         </ul>
       </div>
     </div>
@@ -245,7 +308,7 @@ function openBolt(b: { boltId: number }) {
     <div class="panel panel--glow bygroup">
       <div class="panel-hd"><span class="panel-title">按部位健康</span></div>
       <div class="bg-list">
-        <div v-for="(g, i) in byGroup" :key="i" class="bg-row">
+        <div v-for="g in byGroup" :key="`${g.turbine}-${g.group}`" class="bg-row">
           <div class="bg-name">
             <span class="bg-turbine">{{ g.turbine }}</span>
             <span class="bg-group">{{ g.group }}</span>
@@ -262,7 +325,7 @@ function openBolt(b: { boltId: number }) {
           </div>
           <div class="bg-total mono">{{ g.health.total }} 颗</div>
         </div>
-        <div v-if="loaded && !byGroup.length" class="bg-empty">暂无部位数据</div>
+        <div v-if="loaded && !error && !byGroup.length" class="bg-empty">暂无部位数据</div>
       </div>
     </div>
 
@@ -278,6 +341,20 @@ function openBolt(b: { boltId: number }) {
 
 <style scoped>
 .dash { display: flex; flex-direction: column; gap: 18px; }
+
+.dash-error {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; border-radius: var(--radius-sm);
+  background: rgba(244, 63, 94, 0.08); border: 1px solid var(--crit);
+  color: var(--text-1); font-size: 13px;
+}
+.dash-error .el-icon { color: var(--crit); font-size: 18px; }
+.dash-error-msg { flex: 1; min-width: 0; }
+
+/* 键盘可达：可点击元素聚焦时给出清晰焦点环 */
+.kpi--click:focus-visible,
+.loose-list li:focus-visible,
+.appr-list li:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
 .kpi { padding: 18px 20px; }

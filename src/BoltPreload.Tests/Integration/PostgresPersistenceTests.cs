@@ -85,6 +85,37 @@ public sealed class PostgresPersistenceTests
         ((long)(await cmd.ExecuteScalarAsync())!).Should().Be(1);
     }
 
+    // ---- 自动发现墓碑：被显式软删的通道不得被数据流"悄悄"复活（否则运维的删除操作永远不生效）----
+    // 这正是 dev 库里观察到的行为：设备周期上报全部物理通道，软删通道若被自动重建，删除就形同虚设。
+    [Fact]
+    public async Task Sink_does_not_revive_soft_deleted_channel()
+    {
+        if (!_fx.Available) return;  // 本地无 Docker/DB 时跳过；CI 与有库环境会实际执行下述断言
+
+        var deviceId = await SeedDeviceAsync();
+        // 显式软删一个通道（模拟运维删除空通道：deleted_at 置位）
+        await using (var del = _fx.DataSource.CreateCommand(
+            @"INSERT INTO channels (device_id, channel_no, state, first_seen_at, last_seen_at, deleted_at)
+              VALUES (@d, 11, 'manual', now(), now(), now())"))
+        {
+            del.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
+            await del.ExecuteNonQueryAsync();
+        }
+
+        var sink = NewSink();
+        await sink.WriteAsync(Measurement(deviceId, channel: 11, DateTimeOffset.UtcNow), evaluateAlarms: false);
+
+        // ① 不得新建/复活 live 通道（deleted_at IS NULL 的行数应为 0）
+        await using (var live = _fx.DataSource.CreateCommand(
+            "SELECT count(*) FROM channels WHERE device_id=@d AND channel_no=11 AND deleted_at IS NULL"))
+        {
+            live.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
+            ((long)(await live.ExecuteScalarAsync())!).Should().Be(0, "软删通道不得被数据流自动复活");
+        }
+        // ② 无法解析的软删通道测量应被直接丢弃，不落 unbound_measurements
+        (await UnboundCountAsync(deviceId)).Should().Be(0, "解析不出通道的测量应丢弃，不得落 unbound");
+    }
+
     // ---- WAL 重放对真库：入库失败兜底链路的端到端验证 ----
     [Fact]
     public async Task WalReplay_persists_to_real_db()

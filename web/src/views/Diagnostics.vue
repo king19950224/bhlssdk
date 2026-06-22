@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import EChart from '../components/EChart.vue'
 import { waveApi, type WaveFeature, type WaveCompareResult, type WaveCompareWave } from '../api'
+import { analyzeAscan } from '../utils/ascan'
 
 const features = ref<WaveFeature[]>([])
 const cmp = ref<WaveCompareResult | null>(null)
@@ -10,6 +11,7 @@ const activeChannelId = ref<number | null>(null)
 const loading = ref(false)
 const loadingCmp = ref(false)
 const settingRef = ref(false)
+const error = ref<string | null>(null)
 
 // 实时显示：勾选后每 1.5s 轮询，自动跟随最新波形所在通道刷新对比诊断
 const live = ref(true)
@@ -17,6 +19,7 @@ const follow = ref(true)
 const lastUpdate = ref<number | null>(null)
 let liveTimer: number | undefined
 let ticking = false
+let disposed = false
 
 const cur = computed(() => cmp.value?.current ?? null)
 const refWave = computed(() => cmp.value?.reference ?? null)
@@ -24,19 +27,26 @@ const metrics = computed(() => cmp.value?.metrics ?? null)
 const hasRef = computed(() => !!cmp.value?.hasReference)
 
 async function loadFeatures() {
-  features.value = (await waveApi.features(60)).items
+  const res = await waveApi.features(60)
+  if (disposed) return
+  features.value = res.items
 }
 
 async function loadCompare(channelId: number) {
   loadingCmp.value = true
   try {
-    cmp.value = await waveApi.compare(channelId)
+    const res = await waveApi.compare(channelId)
+    if (disposed) return
+    cmp.value = res
     activeChannelId.value = channelId
     lastUpdate.value = Date.now()
-  } catch {
+    error.value = null
+  } catch (e) {
+    if (disposed) return
     cmp.value = null
+    error.value = e instanceof Error ? e.message : '波形对比加载失败'
   } finally {
-    loadingCmp.value = false
+    if (!disposed) loadingCmp.value = false
   }
 }
 
@@ -47,18 +57,20 @@ async function selectChannel(f: WaveFeature) {
 }
 
 async function tick() {
-  if (ticking) return
+  if (ticking || disposed) return
   ticking = true
   try {
     await loadFeatures()
+    if (disposed) return
     const latest = features.value[0]
     if (follow.value && latest) {
       await loadCompare(latest.channelId)
     } else {
       lastUpdate.value = Date.now()
+      error.value = null
     }
-  } catch {
-    /* 轮询失败下次再试 */
+  } catch (e) {
+    if (!disposed) error.value = e instanceof Error ? e.message : '波形刷新失败'
   } finally {
     ticking = false
   }
@@ -67,7 +79,8 @@ async function tick() {
 function startLive() {
   stopLive()
   if (!live.value) return
-  liveTimer = window.setInterval(tick, 1500)
+  // 标签页隐藏时跳过这一拍（配合 visibilitychange 暂停），避免后台标签页持续拉全波形
+  liveTimer = window.setInterval(() => { if (!document.hidden) tick() }, 1500)
 }
 function stopLive() {
   if (liveTimer) {
@@ -87,6 +100,19 @@ function onLiveChange() {
 function resumeFollow() {
   follow.value = true
   if (features.value[0]) loadCompare(features.value[0].channelId)
+}
+
+function retry() {
+  error.value = null
+  if (!follow.value && activeChannelId.value != null) loadCompare(activeChannelId.value)
+  else tick()
+}
+
+// 标签页隐藏时暂停实时轮询，可见时恢复并立即刷新一次
+function onVisibility() {
+  if (!live.value) return
+  if (document.hidden) stopLive()
+  else { startLive(); tick() }
 }
 
 // 把当前波形设为该通道的参考基线（健康基线）
@@ -109,42 +135,25 @@ onMounted(async () => {
   loading.value = true
   try {
     await loadFeatures()
-    if (features.value.length) await loadCompare(features.value[0].channelId)
+    if (!disposed && features.value.length) await loadCompare(features.value[0].channelId)
+  } catch (e) {
+    if (!disposed) error.value = e instanceof Error ? e.message : '加载失败'
   } finally {
-    loading.value = false
+    if (!disposed) loading.value = false
   }
   startLive()
+  document.addEventListener('visibilitychange', onVisibility)
 })
-onUnmounted(stopLive)
+onUnmounted(() => {
+  disposed = true
+  stopLive()
+  document.removeEventListener('visibilitychange', onVisibility)
+})
 
-// A-Scan 解析：绝对时间轴(echoStart + i·clockInt)、峰值、检出点(过阈)、零交叉
+// A-Scan 基础解析走共享 util；保留 d 别名兼容下方图表 option 里的 s.d 引用
 function computeStats(w: WaveCompareWave | null) {
-  if (!w || !w.waveData.length) return null
-  const clk = w.clockInt || 1
-  const x0 = w.echoStart || 0
-  const d = w.waveData
-  const n = d.length
-  const xmin = x0
-  const xmax = x0 + (n - 1) * clk
-  const t = (i: number) => x0 + i * clk
-  let peakIdx = 0
-  let peakAbs = -1
-  for (let i = 0; i < n; i++) {
-    const a = Math.abs(d[i])
-    if (a > peakAbs) { peakAbs = a; peakIdx = i }
-  }
-  const thr = w.threshold != null ? Math.abs(w.threshold) : null
-  let detIdx = -1
-  if (thr != null && thr > 0) for (let i = 0; i < n; i++) { if (Math.abs(d[i]) >= thr) { detIdx = i; break } }
-  if (detIdx < 0) detIdx = peakIdx
-  const detNs = t(detIdx)
-  let zeroNs: number | null = null
-  for (let i = detIdx; i < n - 1; i++) {
-    const a = d[i]
-    const b = d[i + 1]
-    if ((a <= 0 && b > 0) || (a >= 0 && b < 0)) { zeroNs = t(i) + (a === b ? 0 : a / (a - b)) * clk; break }
-  }
-  return { d, clk, x0, n, xmin, xmax, peakIdx, detIdx, detNs, zeroNs, thr }
+  const s = analyzeAscan(w)
+  return s ? { ...s, d: s.waveData } : null
 }
 
 const curStats = computed(() => computeStats(cur.value))
@@ -208,6 +217,13 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
 
 <template>
   <div class="diag rise">
+    <!-- 加载失败横幅：把「请求失败」与「暂无波形」明确区分，并提供重试 -->
+    <div v-if="error" class="diag-error">
+      <el-icon><WarningFilled /></el-icon>
+      <span class="diag-error-msg">加载失败：{{ error }}</span>
+      <el-button size="small" type="danger" plain @click="retry">重试</el-button>
+    </div>
+
     <!-- A-Scan + 对比 -->
     <div class="panel panel--glow">
       <div class="panel-hd">
@@ -263,7 +279,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
       <EChart v-if="cur" :option="ascanOption" height="300px" />
       <div v-else class="ascan-empty" v-loading="loadingCmp">
         <el-icon><TrendCharts /></el-icon>
-        <span>{{ loading ? '加载中…' : '暂无波形数据。模拟器或真机产生带波形的测量后,可在此实时回放并对比 A-Scan。' }}</span>
+        <span>{{ loading ? '加载中…' : error ? '波形加载失败,请点上方「重试」。' : '暂无波形数据。模拟器或真机产生带波形的测量后,可在此实时回放并对比 A-Scan。' }}</span>
       </div>
 
       <div v-if="curStats" class="ascan-legend">
@@ -295,7 +311,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
           <span class="mono">{{ f.threshold ?? '—' }}</span>
           <span class="mono dim">{{ f.pointCount }}</span>
         </div>
-        <div v-if="!loading && !features.length" class="tbl-empty">
+        <div v-if="!loading && !error && !features.length" class="tbl-empty">
           <span class="led led--off" /> 暂无波形特征。带波形采集启用后,这里展示 SNR / 峰峰值 / 噪声等信号质量指标。
         </div>
       </div>
@@ -305,6 +321,9 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
 
 <style scoped>
 .diag { display: flex; flex-direction: column; gap: 16px; }
+.diag-error { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: 9px; background: rgba(244, 63, 94, 0.08); border: 1px solid var(--crit); color: var(--text-1); font-size: 13px; }
+.diag-error .el-icon { color: var(--crit); font-size: 18px; }
+.diag-error-msg { flex: 1; min-width: 0; }
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 6px; }
 .panel-title { display: inline-flex; align-items: center; }
 .hd-sub { font-size: 12px; color: var(--text-3); margin-left: 8px; }

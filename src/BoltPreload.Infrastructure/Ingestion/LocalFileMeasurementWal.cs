@@ -159,6 +159,11 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
     /// <summary>容量保护：达到上限则丢弃最旧条目（drop-oldest），给即将写入的新条目腾位。调用方需持有 _gate。</summary>
     private void EnforceCapacityLocked()
     {
+        // L2 快路径：未接近上限时只看内存计数，不枚举整个目录——避免每条 append 都 O(n) 扫描磁盘
+        //（DB 长时间故障、WAL 积压数万条时性能尤其关键）。仅在计数触及上限时才枚举做 drop-oldest（罕见）。
+        if (Interlocked.Read(ref _pending) < _maxEntries)
+            return;
+
         var files = ListWalFilesSorted();
         if (files.Count < _maxEntries)
         {

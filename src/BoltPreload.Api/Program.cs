@@ -107,6 +107,8 @@ else
 // 波形存储：Phase 1 走本地文件。Phase 3 可换 S3/MinIO 实现 IWaveStore
 builder.Services.Configure<LocalFileWaveStoreOptions>(builder.Configuration.GetSection("WaveStore"));
 builder.Services.AddSingleton<IWaveStore, LocalFileWaveStore>();
+// 波形保留清理：周期删早于 RetentionDays 的历史波形 + 清扫残留 .tmp，防止 data/waves 无限增长
+builder.Services.AddHostedService<BoltPreload.Api.Runtime.WaveRetentionService>();
 
 // 开发期间：SDK 协议帧打日志（Phase 2 真机调试用，Phase 3 上线前关掉）。
 // 经 BoltPreload.Fx 适配层封装，Api 不直接依赖 FxSDK.Utility。
@@ -207,6 +209,47 @@ app.MapGet("/api/health", () => new
 .AllowAnonymous()
 .WithTags("Health");
 
+// 就绪检查（readiness）：实际探测关键依赖（DB 连通性）。
+// 区别于上面的 liveness（仅表示进程还在）——运维/负载均衡探针用 /ready 判断"能否真正服务请求"，
+// DB 不通时返回 503，避免"进程在、但后端依赖已断"的静默失效被当成健康。
+app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorManager manager, CancellationToken ct) =>
+{
+    // 1) DB 连通性（硬性：down → 503，运维/负载均衡据此摘流）
+    try
+    {
+        await using var cmd = ds.CreateCommand("SELECT 1");
+        await cmd.ExecuteScalarAsync(ct);
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(
+            new { status = "degraded", db = "down", error = ex.Message, timestamp = DateTimeOffset.UtcNow },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    // 2) 采集新鲜度（M1）：暴露各设备最近一次信封/通道结果的时间与空闲秒数，
+    //    让运维探针/监控能发现"进程在、但采集已停"的静默失效（区别于仅探 DB 的旧实现）。
+    //    不因空闲武断 503（真机本就可能阶段性空闲），由调用方按 idleSeconds 设阈值告警。
+    var now = DateTimeOffset.UtcNow;
+    var ingestion = manager.Runtimes.Select(rt =>
+    {
+        var last = rt.RuntimeStatus.LastEnvelopeAt;
+        return new
+        {
+            rt.DeviceId,
+            state = rt.Connector.State.ToString(),
+            lastEnvelopeAt = last,
+            idleSeconds = last is null ? (double?)null : Math.Round((now - last.Value).TotalSeconds, 1),
+            rt.RuntimeStatus.EnvelopeCount,
+            rt.RuntimeStatus.ChannelResultCount
+        };
+    }).ToArray();
+
+    return Results.Ok(new { status = "ready", db = "up", ingestion, timestamp = now });
+})
+.AllowAnonymous()
+.WithTags("Health");
+
 app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseService licenseService, LicenseEnforcementState enforcement, IMeasurementWal wal) =>
 {
     var license = licenseService.GetStatus();
@@ -251,6 +294,8 @@ app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseSer
             runtime.RuntimeStatus.EnvelopeCount,
             runtime.RuntimeStatus.ChannelResultCount,
             runtime.RuntimeStatus.WriteFailureCount,
+            // H3：背压丢弃计数（消费跟不上时通道满丢弃最旧，已落 WAL 兜底；持续 >0 需排查 DB/消费瓶颈）
+            droppedCount = runtime.Connector.DroppedCount,
             sessionChannels = runtime.Connector.GetSessionChannelConfigs()
                 .Select(c => new { c.Address, c.Channel, c.ProbeFreqMhz, c.MeasMode, c.Threshold, c.RefTimeNs, c.RefTempC })
                 .ToArray()

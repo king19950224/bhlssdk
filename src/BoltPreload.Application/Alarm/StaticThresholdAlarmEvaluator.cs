@@ -178,6 +178,75 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
     }
 
     /// <summary>
+    /// 无状态 critical 安全网（C1）：不触碰 <see cref="_states"/>，仅判断单条样本是否已处于
+    /// "立即危险"档。供 WAL 重放兜底补判用——重放的是历史/乱序数据，喂有状态状态机会误触发/误恢复，
+    /// 但 DB 故障窗口内真实发生的脱落 / 严重越限不能因此被吞掉。
+    /// 只补最高危的 critical 档（脱落 + 偏差≥CriticalDeviation 的越限），避免重放噪声刷屏。
+    /// </summary>
+    public AlarmEvent? EvaluateCriticalStateless(AlarmInput input)
+    {
+        if (!input.PreloadRatio.HasValue)
+            return null;
+
+        var ratio = input.PreloadRatio.Value;
+
+        // 预紧力脱落：最高危，立即 critical（与有状态分支一致，脱落不走 on-delay）
+        if (ratio <= _opt.PreloadLossRatio)
+            return BuildTriggerEvent("preload_loss", "critical", input, 1);
+
+        // 严重偏低 / 偏高：越过触发阈值且偏差达 critical 档（默认 30%）
+        if (ratio < _opt.TriggerLowRatio && Math.Abs(1m - ratio) >= _opt.CriticalDeviation)
+            return BuildTriggerEvent("preload_low", "critical", input, 1);
+        if (ratio > _opt.TriggerHighRatio && Math.Abs(1m - ratio) >= _opt.CriticalDeviation)
+            return BuildTriggerEvent("preload_high", "critical", input, 1);
+
+        return null;
+    }
+
+    /// <summary>
+    /// 回滚最近一次 <see cref="Evaluate"/> 的状态转移（C2）。持久化失败时调用，使状态机退到
+    /// "差一格即可重新触发/恢复"的保守态，让下一条同向样本立即重试持久化——
+    /// 宁可重复告警，绝不永久漏报（与 preload_loss"宁可误报不漏报"的哲学一致）。
+    /// </summary>
+    public void RollbackTransition(AlarmEvent ev)
+    {
+        if (!_states.TryGetValue(ev.BoltId, out var state))
+            return;
+
+        lock (state)
+        {
+            switch (ev.Action)
+            {
+                // 撤销 low 槽触发（preload_low / preload_loss 共用 LowActive）
+                case AlarmAction.Trigger when ev.Type is "preload_low" or "preload_loss":
+                    state.LowActive = false;
+                    state.LowAlarmType = "preload_low";
+                    state.LowTriggerStreak = Math.Max(0, _opt.TriggerConsecutive - 1);
+                    state.LowClearStreak = 0;
+                    break;
+
+                case AlarmAction.Trigger when ev.Type == "preload_high":
+                    state.HighActive = false;
+                    state.HighTriggerStreak = Math.Max(0, _opt.TriggerConsecutive - 1);
+                    state.HighClearStreak = 0;
+                    break;
+
+                // 撤销 low 槽恢复：重新置 active，下一条恢复样本立即重试 Clear
+                case AlarmAction.Clear when ev.Type is "preload_low" or "preload_loss":
+                    state.LowActive = true;
+                    state.LowAlarmType = ev.Type;
+                    state.LowClearStreak = Math.Max(0, _opt.ClearConsecutive - 1);
+                    break;
+
+                case AlarmAction.Clear when ev.Type == "preload_high":
+                    state.HighActive = true;
+                    state.HighClearStreak = Math.Max(0, _opt.ClearConsecutive - 1);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
     /// 根据偏离目标的程度分级（GB/T 41261 三级警告：info / warn / critical）。
     /// |1 - ratio| ≥ CriticalDeviation 即 critical（默认 30% 偏离）。
     /// </summary>

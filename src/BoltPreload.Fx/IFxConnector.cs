@@ -22,6 +22,15 @@ public interface IFxConnector : IAsyncDisposable
     /// <summary>解码后的结果流。下游 <c>await foreach</c> 消费即可。</summary>
     ChannelReader<FxDecodedEnvelope> Results { get; }
 
+    /// <summary>结果通道因背压（消费跟不上）累计丢弃的测量数（H3，可观测，经 /api/runtime/devices 暴露）。</summary>
+    long DroppedCount { get; }
+
+    /// <summary>
+    /// 背压溢出兜底（H3）：通道满时被挤掉的最旧测量交给此委托（通常 = 落 WAL，由 WalReplayService 重放补写）。
+    /// 由消费方（IngestionService）在启动时按需设置；null 表示仅计数后直接丢弃。
+    /// </summary>
+    Func<FxDecodedEnvelope, ValueTask>? OverflowSink { get; set; }
+
     /// <summary>异步建立连接</summary>
     Task ConnectAsync(CancellationToken cancellationToken = default);
 

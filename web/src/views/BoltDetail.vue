@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import EChart from '../components/EChart.vue'
 import PreloadScale from '../components/PreloadScale.vue'
 import { computePreloadHealth, pct, signedN } from '../utils/preload'
+import { analyzeAscan } from '../utils/ascan'
 import { boltApi, alarmApi, auditApi, waveApi, configChangeApi, deviceApi, calibrationApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction } from '../api'
 import { onRealtime } from '../api/realtime'
 import { useAuth } from '../stores/auth'
@@ -309,30 +310,13 @@ onUnmounted(() => {
   unsubMeas?.()
 })
 
-// A-Scan 解析：绝对时间轴(echoStart + i·clockInt)、检出点、零交叉、RefTime/ΔTOF、闸门
+// A-Scan 基础解析走共享 util；本页在其上叠加 RefTime/ΔTOF/闸门
 const waveStats = computed(() => {
   const w = wave.value
-  if (!w || !w.waveData.length) return null
-  const clk = w.clockInt || 1
-  const x0 = w.echoStart || 0
-  const n = w.waveData.length
-  const xmin = x0
-  const xmax = x0 + (n - 1) * clk
-  const t = (i: number) => x0 + i * clk
-  let peakIdx = 0, peakAbs = -1
-  for (let i = 0; i < n; i++) { const a = Math.abs(w.waveData[i]); if (a > peakAbs) { peakAbs = a; peakIdx = i } }
-  // 检出点：首个 |样值| ≥ |阈值|；无阈值或未越限则回退到峰值
-  const thr = w.threshold != null ? Math.abs(w.threshold) : null
-  let detIdx = -1
-  if (thr != null && thr > 0) for (let i = 0; i < n; i++) { if (Math.abs(w.waveData[i]) >= thr) { detIdx = i; break } }
-  if (detIdx < 0) detIdx = peakIdx
-  const detNs = t(detIdx)
-  // 零交叉：检出点之后首个过零，线性插值到亚采样时间（TOF 的精细参考点）
-  let zeroNs: number | null = null
-  for (let i = detIdx; i < n - 1; i++) {
-    const a = w.waveData[i], b = w.waveData[i + 1]
-    if ((a <= 0 && b > 0) || (a >= 0 && b < 0)) { zeroNs = t(i) + (a === b ? 0 : a / (a - b)) * clk; break }
-  }
+  if (!w) return null
+  const base = analyzeAscan(w)
+  if (!base) return null
+  const { xmin, xmax, detNs, zeroNs } = base
   // RefTime 标定基线：仅当落在波形窗内才叠加
   const refNs = chCfg.value?.refTimeNs != null ? Number(chCfg.value.refTimeNs) : null
   const refInWin = refNs != null && refNs >= xmin && refNs <= xmax
@@ -346,7 +330,7 @@ const waveStats = computed(() => {
     gate = chCfg.value?.measMode === 1 && refInWin ? [(refNs as number) - ew / 2, (refNs as number) + ew / 2] : [xmin, xmin + ew]
     gate = [Math.max(xmin, gate[0]), Math.min(xmax, gate[1])]
   }
-  return { w, clk, x0, n, xmin, xmax, peakIdx, peakAbs, detIdx, detNs, zeroNs, thr, refNs, refInWin, deltaTof, gate }
+  return { ...base, w, refNs, refInWin, deltaTof, gate }
 })
 
 const ascanOption = computed(() => {

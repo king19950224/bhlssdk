@@ -2,10 +2,12 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'
-import { dashboardApi, runtimeApi, alarmApi, type PreloadHealth, type LooseBolt, type ApproachingBolt, type AlarmItem } from '../api'
+import { dashboardApi, alarmApi, type PreloadHealth, type LooseBolt, type ApproachingBolt, type AlarmItem } from '../api'
+import { useRuntime } from '../stores/runtime'
 import { onRealtime } from '../api/realtime'
 
 const router = useRouter()
+const runtime = useRuntime()
 
 const health = ref<PreloadHealth>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0 })
 const byGroup = ref<{ turbine: string; group: string; health: PreloadHealth }[]>([])
@@ -13,9 +15,9 @@ const topLoose = ref<LooseBolt[]>([])
 const approaching = ref<ApproachingBolt[]>([])
 const openAlarms = ref(0)
 const recentAlarms = ref<AlarmItem[]>([])
-const sys = ref({ online: 0, total: 0, rate: 0 })
+// 设备遥测改由共享 runtime store 提供（统一一处轮询，复用速率差分/可见性暂停/实时刷新）
+const sys = computed(() => ({ online: runtime.online, total: runtime.total, rate: runtime.rate }))
 const now = ref(new Date())
-let lastTotal = 0, lastTs = 0
 let timer: number | undefined, clock: number | undefined
 let unsub: (() => void) | undefined
 
@@ -37,19 +39,11 @@ async function refresh() {
     topLoose.value = d.topLoose
     approaching.value = d.approachingLimit
     openAlarms.value = d.openAlarms
-    const rt = await runtimeApi.devices()
-    const total = rt.items.reduce((a, x) => a + (x.channelResultCount ?? 0), 0)
-    const t = Date.now()
-    sys.value = {
-      online: rt.items.filter((x) => x.state === 'Connected').length,
-      total: rt.count,
-      rate: lastTs ? Math.max(0, Math.round(((total - lastTotal) / ((t - lastTs) / 1000)) * 10) / 10) : 0,
-    }
-    lastTotal = total; lastTs = t
     recentAlarms.value = (await alarmApi.list('?includeCleared=false&limit=10')).items
   } catch { /* 尽力刷新 */ }
 }
 onMounted(() => {
+  runtime.start()
   refresh()
   timer = window.setInterval(refresh, 5000)
   clock = window.setInterval(() => { now.value = new Date() }, 1000)
@@ -59,6 +53,7 @@ onUnmounted(() => {
   if (timer) clearInterval(timer)
   if (clock) clearInterval(clock)
   unsub?.()
+  runtime.stop()
 })
 
 const donutOption = computed(() => {

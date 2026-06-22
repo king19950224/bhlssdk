@@ -92,26 +92,35 @@ public static class WaveDiagnostics
         Subtract(a, Mean(a));
         Subtract(b, Mean(b));
 
-        var normA = Norm(a);
-        var normB = Norm(b);
-        double denom = normA * normB;
+        // 窗口化归一化互相关（NCC）：每个 lag 只在重叠区算点积，并用【重叠区内】各自的范数归一化，
+        // 而不是用全长范数。否则非零 lag 会因"重叠区点积 ÷ 全长范数"被系统性低估，使本应"对平移鲁棒"的
+        // 相似度在真实回波平移（预紧力变化会让回波整体平移）时虚低、bestLag 偏向 0。
+        // 最小重叠保护：重叠点数不足时跳过该 lag，避免极端平移处少数点凑出假高相关。
+        int minLen = Math.Min(a.Length, b.Length);
+        int minOverlap = Math.Max(8, minLen / 2);
 
         double best = 0, zeroLag = 0;
         int bestLag = 0;
-        if (denom > 1e-12)
+        for (int lag = -maxLag; lag <= maxLag; lag++)
         {
-            for (int lag = -maxLag; lag <= maxLag; lag++)
+            // a[i] 对齐 b[i - lag]；只在两序列都有效的重叠区间累加
+            int iStart = Math.Max(0, lag);
+            int iEnd = Math.Min(a.Length, b.Length + lag);
+            if (iEnd - iStart < minOverlap) continue;
+
+            double dot = 0, sumA2 = 0, sumB2 = 0;
+            for (int i = iStart; i < iEnd; i++)
             {
-                double dot = 0;
-                // a[i] 对齐 b[i - lag]；只累加两序列都有效的重叠区间
-                int iStart = Math.Max(0, lag);
-                int iEnd = Math.Min(a.Length, b.Length + lag);
-                for (int i = iStart; i < iEnd; i++)
-                    dot += a[i] * b[i - lag];
-                double ncc = dot / denom;
-                if (lag == 0) zeroLag = ncc;
-                if (ncc > best) { best = ncc; bestLag = lag; }
+                double av = a[i];
+                double bv = b[i - lag];
+                dot += av * bv;
+                sumA2 += av * av;
+                sumB2 += bv * bv;
             }
+            double denom = Math.Sqrt(sumA2) * Math.Sqrt(sumB2);
+            double ncc = denom > 1e-12 ? dot / denom : 0;
+            if (lag == 0) zeroLag = ncc;
+            if (ncc > best) { best = ncc; bestLag = lag; }
         }
 
         // 衰减比用原始（未去均值）峰峰值算，反映真实幅度变化
@@ -193,13 +202,6 @@ public static class WaveDiagnostics
     private static void Subtract(double[] x, double v)
     {
         for (int i = 0; i < x.Length; i++) x[i] -= v;
-    }
-
-    private static double Norm(double[] x)
-    {
-        double s = 0;
-        for (int i = 0; i < x.Length; i++) s += x[i] * x[i];
-        return Math.Sqrt(s);
     }
 
     private static double PeakToPeak(IReadOnlyList<short> data)

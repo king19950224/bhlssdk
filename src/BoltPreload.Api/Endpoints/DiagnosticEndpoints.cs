@@ -24,7 +24,9 @@ public static class DiagnosticEndpoints
     {
         var group = app.MapGroup("/api/devices/{deviceId:long}/diagnostic")
             .WithTags("Diagnostic")
-            .RequireAuthorization(AuthPolicies.WriteAccess);
+            // M2：诊断端点都是对硬件设备的直接交互（读参 / 改配置 / 改工作模式 / 下发轮询），属工程师级高危操作，
+            // 从 operator 级 WriteAccess 收紧到 reviewer+（ReviewerAccess），operator 不再能直接下发设备命令。
+            .RequireAuthorization(AuthPolicies.ReviewerAccess);
 
         // 读设备级参数
         group.MapPost("/read-device-param/{propertyName}", async (

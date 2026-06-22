@@ -22,7 +22,7 @@ public static class AuthEndpoints
                 return Results.BadRequest(new { error = "username 与 password 必填" });
 
             const string sql = @"
-                SELECT id, username, role, password_hash, enabled, locked_until, failed_attempts
+                SELECT id, username, role, password_hash, enabled, locked_until, failed_attempts, token_version
                 FROM users WHERE username = @u";
             await using var cmd = ds.CreateCommand(sql);
             cmd.Parameters.AddWithValue("u", NpgsqlDbType.Varchar, req.Username);
@@ -42,7 +42,7 @@ public static class AuthEndpoints
             var hash = r.GetString(3);
             var enabled = r.GetBoolean(4);
             var lockedUntil = r.IsDBNull(5) ? (DateTime?)null : r.GetDateTime(5);
-            var failed = r.GetInt16(6);
+            var tokenVersion = r.GetInt32(7);
             await r.CloseAsync();
 
             if (!enabled)
@@ -65,8 +65,8 @@ public static class AuthEndpoints
             var verifyResult = hasher.VerifyHashedPassword(account, hash, req.Password);
             if (verifyResult == PasswordVerificationResult.Failed)
             {
-                await BumpFailureAsync(ds, id, failed + 1, ct);
-                logger.LogInformation("登录失败 username={U}（密码错误，连续失败={N}）", username, failed + 1);
+                var attempts = await BumpFailureAsync(ds, id, ct);
+                logger.LogInformation("登录失败 username={U}（密码错误，连续失败={N}）", username, attempts);
                 return Results.Unauthorized();
             }
 
@@ -88,7 +88,7 @@ public static class AuthEndpoints
                 await clear.ExecuteNonQueryAsync(ct);
             }
 
-            var token = issuer.Issue(id, username, role);
+            var token = issuer.Issue(id, username, role, tokenVersion);
             return Results.Ok(new LoginResponse(token, id, username, role));
         })
         .AllowAnonymous()
@@ -130,7 +130,8 @@ public static class AuthEndpoints
                         role      = EXCLUDED.role,
                         enabled   = true,
                         failed_attempts = 0,
-                        locked_until = NULL
+                        locked_until = NULL,
+                        token_version = users.token_version + 1
                 RETURNING id";
             await using var cmd = ds.CreateCommand(sql);
             cmd.Parameters.AddWithValue("u", NpgsqlDbType.Varchar, req.Username);
@@ -185,7 +186,7 @@ public static class AuthEndpoints
             string username;
             bool enabled;
             await using (var cmd = ds.CreateCommand(@"
-                UPDATE users SET enabled = NOT enabled WHERE id=@id AND deleted_at IS NULL
+                UPDATE users SET enabled = NOT enabled, token_version = token_version + 1 WHERE id=@id AND deleted_at IS NULL
                 RETURNING username, enabled"))
             {
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
@@ -216,20 +217,30 @@ public static class AuthEndpoints
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    private static async Task BumpFailureAsync(NpgsqlDataSource ds, long userId, int failed, CancellationToken ct)
+    // 登录失败计数：必须在 DB 内原子自增（failed_attempts = failed_attempts + 1），
+    // 不能用"登录时读到的值 + 1"回写——并发失败请求会 lost update，使计数停滞、
+    // 锁定阈值被绕过、可无限撞库（H1）。锁定判定同样基于自增后的真实值。
+    // 返回自增后的真实失败次数（供日志）。
+    private static async Task<int> BumpFailureAsync(NpgsqlDataSource ds, long userId, CancellationToken ct)
     {
-        // 失败 5 次以上锁 15 分钟（合理保护，仍可由 admin 解锁）
-        var lockUntil = failed >= 5 ? (DateTime?)DateTime.UtcNow.AddMinutes(15) : null;
+        const int lockThreshold = 5;   // 失败 5 次以上锁 15 分钟（合理保护，仍可由 admin 解锁）
+        const int lockMinutes = 15;
         const string sql = @"
             UPDATE users
-               SET failed_attempts = @n,
-                   locked_until    = CASE WHEN @lock::timestamptz IS NULL THEN locked_until ELSE @lock END
-             WHERE id = @id";
+               SET failed_attempts = failed_attempts + 1,
+                   locked_until = CASE
+                       WHEN failed_attempts + 1 >= @threshold
+                       THEN now() + (@lockMinutes * interval '1 minute')
+                       ELSE locked_until
+                   END
+             WHERE id = @id
+            RETURNING failed_attempts";
         await using var cmd = ds.CreateCommand(sql);
-        cmd.Parameters.AddWithValue("n", NpgsqlDbType.Smallint, (short)Math.Min(failed, short.MaxValue));
-        cmd.Parameters.AddWithValue("lock", NpgsqlDbType.TimestampTz, (object?)lockUntil ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("threshold", NpgsqlDbType.Integer, lockThreshold);
+        cmd.Parameters.AddWithValue("lockMinutes", NpgsqlDbType.Integer, lockMinutes);
         cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, userId);
-        await cmd.ExecuteNonQueryAsync(ct);
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result switch { short s => s, int i => i, long l => (int)l, _ => 0 };
     }
 }
 

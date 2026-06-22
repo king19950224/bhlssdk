@@ -1,7 +1,10 @@
+using System.Security.Claims;
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
+using Npgsql;
 
 namespace BoltPreload.Api.Auth;
 
@@ -58,6 +61,42 @@ public static class JwtAuthExtensions
                     ValidIssuer = jwt.Issuer,
                     ValidAudience = jwt.Audience,
                     IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwt.SigningKey))
+                };
+
+                // H2：令牌通过签名 / 有效期校验后，再比对 users.token_version 与 enabled。
+                // 停用 / 改角色 / 改密码 / 重置 会自增 token_version，使旧令牌立即失效（赋予服务端吊销能力）。
+                // 代价：每个携带 JWT 的请求多一次按主键查询；监测系统 QPS 不高可接受，必要时可加短 TTL 缓存。
+                opts.Events = new JwtBearerEvents
+                {
+                    OnTokenValidated = async ctx =>
+                    {
+                        var principal = ctx.Principal;
+                        var idStr = principal?.FindFirstValue(ClaimTypes.NameIdentifier);
+                        var verStr = principal?.FindFirstValue(BoltPreloadClaims.TokenVersion);
+                        if (!long.TryParse(idStr, out var uid) || !int.TryParse(verStr, out var tokenVer))
+                        {
+                            ctx.Fail("令牌缺少必要声明");
+                            return;
+                        }
+
+                        var ds = ctx.HttpContext.RequestServices.GetRequiredService<NpgsqlDataSource>();
+                        await using var cmd = ds.CreateCommand(
+                            "SELECT token_version, enabled FROM users WHERE id = @id AND deleted_at IS NULL");
+                        cmd.Parameters.AddWithValue("id", uid);
+                        await using var reader = await cmd.ExecuteReaderAsync(ctx.HttpContext.RequestAborted);
+                        if (!await reader.ReadAsync(ctx.HttpContext.RequestAborted))
+                        {
+                            ctx.Fail("用户不存在或已删除");
+                            return;
+                        }
+
+                        var currentVersion = reader.GetInt32(0);
+                        var enabled = reader.GetBoolean(1);
+                        if (!enabled)
+                            ctx.Fail("账号已停用");
+                        else if (currentVersion != tokenVer)
+                            ctx.Fail("令牌已失效（版本不匹配：改密码 / 改角色 / 重新登录后旧令牌作废）");
+                    }
                 };
             });
 

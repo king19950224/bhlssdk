@@ -49,6 +49,25 @@ public class WaveDiagnosticsTests
     }
 
     [Fact]
+    public void Compare_ShiftedFullWidthSignal_WindowedNccStaysNearOne()
+    {
+        // 能量铺满整段的信号平移 40 点：窗口化 NCC 在最佳对齐处应≈1。
+        // 旧实现"重叠区点积 ÷ 全长范数"会被重叠占比拉低（约 0.95 量级），这里用 >0.98 锁定平移鲁棒性修复。
+        const int n = 256, shift = 40;
+        var current = new short[n];
+        var reference = new short[n];
+        for (int i = 0; i < n; i++)
+        {
+            current[i] = (short)(400 * Math.Sin(i * 0.2));
+            reference[i] = (short)(400 * Math.Sin((i - shift) * 0.2));
+        }
+
+        var r = WaveDiagnostics.Compare(Series(current), Series(reference), snrDb: 30);
+
+        r.Similarity.Should().BeGreaterThan(0.98, "窗口化归一化互相关对平移鲁棒，最佳对齐处应接近 1");
+    }
+
+    [Fact]
     public void Compare_HalfAmplitude_SimilarityHighButAttenuationLow()
     {
         // 形态相同、幅度减半：相似度（归一化）仍≈1，但衰减比≈0.5（信号变弱 → 耦合劣化征兆）

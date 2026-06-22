@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Linq;
 using System.Text.Json;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Fx.Models;
@@ -16,6 +18,12 @@ public sealed class LocalFileWaveStoreOptions
 
     /// <summary>截断后保留的最小点数（避免截断后只剩几十个点没有诊断价值）。</summary>
     public int MinPointsAfterTruncate { get; set; } = 256;
+
+    /// <summary>波形文件保留天数。早于此的按日归档目录会被周期清理（防止磁盘无限增长）。&lt;=0 表示不清理。</summary>
+    public int RetentionDays { get; set; } = 30;
+
+    /// <summary>清理周期（小时）。波形是辅助诊断数据，低频清理即可。</summary>
+    public int CleanupIntervalHours { get; set; } = 24;
 }
 
 /// <summary>
@@ -50,7 +58,9 @@ public sealed class LocalFileWaveStore : IWaveStore
         long deviceId, ushort channelNo, DateTimeOffset ts, FxEchoWaveDto wave, CancellationToken ct = default)
     {
         var dayDir = ts.UtcDateTime.ToString("yyyyMMdd");
-        var fileName = $"{ts.ToUnixTimeMilliseconds()}_{wave.WaveData.Length}.json";
+        // 文件名带短 GUID 唯一化：同毫秒同点数的两条测量不会再相互覆盖（旧命名 {ms}_{pts}.json 会 File.Move overwrite）
+        var uniq = Guid.NewGuid().ToString("N")[..8];
+        var fileName = $"{ts.ToUnixTimeMilliseconds()}_{wave.WaveData.Length}_{uniq}.json";
 
         var relPath = Path.Combine(deviceId.ToString(), channelNo.ToString(), dayDir, fileName);
         var absPath = Path.Combine(_opt.RootPath, relPath);
@@ -77,7 +87,8 @@ public sealed class LocalFileWaveStore : IWaveStore
         }
 
         // 原子写：先写 .tmp 再 rename。Rename 是 POSIX 原子操作，断电要么完整要么不存在。
-        var tmpPath = absPath + ".tmp";
+        // 每次写用独立 .tmp（带 GUID），避免并发写共享同一个 .tmp 造成竞态/串扰。
+        var tmpPath = $"{absPath}.{Guid.NewGuid():N}.tmp";
         await File.WriteAllBytesAsync(tmpPath, json, ct);
         File.Move(tmpPath, absPath, overwrite: true);
 
@@ -114,6 +125,99 @@ public sealed class LocalFileWaveStore : IWaveStore
             return null;
 
         return await File.ReadAllBytesAsync(absPath, ct);
+    }
+
+    public Task<bool> DeleteAsync(string relativePath, CancellationToken ct = default)
+    {
+        if (!TryResolveSafePath(relativePath, out var absPath))
+        {
+            _logger.LogWarning("删除波形：非法路径 {Path}", relativePath);
+            return Task.FromResult(false);
+        }
+        try
+        {
+            if (File.Exists(absPath))
+            {
+                File.Delete(absPath);
+                return Task.FromResult(true);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "删除波形文件失败 {Path}", relativePath);
+        }
+        return Task.FromResult(false);
+    }
+
+    // 文件 IO 是同步 API，放到线程池跑，避免在后台清理时占用调用线程。
+    public Task<int> PurgeOlderThanAsync(DateTimeOffset cutoff, IReadOnlySet<string> protectedRelativePaths, CancellationToken ct = default)
+        => Task.Run(() => PurgeCore(cutoff, protectedRelativePaths, ct), ct);
+
+    private int PurgeCore(DateTimeOffset cutoff, IReadOnlySet<string> protectedPaths, CancellationToken ct)
+    {
+        int deleted = 0;
+        // 1. 清扫崩溃残留的 .tmp（成功写入会立即 rename，存活的 .tmp 一定是半截文件）
+        deleted += CleanupTempFiles();
+
+        if (!Directory.Exists(_rootAbs)) return deleted;
+
+        // 2. 删除早于 cutoff 当天的归档：{root}/{deviceId}/{channelNo}/{yyyyMMdd}/
+        //    逐文件删（而非整目录），以便跳过被保护的参考波形文件（参考基线可能比 cutoff 更老但仍在用）。
+        var cutoffDay = cutoff.UtcDateTime.Date;
+        foreach (var deviceDir in Directory.EnumerateDirectories(_rootAbs))
+        {
+            foreach (var channelDir in Directory.EnumerateDirectories(deviceDir))
+            {
+                foreach (var dayDir in Directory.EnumerateDirectories(channelDir))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var name = Path.GetFileName(dayDir);
+                    if (!DateTime.TryParseExact(name, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day))
+                        continue;
+                    if (day.Date >= cutoffDay) continue;
+                    try
+                    {
+                        foreach (var file in Directory.EnumerateFiles(dayDir))
+                        {
+                            var rel = Path.GetRelativePath(_rootAbs, file).Replace('\\', '/');
+                            if (protectedPaths.Contains(rel)) continue;  // 保护：参考波形文件不清
+                            File.Delete(file);
+                            deleted++;
+                        }
+                        // 目录清空后再删；仍含被保护文件则保留目录
+                        if (!Directory.EnumerateFileSystemEntries(dayDir).Any())
+                            Directory.Delete(dayDir);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "清理波形日目录失败 {Dir}", dayDir);
+                    }
+                }
+            }
+        }
+        if (deleted > 0)
+            _logger.LogInformation("波形清理完成：删除 {Count} 个文件（cutoff={Cutoff:yyyy-MM-dd}）", deleted, cutoffDay);
+        return deleted;
+    }
+
+    /// <summary>清扫根目录下所有残留 .tmp（断电/崩溃在 rename 前留下的半截文件）。返回删除数。</summary>
+    private int CleanupTempFiles()
+    {
+        int n = 0;
+        try
+        {
+            if (!Directory.Exists(_rootAbs)) return 0;
+            foreach (var tmp in Directory.EnumerateFiles(_rootAbs, "*.tmp", SearchOption.AllDirectories))
+            {
+                try { File.Delete(tmp); n++; }
+                catch { /* best-effort，单个删失败不影响其它 */ }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "清扫残留 .tmp 失败");
+        }
+        return n;
     }
 
     /// <summary>

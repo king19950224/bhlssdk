@@ -29,6 +29,10 @@ public sealed class FxSdkConnector : IFxConnector
     private string? _sessionId;
     private bool _disposed;
 
+    // H3：背压丢弃计数 + 告警节流时间戳
+    private long _dropped;
+    private long _lastOverflowWarnTicks;
+
     // 重连时 Close 与 Connect 之间的间隔：给旧 TCP 会话/socket 完全拆除的时间
     //（厂家重连参考实现 CloseAsync 后用 100ms，这里取稍保守的 200ms）
     private const int ReconnectGapMs = 200;
@@ -44,6 +48,8 @@ public sealed class FxSdkConnector : IFxConnector
     public long DeviceId => _deviceId;
     public FxConnectorState State { get; private set; } = FxConnectorState.Idle;
     public ChannelReader<FxDecodedEnvelope> Results => _channel.Reader;
+    public long DroppedCount => Interlocked.Read(ref _dropped);
+    public Func<FxDecodedEnvelope, ValueTask>? OverflowSink { get; set; }
 
     public FxSdkConnector(
         long deviceId,
@@ -56,10 +62,12 @@ public sealed class FxSdkConnector : IFxConnector
         _initialChannelConfigs = (initialChannelConfigs ?? Array.Empty<ChannelConfig>()).ToArray();
         _logger = logger;
         _client = new FxClient();
+        // FullMode=Wait：让 TryWrite 满时返回 false，从而能精确统计背压丢弃并在丢弃前落 WAL 兜底（H3）。
+        // 实际不会阻塞——写入端只用非阻塞 TryWrite（见 BackpressureWriter），满时手动丢最旧腾位。
         _channel = System.Threading.Channels.Channel.CreateBounded<FxDecodedEnvelope>(
             new BoundedChannelOptions(capacity: 8192)
             {
-                FullMode = BoundedChannelFullMode.DropOldest,
+                FullMode = BoundedChannelFullMode.Wait,
                 SingleReader = false,
                 SingleWriter = true
             });
@@ -341,11 +349,24 @@ public sealed class FxSdkConnector : IFxConnector
             UpdateRecalibrateCache(result);
 
             var envelope = ConvertResult(result, now);
-            if (envelope is not null && !_channel.Writer.TryWrite(envelope))
-            {
-                _logger.LogWarning("FxSdk 结果通道已满，丢弃 device={DeviceId}", _deviceId);
-            }
+            if (envelope is null) continue;
+
+            // H3：背压可观测 + 丢弃前落 WAL 兜底（旧实现 DropOldest 静默丢数，"通道已满"日志是死代码）。
+            var dropped = BackpressureWriter.WriteWithBackpressure(_channel, envelope, ref _dropped, OverflowSink);
+            if (dropped > 0) WarnOverflowThrottled(dropped);
         }
+    }
+
+    /// <summary>背压丢弃告警（节流：每设备每秒最多一条，避免高频刷屏）。</summary>
+    private void WarnOverflowThrottled(int droppedThisBatch)
+    {
+        var now = DateTime.UtcNow.Ticks;
+        var last = Interlocked.Read(ref _lastOverflowWarnTicks);
+        if (now - last < TimeSpan.TicksPerSecond) return;
+        if (Interlocked.CompareExchange(ref _lastOverflowWarnTicks, now, last) != last) return;
+        _logger.LogWarning(
+            "FxSdk 结果通道背压丢弃（消费跟不上，DB 慢?）device={DeviceId} 本批丢弃={Dropped} 累计丢弃={Total} WAL兜底={Wal}",
+            _deviceId, droppedThisBatch, DroppedCount, OverflowSink is not null);
     }
 
     /// <summary>
@@ -578,11 +599,15 @@ public sealed class FxSdkConnector : IFxConnector
 
     private static FxDeviceParameterDto ToDto(DeviceParameter dp)
     {
+        // ReadChannelParam("LEchoWave") 响应里 ParamValue 是 SDK 的 EchoWave —— 必须解耦成 FxEchoWaveDto，
+        // 否则 PostgresMeasurementSink 的 `case FxEchoWaveDto` 永不命中，主动采集的波形会被当成大 JSON
+        // 塞进 device_parameter_history，而不是落 WaveStore + wave_features（波形诊断数据源）。
+        var value = dp.ParamValue is EchoWave ew ? ToDto(ew) : dp.ParamValue;
         return new FxDeviceParameterDto(
             Address: dp.Address,
             Channel: dp.Channel,
             ParamName: dp.ParamName,
-            ParamValue: dp.ParamValue);
+            ParamValue: value);
     }
 
     private static FxChannelResultDto ToDto(ChannelResult cr)
