@@ -12,6 +12,13 @@ const username = ref('')
 const password = ref('')
 const loading = ref(false)
 
+// 只接受站内绝对路径作为登录后跳转目标，挡住 open-redirect（//host、http(s)://、/\ 反斜杠变体）。
+function safeRedirect(r: unknown): string | null {
+  if (typeof r !== 'string' || !r.startsWith('/')) return null
+  if (r.startsWith('//') || r.startsWith('/\\')) return null
+  return r
+}
+
 async function submit() {
   if (!username.value || !password.value) {
     ElMessage.warning('请输入用户名和密码')
@@ -20,7 +27,7 @@ async function submit() {
   loading.value = true
   try {
     await auth.login(username.value, password.value)
-    router.replace((route.query.r as string) || { name: auth.homeName })
+    router.replace(safeRedirect(route.query.r) ?? { name: auth.homeName })
   } catch (e) {
     ElMessage.error((e as Error)?.message || '登录失败')
   } finally {

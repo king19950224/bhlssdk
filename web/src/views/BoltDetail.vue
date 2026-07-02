@@ -4,7 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import EChart from '../components/EChart.vue'
 import PreloadScale from '../components/PreloadScale.vue'
-import { computePreloadHealth, pct, signedN } from '../utils/preload'
+import { computePreloadHealth, pct, signedN, fmtAgo } from '../utils/preload'
+import { useNow } from '../utils/useNow'
 import { analyzeAscan } from '../utils/ascan'
 import { boltApi, alarmApi, auditApi, waveApi, configChangeApi, deviceApi, calibrationApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction } from '../api'
 import { onRealtime } from '../api/realtime'
@@ -69,10 +70,19 @@ const STATUS: Record<string, { label: string; color: string; cls: string }> = {
 // 标定方法枚举的中文映射（与标定中心/标定弹窗保持一致，未知值回退原值）
 const METHOD_LABEL: Record<string, string> = {
   load_calibrated: '正式载荷标定', gb_single_wave: 'GB 单波法', gb_bi_wave: 'GB 双波法',
-  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定',
+  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定', sim_baseline: '仿真基线（演示）',
 }
-const num = (v: number | string | null | undefined) => (v == null ? null : Number(v))
+// 通道标定生命周期状态：仅在「过期/停用」时覆盖标签（避免把仍有 K_L、在出数的临时标定误标为未标定），
+// 其余回退到 calibrated 布尔。让「标定过期」不再笼统显示为「已标定」，与总览「未标定/过期」桶口径一致。
+const STATE_LABEL: Record<string, string> = { expired: '标定过期', disabled: '已停用' }
+const num = (v: number | string | null | undefined) => {
+  if (v == null) return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
 
+// 让 stale/nodata 判定与「N 分钟前」随时间刷新（离线后不再卡在最后一次加载的判定）
+const now = useNow(30000)
 // 统一的"状态 + 变化程度"模型（与服务端 bolt_status 口径一致）
 const health = computed(() =>
   computePreloadHealth({
@@ -81,9 +91,17 @@ const health = computed(() =>
     current: bolt.value?.lastPreloadN ?? null,
     target: bolt.value?.targetPreloadN ?? null,
     min: bolt.value?.minPreloadN ?? null,
-  }),
+  }, now.value),
 )
 const status = computed(() => health.value.status)
+// 数据陈旧（nodata = 无有效预紧力或超过 10 分钟无新测量）时：头部数值标注为「最后已知」，并抑制趋势预测（陈旧/稀疏样本外推不可信）
+const isStale = computed(() => status.value === 'nodata')
+const liveLabel = computed(() => (isStale.value ? '最后已知' : '当前'))
+// 区分两类 nodata：设备失联（>10min 无测量）vs 信号丢失（有测量但无有效预紧力读数），文案分别表述
+const offlineStale = computed(() => {
+  const t = bolt.value?.lastTs
+  return !t || now.value - new Date(t).getTime() > 10 * 60000
+})
 
 const marginStyle = computed(() => {
   const m = health.value.safetyMargin
@@ -263,6 +281,10 @@ async function countersign(c: CalibRecord) {
 }
 
 onMounted(async () => {
+  if (!Number.isFinite(boltId)) {
+    ElMessage.error('无效的螺栓 ID')
+    return
+  }
   try {
     bolt.value = (await boltApi.list()).items.find((b) => b.id === boltId) ?? null
     await loadTrend()
@@ -270,16 +292,21 @@ onMounted(async () => {
     measurements.value = (await boltApi.measurements(boltId, 24)).items
     if (bolt.value) {
       calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items
-      const [al, au] = await Promise.all([
-        alarmApi.list('?includeCleared=true&limit=200'),
-        auditApi.query(`?targetId=${bolt.value.channelId}&limit=80`),
-      ])
+      const al = await alarmApi.list('?includeCleared=true&limit=200')
+      // 审计履历是 reviewer+ 专属接口：operator 请求会 403。仅 reviewer 拉取，且单独 try 兜底，
+      // 避免因审计 403 让 Promise.all 整体失败、后续波形/实时订阅不执行（operator 打开详情页残缺）。
+      let auditItems: { at: string; action: string; note: string | null }[] = []
+      if (auth.isReviewer) {
+        try {
+          auditItems = (await auditApi.query(`?targetId=${bolt.value.channelId}&limit=80`)).items
+        } catch { /* 审计不可用不阻断本页其它区块 */ }
+      }
       const ev: typeof events.value = []
       for (const c of calibrations.value)
         ev.push({ at: c.createdAt, kind: 'calib', title: `标定 · ${c.method}`, note: c.passed ? '通过' : '未通过', color: c.passed ? '#10b981' : '#f43f5e' })
       for (const a of al.items.filter((x) => x.boltId === boltId))
         ev.push({ at: a.triggeredAt, kind: 'alarm', title: `告警 · ${a.type}`, note: a.message || '', color: '#f59e0b' })
-      for (const e of au.items)
+      for (const e of auditItems)
         ev.push({ at: e.at, kind: 'audit', title: e.action, note: e.note || '', color: '#38bdf8' })
       events.value = ev.sort((x, y) => new Date(y.at).getTime() - new Date(x.at).getTime())
 
@@ -490,8 +517,8 @@ const trendOption = computed(() => {
     },
   ]
 
-  // 到限投影：把下降预测画到图上（从最后点外推到下限）
-  if (prediction.value?.trend === 'falling' && prediction.value.days != null && min != null) {
+  // 到限投影：把下降预测画到图上（从最后点外推到下限）。数据陈旧时不外推，避免误导。
+  if (!isStale.value && prediction.value?.trend === 'falling' && prediction.value.days != null && min != null) {
     const last = [...pts].reverse().find((p) => p.avgPreloadN != null)
     if (last) {
       const x0 = t(last), y0 = Number(last.avgPreloadN)
@@ -543,20 +570,41 @@ function ratioStr(r: number | null | undefined) {
           <h2>{{ bolt.code }}</h2>
           <span class="status-tag" :style="`color:${STATUS[status].color};border-color:${STATUS[status].color}`">{{ STATUS[status].label }}</span>
         </div>
-        <div class="head-sub">{{ bolt.nominalDiam }} · {{ bolt.grade }} 级 · CH{{ bolt.channelNo }} · {{ bolt.calibrated ? '已标定' : '未标定' }}</div>
+        <div class="head-sub">{{ bolt.nominalDiam }} · {{ bolt.grade }} 级 · CH{{ bolt.channelNo }} · {{ STATE_LABEL[bolt.state] || (bolt.calibrated ? '已标定' : '未标定') }}</div>
       </div>
-      <div class="head-metrics">
-        <div class="hm"><span class="hm-k">当前预紧力</span><b class="metric" :style="`color:${STATUS[status].color}`">{{ fmtN(bolt.lastPreloadN) }}<i>N</i></b></div>
-        <div class="hm"><span class="hm-k">当前比值</span><b class="metric">{{ ratioStr(bolt.lastRatio) }}</b></div>
-        <div class="hm"><span class="hm-k">目标 / 下限</span><b class="metric small">{{ fmtN(bolt.targetPreloadN) }} / {{ fmtN(bolt.minPreloadN) }}</b></div>
-        <div class="hm"><span class="hm-k">温度</span><b class="metric small">{{ bolt.lastSpTempC != null ? Number(bolt.lastSpTempC).toFixed(1) + '°C' : '—' }}</b></div>
+    </div>
+
+    <!-- 关键指标卡（Grafana stat 风） -->
+    <div class="kpi-row" v-if="bolt">
+      <div class="stat panel" :class="status === 'loose' ? 'stat--crit' : status === 'normal' ? 'stat--ok' : ''">
+        <div class="stat-hd"><span class="stat-label">{{ liveLabel }}预紧力</span><span class="led" :class="STATUS[status].cls" /></div>
+        <div class="stat-val metric" :style="`color:${STATUS[status].color}`">{{ fmtN(bolt.lastPreloadN) }}<i>N</i></div>
       </div>
+      <div class="stat panel">
+        <div class="stat-hd"><span class="stat-label">{{ liveLabel }}比值</span><el-icon class="stat-ic"><Odometer /></el-icon></div>
+        <div class="stat-val metric">{{ ratioStr(bolt.lastRatio) }}</div>
+      </div>
+      <div class="stat panel">
+        <div class="stat-hd"><span class="stat-label">目标 / 下限</span><el-icon class="stat-ic"><Aim /></el-icon></div>
+        <div class="stat-val metric stat-val--sm">{{ fmtN(bolt.targetPreloadN) }} / {{ fmtN(bolt.minPreloadN) }}</div>
+      </div>
+      <div class="stat panel">
+        <div class="stat-hd"><span class="stat-label">温度</span><el-icon class="stat-ic"><Sunny /></el-icon></div>
+        <div class="stat-val metric stat-val--sm">{{ bolt.lastSpTempC != null ? Number(bolt.lastSpTempC).toFixed(1) + '°C' : '—' }}</div>
+      </div>
+    </div>
+
+    <!-- 失联 / 数据陈旧横幅：明确标出数值为「最后已知」、趋势预测暂不可信，避免误读为实时 -->
+    <div v-if="bolt && isStale" class="stale-banner">
+      <el-icon><WarningFilled /></el-icon>
+      <span v-if="offlineStale">该通道已 <b>{{ fmtAgo(bolt.lastTs, now) }}</b> 无新测量（设备离线 / 失联）。下列数值为<b>最后已知值</b>，趋势预测已暂停。</span>
+      <span v-else>最近一次测量<b>未得到有效预紧力读数</b>（信号丢失：探头脱落 / 接头松动 / 无回波）。下列为<b>最后已知值</b>，趋势预测已暂停。</span>
     </div>
 
     <!-- 状态 · 预紧力变化程度 -->
     <div class="panel panel--glow" v-if="bolt">
       <div class="panel-hd">
-        <span class="panel-title">状态 · 预紧力变化程度</span>
+        <span class="panel-title"><i class="hd-mark" :class="status === 'loose' ? 'hd-mark--crit' : status === 'warn' ? 'hd-mark--warn' : status === 'normal' ? 'hd-mark--ok' : ''" />状态 · 预紧力变化程度</span>
         <span class="hd-right chg-reason">
           <span v-if="health.relax" class="relax-tag" :style="`color:${health.relax.color};border-color:${health.relax.color}`">{{ health.relax.label }}</span>
           {{ health.reason }}
@@ -565,7 +613,7 @@ function ratioStr(r: number | null | undefined) {
       <div class="chg-body">
         <div class="chg-metrics">
           <div class="cm">
-            <span class="cm-k">残余预紧力率</span>
+            <span class="cm-k">预紧力保持率</span>
             <b class="cm-v" :style="`color:${health.meta.color}`">{{ pct(health.residualRatio) }}</b>
             <span class="cm-i">当前 / 目标</span>
           </div>
@@ -581,11 +629,12 @@ function ratioStr(r: number | null | undefined) {
           </div>
           <div class="cm">
             <span class="cm-k">变化速率</span>
-            <b class="cm-v" :class="prediction?.trend === 'falling' ? 'rate-down' : ''">
-              {{ !prediction || prediction.trend === 'insufficient' ? '—' : prediction.trend === 'stable' ? '平稳' : signedN(prediction.perDay) + ' N/天' }}
+            <b class="cm-v" :class="!isStale && prediction?.trend === 'falling' ? 'rate-down' : ''">
+              {{ isStale ? '—' : !prediction || prediction.trend === 'insufficient' ? '—' : prediction.trend === 'stable' ? '平稳' : signedN(prediction.perDay) + ' N/天' }}
             </b>
             <span class="cm-i">
-              <template v-if="prediction?.trend === 'falling' && prediction.days != null">约 {{ Math.max(0, Math.round(prediction.days)) }} 天到下限</template>
+              <template v-if="isStale">数据陈旧 · 暂不预测</template>
+              <template v-else-if="prediction?.trend === 'falling' && prediction.days != null">约 {{ Math.max(0, Math.round(prediction.days)) }} 天到下限</template>
               <template v-else-if="prediction?.trend === 'insufficient'">样本不足({{ prediction.samples }})</template>
               <template v-else>近{{ prediction?.windowDays ?? 7 }}天{{ prediction?.r2 != null ? ' · R² ' + prediction.r2.toFixed(2) : '' }}</template>
             </span>
@@ -598,7 +647,7 @@ function ratioStr(r: number | null | undefined) {
     <!-- 趋势 -->
     <div class="panel panel--glow">
       <div class="panel-hd">
-        <span class="panel-title">预紧力趋势</span>
+        <span class="panel-title"><i class="hd-mark" />预紧力趋势</span>
         <div class="trend-ctrls">
           <span class="temp-toggle" :class="{ active: showTemp }" @click="showTemp = !showTemp"><el-icon><Sunny /></el-icon> 温度</span>
           <div class="range-tabs">
@@ -608,7 +657,12 @@ function ratioStr(r: number | null | undefined) {
       </div>
       <EChart :option="trendOption" height="280px" />
       <div v-if="!loading && !trend.length" class="chart-empty">该时段无测量数据</div>
-      <div v-if="prediction && prediction.trend !== 'insufficient'" class="predict" :class="prediction.trend === 'falling' ? (prediction.days != null && prediction.days < 30 ? 'crit' : 'warn') : 'ok'">
+      <div v-if="isStale && !loading && trend.length" class="predict stale">
+        <el-icon><WarningFilled /></el-icon>
+        <span v-if="offlineStale">数据已陈旧（{{ fmtAgo(bolt?.lastTs, now) }}无新测量），趋势预测已暂停，恢复采集后自动恢复。</span>
+        <span v-else>无近期有效读数（信号丢失），趋势预测已暂停，恢复有效采集后自动恢复。</span>
+      </div>
+      <div v-else-if="prediction && prediction.trend !== 'insufficient'" class="predict" :class="prediction.trend === 'falling' ? (prediction.days != null && prediction.days < 30 ? 'crit' : 'warn') : 'ok'">
         <el-icon><component :is="prediction.trend === 'falling' ? 'Bottom' : prediction.trend === 'rising' ? 'Top' : 'Minus'" /></el-icon>
         <span v-if="prediction.trend === 'falling'">
           预紧力下降中 · 约 {{ Math.abs(prediction.perDay).toFixed(0) }} N/天 ·
@@ -623,11 +677,12 @@ function ratioStr(r: number | null | undefined) {
     <!-- 实时回波波形 A-Scan + 松紧状态 -->
     <div class="panel panel--glow">
       <div class="panel-hd">
-        <span class="panel-title">实时回波波形 A-Scan <span v-if="live" class="live-dot" /></span>
+        <span class="panel-title"><i class="hd-mark" />实时回波波形 A-Scan <span v-if="live" class="live-dot" /></span>
         <div class="ascan-hd">
           <span v-if="waveStats" class="mono ascan-meta">检出 {{ waveStats.detNs.toFixed(0) }}ns · SNR {{ waveFeat?.snrDb != null ? Number(waveFeat.snrDb).toFixed(1) : '—' }}dB · 阈值 {{ wave?.threshold ?? '—' }}</span>
           <span class="ascan-ctrl" :class="{ active: live }" @click="toggleLive"><el-icon><component :is="live ? 'VideoPause' : 'VideoPlay'" /></el-icon> {{ live ? '实时' : '已暂停' }}</span>
-          <el-button size="small" :loading="baselining" @click="setBaseline"><el-icon><Aim /></el-icon> 设当前为基线</el-button>
+          <!-- 重标定(设基线)后端要求 reviewer+：非复核员隐藏按钮，避免点击必 403 的误导 -->
+          <el-button v-if="auth.isReviewer" size="small" :loading="baselining" @click="setBaseline"><el-icon><Aim /></el-icon> 设当前为基线</el-button>
         </div>
       </div>
 
@@ -666,8 +721,9 @@ function ratioStr(r: number | null | undefined) {
     <!-- 通道超声参数 + 标定基线 -->
     <div class="panel panel--glow" v-if="chCfg">
       <div class="panel-hd">
-        <span class="panel-title">通道超声参数 · 标定基线</span>
-        <el-button size="small" @click="openAdjust"><el-icon><MagicStick /></el-icon> 调整参数(提交审批)</el-button>
+        <span class="panel-title"><i class="hd-mark" />通道超声参数 · 标定基线</span>
+        <!-- 提交参数变更请求走 diagnostic 组，后端要求 reviewer+：非复核员隐藏 -->
+        <el-button v-if="auth.isReviewer" size="small" @click="openAdjust"><el-icon><MagicStick /></el-icon> 调整参数(提交审批)</el-button>
       </div>
       <div class="cfg-grid">
         <div class="cfg-cell"><span class="cfg-k">设备 / 通道</span><b class="mono">#{{ chCfg.deviceId }} · CH{{ chCfg.channelNo }}</b></div>
@@ -690,7 +746,7 @@ function ratioStr(r: number | null | undefined) {
     <!-- 测量 + 标定 -->
     <div class="two-col">
       <div class="panel panel--glow">
-        <div class="panel-hd"><span class="panel-title">近期测量</span></div>
+        <div class="panel-hd"><span class="panel-title"><i class="hd-mark" />近期测量</span></div>
         <div class="tbl">
           <div class="tr th"><span>时间</span><span>声时 ns</span><span>温度</span><span>状态</span></div>
           <div v-for="(m, i) in measurements" :key="i" class="tr">
@@ -704,7 +760,7 @@ function ratioStr(r: number | null | undefined) {
       </div>
 
       <div class="panel panel--glow">
-        <div class="panel-hd"><span class="panel-title">标定档案</span></div>
+        <div class="panel-hd"><span class="panel-title"><i class="hd-mark" />标定档案</span></div>
         <ul class="calib-list">
           <li v-for="c in calibrations" :key="c.id">
             <div class="cl-left">
@@ -734,7 +790,7 @@ function ratioStr(r: number | null | undefined) {
 
     <!-- 螺栓履历 -->
     <div class="panel panel--glow">
-      <div class="panel-hd"><span class="panel-title">螺栓履历</span></div>
+      <div class="panel-hd"><span class="panel-title"><i class="hd-mark" />螺栓履历</span></div>
       <ul class="timeline">
         <li v-for="(e, i) in events" :key="i">
           <span class="tl-dot" :style="`background:${e.color}`" />
@@ -794,17 +850,25 @@ function ratioStr(r: number | null | undefined) {
 .bd-back:hover { color: var(--accent); }
 .form-sec { font-size: 12px; color: var(--accent-2); letter-spacing: 0.06em; margin: 2px 0 14px; padding-bottom: 7px; border-bottom: 1px solid var(--hairline); }
 
-.head { display: flex; align-items: center; justify-content: space-between; padding: 22px 26px; gap: 24px; flex-wrap: wrap; }
+.stale-banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 16px; border-radius: var(--radius-sm);
+  background: rgba(148, 163, 184, 0.07); border: 1px solid var(--hairline);
+  color: var(--text-2); font-size: 13px; line-height: 1.5;
+}
+.stale-banner .el-icon { color: var(--warn); font-size: 17px; flex-shrink: 0; }
+.stale-banner b { color: var(--text-1); font-weight: 700; }
+
+.head { display: flex; align-items: center; justify-content: space-between; padding: 20px 24px; gap: 24px; flex-wrap: wrap; }
 .head-top { display: flex; align-items: center; gap: 12px; }
 .head-top h2 { margin: 0; font-size: 24px; font-weight: 700; }
 .status-tag { font-size: 12px; padding: 2px 10px; border: 1px solid; border-radius: 12px; }
 .head-sub { color: var(--text-3); font-size: 13px; margin-top: 8px; }
-.head-metrics { display: flex; gap: 30px; }
-.hm { display: flex; flex-direction: column; gap: 5px; }
-.hm-k { font-size: 11px; color: var(--text-3); letter-spacing: 0.08em; }
-.hm b { font-size: 24px; font-weight: 700; }
-.hm b.small { font-size: 16px; color: var(--text-2); }
-.hm b i { font-size: 13px; color: var(--text-3); font-style: normal; margin-left: 3px; }
+
+/* 关键指标卡：套用全局 .stat（.stat-val--sm 用于较长的双值/温度） */
+.kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.stat-val.stat-val--sm { font-size: 18px; }
+@media (max-width: 760px) { .kpi-row { grid-template-columns: repeat(2, 1fr); } }
 
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 4px; }
 .chg-reason { display: inline-flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-2); }
@@ -865,13 +929,17 @@ function ratioStr(r: number | null | undefined) {
 @media (max-width: 1100px) { .cfg-grid { grid-template-columns: repeat(3, 1fr); } }
 
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.tbl { padding: 6px 16px 16px; }
-.tr { display: grid; grid-template-columns: 1.6fr 1fr 1fr 0.5fr; align-items: center; padding: 8px 6px; border-bottom: 1px solid var(--hairline); font-size: 12.5px; }
-.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; }
+.tbl { padding: 4px 12px 16px; }
+.tr { display: grid; grid-template-columns: 1.6fr 1fr 1fr 0.5fr; align-items: center; padding: 9px 8px; border-radius: 8px; font-size: 12.5px; }
+.tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
+.tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
+.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
 .tbl-empty, .calib-empty { color: var(--text-3); font-size: 13px; padding: 16px 6px; text-align: center; }
 
-.calib-list { list-style: none; margin: 0; padding: 6px 16px 16px; }
-.calib-list li { display: flex; align-items: center; justify-content: space-between; padding: 11px 6px; border-bottom: 1px solid var(--hairline); }
+.calib-list { list-style: none; margin: 0; padding: 4px 12px 16px; }
+.calib-list li { display: flex; align-items: center; justify-content: space-between; padding: 11px 8px; border-radius: 8px; }
+.calib-list li:not(.calib-empty) { box-shadow: inset 0 -1px 0 var(--hairline); }
+.calib-list li:not(.calib-empty):hover { background: rgba(56, 189, 248, 0.05); }
 .cl-left { display: flex; align-items: center; gap: 11px; }
 .cl-method { font-size: 13px; font-weight: 600; }
 .cl-active { font-size: 10px; color: var(--accent); border: 1px solid var(--panel-border-strong); border-radius: 8px; padding: 1px 6px; margin-left: 6px; }
@@ -889,6 +957,7 @@ function ratioStr(r: number | null | undefined) {
 .predict.ok { color: var(--ok); border-color: rgba(16, 185, 129, 0.3); background: rgba(16, 185, 129, 0.06); }
 .predict.warn { color: var(--warn); border-color: rgba(245, 158, 11, 0.3); background: rgba(245, 158, 11, 0.07); }
 .predict.crit { color: var(--crit); border-color: rgba(244, 63, 94, 0.35); background: rgba(244, 63, 94, 0.08); }
+.predict.stale { color: var(--text-3); border-color: var(--hairline); background: rgba(148, 163, 184, 0.05); }
 .predict b { font-weight: 700; }
 .predict-conf { margin-left: auto; font-size: 11px; color: var(--text-3); white-space: nowrap; opacity: 0.85; }
 

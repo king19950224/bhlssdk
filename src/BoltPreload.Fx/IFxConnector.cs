@@ -98,6 +98,13 @@ public interface IFxConnector : IAsyncDisposable
 
     /// <summary>返回已注入 SDK SessionContext 的通道配置快照（仅诊断用）</summary>
     IReadOnlyList<FxSessionChannelConfigSnapshot> GetSessionChannelConfigs();
+
+    /// <summary>
+    /// 当前设备端 MCR 轮询启用的通道集（实时会话状态）。ProbeScan 扫描前据此快照，扫描后恢复业务通道集——
+    /// 比读 DB 的 sampling_enabled 标志更可靠（后者可能与设备实际 MCR 不同步）。
+    /// 默认返回空（无 MCR 概念的实现，如模拟器 / 测试桩）。
+    /// </summary>
+    IReadOnlyList<ushort> GetSessionMcrChannels() => Array.Empty<ushort>();
 }
 
 /// <summary>重标定结果</summary>

@@ -60,11 +60,14 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
             throw new ProbeScanConflictException("ProbeScanState 占位失败", runId);
         }
 
-        // Task.Run 跑主流程；不要让 HTTP 请求 hold 几分钟
-        // 显式传 handle.Cts.Token：扫描的"主取消令牌"是 ProbeScanState 里的 Cts，
-        // 不能跟着 HTTP 请求的 ct 走（请求一返回，ct 就被释放，扫描会被立刻取消）
+        // Task.Run 跑主流程；不要让 HTTP 请求 hold 几分钟。
+        // scanCt（ProbeScanState 里的 Cts）是扫描的"主取消令牌"，作为参数传进 RunInternalAsync，
+        // 由其内部循环 / finally 响应取消并清理。
+        // 调度用 CancellationToken.None：若在此前一刻被 TryAbort 取消，用 scanCt 调度会让 Task.Run
+        // 直接判为 Canceled 而【不执行方法体】→ RunInternalAsync 的 finally（含 _state.End）永不运行，
+        // 设备会被永久卡在 IsRunning。用 None 调度可保证方法体一定执行、finally 一定清理。
         var scanCt = handle.Cts.Token;
-        _ = Task.Run(() => RunInternalAsync(req, runId, scanCt), scanCt);
+        _ = Task.Run(() => RunInternalAsync(req, runId, scanCt), CancellationToken.None);
 
         return await _repo.LoadRunAsync(runId, ct)
                ?? throw new InvalidOperationException("插入后查询不到 scan run");
@@ -88,13 +91,20 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
 
         // 扫描开始前快照"业务期启用通道集"。mcr_single 策略每次只把单个通道写进 MCR，
         // 扫描完成后必须把这份快照恢复回去，否则业务监测会只跑最后扫描的那个通道。
+        // 优先用连接器【实时设备 MCR】快照（扫描前设备真实在轮询的通道集）；它比 DB 的 sampling_enabled
+        // 标志更可靠（后者可能与设备实际 MCR 不同步）。实时 MCR 为空再回退 DB。
         IReadOnlyList<ushort> originalEnabledChannels = Array.Empty<ushort>();
+        bool snapshotFailed = false;
         try
         {
-            originalEnabledChannels = await _repo.LoadEnabledChannelsAsync(req.DeviceId, ct);
+            var liveMcr = connector.GetSessionMcrChannels();
+            originalEnabledChannels = liveMcr.Count > 0
+                ? liveMcr
+                : await _repo.LoadEnabledChannelsAsync(req.DeviceId, ct);
         }
         catch (Exception ex)
         {
+            snapshotFailed = true;
             _logger.LogError(ex, "扫描启动：读取原始 MCR 通道快照失败 device={DeviceId}（mcr_single 策略下恢复可能不准）",
                 req.DeviceId);
         }
@@ -110,6 +120,12 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
             _logger.LogInformation(
                 "开始通道扫描 device={DeviceId} run={RunId} channels={ChCount} strategy={Strategy} originalMCR={Mcr}",
                 req.DeviceId, runId, req.Channels.Count, req.Strategy, originalEnabledChannels.Count);
+
+            // mcr_single 会逐通道改写 MCR，扫完必须用快照恢复原通道集。若快照【读取失败】(异常) 则无从恢复：
+            // 与其扫完把业务监测只留在最后一个通道，不如在改动任何 MCR 之前直接失败（此刻尚未动过 MCR）。
+            if (req.Strategy == "mcr_single" && snapshotFailed)
+                throw new InvalidOperationException(
+                    "mcr_single 策略读取原始 MCR 通道快照失败，已在改动 MCR 前中止扫描，避免扫描后无法恢复业务通道集");
 
             foreach (var ch in req.Channels)
             {
@@ -142,15 +158,26 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
             // mcr_single 策略每次只把单个通道写进 MCR，必须先恢复 MCR 通道集，再切回 MultiMeas
             try
             {
-                if (req.Strategy == "mcr_single" && originalEnabledChannels.Count > 0)
+                if (req.Strategy == "mcr_single")
                 {
-                    await connector.ConfigureMultiChannelPollingAsync(
-                        originalEnabledChannels,
-                        singleCount: 1, dailyCount: 0, startSeconds: null,
-                        cancellationToken: CancellationToken.None);
-                    _logger.LogInformation(
-                        "扫描完成，已恢复 MCR 通道集 device={DeviceId} channels={Count}",
-                        req.DeviceId, originalEnabledChannels.Count);
+                    if (originalEnabledChannels.Count > 0)
+                    {
+                        await connector.ConfigureMultiChannelPollingAsync(
+                            originalEnabledChannels,
+                            singleCount: 1, dailyCount: 0, startSeconds: null,
+                            cancellationToken: CancellationToken.None);
+                        _logger.LogInformation(
+                            "扫描完成，已恢复 MCR 通道集 device={DeviceId} channels={Count}",
+                            req.DeviceId, originalEnabledChannels.Count);
+                    }
+                    else
+                    {
+                        // 既无实时 MCR 也无 DB 启用通道可恢复：设备端 MCR 可能仍停在最后扫描通道。
+                        // 显式告警而非静默——运维需重新下发业务 MCR 或核对 sampling_enabled。
+                        _logger.LogWarning(
+                            "扫描完成但无原始 MCR 通道集可恢复 device={DeviceId}：设备端 MCR 可能仅剩最后扫描通道，" +
+                            "请重新下发业务多通道轮询配置或核对 channels.sampling_enabled", req.DeviceId);
+                    }
                 }
 
                 await connector.SetWorkModeAsync(originalMode, channel: 0, address: address, CancellationToken.None);

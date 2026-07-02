@@ -47,7 +47,10 @@ public sealed class SimulatedCalibrationProvisioner : IHostedService
 
     private async Task ProvisionAsync(CancellationToken ct)
     {
-        var deviceId = _cfg.GetValue<long>("Fx:Simulator:DeviceId", 1);
+        // 多模拟器：DeviceConnectorManager 会建 deviceId = DeviceId .. DeviceId+DeviceCount-1 个模拟器，
+        // 标定供给必须覆盖全部，否则除首台外的模拟设备通道无 sim 标定、预紧力走 raw/null（仿真链路不完整）。
+        var baseDeviceId = _cfg.GetValue<long>("Fx:Simulator:DeviceId", 1);
+        var deviceCount = Math.Max(1, _cfg.GetValue<int>("Fx:Simulator:DeviceCount", 1));
 
         long? userId = null;
         await using (var u = _ds.CreateCommand(
@@ -61,6 +64,18 @@ public sealed class SimulatedCalibrationProvisioner : IHostedService
             return;
         }
 
+        var provisioned = 0;
+        for (var deviceId = baseDeviceId; deviceId < baseDeviceId + deviceCount; deviceId++)
+            provisioned += await ProvisionDeviceAsync(deviceId, userId.Value, ct);
+
+        _resolver.InvalidateAll(); // 让采集热路径立刻读到新标定
+        _logger.LogInformation("仿真基线标定供给完成：{N} 个螺栓通道已标定（devices={Base}..{End}），真实预紧力将由采集链路算出",
+            provisioned, baseDeviceId, baseDeviceId + deviceCount - 1);
+    }
+
+    /// <summary>为单个仿真设备的已绑螺栓通道供给 sim_baseline 标定，返回本设备处理的通道数。</summary>
+    private async Task<int> ProvisionDeviceAsync(long deviceId, long userId, CancellationToken ct)
+    {
         var provisioned = 0;
         foreach (var ch in SimulatedBoltPhysics.BoltedChannels)
         {
@@ -102,7 +117,7 @@ public sealed class SimulatedCalibrationProvisioner : IHostedService
                        @rt,@rtemp,true,now(),now(),(now()+interval '365 days')::date,'仿真基线标定（开发环境，模拟器物理基线）')
                     RETURNING id");
                 ins.Parameters.AddWithValue("b", NpgsqlDbType.Bigint, boltId);
-                ins.Parameters.AddWithValue("u", NpgsqlDbType.Bigint, userId.Value);
+                ins.Parameters.AddWithValue("u", NpgsqlDbType.Bigint, userId);
                 ins.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, phys.Kl);
                 ins.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, SimulatedBoltPhysics.KlUncertainty);
                 ins.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, phys.RefTofNs);
@@ -143,7 +158,6 @@ public sealed class SimulatedCalibrationProvisioner : IHostedService
             provisioned++;
         }
 
-        _resolver.InvalidateAll(); // 让采集热路径立刻读到新标定
-        _logger.LogInformation("仿真基线标定供给完成：{N} 个螺栓通道已标定（device={Dev}），真实预紧力将由采集链路算出", provisioned, deviceId);
+        return provisioned;
     }
 }

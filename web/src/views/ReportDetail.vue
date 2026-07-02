@@ -42,6 +42,12 @@ const METHOD: Record<string, string> = {
 }
 
 async function load() {
+  if (!Number.isFinite(id)) {
+    loading.value = false
+    ElMessage.error('无效的报告 ID')
+    router.replace({ name: 'reports' })
+    return
+  }
   const d = await reportApi.get(id)
   title.value = d.title
   reportType.value = d.reportType
@@ -240,14 +246,14 @@ function doPrint() {
 </template>
 
 <style scoped>
-.rd { display: flex; flex-direction: column; gap: 16px; }
+.rd { display: flex; flex-direction: column; gap: 14px; }
 .rd-toolbar { display: flex; align-items: center; justify-content: space-between; }
 .back { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); cursor: pointer; font-size: 13px; }
 .back:hover { color: var(--accent); }
 .tb-right { display: flex; align-items: center; gap: 12px; }
-.status-badge { font-size: 12px; padding: 4px 12px; border-radius: 12px; border: 1px solid; }
-.status-badge.draft { color: var(--warn); border-color: var(--warn); }
-.status-badge.signed { color: var(--ok); border-color: var(--ok); background: rgba(16, 185, 129, 0.08); }
+.status-badge { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 8px; border: 1px solid; letter-spacing: 0.02em; }
+.status-badge.draft { color: var(--warn); border-color: rgba(245, 158, 11, 0.5); background: rgba(245, 158, 11, 0.08); }
+.status-badge.signed { color: var(--ok); border-color: rgba(16, 185, 129, 0.5); background: rgba(16, 185, 129, 0.08); }
 
 .sheet { padding: 36px 40px; max-width: 1100px; margin: 0 auto; width: 100%; }
 .rh { text-align: center; border-bottom: 2px solid var(--panel-border-strong); padding-bottom: 18px; margin-bottom: 22px; }
@@ -260,7 +266,7 @@ function doPrint() {
 .meta-grid span { font-size: 11px; color: var(--text-3); }
 .meta-grid b { font-size: 14px; }
 
-.verdict { display: flex; align-items: center; justify-content: space-between; padding: 18px 24px; border-radius: 12px; border: 1px solid; margin-bottom: 22px; }
+.verdict { display: flex; align-items: center; justify-content: space-between; padding: 18px 24px; border-radius: 10px; border: 1px solid; margin-bottom: 22px; }
 .verdict.ok { border-color: rgba(16, 185, 129, 0.4); background: rgba(16, 185, 129, 0.07); }
 .verdict.no { border-color: rgba(244, 63, 94, 0.4); background: rgba(244, 63, 94, 0.08); }
 .v-main { display: flex; flex-direction: column; gap: 4px; }
@@ -274,8 +280,10 @@ function doPrint() {
 .v-stats span { font-size: 11px; color: var(--text-3); }
 
 .rt { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-bottom: 26px; }
-.rt th { text-align: left; padding: 10px 8px; color: var(--text-3); font-weight: 600; border-bottom: 1px solid var(--panel-border-strong); font-size: 11px; }
-.rt td { padding: 9px 8px; border-bottom: 1px solid var(--hairline); }
+.rt th { text-align: left; padding: 10px 10px; color: var(--text-3); font-weight: 600; border-bottom: 1px solid var(--panel-border-strong); font-size: 11px; letter-spacing: 0.08em; }
+.rt td { padding: 9px 10px; border-bottom: 1px solid var(--hairline); }
+.rt tbody tr { transition: background 0.14s; }
+.rt tbody tr:hover { background: rgba(56, 189, 248, 0.05); }
 .rt tr.excluded { opacity: 0.5; }
 .res { font-weight: 600; }
 

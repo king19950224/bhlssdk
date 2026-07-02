@@ -7,6 +7,7 @@ import FlangeRadar from '../components/FlangeRadar.vue'
 import GroupTrend from '../components/GroupTrend.vue'
 import PreloadScale from '../components/PreloadScale.vue'
 import { computePreloadHealth, pct } from '../utils/preload'
+import { useNow } from '../utils/useNow'
 import { assetApi, reportApi, type ProjectNode, type TurbineNode, type GroupNode, type GroupBolt } from '../api'
 import { onRealtime } from '../api/realtime'
 import { useAuth } from '../stores/auth'
@@ -50,12 +51,14 @@ const sel = ref<{ turbine?: TurbineNode; group?: GroupNode }>({})
 const loading = ref(false)
 const boltView = ref<'radar' | 'grid' | 'trend'>('radar')
 
-const num = (v: number | null) => (v == null ? null : Number(v))
-// 预计算每螺栓的"变化程度"指标（残余率/损失/安全裕度/松弛）
+const num = (v: number | null) => (v == null || !Number.isFinite(v) ? null : Number(v))
+// 让 stale/nodata 判定随时间刷新（否则设备离线后状态灯会一直停在最后一次加载时的判定）
+const now = useNow(30000)
+// 预计算每螺栓的"变化程度"指标（保持率/损失/安全裕度/松弛）
 const boltCells = computed(() =>
   bolts.value.map((b) => ({
     b,
-    h: computePreloadHealth({ state: b.boltState, lastTs: b.lastTs, current: b.preloadN, target: b.targetPreloadN, min: b.minPreloadN }),
+    h: computePreloadHealth({ state: b.boltState, lastTs: b.lastTs, current: b.preloadN, target: b.targetPreloadN, min: b.minPreloadN }, now.value),
   })),
 )
 const marginStyle = (m: number | null) => (m == null ? '' : `color:${m < 0.1 ? '#f43f5e' : m < 0.3 ? '#f59e0b' : '#10b981'}`)
@@ -69,40 +72,52 @@ function matchQ(...parts: (string | null | undefined)[]) {
 }
 const filteredTurbines = computed(() => turbines.value.filter((t) => matchQ(t.name, t.code, t.model)))
 const filteredGroups = computed(() => groups.value.filter((g) => matchQ(g.name, g.code, g.structureType)))
-// 螺栓排序：worst 把残余率最低（最危险）排前，便于一眼抓问题
+// 螺栓排序：worst 把保持率最低（最危险）排前，便于一眼抓问题
 const sortedBoltCells = computed(() => {
   const cells = boltCells.value.filter((c) => matchQ(c.b.code, c.b.positionLabel))
   if (boltSort.value !== 'worst') return cells
   return [...cells].sort((a, b) => (a.b.preloadRatio ?? 99) - (b.b.preloadRatio ?? 99))
 })
 
+// 请求序号：快速切换风场/风机/部位时，后发先至的旧响应不得覆盖当前视图（与 GroupTrend 同一防护）。
+let loadSeq = 0
+
 async function loadTurbines() {
   if (projectId.value == null) return
+  const seq = ++loadSeq
   loading.value = true
   try {
-    turbines.value = (await assetApi.turbines(projectId.value)).items
+    const items = (await assetApi.turbines(projectId.value)).items
+    if (seq !== loadSeq) return
+    turbines.value = items
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 async function openTurbine(t: TurbineNode) {
   sel.value = { turbine: t }
+  const seq = ++loadSeq
   loading.value = true
   try {
-    groups.value = (await assetApi.groups(t.id)).items
+    const items = (await assetApi.groups(t.id)).items
+    if (seq !== loadSeq) return
+    groups.value = items
     level.value = 'groups'
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 async function openGroup(g: GroupNode) {
   sel.value = { ...sel.value, group: g }
+  const seq = ++loadSeq
   loading.value = true
   try {
-    bolts.value = (await assetApi.groupBolts(g.id)).items
+    const items = (await assetApi.groupBolts(g.id)).items
+    if (seq !== loadSeq) return
+    bolts.value = items
     level.value = 'bolts'
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 function backTo(l: 'turbines' | 'groups') {
@@ -113,10 +128,16 @@ function backTo(l: 'turbines' | 'groups') {
 
 // 实时刷新：告警变化即时刷新当前层；测量仅在螺栓层做去抖刷新（避免高频抖动）
 async function refreshCurrent() {
+  const seq = ++loadSeq
   try {
-    if (level.value === 'turbines') await loadTurbines()
-    else if (level.value === 'groups' && sel.value.turbine) groups.value = (await assetApi.groups(sel.value.turbine.id)).items
-    else if (level.value === 'bolts' && sel.value.group) bolts.value = (await assetApi.groupBolts(sel.value.group.id)).items
+    if (level.value === 'turbines') { await loadTurbines(); return }
+    if (level.value === 'groups' && sel.value.turbine) {
+      const items = (await assetApi.groups(sel.value.turbine.id)).items
+      if (seq === loadSeq) groups.value = items
+    } else if (level.value === 'bolts' && sel.value.group) {
+      const items = (await assetApi.groupBolts(sel.value.group.id)).items
+      if (seq === loadSeq) bolts.value = items
+    }
   } catch { /* 尽力刷新 */ }
 }
 let debounceTimer: number | undefined
@@ -182,7 +203,7 @@ function onProjectChange() {
     <div v-if="level === 'turbines'" class="grid">
       <div v-for="t in filteredTurbines" :key="t.id" class="card panel" @click="openTurbine(t)">
         <div class="card-hd">
-          <el-icon class="card-ic"><Cpu /></el-icon>
+          <span class="card-ic"><el-icon><Cpu /></el-icon></span>
           <div class="card-titles">
             <div class="card-name">{{ t.name }}</div>
             <div class="card-sub mono">{{ t.code }} · {{ t.model || '—' }}</div>
@@ -202,7 +223,7 @@ function onProjectChange() {
     <div v-else-if="level === 'groups'" class="grid">
       <div v-for="g in filteredGroups" :key="g.id" class="card panel" @click="openGroup(g)">
         <div class="card-hd">
-          <el-icon class="card-ic"><Connection /></el-icon>
+          <span class="card-ic"><el-icon><Connection /></el-icon></span>
           <div class="card-titles">
             <div class="card-name">{{ g.name }}</div>
             <div class="card-sub mono">{{ g.structureType || '部位' }} · 目标 {{ g.targetPreloadN ? (g.targetPreloadN / 1000).toFixed(0) + 'kN' : '—' }}</div>
@@ -238,8 +259,14 @@ function onProjectChange() {
       </div>
 
       <div v-if="boltView === 'radar'" class="panel panel--glow ring-panel">
-        <FlangeRadar v-if="bolts.length" :bolts="bolts" @select="(id) => router.push({ name: 'boltDetail', params: { boltId: id } })" />
-        <div v-else-if="!loading" class="empty">该部位暂无螺栓</div>
+        <div class="panel-hd">
+          <span class="panel-title"><i class="hd-mark" />法兰预紧力雷达</span>
+          <span class="hd-sub mono">{{ sel.group?.name }} · {{ bolts.length }} 颗</span>
+        </div>
+        <div class="ring-body">
+          <FlangeRadar v-if="bolts.length" :bolts="bolts" @select="(id) => router.push({ name: 'boltDetail', params: { boltId: id } })" />
+          <div v-else-if="!loading" class="empty">该部位暂无螺栓</div>
+        </div>
       </div>
 
       <div v-else-if="boltView === 'trend'" class="panel panel--glow trend-panel">
@@ -255,7 +282,7 @@ function onProjectChange() {
             <span class="bolt-tag" :style="`color:${STATUS[b.status]?.color}`">{{ STATUS[b.status]?.label }}</span>
           </div>
           <div class="bolt-ratio metric" :style="`color:${STATUS[b.status]?.color}`">
-            {{ ratioStr(b.preloadRatio) }}<span class="bolt-ratio-cap">残余</span>
+            {{ ratioStr(b.preloadRatio) }}<span class="bolt-ratio-cap">保持</span>
           </div>
           <PreloadScale :current="num(b.preloadN)" :target="num(b.targetPreloadN)" :min="num(b.minPreloadN)" :height="6" compact />
           <div class="bolt-margin">
@@ -272,36 +299,39 @@ function onProjectChange() {
 </template>
 
 <style scoped>
-.asset { display: flex; flex-direction: column; gap: 18px; }
-.crumbs { display: flex; align-items: center; gap: 10px; font-size: 15px; }
+.asset { display: flex; flex-direction: column; gap: 14px; }
+.crumbs { display: flex; align-items: center; gap: 10px; font-size: 14px; }
 .proj-sel { width: 180px; }
 .crumb-link { color: var(--text-2); cursor: pointer; transition: color 0.15s; }
 .crumb-link:hover { color: var(--text-1); }
 .crumb-link.active { color: var(--accent); font-weight: 600; }
 .crumb-sep { color: var(--text-3); font-size: 13px; }
 
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
-.grid--bolts { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+.grid--bolts { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
 
-.card { padding: 18px 20px; cursor: pointer; transition: all 0.18s; }
-.card:hover { border-color: var(--panel-border-strong); transform: translateY(-2px); }
-.card-hd { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-.card-ic { font-size: 22px; color: var(--accent); }
+/* 风机 / 部位实体卡（图标容器 + 健康分布 + 脚注，克制边框 hover） */
+.card { padding: 16px 18px; cursor: pointer; transition: border-color 0.16s, transform 0.16s; }
+.card:hover { border-color: var(--panel-border-strong); transform: translateY(-1px); }
+.card-hd { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.card-ic { width: 36px; height: 36px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; background: rgba(56, 189, 248, 0.08); border: 1px solid var(--panel-border); color: var(--accent); font-size: 18px; }
 .card-titles { flex: 1; min-width: 0; }
-.card-name { font-size: 16px; font-weight: 600; }
+.card-name { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-sub { font-size: 11px; color: var(--text-3); }
-.alarm-pill { background: var(--crit); color: #fff; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; box-shadow: 0 0 10px var(--crit-glow); }
+.alarm-pill { background: var(--crit); color: #fff; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; flex-shrink: 0; cursor: pointer; }
 .card-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; font-size: 12px; color: var(--text-3); }
 .loose-hint { display: flex; align-items: center; gap: 6px; color: var(--crit); }
 
-.bolt { padding: 16px; cursor: pointer; transition: all 0.18s; border-radius: var(--radius-sm); }
+/* 螺栓网格卡（stat 风：大号保持率 + 状态点 + 脚注，状态色仅用于边/标记） */
+.bolt { padding: 14px 14px 13px; cursor: pointer; transition: border-color 0.16s, transform 0.16s; border-radius: var(--radius-sm); }
 .bolt:hover { transform: translateY(-2px); }
-.bolt--loose { border-color: var(--crit); box-shadow: 0 0 22px -10px var(--crit-glow); }
+.bolt:not(.bolt--loose):not(.bolt--warn):hover { border-color: var(--panel-border-strong); }
+.bolt--loose { border-color: var(--crit); }
 .bolt--warn { border-color: var(--warn); }
 .bolt-hd { display: flex; align-items: center; gap: 8px; }
 .bolt-code { font-size: 13px; font-weight: 600; flex: 1; }
 .bolt-tag { font-size: 11px; }
-.bolt-ratio { font-size: 32px; font-weight: 700; margin: 10px 0 10px; line-height: 1; display: flex; align-items: baseline; gap: 6px; }
+.bolt-ratio { font-size: 30px; font-weight: 700; margin: 10px 0; line-height: 1; display: flex; align-items: baseline; gap: 6px; }
 .bolt-ratio-cap { font-size: 11px; font-weight: 500; color: var(--text-3); }
 .bolt-margin { display: flex; justify-content: space-between; align-items: center; font-size: 11.5px; color: var(--text-3); margin-top: 10px; }
 .bolt-margin b { font-weight: 700; }
@@ -311,14 +341,18 @@ function onProjectChange() {
 
 .bolt-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .bolt-toggle { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 4px; width: fit-content; }
-.bv-tab { display: flex; align-items: center; gap: 6px; font-size: 13px; padding: 6px 16px; border-radius: 7px; cursor: pointer; color: var(--text-3); }
+.bv-tab { display: flex; align-items: center; gap: 6px; font-size: 13px; padding: 6px 16px; border-radius: 7px; cursor: pointer; color: var(--text-3); transition: color 0.15s, background 0.15s; }
+.bv-tab:hover { color: var(--text-1); }
 .bv-tab.active { color: #04121a; background: linear-gradient(135deg, var(--accent), var(--accent-2)); font-weight: 600; }
-.ring-panel { padding: 26px 20px; display: flex; justify-content: center; }
+
+/* 可视化面板：统一面板头（hd-mark + 标题 + 副标题） */
+.panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px 9px; }
+.ring-panel { display: flex; flex-direction: column; }
+.ring-body { display: flex; justify-content: center; padding: 18px 20px 26px; }
 .trend-panel { padding: 18px 20px; }
 
 .crumb-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .unbound-link { font-size: 12px; white-space: nowrap; }
-.alarm-pill { cursor: pointer; }
 .bolt-bar-right { display: flex; align-items: center; gap: 12px; }
 .sort-toggle { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px; padding: 3px; }
 .sort-toggle .bv-tab { padding: 5px 12px; font-size: 12px; border-radius: 6px; }

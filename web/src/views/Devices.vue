@@ -41,23 +41,32 @@ async function selectDevice(d: RuntimeDevice) {
   await Promise.all([loadHealth(), loadScan(), loadBinding()])
 }
 async function loadHealth() {
-  if (!selected.value) return
+  const did = selected.value?.deviceId
+  if (did == null) return
   loading.value = true
-  try { channels.value = (await deviceApi.channelHealth(selected.value.deviceId)).items }
-  finally { loading.value = false }
+  try {
+    const items = (await deviceApi.channelHealth(did)).items
+    // 快速切换设备时，仅当结果仍属当前选中设备才写入，避免把 A 的健康显示在 B 下。
+    if (selected.value?.deviceId === did) channels.value = items
+  }
+  finally { if (selected.value?.deviceId === did) loading.value = false }
 }
 async function loadScan() {
-  if (!selected.value) return
+  const did = selected.value?.deviceId
+  if (did == null) return
   try {
-    scan.value = await probeScanApi.latest(selected.value.deviceId)
+    const v = await probeScanApi.latest(did)
+    if (selected.value?.deviceId !== did) return
+    scan.value = v
     scanning.value = scan.value?.status === 'running' || scan.value?.status === 'pending'
-  } catch { scan.value = null; scanning.value = false }
+  } catch { if (selected.value?.deviceId === did) { scan.value = null; scanning.value = false } }
 }
 async function loadBinding() {
-  if (!selected.value) return
+  const did = selected.value?.deviceId
+  if (did == null) return
   try {
-    const did = selected.value.deviceId
     const [list, ub] = await Promise.all([channelApi.list(), channelApi.unboundSummary()])
+    if (selected.value?.deviceId !== did) return
     chanRows.value = list.items.filter((c) => c.deviceId === did)
     unbound.value = ub.items.filter((u) => u.deviceId === did)
   } catch { /* ignore */ }
@@ -183,9 +192,9 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
         </div>
         <div class="dc-state mono">{{ DEV_STATE[d.state] || d.state }}</div>
         <div class="dc-metrics">
-          <div><b class="mono">{{ d.sessionChannels?.length ?? 0 }}</b><span>通道</span></div>
-          <div><b class="mono">{{ fmt(d.channelResultCount ?? 0) }}</b><span>测量</span></div>
-          <div><b class="mono" :style="d.writeFailureCount ? 'color:var(--warn)' : ''">{{ d.writeFailureCount ?? 0 }}</b><span>写失败</span></div>
+          <div><b class="metric">{{ d.sessionChannels?.length ?? 0 }}</b><span>通道</span></div>
+          <div><b class="metric">{{ fmt(d.channelResultCount ?? 0) }}</b><span>测量</span></div>
+          <div><b class="metric" :style="d.writeFailureCount ? 'color:var(--warn)' : ''">{{ d.writeFailureCount ?? 0 }}</b><span>写失败</span></div>
         </div>
       </div>
       <EmptyState v-if="!devices.length" empty empty-text="暂无设备运行时" />
@@ -193,7 +202,7 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
 
     <div class="panel panel--glow" v-if="selected">
       <div class="panel-hd">
-        <span class="panel-title">{{ selected.name }} · 调试控制台</span>
+        <span class="panel-title"><i class="hd-mark" />{{ selected.name }} · 调试控制台</span>
         <router-link :to="{ name: 'identify' }" class="hd-link">敲击识别 →</router-link>
       </div>
       <el-tabs v-model="tab" class="dev-tabs">
@@ -201,8 +210,9 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
         <el-tab-pane label="通道健康" name="health">
           <div class="modebar">
             <span class="mb-k">工作模式：</span>
+            <!-- set-mode 整组后端要求 reviewer+：所有工作模式按钮对 operator 一律禁用（不止 Reboot），与后端一致 -->
             <el-button v-for="m in MODES" :key="m.mode" size="small" :type="m.type" :loading="busyMode === m.mode"
-              :disabled="!auth.isReviewer && m.mode === 'Reboot'" @click="setMode(m.mode, m.label)">{{ m.label }}</el-button>
+              :disabled="!auth.isReviewer" @click="setMode(m.mode, m.label)">{{ m.label }}</el-button>
             <span class="mb-hint">扫描进行中不可切换</span>
           </div>
           <div class="tbl">
@@ -280,7 +290,7 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
 .dev-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
 .dc { padding: 16px 18px; cursor: pointer; transition: all 0.18s; }
 .dc:hover { border-color: var(--panel-border-strong); }
-.dc.active { border-color: var(--accent); box-shadow: 0 0 22px -10px var(--accent-glow); }
+.dc.active { border-color: var(--accent); background: rgba(34, 211, 238, 0.06); }
 .dc-hd { display: flex; align-items: center; gap: 9px; }
 .dc-name { font-weight: 600; font-size: 14px; flex: 1; }
 .ptag { background: rgba(34, 211, 238, 0.16) !important; border-color: var(--panel-border-strong) !important; color: var(--accent) !important; }
@@ -301,11 +311,13 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
 .scan-st .st-run { color: var(--accent); }
 .unbound-note { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--warn); padding: 4px 0 12px; }
 
-.tbl { border-top: 1px solid var(--hairline); }
-.tr { display: grid; grid-template-columns: 50px 110px 130px 110px 100px 80px 70px 70px 90px; align-items: center; padding: 10px 6px; border-bottom: 1px solid var(--hairline); font-size: 12.5px; }
+.tbl { padding: 4px 4px 8px; }
+.tr { display: grid; grid-template-columns: 50px 110px 130px 110px 100px 80px 70px 70px 90px; align-items: center; padding: 10px 10px; border-radius: 8px; font-size: 12.5px; }
+.tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
+.tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
 .tr.th.scan, .tr.scan { grid-template-columns: 60px 90px 80px 90px 80px 70px 1fr; }
 .tr.th.binds, .tr.binds { grid-template-columns: 60px 130px 130px 120px 120px 130px; }
-.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; }
+.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
 .hw { display: flex; align-items: center; gap: 8px; }
 .vd { font-style: normal; font-weight: 600; }
 .dim { color: var(--text-3); }

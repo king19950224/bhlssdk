@@ -16,6 +16,7 @@ const navGroups = [
     title: '监测运营',
     items: [
       { name: 'dashboard', label: '总览', icon: 'Odometer' },
+      { name: 'live', label: '实时波形', icon: 'TrendCharts' },
       { name: 'assets', label: '资产监测', icon: 'Histogram' },
       { name: 'alarms', label: '告警中心', icon: 'BellFilled' },
     ],
@@ -23,7 +24,8 @@ const navGroups = [
   {
     title: '计量与变更',
     items: [
-      { name: 'calibration', label: '标定中心', icon: 'Aim' },
+      // 标定中心路由 meta.roles=reviewer/admin：与路由守卫一致，operator 不显示（否则点了被弹回首页）
+      { name: 'calibration', label: '标定中心', icon: 'Aim', reviewerOnly: true },
       { name: 'configChanges', label: '参数审批', icon: 'DocumentChecked' },
     ],
   },
@@ -32,21 +34,23 @@ const navGroups = [
     items: [
       { name: 'devices', label: '采集设备', icon: 'Cpu' },
       { name: 'identify', label: '通道识别', icon: 'Aim' },
-      { name: 'diagnostics', label: '波形诊断', icon: 'TrendCharts' },
+      { name: 'diagnostics', label: '波形诊断', icon: 'TrendCharts', reviewerOnly: true },
     ],
   },
   {
     title: '治理',
     items: [
-      { name: 'audit', label: '审计日志', icon: 'Tickets' },
+      { name: 'audit', label: '审计日志', icon: 'Tickets', reviewerOnly: true },
       { name: 'reports', label: '报告', icon: 'Document' },
       { name: 'users', label: '用户管理', icon: 'User', adminOnly: true },
     ],
   },
 ]
 
-function visibleItems(items: { name: string; label: string; icon: string; adminOnly?: boolean }[]) {
-  return items.filter((i) => !i.adminOnly || auth.isAdmin)
+// 菜单可见性与路由 meta.roles 对齐：admin-only 仅管理员、reviewer-only 复核员+管理员可见。
+// 纵深防御 + 一致体验（后端仍有 403 兜底）。
+function visibleItems(items: { name: string; label: string; icon: string; adminOnly?: boolean; reviewerOnly?: boolean }[]) {
+  return items.filter((i) => (!i.adminOnly || auth.isAdmin) && (!i.reviewerOnly || auth.isReviewer))
 }
 
 const titleMap: Record<string, string> = Object.fromEntries(
