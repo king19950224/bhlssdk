@@ -1,25 +1,20 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { GroupBolt } from '../api'
-import { pct } from '../utils/preload'
+import { pct, STATUS_META } from '../utils/preload'
 
 const props = defineProps<{ bolts: GroupBolt[] }>()
 const emit = defineEmits<{ (e: 'select', boltId: number): void }>()
 
-const STATUS: Record<string, { label: string; color: string }> = {
-  normal: { label: '正常', color: '#10b981' },
-  warn: { label: '预警', color: '#f59e0b' },
-  loose: { label: '松动', color: '#f43f5e' },
-  uncalibrated: { label: '未标定', color: '#5b6b82' },
-  nodata: { label: '无数据', color: '#3b4659' },
-}
+// 状态颜色/文案统一来自 STATUS_META（含 high 偏高/超张力），不再本组件另写一份
+const STATUS: Record<string, { label: string; color: string; cls: string }> = STATUS_META
 
 const SIZE = 460
 const C = SIZE / 2
 const OUTER = 182
 const INNER = 48
-const R_LO = 0.6 // 残余率域下界
-const R_HI = 1.1 // 残余率域上界
+const R_LO = 0.6 // 保持率域下界
+const R_HI = 1.1 // 保持率域上界
 
 function radiusOf(res: number | null) {
   if (res == null) return OUTER
@@ -33,9 +28,10 @@ function pol(angDeg: number, r: number): [number, number] {
   const a = (angDeg * Math.PI) / 180
   return [C + r * Math.cos(a), C + r * Math.sin(a)]
 }
+// 节点编号用通道号：组内螺栓同设备、通道号唯一，不会像"取 code 末尾数字"那样把
+// FLANGE-CH1 与 M20-001 都标成 "1"（编号碰撞，运维分不清）。缺通道号才回退序号。
 function boltNo(b: GroupBolt, i: number) {
-  const m = b.code.match(/(\d+)\s*$/)
-  return m ? String(Number(m[1])) : String(i + 1)
+  return b.channelNo != null ? String(b.channelNo) : String(i + 1)
 }
 
 const limitRatio = computed(() => {
@@ -67,7 +63,7 @@ const warnR = computed(() => radiusOf(limitRatio.value * 1.1))
 const gridRings = [0.7, 0.8, 0.9, 1.0]
 
 const counts = computed(() => {
-  const c: Record<string, number> = { normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0 }
+  const c: Record<string, number> = { normal: 0, warn: 0, loose: 0, high: 0, uncalibrated: 0, nodata: 0 }
   for (const b of props.bolts) c[b.status] = (c[b.status] ?? 0) + 1
   return c
 })
@@ -96,7 +92,7 @@ const labelPos = (res: number) => pol(-90, radiusOf(res))
 
       <circle :cx="C" :cy="C" :r="OUTER" fill="url(#coreGlow)" />
 
-      <!-- 残余率栅格环 -->
+      <!-- 保持率栅格环 -->
       <circle v-for="g in gridRings" :key="'g' + g" :cx="C" :cy="C" :r="radiusOf(g)" fill="none" stroke="rgba(148,163,184,0.09)" stroke-width="1" />
 
       <!-- 扫描扇形 -->
@@ -122,7 +118,7 @@ const labelPos = (res: number) => pol(-90, radiusOf(res))
         <circle v-if="n.alert" :cx="n.x" :cy="n.y" r="15" :fill="n.color" opacity="0.18" class="halo" />
         <circle :cx="n.x" :cy="n.y" r="11" :fill="n.color" :opacity="n.hasData ? 0.95 : 0.5" stroke="rgba(4,18,26,0.6)" stroke-width="1" />
         <text :x="n.x" :y="n.y + 3.5" text-anchor="middle" class="node-no">{{ n.no }}</text>
-        <title>{{ n.b.code }} · {{ STATUS[n.b.status]?.label }}{{ n.res != null ? ' · 残余 ' + pct(n.res) : '' }}</title>
+        <title>{{ n.b.code }} · {{ STATUS[n.b.status]?.label }}{{ n.res != null ? ' · 保持 ' + pct(n.res) : '' }}</title>
       </g>
 
       <!-- 参考环标注 -->
@@ -132,16 +128,16 @@ const labelPos = (res: number) => pol(-90, radiusOf(res))
       <!-- 中心 -->
       <text :x="C" :y="C - 6" text-anchor="middle" class="c-num">{{ bolts.length }}</text>
       <text :x="C" :y="C + 14" text-anchor="middle" class="c-cap">螺栓</text>
-      <text v-if="counts.loose + counts.warn > 0" :x="C" :y="C + 38" text-anchor="middle" class="c-alert">{{ counts.loose }} 松动 · {{ counts.warn }} 预警</text>
+      <text v-if="counts.loose + counts.warn + counts.high > 0" :x="C" :y="C + 38" text-anchor="middle" class="c-alert">{{ counts.loose }} 松动 · {{ counts.warn }} 预警 · {{ counts.high }} 偏高</text>
       <text v-else :x="C" :y="C + 38" text-anchor="middle" class="c-ok">预紧力均衡</text>
     </svg>
 
     <div class="radar-legend">
       <span class="lg"><i class="ring-c" style="border-color:#22d3ee" /> 目标环 (100%)</span>
       <span class="lg"><i class="ring-c" style="border-color:#f43f5e;border-style:dashed" /> 下限环</span>
-      <span v-for="k in ['normal', 'warn', 'loose']" :key="k" class="lg"><i :style="`background:${STATUS[k].color}`" /> {{ STATUS[k].label }} {{ counts[k] }}</span>
+      <span v-for="k in ['normal', 'warn', 'loose', 'high']" :key="k" class="lg"><i :style="`background:${STATUS[k].color}`" /> {{ STATUS[k].label }} {{ counts[k] }}</span>
     </div>
-    <div class="radar-hint">节点离圆心越近 = 残余预紧力越低；跌破红色下限环即松动</div>
+    <div class="radar-hint">节点离圆心越近 = 预紧力保持率越低；跌破红色下限环即松动</div>
   </div>
 </template>
 

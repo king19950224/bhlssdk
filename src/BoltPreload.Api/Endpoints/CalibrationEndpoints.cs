@@ -39,7 +39,7 @@ public static class CalibrationEndpoints
                 SELECT
                     cr.method,
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE cr.superseded_by IS NULL) AS active_count,
+                    COUNT(*) FILTER (WHERE cr.superseded_by IS NULL AND cr.review_state IN ('approved','self_signed')) AS active_count,
                     COUNT(*) FILTER (WHERE cr.expires_at < CURRENT_DATE) AS expired_count,
                     ROUND(AVG(cr.r_squared), 4) AS avg_r2
                 FROM calibration_records cr
@@ -196,6 +196,7 @@ public static class CalibrationEndpoints
                     UPDATE channels SET
                         k_l = @kl,
                         k_l_uncertainty = @klu,
+                        k_l_intercept_ns = NULL,
                         ref_time_ns = @rt,
                         ref_temp_c = @rtemp,
                         active_calibration_id = @cid,
@@ -210,6 +211,9 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, channelId);
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
+
+                // 标定激活后回写 bolts.state（历史遗漏点：API 标定只更新 channels，漏写 state → 已标定却显示"未标定"）
+                await MarkBoltCalibratedAsync(conn, tx, boltId, ct);
 
                 // audit_log
                 var afterJson = System.Text.Json.JsonSerializer.Serialize(new
@@ -288,11 +292,11 @@ public static class CalibrationEndpoints
             short channelNo;
             string nominalDiam;
             decimal? existingRefTime, existingRefTemp;
-            decimal? currentTarget, rp02Mpa, crossSectionMm2;
+            decimal? currentTarget, rp02Mpa, crossSectionMm2, boltTempCoeff;
             await using (var cmd = ds.CreateCommand(@"
                 SELECT b.id, c.device_id, c.channel_no, b.nominal_diam,
                        c.ref_time_ns, c.ref_temp_c, b.target_preload_n,
-                       b.rp02_mpa, b.cross_section_mm2
+                       b.rp02_mpa, b.cross_section_mm2, b.temp_coefficient_per_c
                 FROM channels c
                 JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE c.id = @cid AND c.deleted_at IS NULL"))
@@ -311,6 +315,7 @@ public static class CalibrationEndpoints
                 currentTarget = r.IsDBNull(6) ? null : r.GetDecimal(6);
                 rp02Mpa = r.IsDBNull(7) ? null : r.GetDecimal(7);
                 crossSectionMm2 = r.IsDBNull(8) ? null : r.GetDecimal(8);
+                boltTempCoeff = r.IsDBNull(9) ? null : r.GetDecimal(9);
             }
 
             var diameterMm = req.NominalDiameterMm ?? ParseNominalDiameterMm(nominalDiam);
@@ -352,7 +357,8 @@ public static class CalibrationEndpoints
             if (refTime is null || refTemp is null)
                 return Results.BadRequest(new { error = "缺少 RefTime/RefTemp，请先同步通道配置或在请求里传 refTimeNs/refTempC" });
 
-            var normalizedEcho = avgEcho / (1m + sdkDefaultTempCoeff * (avgTemp - refTemp.Value));
+            // 用螺栓自身温度系数(缺省回退 SDK 默认)，与采集热路径(PostgresMeasurementSink)一致，避免标定/运行两套温补
+            var normalizedEcho = avgEcho / (1m + (boltTempCoeff ?? sdkDefaultTempCoeff) * (avgTemp - refTemp.Value));
             var deltaTof = normalizedEcho - refTime.Value;
             var kL = deltaTof / estimatedPreloadN;
             if (kL <= 0)
@@ -434,6 +440,7 @@ public static class CalibrationEndpoints
                         effective_length_mm = COALESCE(@effective_len, effective_length_mm),
                         total_length_mm = COALESCE(@total_len, total_length_mm),
                         cross_section_mm2 = COALESCE(@area, cross_section_mm2),
+                        state = 'calibrated',
                         updated_at = now()
                     WHERE id = @bolt_id", conn, tx))
                 {
@@ -451,6 +458,7 @@ public static class CalibrationEndpoints
                     UPDATE channels SET
                         k_l = @kl,
                         k_l_uncertainty = @klu,
+                        k_l_intercept_ns = NULL,
                         ref_time_ns = @rt,
                         ref_temp_c = @rtemp,
                         active_calibration_id = @cid,
@@ -521,9 +529,9 @@ public static class CalibrationEndpoints
 
             long boltId;
             string nominalDiam;
-            decimal? refTime, refTemp;
+            decimal? refTime, refTemp, boltTempCoeff;
             await using (var cmd = ds.CreateCommand(@"
-                SELECT b.id, b.nominal_diam, c.ref_time_ns, c.ref_temp_c
+                SELECT b.id, b.nominal_diam, c.ref_time_ns, c.ref_temp_c, b.temp_coefficient_per_c
                 FROM channels c
                 JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE c.id = @cid AND c.deleted_at IS NULL"))
@@ -537,6 +545,7 @@ public static class CalibrationEndpoints
                 nominalDiam = r.GetString(1);
                 refTime = r.IsDBNull(2) ? null : r.GetDecimal(2);
                 refTemp = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                boltTempCoeff = r.IsDBNull(4) ? null : r.GetDecimal(4);
             }
 
             if (refTime is null || refTemp is null)
@@ -592,7 +601,8 @@ public static class CalibrationEndpoints
                 windowEnd = r.GetDateTime(7);
             }
 
-            normalizedEcho = avgEcho / (1m + sdkDefaultTempCoeff * (avgTemp - refTemp.Value));
+            // 用螺栓自身温度系数(缺省回退 SDK 默认)，与采集热路径一致
+            normalizedEcho = avgEcho / (1m + (boltTempCoeff ?? sdkDefaultTempCoeff) * (avgTemp - refTemp.Value));
             deltaTof = normalizedEcho - refTime.Value;
 
             long pointId;
@@ -633,7 +643,7 @@ public static class CalibrationEndpoints
                 cmd.Parameters.AddWithValue("avg_temp", NpgsqlDbType.Numeric, avgTemp);
                 cmd.Parameters.AddWithValue("ref_time", NpgsqlDbType.Numeric, refTime.Value);
                 cmd.Parameters.AddWithValue("ref_temp", NpgsqlDbType.Numeric, refTemp.Value);
-                cmd.Parameters.AddWithValue("tc", NpgsqlDbType.Numeric, sdkDefaultTempCoeff);
+                    cmd.Parameters.AddWithValue("tc", NpgsqlDbType.Numeric, boltTempCoeff ?? sdkDefaultTempCoeff);
                 cmd.Parameters.AddWithValue("normalized_echo", NpgsqlDbType.Numeric, normalizedEcho);
                 cmd.Parameters.AddWithValue("delta_tof", NpgsqlDbType.Numeric, deltaTof);
                 cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
@@ -909,6 +919,10 @@ public static class CalibrationEndpoints
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
 
+                // 仅在达标(passed)时激活并顶替旧标定；未达合格线的临时拟合只留档不激活——
+                // 否则会把在产的好标定 supersede 掉，而 sink 对 passed=false 又不出预紧力 → 通道从"能出数"变"无数据"。
+                if (passed)
+                {
                 await SupersedeActiveCalibrationsAsync(conn, tx, boltId, newCalibId, ct);
 
                 await using (var cmd = new NpgsqlCommand(@"
@@ -930,6 +944,9 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Uuid, newCalibId);
                     cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
                     await cmd.ExecuteNonQueryAsync(ct);
+                }
+                // 仅在达标激活时才回写 bolts.state（未达标只留档不激活，状态不应变已标定）
+                await MarkBoltCalibratedAsync(conn, tx, boltId, ct);
                 }
 
                 var afterJson = System.Text.Json.JsonSerializer.Serialize(new
@@ -966,7 +983,7 @@ public static class CalibrationEndpoints
                     formula = "F = (Δt - kLInterceptNs) / kL",
                     warning = passed
                         ? "torque_fit 仍是扭矩法临时拟合，非正式载荷标定。"
-                        : $"R²={rSquared} 介于 [{R2RejectThreshold}, {R2PassThreshold})，未达 0.98 合格线，已记为 passed=false（现场临时可用，建议补采载荷点重拟合）。torque_fit 仍是扭矩法临时拟合，非正式载荷标定。"
+                        : $"R²={rSquared} 介于 [{R2RejectThreshold}, {R2PassThreshold})，未达 0.98 合格线，已记为 passed=false 并留档，但【未激活到通道】——通道仍沿用原标定（避免把在产好标定顶替成无预紧力）。请补采载荷点重拟合。"
                 });
             }
             catch (Exception ex)
@@ -1218,7 +1235,10 @@ public static class CalibrationEndpoints
 
                 await using (var cmd = new NpgsqlCommand(@"
                     UPDATE calibration_records
-                       SET reviewer_user_id = @rev, reviewer_signature_at = now(), review_state = 'approved'
+                       SET reviewer_user_id = @rev, reviewer_signature_at = now(), review_state = 'approved',
+                           -- 有效期从【激活(会签)】起算：pending 审核期间不消耗有效期
+                           --（原按提交时刻固定,久审后的标定一激活就快到期）
+                           expires_at = CURRENT_DATE + (expires_at - created_at::date)
                      WHERE id = @id", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, reviewerId);
@@ -1243,6 +1263,9 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
+
+                // 会签激活正式载荷标定后回写 bolts.state
+                await MarkBoltCalibratedAsync(conn, tx, boltId, ct);
 
                 await WriteChannelAuditAsync(conn, tx, reviewerId, "load_calibrate_countersign", channelId,
                     System.Text.Json.JsonSerializer.Serialize(new { calibrationId, operatorUserId = operatorId, reviewerUserId = reviewerId, kL = kl }),
@@ -1271,6 +1294,75 @@ public static class CalibrationEndpoints
         })
         .WithName("CountersignCalibration")
         .WithSummary("会签激活正式载荷标定（必须由不同于提交人的 reviewer 执行）");
+
+        // 驳回：把 pending 正式标定置为 rejected（不激活、不动通道）。补齐"只能会签、无法驳回"导致 pending 堆积的缺口。
+        grp.MapPost("/calibrations/{calibrationId:guid}/reject", async (
+            long channelId, Guid calibrationId, string? reason, HttpContext http,
+            NpgsqlDataSource ds, ILoggerFactory lf, CancellationToken ct) =>
+        {
+            var logger = lf.CreateLogger("Calibration");
+            var reviewerId = UserContext.Require(http).UserId;
+            var rejectReason = string.IsNullOrWhiteSpace(reason) ? "（未填写驳回原因）" : reason.Trim();
+
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            try
+            {
+                long channelBoltId;
+                await using (var q = new NpgsqlCommand(@"
+                    SELECT b.id FROM channels c
+                    JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                    WHERE c.id = @cid AND c.deleted_at IS NULL", conn, tx))
+                {
+                    q.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                    var v = await q.ExecuteScalarAsync(ct);
+                    if (v is null) { await tx.RollbackAsync(ct); return Results.NotFound(new { error = "通道不存在或未绑定 bolt", channelId }); }
+                    channelBoltId = (long)v;
+                }
+
+                long calibBoltId; string reviewState;
+                await using (var q = new NpgsqlCommand(
+                    "SELECT bolt_id, review_state FROM calibration_records WHERE id = @id FOR UPDATE", conn, tx))
+                {
+                    q.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, calibrationId);
+                    await using var r = await q.ExecuteReaderAsync(ct);
+                    if (!await r.ReadAsync(ct)) { await tx.RollbackAsync(ct); return Results.NotFound(new { error = "标定档案不存在", calibrationId }); }
+                    calibBoltId = r.GetInt64(0);
+                    reviewState = r.GetString(1);
+                }
+                if (calibBoltId != channelBoltId) { await tx.RollbackAsync(ct); return Results.BadRequest(new { error = "该标定不属于此通道绑定的螺栓", calibrationId, channelId }); }
+                if (reviewState != "pending") { await tx.RollbackAsync(ct); return Results.Conflict(new { error = $"标定当前状态为 {reviewState}，仅 pending 可驳回", calibrationId }); }
+
+                await using (var upd = new NpgsqlCommand(@"
+                    UPDATE calibration_records
+                       SET review_state = 'rejected', reviewer_user_id = @rev, reviewer_signature_at = now(),
+                           notes = COALESCE(notes, '') || @suffix
+                     WHERE id = @id AND review_state = 'pending'", conn, tx))
+                {
+                    upd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, reviewerId);
+                    upd.Parameters.AddWithValue("suffix", NpgsqlDbType.Text, $" [驳回:{rejectReason}]");
+                    upd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, calibrationId);
+                    if (await upd.ExecuteNonQueryAsync(ct) == 0) { await tx.RollbackAsync(ct); return Results.Conflict(new { error = "状态已变更，驳回未生效", calibrationId }); }
+                }
+
+                await WriteChannelAuditAsync(conn, tx, reviewerId, "load_calibrate_reject", channelId,
+                    System.Text.Json.JsonSerializer.Serialize(new { calibrationId, reason = rejectReason }),
+                    $"驳回 pending 正式标定 #{calibrationId}：{rejectReason}", ct);
+
+                await tx.CommitAsync(ct);
+                logger.LogWarning("驳回 pending 标定 channel={Ch} calibId={Id} reviewer={Rev} reason={Reason}",
+                    channelId, calibrationId, reviewerId, rejectReason);
+                return Results.Ok(new { rejected = true, calibrationId, channelId, reviewState = "rejected", reason = rejectReason });
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync(ct);
+                logger.LogError(ex, "驳回失败 channel={Ch} calibId={Id}", channelId, calibrationId);
+                return Results.Problem(detail: ex.Message, statusCode: 500);
+            }
+        })
+        .WithName("RejectCalibration")
+        .WithSummary("驳回 pending 正式标定（reviewer）");
 
         // 查通道标定历史
         grp.MapGet("/calibrations", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
@@ -1385,6 +1477,20 @@ public static class CalibrationEndpoints
         cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
         cmd.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, afterJson);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// 标定激活后把螺栓状态置 'calibrated'。历史遗漏点：API 标定路径（quick/torque/torque_fit/countersign）
+    /// 只更新 channels 的 k_l/active_calibration_id，漏写 bolts.state，导致已标定螺栓在总览/资产/验收报告里被误判"未标定"。
+    /// 判定口径已改为按通道有效标定派生（单一事实源），此处同步 state 让冗余字段不再漂移、且旧数据经再标定自愈。
+    /// </summary>
+    private static async Task MarkBoltCalibratedAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, long boltId, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand(
+            "UPDATE bolts SET state='calibrated', updated_at=now() WHERE id=@id AND state <> 'calibrated'", conn, tx);
+        cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 

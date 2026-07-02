@@ -12,19 +12,28 @@ public static class AssetEndpoints
 {
     // 每螺栓预紧力状态（相对安全下限 min_preload_n）：
     //   uncalibrated 未标定 / nodata 无近期数据 / loose 松动(<下限) / warn 预警(<下限×1.1) / normal 正常
+    // 【软删约定，跨切面统一】：所有健康/告警聚合都必须排除软删实体。本 CTE 对 channels / monitor_groups /
+    //   turbines / bolts 均加 deleted_at IS NULL；各级 open_alarms 子查询同样按 bolts.deleted_at 过滤
+    //   （见 /projects、/turbines、/groups 与 DashboardEndpoints 的按 severity 计数）。新增聚合请沿用此约定。
     internal const string BoltStatusCte = @"
         bolt_status AS (
             SELECT b.id, b.group_id, mg.turbine_id, t.project_id,
                    l.preload_n, l.preload_ratio, l.ts AS last_ts,
                    CASE
-                     WHEN b.state <> 'calibrated' OR c.k_l IS NULL THEN 'uncalibrated'
+                     -- 是否已标定：以通道有效标定（k_l + active_calibration_id）为单一事实源，
+                     -- 与采集算预紧力所依据的完全一致；不再单看 bolts.state（该冗余字段由标定接口维护，
+                     -- 历史上 API 标定路径漏写会漂移，导致已标定却显示未标定）。
+                     WHEN c.k_l IS NULL OR c.active_calibration_id IS NULL THEN 'uncalibrated'
                      WHEN l.preload_n IS NULL OR l.ts < now() - interval '10 minutes' THEN 'nodata'
                      WHEN b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n THEN 'loose'
                      WHEN b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n * 1.1 THEN 'warn'
+                     -- 偏高/超张力：保持率 > 1.10（与告警 Alarm:StaticThreshold:TriggerHighRatio 默认对齐）。
+                     -- 预紧力远超目标同样是风险（可能接近屈服 / 标定目标配错），不能一律算 normal。
+                     WHEN l.preload_ratio > 1.10 THEN 'high'
                      ELSE 'normal'
                    END AS status
             FROM bolts b
-            JOIN channels c ON c.id = b.channel_id
+            JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
             JOIN monitor_groups mg ON mg.id = b.group_id AND mg.deleted_at IS NULL
             JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
             LEFT JOIN LATERAL (
@@ -40,7 +49,8 @@ public static class AssetEndpoints
         count(*) FILTER (WHERE status='warn') AS warn,
         count(*) FILTER (WHERE status='loose') AS loose,
         count(*) FILTER (WHERE status='uncalibrated') AS uncalibrated,
-        count(*) FILTER (WHERE status='nodata') AS nodata";
+        count(*) FILTER (WHERE status='nodata') AS nodata,
+        count(*) FILTER (WHERE status='high') AS high";
 
     public static IEndpointRouteBuilder MapAssetEndpoints(this IEndpointRouteBuilder app)
     {
@@ -54,8 +64,8 @@ public static class AssetEndpoints
                 SELECT p.id, p.code, p.name, p.industry, p.location,
                        (SELECT count(*) FROM turbines t WHERE t.project_id=p.id AND t.deleted_at IS NULL) AS turbines,
                        COALESCE(bs.total,0), COALESCE(bs.normal,0), COALESCE(bs.warn,0), COALESCE(bs.loose,0),
-                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0),
-                       (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id
+                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0),
+                       (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id AND b2.deleted_at IS NULL
                           JOIN monitor_groups mg2 ON mg2.id=b2.group_id JOIN turbines t2 ON t2.id=mg2.turbine_id
                         WHERE t2.project_id=p.id AND a.cleared_at IS NULL) AS open_alarms
                 FROM projects p
@@ -71,7 +81,7 @@ public static class AssetEndpoints
                     industry = r.GetString(3), location = r.IsDBNull(4) ? null : r.GetString(4),
                     turbines = r.GetInt64(5),
                     health = Health(r, 6),
-                    openAlarms = r.GetInt64(12),
+                    openAlarms = r.GetInt64(13),
                 });
             return Results.Ok(new { count = items.Count, items });
         }).WithName("ListProjects");
@@ -84,8 +94,9 @@ public static class AssetEndpoints
                 SELECT t.id, t.code, t.name, t.model, t.capacity_kw, t.location, t.state,
                        (SELECT count(*) FROM monitor_groups mg WHERE mg.turbine_id=t.id AND mg.deleted_at IS NULL) AS groups,
                        COALESCE(bs.total,0), COALESCE(bs.normal,0), COALESCE(bs.warn,0), COALESCE(bs.loose,0),
-                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0),
-                       (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id JOIN monitor_groups mg2 ON mg2.id=b2.group_id
+                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0),
+                       (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id AND b2.deleted_at IS NULL
+                          JOIN monitor_groups mg2 ON mg2.id=b2.group_id
                         WHERE mg2.turbine_id=t.id AND a.cleared_at IS NULL) AS open_alarms
                 FROM turbines t
                 LEFT JOIN (SELECT turbine_id, {StatusAgg} FROM bolt_status GROUP BY turbine_id) bs ON bs.turbine_id=t.id
@@ -104,7 +115,7 @@ public static class AssetEndpoints
                     state = r.GetString(6),
                     groups = r.GetInt64(7),
                     health = Health(r, 8),
-                    openAlarms = r.GetInt64(14),
+                    openAlarms = r.GetInt64(15),
                 });
             return Results.Ok(new { count = items.Count, items });
         }).WithName("ListTurbines");
@@ -116,8 +127,8 @@ public static class AssetEndpoints
                 WITH {BoltStatusCte}
                 SELECT mg.id, mg.code, mg.name, mg.structure_type, mg.expected_bolt_count, mg.target_preload_n,
                        COALESCE(bs.total,0), COALESCE(bs.normal,0), COALESCE(bs.warn,0), COALESCE(bs.loose,0),
-                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0),
-                       (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id
+                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0),
+                       (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id AND b2.deleted_at IS NULL
                         WHERE b2.group_id=mg.id AND a.cleared_at IS NULL) AS open_alarms
                 FROM monitor_groups mg
                 LEFT JOIN (SELECT group_id, {StatusAgg} FROM bolt_status GROUP BY group_id) bs ON bs.group_id=mg.id
@@ -134,7 +145,7 @@ public static class AssetEndpoints
                     expectedBoltCount = r.IsDBNull(4) ? (int?)null : r.GetInt16(4),
                     targetPreloadN = r.IsDBNull(5) ? (decimal?)null : r.GetDecimal(5),
                     health = Health(r, 6),
-                    openAlarms = r.GetInt64(12),
+                    openAlarms = r.GetInt64(13),
                 });
             return Results.Ok(new { count = items.Count, items });
         }).WithName("ListGroups");
@@ -181,7 +192,7 @@ public static class AssetEndpoints
         return app;
     }
 
-    // 读取连续 6 列 total/normal/warn/loose/uncalibrated/nodata 为 health 对象
+    // 读取连续 7 列 total/normal/warn/loose/uncalibrated/nodata/high 为 health 对象
     internal static object Health(NpgsqlDataReader r, int offset) => new
     {
         total = r.GetInt64(offset),
@@ -190,5 +201,6 @@ public static class AssetEndpoints
         loose = r.GetInt64(offset + 3),
         uncalibrated = r.GetInt64(offset + 4),
         nodata = r.GetInt64(offset + 5),
+        high = r.GetInt64(offset + 6),
     };
 }

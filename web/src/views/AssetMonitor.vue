@@ -6,7 +6,7 @@ import HealthBar from '../components/HealthBar.vue'
 import FlangeRadar from '../components/FlangeRadar.vue'
 import GroupTrend from '../components/GroupTrend.vue'
 import PreloadScale from '../components/PreloadScale.vue'
-import { computePreloadHealth, pct } from '../utils/preload'
+import { computePreloadHealth, pct, STATUS_META } from '../utils/preload'
 import { useNow } from '../utils/useNow'
 import { assetApi, reportApi, type ProjectNode, type TurbineNode, type GroupNode, type GroupBolt } from '../api'
 import { onRealtime } from '../api/realtime'
@@ -32,13 +32,8 @@ async function genReport() {
   }
 }
 
-const STATUS: Record<string, { label: string; color: string; cls: string }> = {
-  normal: { label: '正常', color: '#10b981', cls: 'led--ok' },
-  warn: { label: '预警', color: '#f59e0b', cls: 'led--warn' },
-  loose: { label: '松动', color: '#f43f5e', cls: 'led--crit' },
-  uncalibrated: { label: '未标定', color: '#61748f', cls: 'led--off' },
-  nodata: { label: '无数据', color: '#3b4659', cls: 'led--off' },
-}
+// 状态元数据统一来自 utils/preload（含 high 偏高/超张力），不再本页各写一份
+const STATUS: Record<string, { label: string; color: string; cls: string }> = STATUS_META
 
 const projects = ref<ProjectNode[]>([])
 const projectId = ref<number | null>(null)
@@ -275,19 +270,23 @@ function onProjectChange() {
       </div>
 
       <div v-else class="grid grid--bolts">
-        <div v-for="{ b, h } in sortedBoltCells" :key="b.id" class="bolt panel" :class="`bolt--${b.status}`" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
+        <div v-for="{ b, h } in sortedBoltCells" :key="b.id" class="bolt panel" :class="`bolt--${b.status}`" :title="h.reason" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
           <div class="bolt-hd">
             <span class="led" :class="STATUS[b.status]?.cls" />
             <span class="bolt-code">{{ b.code }}</span>
             <span class="bolt-tag" :style="`color:${STATUS[b.status]?.color}`">{{ STATUS[b.status]?.label }}</span>
+            <!-- 安全状态正常但松弛显著（损失≥10%，风电常见复拧阈）时加一枚次级提示，调和"绿灯却在掉力"的观感 -->
+            <span v-if="b.status === 'normal' && h.relax && h.relax.band === 'significant'" class="bolt-subtag" :style="`color:${h.relax.color}`">松弛</span>
           </div>
           <div class="bolt-ratio metric" :style="`color:${STATUS[b.status]?.color}`">
             {{ ratioStr(b.preloadRatio) }}<span class="bolt-ratio-cap">保持</span>
           </div>
           <PreloadScale :current="num(b.preloadN)" :target="num(b.targetPreloadN)" :min="num(b.minPreloadN)" :height="6" compact />
           <div class="bolt-margin">
-            <span>裕度 <b :style="marginStyle(h.safetyMargin)">{{ pct(h.safetyMargin) }}</b></span>
-            <span v-if="h.relax && h.relax.band !== 'good'" :style="`color:${h.relax.color}`">损失 {{ pct(h.lossPct) }}</span>
+            <!-- 偏高/超张力：主指标改显"超目标 +X%"，避免"裕度 240%"这种看着很安全实则过张力的误导 -->
+            <span v-if="b.status === 'high'">超目标 <b style="color:#a78bfa">+{{ pct((h.residualRatio ?? 1) - 1) }}</b></span>
+            <span v-else>裕度 <b :style="marginStyle(h.safetyMargin)">{{ pct(h.safetyMargin) }}</b></span>
+            <span v-if="h.relax && h.relax.band !== 'good' && b.status !== 'high'" :style="`color:${h.relax.color}`">损失 {{ pct(h.lossPct) }}</span>
             <span v-else class="mono">{{ b.preloadN ? (Number(b.preloadN) / 1000).toFixed(1) + 'kN' : '—' }}</span>
           </div>
           <div class="bolt-foot mono">{{ b.nominalDiam }}·{{ b.grade }} · CH{{ b.channelNo }}</div>
@@ -325,9 +324,11 @@ function onProjectChange() {
 /* 螺栓网格卡（stat 风：大号保持率 + 状态点 + 脚注，状态色仅用于边/标记） */
 .bolt { padding: 14px 14px 13px; cursor: pointer; transition: border-color 0.16s, transform 0.16s; border-radius: var(--radius-sm); }
 .bolt:hover { transform: translateY(-2px); }
-.bolt:not(.bolt--loose):not(.bolt--warn):hover { border-color: var(--panel-border-strong); }
+.bolt:not(.bolt--loose):not(.bolt--warn):not(.bolt--high):hover { border-color: var(--panel-border-strong); }
 .bolt--loose { border-color: var(--crit); }
 .bolt--warn { border-color: var(--warn); }
+.bolt--high { border-color: #a78bfa; }
+.bolt-subtag { font-size: 10px; padding: 0 5px; border-radius: 4px; background: rgba(167, 139, 250, 0.12); }
 .bolt-hd { display: flex; align-items: center; gap: 8px; }
 .bolt-code { font-size: 13px; font-weight: 600; flex: 1; }
 .bolt-tag { font-size: 11px; }

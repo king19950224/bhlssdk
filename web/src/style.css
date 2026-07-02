@@ -130,6 +130,30 @@ body {
   color: var(--text-3);
 }
 
+/* 标题强调标记（页面通用）：标题左侧一道状态色竖条，统一各页层次。
+   用 inline-block + vertical-align，不依赖父级 flex，任意 .panel-title 内直接放即可。 */
+.hd-mark { display: inline-block; width: 3px; height: 11px; border-radius: 2px; margin-right: 8px; vertical-align: middle; background: var(--accent); }
+.hd-mark--crit { background: var(--crit); }
+.hd-mark--warn { background: var(--warn); }
+.hd-mark--ok { background: var(--ok); }
+.hd-sub { font-size: 11.5px; color: var(--text-3); }
+
+/* 指标卡 stat（页面通用）：图标容器/状态点 + 标签 + 大数 + 可选脚注。
+   配合 .panel 提供背景与边框；Dashboard 的 sparkline/delta 等为该页 scoped 扩展。 */
+.stat { padding: 13px 16px 12px; display: flex; flex-direction: column; gap: 7px; min-width: 0; transition: border-color 0.16s, transform 0.16s; }
+.stat-hd { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 16px; }
+.stat-label { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat-ic { font-size: 16px; color: var(--text-3); }
+.stat-val { font-size: 30px; font-weight: 700; line-height: 1; display: flex; align-items: baseline; }
+.stat-val i { font-size: 15px; font-style: normal; color: var(--text-3); margin-left: 2px; }
+.stat-foot { font-size: 11px; color: var(--text-3); display: flex; align-items: center; }
+.stat--crit { border-color: rgba(244, 63, 94, 0.35); }
+.stat--ok { border-color: rgba(16, 185, 129, 0.3); }
+.stat--click { cursor: pointer; }
+.stat--click:hover { border-color: var(--panel-border-strong); transform: translateY(-1px); }
+.stat-go { font-size: 12px; color: var(--text-3); transition: transform 0.16s; }
+.stat--click:hover .stat-go { transform: translateX(2px); color: var(--accent); }
+
 /* 脉冲状态灯 */
 .led {
   display: inline-block;
@@ -150,6 +174,7 @@ body {
 .led--ok { background: var(--ok); box-shadow: 0 0 10px var(--ok-glow); }
 .led--warn { background: var(--warn); box-shadow: 0 0 10px var(--warn-glow); }
 .led--crit { background: var(--crit); box-shadow: 0 0 10px var(--crit-glow); }
+.led--high { background: #a78bfa; box-shadow: 0 0 10px rgba(167, 139, 250, 0.55); }
 .led--off { background: var(--text-3); }
 @keyframes led-pulse {
   0% { transform: scale(0.8); opacity: 0.6; }

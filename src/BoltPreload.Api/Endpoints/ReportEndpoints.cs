@@ -88,6 +88,8 @@ public static class ReportEndpoints
             catch
             {
                 await tx.RollbackAsync(ct);
+                // 事务失败：删掉已落盘的报告文件，避免留下无 reports 行对应的孤儿 HTML
+                try { if (File.Exists(absolutePath)) File.Delete(absolutePath); } catch { /* 清理尽力 */ }
                 throw;
             }
 
@@ -331,8 +333,9 @@ public static class ReportEndpoints
                 while (await r.ReadAsync(ct))
                 {
                     total++;
-                    var state = r.GetString(6);
-                    var isCal = !r.IsDBNull(8) && state == "calibrated";
+                    // "已标定"以通道有效标定为准（c.k_l 非空[8] 且有 active calibration → cr.method 非空[12]），
+                    // 不再依赖易漂移的 bolts.state[6]（API 标定路径历史上漏写 state，会让在产螺栓被误判未标定）。
+                    var isCal = !r.IsDBNull(8) && !r.IsDBNull(12);
                     decimal? min = r.IsDBNull(5) ? null : r.GetDecimal(5);
                     decimal? pre = r.IsDBNull(9) ? null : r.GetDecimal(9);
                     var method = r.IsDBNull(12) ? null : r.GetString(12);
@@ -429,6 +432,8 @@ public static class ReportEndpoints
             catch
             {
                 await tx.RollbackAsync(ct);
+                // 事务失败：删掉已落盘的报告文件，避免留下无 reports 行对应的孤儿 HTML
+                try { if (File.Exists(absolutePath)) File.Delete(absolutePath); } catch { /* 清理尽力 */ }
                 throw;
             }
 

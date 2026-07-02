@@ -13,6 +13,7 @@ const STATUS_COLOR: Record<string, string> = {
   normal: 'rgba(56,189,248,0.7)',
   warn: '#f59e0b',
   loose: '#f43f5e',
+  high: '#a78bfa',
   uncalibrated: 'rgba(97,116,143,0.5)',
   nodata: 'rgba(97,116,143,0.5)',
 }
@@ -24,8 +25,10 @@ const limitRatio = computed(() => {
   return rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : 0.8
 })
 
+let loadSeq = 0
 async function load() {
-  if (!props.bolts.length) return
+  if (!props.bolts.length) { seriesData.value = []; return }
+  const seq = ++loadSeq // 竞态令牌：bolts/range 快速切换时，只保留最后一次发起的结果
   loading.value = true
   const hours = range.value === '24h' ? 24 : 168
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
@@ -38,12 +41,13 @@ async function load() {
           .catch(() => ({ bolt: b, items: [] as { ts: string; avgRatio: number | null }[] })),
       ),
     )
+    if (seq !== loadSeq) return // 已有更新的加载在途，丢弃这次陈旧结果
     seriesData.value = results.map(({ bolt, items }) => ({
       bolt,
       pts: items.map((p) => [new Date(p.ts).getTime(), p.avgRatio == null ? null : Number(p.avgRatio) * 100] as [number, number | null]),
     }))
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 onMounted(load)
@@ -53,11 +57,11 @@ watch(range, load)
 const hasData = computed(() => seriesData.value.some((s) => s.pts.some((p) => p[1] != null)))
 
 const option = computed(() => {
-  const order: Record<string, number> = { loose: 3, warn: 2, normal: 1, uncalibrated: 0, nodata: 0 }
+  const order: Record<string, number> = { loose: 3, high: 3, warn: 2, normal: 1, uncalibrated: 0, nodata: 0 }
   const sorted = [...seriesData.value].sort((a, b) => (order[a.bolt.status] ?? 0) - (order[b.bolt.status] ?? 0))
   const series: Record<string, unknown>[] = sorted.map((s) => {
     const st = s.bolt.status
-    const alert = st === 'loose' || st === 'warn'
+    const alert = st === 'loose' || st === 'warn' || st === 'high'
     const col = STATUS_COLOR[st] ?? 'rgba(148,163,184,0.5)'
     return {
       name: s.bolt.code, type: 'line', smooth: true, symbol: 'none', connectNulls: true, data: s.pts,
@@ -77,7 +81,7 @@ const option = computed(() => {
     tooltip: { trigger: 'axis', backgroundColor: '#0d1320', borderColor: 'rgba(56,189,248,0.3)', textStyle: { color: '#e8eef8' }, valueFormatter: (v: number) => (v == null ? '—' : v.toFixed(1) + '%') },
     legend: { type: 'scroll', bottom: 0, textStyle: { color: '#9fb0c8', fontSize: 11 }, inactiveColor: '#3b4659', pageIconColor: '#61748f', pageTextStyle: { color: '#9fb0c8' } },
     xAxis: { type: 'time', axisLine: { lineStyle: { color: 'rgba(148,163,184,0.2)' } }, axisLabel: { color: '#61748f', fontSize: 11 } },
-    yAxis: { type: 'value', scale: true, name: '残余率 %', nameTextStyle: { color: '#61748f', fontSize: 11 }, axisLabel: { color: '#61748f', fontSize: 11, formatter: '{value}%' }, splitLine: { lineStyle: { color: 'rgba(148,163,184,0.08)' } } },
+    yAxis: { type: 'value', scale: true, name: '保持率 %', nameTextStyle: { color: '#61748f', fontSize: 11 }, axisLabel: { color: '#61748f', fontSize: 11, formatter: '{value}%' }, splitLine: { lineStyle: { color: 'rgba(148,163,184,0.08)' } } },
     series,
   }
 })
@@ -86,7 +90,7 @@ const option = computed(() => {
 <template>
   <div class="gtrend">
     <div class="gt-bar">
-      <span class="gt-title">同部位残余预紧力率对比 <i>全圈齐降 = 系统性松弛；单根掉队 = 个别松动</i></span>
+      <span class="gt-title">同部位预紧力保持率对比 <i>全圈齐降 = 系统性松弛；单根掉队 = 个别松动</i></span>
       <div class="range-tabs">
         <span v-for="k in (['24h', '7d'] as const)" :key="k" class="range-tab" :class="{ active: range === k }" @click="range = k">{{ k }}</span>
       </div>

@@ -4,11 +4,13 @@ import type { PreloadHealth } from '../api'
 
 const props = defineProps<{ health: PreloadHealth }>()
 
-const ORDER = ['normal', 'warn', 'loose', 'uncalibrated', 'nodata'] as const
+// 与 utils/preload STATUS_META 顺序/配色一致；high(偏高/超张力)=紫
+const ORDER = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata'] as const
 const COLOR: Record<string, string> = {
   normal: '#10b981',
   warn: '#f59e0b',
   loose: '#f43f5e',
+  high: '#a78bfa',
   uncalibrated: '#61748f',
   nodata: '#3b4659',
 }

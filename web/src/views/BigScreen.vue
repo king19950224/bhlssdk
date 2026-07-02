@@ -5,11 +5,12 @@ import EChart from '../components/EChart.vue'
 import { dashboardApi, alarmApi, type PreloadHealth, type LooseBolt, type ApproachingBolt, type AlarmItem } from '../api'
 import { useRuntime } from '../stores/runtime'
 import { onRealtime } from '../api/realtime'
+import { pctParts } from '../utils/preload'
 
 const router = useRouter()
 const runtime = useRuntime()
 
-const health = ref<PreloadHealth>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0 })
+const health = ref<PreloadHealth>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0, high: 0 })
 const byGroup = ref<{ turbine: string; group: string; health: PreloadHealth }[]>([])
 const topLoose = ref<LooseBolt[]>([])
 const approaching = ref<ApproachingBolt[]>([])
@@ -25,11 +26,17 @@ const STATUS: Record<string, { label: string; color: string; cls: string }> = {
   normal: { label: '正常', color: '#10b981', cls: 'led--ok' },
   warn: { label: '预警', color: '#f59e0b', cls: 'led--warn' },
   loose: { label: '松动', color: '#f43f5e', cls: 'led--crit' },
-  uncalibrated: { label: '未标定', color: '#61748f', cls: 'led--off' },
-  nodata: { label: '无数据', color: '#3b4659', cls: 'led--off' },
+  high: { label: '偏高', color: '#a78bfa', cls: 'led--high' },
+  uncalibrated: { label: '未标定/过期', color: '#61748f', cls: 'led--off' },
+  nodata: { label: '无近期数据', color: '#3b4659', cls: 'led--off' },
 }
-const ORDER = ['normal', 'warn', 'loose', 'uncalibrated', 'nodata'] as const
+const ORDER = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata'] as const
 const SEV: Record<string, string> = { critical: '#f43f5e', crit: '#f43f5e', warn: '#f59e0b', warning: '#f59e0b', info: '#38bdf8' }
+// 各状态整数百分比（最大余数法，合计恰为 100%）
+const healthPct = computed<Record<string, number>>(() => {
+  const parts = pctParts(ORDER.map((k) => health.value[k]), health.value.total)
+  return Object.fromEntries(ORDER.map((k, i) => [k, parts[i]]))
+})
 
 async function refresh() {
   try {
@@ -98,7 +105,7 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
           <div class="donut-center"><b class="mono">{{ health.total }}</b><span>监测螺栓</span></div>
         </div>
         <div class="legend">
-          <div v-for="k in ORDER" :key="k" class="lg"><span class="led" :class="STATUS[k].cls" /><span class="lg-l">{{ STATUS[k].label }}</span><b class="mono">{{ health[k] }}</b><span class="lg-p mono">{{ pct(health[k], health.total).toFixed(0) }}%</span></div>
+          <div v-for="k in ORDER" :key="k" class="lg"><span class="led" :class="STATUS[k].cls" /><span class="lg-l">{{ STATUS[k].label }}</span><b class="mono">{{ health[k] }}</b><span class="lg-p mono">{{ healthPct[k] }}%</span></div>
         </div>
       </section>
 

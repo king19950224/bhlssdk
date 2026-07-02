@@ -132,6 +132,7 @@ export interface PreloadHealth {
   loose: number
   uncalibrated: number
   nodata: number
+  high: number
 }
 export interface LooseBolt {
   boltCode: string
@@ -149,6 +150,14 @@ export interface ApproachingBolt {
   preloadN: number | null; minPreloadN: number | null; preloadRatio: number | null
   boltId: number; ratePerDay: number | null; daysToLimit: number | null; r2: number | null
 }
+export interface DashboardTrendPoint {
+  ts: string
+  avgRatio: number | null
+  minRatio: number | null
+  count: number
+  activeBolts: number
+  alarms: number
+}
 export const dashboardApi = {
   preloadHealth: () =>
     http.get<{
@@ -160,6 +169,8 @@ export const dashboardApi = {
       residualDist: ResidualDist
       approachingLimit: ApproachingBolt[]
     }>('/api/dashboard/preload-health'),
+  trend: (hours = 24) =>
+    http.get<{ bucketMinutes: number; hours: number; points: DashboardTrendPoint[] }>(`/api/dashboard/trend?hours=${hours}`),
 }
 
 // ---- 资产层级 ----
@@ -294,7 +305,7 @@ export interface ChannelLive {
 
 // ---- 波形诊断 ----
 export interface WaveFeature {
-  id: number; boltId: number | null; channelId: number; ts: string; pointCount: number
+  id: number; boltId: number | null; channelId: number; channelNo: number | null; ts: string; pointCount: number
   threshold: number | null; peakToPeak: number | null; rmsValue: number | null
   noiseRms: number | null; snrDb: number | null; waveUrl: string
 }
@@ -413,6 +424,11 @@ export const calibrationApi = {
     http.post<{ calibrationId: string; channelId: number; kL: number; rSquared: number; reviewState: string }>(`/api/channels/${channelId}/load-calibrate`, body),
   countersign: (channelId: number, calibrationId: string) =>
     http.post<{ activated: boolean; calibrationId: string; reviewState: string }>(`/api/channels/${channelId}/calibrations/${calibrationId}/countersign`),
+  // 驳回 pending 正式标定（reviewer）：置 rejected，不激活、不动通道
+  reject: (channelId: number, calibrationId: string, reason?: string) =>
+    http.post<{ rejected: boolean; calibrationId: string; reviewState: string; reason: string }>(
+      `/api/channels/${channelId}/calibrations/${calibrationId}/reject${reason ? `?reason=${encodeURIComponent(reason)}` : ''}`,
+    ),
 }
 
 // ---- 通道自动检测（probe-scan） ----

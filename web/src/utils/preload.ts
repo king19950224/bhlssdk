@@ -1,16 +1,23 @@
 // 螺栓状态 + 预紧力变化程度的统一模型。
 // 状态口径与服务端 bolt_status CTE 一致（仅看安全下限 min_preload_n），
-// 在此之上补充"变化程度"的量化指标：残余率 / 损失 / 安全裕度 / 松弛分级。
+// 在此之上补充"变化程度"的量化指标：保持率 / 损失 / 安全裕度 / 松弛分级。
 
-export type PreloadStatus = 'normal' | 'warn' | 'loose' | 'uncalibrated' | 'nodata'
+export type PreloadStatus = 'normal' | 'warn' | 'loose' | 'high' | 'uncalibrated' | 'nodata'
 
+// 全项目唯一的螺栓状态元数据（颜色/文案/LED 类）。AssetMonitor / FlangeRadar / HealthBar 等一律引用此表，
+// 不再各自复制（历史上三处各写一份、颜色文案还不一致）。
+// high(偏高/超张力)：保持率 > 110%，用紫色——与总览"超张力"配色一致，且和 warn 的琥珀(偏低预警)区分开。
 export const STATUS_META: Record<PreloadStatus, { label: string; color: string; cls: string }> = {
   normal: { label: '正常', color: '#10b981', cls: 'led--ok' },
   warn: { label: '预警', color: '#f59e0b', cls: 'led--warn' },
   loose: { label: '松动', color: '#f43f5e', cls: 'led--crit' },
+  high: { label: '偏高', color: '#a78bfa', cls: 'led--high' },
   uncalibrated: { label: '未标定', color: '#61748f', cls: 'led--off' },
   nodata: { label: '无数据', color: '#3b4659', cls: 'led--off' },
 }
+
+// 展示顺序（健康条 / 图例统一用）
+export const STATUS_ORDER: PreloadStatus[] = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata']
 
 export interface PreloadInput {
   calibrated?: boolean
@@ -42,8 +49,11 @@ export interface PreloadHealth {
   reason: string
 }
 
-const num = (v: number | string | null | undefined): number | null =>
-  v == null || v === '' ? null : Number(v)
+const num = (v: number | string | null | undefined): number | null => {
+  if (v == null || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null // 挡住 NaN/Infinity，避免脏值流进图表与计算
+}
 
 export function fmtN(n: number | null | undefined): string {
   return n == null ? '—' : Math.round(Number(n)).toLocaleString('en-US')
@@ -57,12 +67,45 @@ export function signedN(n: number | null | undefined): string {
   return (v > 0 ? '+' : '') + v.toLocaleString('en-US')
 }
 
-export function computePreloadHealth(inp: PreloadInput): PreloadHealth {
+/**
+ * 把若干计数按总和换算成整数百分比，用最大余数法保证合计恰为 100（避免
+ * 各自四舍五入后出现 101% / 99% 的违和）。total 缺省时按 counts 求和；总和为 0 返回全 0。
+ */
+export function pctParts(counts: number[], total?: number): number[] {
+  const sum = total ?? counts.reduce((a, b) => a + b, 0)
+  if (!sum) return counts.map(() => 0)
+  const raw = counts.map((c) => (c / sum) * 100)
+  const out = raw.map((v) => Math.floor(v))
+  let remainder = 100 - out.reduce((a, b) => a + b, 0)
+  // 余数按小数部分从大到小逐个 +1，分配完为止
+  const order = raw
+    .map((v, i) => ({ i, frac: v - Math.floor(v) }))
+    .sort((a, b) => b.frac - a.frac)
+  for (let k = 0; k < order.length && remainder > 0; k++, remainder--) out[order[k].i]++
+  return out
+}
+
+/** 把时间戳格式化为「N 秒/分钟/小时/天前」，用于「最后已知数据」的陈旧度提示。 */
+export function fmtAgo(iso: string | null | undefined, nowMs: number = Date.now()): string {
+  if (!iso) return '—'
+  const ms = nowMs - new Date(iso).getTime()
+  if (!isFinite(ms)) return '—'
+  if (ms < 0) return '刚刚'
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s} 秒前`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h} 小时前`
+  return `${Math.floor(h / 24)} 天前`
+}
+
+export function computePreloadHealth(inp: PreloadInput, nowMs: number = Date.now()): PreloadHealth {
   const target = num(inp.target)
   const min = num(inp.min)
   const current = num(inp.current)
   const calibrated = inp.calibrated ?? inp.state === 'calibrated'
-  const stale = inp.lastTs ? Date.now() - new Date(inp.lastTs).getTime() > (inp.staleMinutes ?? 10) * 60000 : false
+  const stale = inp.lastTs ? nowMs - new Date(inp.lastTs).getTime() > (inp.staleMinutes ?? 10) * 60000 : false
 
   const residualRatio = current != null && target != null && target > 0 ? current / target : null
   const lossN = current != null && target != null ? target - current : null
@@ -84,9 +127,13 @@ export function computePreloadHealth(inp: PreloadInput): PreloadHealth {
   } else if (min != null && current < min * 1.1) {
     status = 'warn'
     reason = `接近下限,安全裕度仅 ${pct(safetyMargin)}`
+  } else if (residualRatio != null && residualRatio > 1.1) {
+    // 偏高/超张力：保持率 > 110%（与服务端 bolt_status CTE 和告警 TriggerHighRatio 口径一致）
+    status = 'high'
+    reason = `预紧力偏高,当前为目标的 ${pct(residualRatio)}(超张力风险)`
   } else {
     status = 'normal'
-    reason = target != null ? `残余 ${pct(residualRatio)} · 裕度 ${pct(safetyMargin)}` : '运行正常'
+    reason = target != null ? `保持 ${pct(residualRatio)} · 裕度 ${pct(safetyMargin)}` : '运行正常'
   }
 
   // 松弛程度：变化程度的定性分级（独立于安全状态）。风电螺栓常以损失 10% 作为复拧阈。
