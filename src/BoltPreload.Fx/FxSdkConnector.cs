@@ -25,8 +25,11 @@ public sealed class FxSdkConnector : IFxConnector
     private readonly long _deviceId;
     private readonly ILogger<FxSdkConnector> _logger;
     private readonly Channel<FxDecodedEnvelope> _channel;
-    private readonly SemaphoreSlim _connectLock = new(1, 1);
-    private string? _sessionId;
+    private readonly SemaphoreSlim _sessionLock = new(1, 1);
+    private volatile string? _sessionId;
+    // 会话代次：每次(重)连的 provisioning 进锁后记录一个代次，断开事件(OnSdkDisconnected/DisconnectAsync)自增它。
+    // provisioning 在置 Connected 前校验代次未变，杜绝"断开与 provisioning 交叉"把过期会话错误标成 Connected 的竞态。
+    private long _sessionGeneration;
     private bool _disposed;
 
     // H3：背压丢弃计数 + 告警节流时间戳
@@ -46,7 +49,13 @@ public sealed class FxSdkConnector : IFxConnector
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, TaskCompletionSource<EchoWave>> _echoWaveWaiters = new();
 
     public long DeviceId => _deviceId;
-    public FxConnectorState State { get; private set; } = FxConnectorState.Idle;
+    private int _state = (int)FxConnectorState.Idle;
+    // State 跨线程访问（SDK 事件线程写断开、看门狗/命令线程读写连接）：用 volatile backing field 保证可见性。
+    public FxConnectorState State
+    {
+        get => (FxConnectorState)Volatile.Read(ref _state);
+        private set => Volatile.Write(ref _state, (int)value);
+    }
     public ChannelReader<FxDecodedEnvelope> Results => _channel.Reader;
     public long DroppedCount => Interlocked.Read(ref _dropped);
     public Func<FxDecodedEnvelope, ValueTask>? OverflowSink { get; set; }
@@ -80,7 +89,7 @@ public sealed class FxSdkConnector : IFxConnector
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
-        await _connectLock.WaitAsync(cancellationToken);
+        await _sessionLock.WaitAsync(cancellationToken);
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -102,13 +111,13 @@ public sealed class FxSdkConnector : IFxConnector
         }
         finally
         {
-            _connectLock.Release();
+            _sessionLock.Release();
         }
     }
 
     public async Task DisconnectAsync(CancellationToken cancellationToken = default)
     {
-        await _connectLock.WaitAsync(cancellationToken);
+        await _sessionLock.WaitAsync(cancellationToken);
         try
         {
             if (_sessionId is null)
@@ -118,13 +127,15 @@ public sealed class FxSdkConnector : IFxConnector
             }
 
             await _client.CloseAsync(_sessionId);
+            // 自增代次：与断开事件一致，使任何进行中的 provisioning 结束时不再把过期会话标 Connected。
+            Interlocked.Increment(ref _sessionGeneration);
             _sessionId = null;
             State = FxConnectorState.Disconnected;
             // 不能 TryComplete：IngestionService 正在 ReadAllAsync，重连后还要继续消费同一个通道。
         }
         finally
         {
-            _connectLock.Release();
+            _sessionLock.Release();
         }
     }
 
@@ -149,34 +160,45 @@ public sealed class FxSdkConnector : IFxConnector
         }
         catch (OperationCanceledException)
         {
-            return; // 取消则放弃本次重连
+            // 取消则放弃本次重连。DisconnectAsync 已把 State 置 Disconnected；此处兜底确保不残留 Reconnecting
+            // （若上面的断开因异常未走到置位分支），避免运维/诊断长期看到 Reconnecting 假象。
+            if (State == FxConnectorState.Reconnecting)
+                State = FxConnectorState.Disconnected;
+            return;
         }
 
         await ConnectAsync(cancellationToken);
     }
 
-    public Task SetWorkModeAsync(FxWorkMode mode, ushort channel = 0, ushort address = 1, CancellationToken cancellationToken = default)
+    // 串行化所有"会话级"操作（连接/断开 + 下发命令）：避免命令与 ReconnectAsync/DisconnectAsync 并发使用 _sessionId，
+    // 否则命令可能在会话被置空/换新的瞬间读到过期 session（看门狗重连 + 波形采样 + 通道扫描会在同一会话上交错）。
+    // Connect/Disconnect 已用同一把 _sessionLock，命令方法只调用 _client.*（不回调本类公开方法），故不会重入死锁。
+    private async Task RunUnderSessionLockAsync(Func<string, Task> action, CancellationToken ct)
     {
-        if (_sessionId is null)
-            throw new InvalidOperationException("Not connected");
-
-        var sdkMode = (WorkMode)(int)mode;
-        return _client.SetDeviceModeAsync(_sessionId, sdkMode, channel, address);
+        await _sessionLock.WaitAsync(ct);
+        try
+        {
+            var session = _sessionId ?? throw new InvalidOperationException("Not connected");
+            await action(session);
+        }
+        finally
+        {
+            _sessionLock.Release();
+        }
     }
+
+    public Task SetWorkModeAsync(FxWorkMode mode, ushort channel = 0, ushort address = 1, CancellationToken cancellationToken = default)
+        => RunUnderSessionLockAsync(session =>
+        {
+            var sdkMode = (WorkMode)(int)mode;
+            return _client.SetDeviceModeAsync(session, sdkMode, channel, address);
+        }, cancellationToken);
 
     public Task ReadDeviceParamAsync(string propertyName, ushort address = 1, CancellationToken cancellationToken = default)
-    {
-        if (_sessionId is null)
-            throw new InvalidOperationException("Not connected");
-        return _client.ReadDeviceParamAsync(_sessionId, propertyName, address);
-    }
+        => RunUnderSessionLockAsync(session => _client.ReadDeviceParamAsync(session, propertyName, address), cancellationToken);
 
     public Task ReadChannelParamAsync(string propertyName, ushort channel = 1, ushort address = 1, CancellationToken cancellationToken = default)
-    {
-        if (_sessionId is null)
-            throw new InvalidOperationException("Not connected");
-        return _client.ReadChannelParamAsync(_sessionId, propertyName, channel, address);
-    }
+        => RunUnderSessionLockAsync(session => _client.ReadChannelParamAsync(session, propertyName, channel, address), cancellationToken);
 
     public Task ConfigureMultiChannelPollingAsync(
         IReadOnlyCollection<ushort> enabledChannels,
@@ -185,8 +207,6 @@ public sealed class FxSdkConnector : IFxConnector
         uint? startSeconds = null,
         CancellationToken cancellationToken = default)
     {
-        if (_sessionId is null)
-            throw new InvalidOperationException("Not connected");
         if (enabledChannels.Count == 0)
             throw new ArgumentException("enabledChannels 不能为空", nameof(enabledChannels));
 
@@ -198,16 +218,20 @@ public sealed class FxSdkConnector : IFxConnector
         if (channels.Count == 0)
             throw new ArgumentException("enabledChannels 必须包含正数通道号", nameof(enabledChannels));
 
-        _config.MCRConfig ??= new MCRConfig();
-        _config.MCRConfig.EnabledChannels = channels;
-        if (singleCount is not null) _config.MCRConfig.SingleCount = singleCount.Value;
-        if (dailyCount is not null) _config.MCRConfig.DailyCount = dailyCount.Value;
-        if (startSeconds is not null) _config.MCRConfig.StartSeconds = startSeconds.Value;
+        return RunUnderSessionLockAsync(session =>
+        {
+            // _config.MCRConfig 是共享可变状态：放在会话锁内改，避免与并发下发命令交错读到半更新的配置
+            _config.MCRConfig ??= new MCRConfig();
+            _config.MCRConfig.EnabledChannels = channels;
+            if (singleCount is not null) _config.MCRConfig.SingleCount = singleCount.Value;
+            if (dailyCount is not null) _config.MCRConfig.DailyCount = dailyCount.Value;
+            if (startSeconds is not null) _config.MCRConfig.StartSeconds = startSeconds.Value;
 
-        _logger.LogWarning("下发多通道轮询配置 device={DeviceId} enabledChannels={Channels} singleCount={SingleCount} dailyCount={DailyCount}",
-            _deviceId, string.Join(",", channels), _config.MCRConfig.SingleCount, _config.MCRConfig.DailyCount);
+            _logger.LogWarning("下发多通道轮询配置 device={DeviceId} enabledChannels={Channels} singleCount={SingleCount} dailyCount={DailyCount}",
+                _deviceId, string.Join(",", channels), _config.MCRConfig.SingleCount, _config.MCRConfig.DailyCount);
 
-        return _client.ConfigureDeviceAsync(_sessionId, _config, nameof(_config.MCRConfig), sendCommand: true);
+            return _client.ConfigureDeviceAsync(session, _config, nameof(_config.MCRConfig), sendCommand: true);
+        }, cancellationToken);
     }
 
     public IReadOnlyList<FxSessionChannelConfigSnapshot> GetSessionChannelConfigs()
@@ -229,62 +253,65 @@ public sealed class FxSdkConnector : IFxConnector
             .ToArray();
     }
 
-    public async Task ConfigureChannelAsync(
+    // 当前设备端 MCR 轮询启用的通道集（读 DeviceConfig.MCRConfig 的实时会话状态）。
+    // ProbeScan 扫描前快照它作为"业务轮询集"，扫描后恢复，避免 mcr_single 逐通道改写后只剩最后一个通道。
+    public IReadOnlyList<ushort> GetSessionMcrChannels()
+        => _config.MCRConfig?.EnabledChannels is { Count: > 0 } ch ? ch.ToArray() : Array.Empty<ushort>();
+
+    public Task ConfigureChannelAsync(
         ushort channel,
         ChannelConfigUpdate updates,
         ushort address = 1,
         CancellationToken cancellationToken = default)
-    {
-        if (_sessionId is null)
-            throw new InvalidOperationException("Not connected");
+        => RunUnderSessionLockAsync(async session =>
+        {
+            // ChannelConfig 是 stateful，必须先填好整个对象（address/channel + 要改的字段），
+            // 再用 propertyName 标记 SDK 只编码哪一项指令发到设备
+            var cfg = new FxSDK.Models.ChannelConfig
+            {
+                Address = address,
+                Channel = channel
+            };
 
-        // ChannelConfig 是 stateful，必须先填好整个对象（address/channel + 要改的字段），
-        // 再用 propertyName 标记 SDK 只编码哪一项指令发到设备
-        var cfg = new FxSDK.Models.ChannelConfig
-        {
-            Address = address,
-            Channel = channel
-        };
+            // SDK 协议层（MultiChIotProtocolHandler.EncodeChannel）只支持 5 个 propertyName：
+            //     ProbeFreq / EchoWin / EchoWidth / PulseConfig / Gain
+            //   以及 RefTime —— 但它实际是「整组标定基线」：一条命令把
+            //   MeasMode + Threshold + RefTime + RefTemp + LEchoWave 一起写。
+            //   所以单写 RefTemp / Threshold / MeasMode / TcMode / TempCoefficient 都会被 SDK 拒绝。
+            //   这里只接受 SDK 真实支持的属性；RefTime 走专门的"重标定"流程（需先读到 LEchoWave）。
+            if (updates.ProbeFreqMhz is not null)
+            {
+                cfg.ProbeFreq = updates.ProbeFreqMhz.Value;
+                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.ProbeFreq), sendCommand: true);
+            }
+            if (updates.EchoWinNs is not null)
+            {
+                cfg.EchoWin = updates.EchoWinNs.Value;
+                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.EchoWin), sendCommand: true);
+            }
+            if (updates.EchoWidthUs is not null)
+            {
+                cfg.EchoWidth = updates.EchoWidthUs.Value;
+                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.EchoWidth), sendCommand: true);
+            }
+            if (updates.Gain is not null)
+            {
+                cfg.Gain = updates.Gain.Value;
+                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.Gain), sendCommand: true);
+            }
 
-        // SDK 协议层（MultiChIotProtocolHandler.EncodeChannel）只支持 5 个 propertyName：
-        //     ProbeFreq / EchoWin / EchoWidth / PulseConfig / Gain
-        //   以及 RefTime —— 但它实际是「整组标定基线」：一条命令把
-        //   MeasMode + Threshold + RefTime + RefTemp + LEchoWave 一起写。
-        //   所以单写 RefTemp / Threshold / MeasMode / TcMode / TempCoefficient 都会被 SDK 拒绝。
-        //   这里只接受 SDK 真实支持的属性；RefTime 走专门的"重标定"流程（需先读到 LEchoWave）。
-        if (updates.ProbeFreqMhz is not null)
-        {
-            cfg.ProbeFreq = updates.ProbeFreqMhz.Value;
-            await _client.ConfigureChannelAsync(_sessionId, cfg, nameof(cfg.ProbeFreq), sendCommand: true);
-        }
-        if (updates.EchoWinNs is not null)
-        {
-            cfg.EchoWin = updates.EchoWinNs.Value;
-            await _client.ConfigureChannelAsync(_sessionId, cfg, nameof(cfg.EchoWin), sendCommand: true);
-        }
-        if (updates.EchoWidthUs is not null)
-        {
-            cfg.EchoWidth = updates.EchoWidthUs.Value;
-            await _client.ConfigureChannelAsync(_sessionId, cfg, nameof(cfg.EchoWidth), sendCommand: true);
-        }
-        if (updates.Gain is not null)
-        {
-            cfg.Gain = updates.Gain.Value;
-            await _client.ConfigureChannelAsync(_sessionId, cfg, nameof(cfg.Gain), sendCommand: true);
-        }
-
-        // 这些属性 SDK 协议不允许单独写，直接报错引导调用者用 /recalibrate
-        if (updates.RefTimeNs is not null || updates.RefTempC is not null
-            || updates.Threshold is not null || updates.MeasMode is not null
-            || updates.TcMode is not null || updates.TempCoefficient is not null)
-        {
-            throw new NotSupportedException(
-                "RefTime/RefTemp/Threshold/MeasMode/TcMode/TempCoefficient 必须通过重标定流程（一次性写整组基线）。" +
-                "调用 POST /api/devices/{id}/channels/{ch}/recalibrate 即可；或者：" +
-                "1) 先 ReadChannelParam(LEchoWave) 拿当前波形；" +
-                "2) 然后 SDK 自带 RefTime 命令一次性写 MeasMode+Threshold+RefTime+RefTemp+LEchoWave 整组。");
-        }
-    }
+            // 这些属性 SDK 协议不允许单独写，直接报错引导调用者用 /recalibrate
+            if (updates.RefTimeNs is not null || updates.RefTempC is not null
+                || updates.Threshold is not null || updates.MeasMode is not null
+                || updates.TcMode is not null || updates.TempCoefficient is not null)
+            {
+                throw new NotSupportedException(
+                    "RefTime/RefTemp/Threshold/MeasMode/TcMode/TempCoefficient 必须通过重标定流程（一次性写整组基线）。" +
+                    "调用 POST /api/devices/{id}/channels/{ch}/recalibrate 即可；或者：" +
+                    "1) 先 ReadChannelParam(LEchoWave) 拿当前波形；" +
+                    "2) 然后 SDK 自带 RefTime 命令一次性写 MeasMode+Threshold+RefTime+RefTemp+LEchoWave 整组。");
+            }
+        }, cancellationToken);
 
     // ========== SDK 事件 → 内部 Channel ==========
 
@@ -298,15 +325,24 @@ public sealed class FxSdkConnector : IFxConnector
 
     private async Task OnSdkConnectedAsync()
     {
-        _sessionId = _config.GetSessionId();
-        _logger.LogInformation("FxSdk 已连接 device={DeviceId}, session={Session}", _deviceId, _sessionId);
-
+        // provision（写 SessionContext）本身也是"会话级"操作，必须与命令/重连共用 _sessionLock 串行化：
+        // 否则 _sessionId 赋值 + Configure*(sessionId) 会与 RunUnderSessionLockAsync 的命令在同一 session 上交错。
+        // 本方法由 OnSdkConnectedSync 以 fire-and-forget 在线程池执行，且只调用 _client.*（不回调本类公开方法），故不会重入死锁。
+        await _sessionLock.WaitAsync();
         try
         {
+            if (_disposed) return;
+            // 记录本次 provisioning 的会话代次；断开事件会自增它，末尾据此判断期间是否已断开。
+            var myGeneration = Interlocked.Increment(ref _sessionGeneration);
+            // 会话 id 读入局部变量全程使用，避免中途被断开事件清空导致 NRE / 用到过期字段。
+            var session = _config.GetSessionId();
+            _sessionId = session;
+            _logger.LogInformation("FxSdk 已连接 device={DeviceId}, session={Session}", _deviceId, session);
+
             // 必须把 DeviceConfig 存到 SessionContext，否则后续 ReadDeviceParam / ReadChannelParam
             // 走 SDK EncodeReadDeviceParameter 时 GetDeviceConfig 返回 null 导致空指令发不出去
             // 用 sendCommand=false 表示只更新会话状态，不下发指令到设备
-            await _client.ConfigureDeviceAsync(_sessionId, _config, propertyName: null, sendCommand: false);
+            await _client.ConfigureDeviceAsync(session, _config, propertyName: null, sendCommand: false);
             _logger.LogInformation("已把 DeviceConfig 存到 SessionContext device={DeviceId}", _deviceId);
 
             // SDK 的 MultiChIotProtocolHandler.ProcessResult 只有在 SessionContext 里存在
@@ -314,29 +350,50 @@ public sealed class FxSdkConnector : IFxConnector
             // 这里的 sendCommand=false 只写 SDK 本地会话，不改设备参数。
             foreach (var chCfg in _initialChannelConfigs)
             {
-                await _client.ConfigureChannelAsync(_sessionId, chCfg, propertyName: null, sendCommand: false);
+                await _client.ConfigureChannelAsync(session, chCfg, propertyName: null, sendCommand: false);
                 _latestChannelConfig[chCfg.Channel] = chCfg;
                 _logger.LogInformation(
                     "已把 ChannelConfig 存到 SessionContext device={DeviceId} addr={Addr} ch={Ch} probe={Probe}MHz mode={Mode} threshold={Thr} refTime={RefTime} refTemp={RefTemp}",
                     _deviceId, chCfg.Address, chCfg.Channel, chCfg.ProbeFreq, chCfg.MeasMode,
                     chCfg.Threshold, chCfg.RefTime, chCfg.RefTemp);
             }
+
+            // 代次守卫：provisioning 期间若已发生断开（DisconnectAsync/OnSdkDisconnected 自增了代次），
+            // 不得把这个已过期的会话标成 Connected，否则 IngestionService 会对着已断链路发 MultiMeas 采空数据。
+            if (Volatile.Read(ref _sessionGeneration) != myGeneration)
+            {
+                _logger.LogWarning("provisioning 期间设备已断开，放弃置 Connected device={DeviceId}", _deviceId);
+                return;
+            }
+
+            // 会话已完整 provision（DeviceConfig + 各 ChannelConfig 均已注入 SessionContext）后，才对外置 Connected。
+            // 否则 IngestionService 一见 Connected 就 SetWorkMode(MultiMeas)，可能赶在 ChannelConfig 注入完成前，
+            // 导致开机最初若干条测量 EchoTime=null（SDK 需 ChannelConfig.ProbeFreq>0 才计算 EchoTime）。
+            State = FxConnectorState.Connected;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "存储 DeviceConfig 到 session 失败 device={DeviceId}", _deviceId);
+            // provisioning 关键步骤（ConfigureDevice/Channel）失败：绝不能置 Connected 让上层采空数据。
+            // 置 Faulted 并清会话，交由看门狗按"未连接"重连、重跑 provisioning（旧实现吞异常仍置 Connected → EchoTime 长期 null）。
+            Interlocked.Increment(ref _sessionGeneration);
+            _sessionId = null;
+            State = FxConnectorState.Faulted;
+            _logger.LogError(ex, "provisioning 失败，置 Faulted 待看门狗重连 device={DeviceId}", _deviceId);
         }
-
-        // 会话已完整 provision（DeviceConfig + 各 ChannelConfig 均已注入 SessionContext）后，才对外置 Connected。
-        // 否则 IngestionService 一见 Connected 就 SetWorkMode(MultiMeas)，可能赶在 ChannelConfig 注入完成前，
-        // 导致开机最初若干条测量 EchoTime=null（SDK 需 ChannelConfig.ProbeFreq>0 才计算 EchoTime）。
-        State = FxConnectorState.Connected;
+        finally
+        {
+            _sessionLock.Release();
+        }
     }
 
     private void OnSdkDisconnected(object? sender, SessionDisconnectedEventArgs args)
     {
-        State = FxConnectorState.Disconnected;
+        // 不持锁、立即生效：自增代次让任何进行中的 provisioning 结束时不再置 Connected；
+        // 抢锁反而会被正在跑的 provisioning 阻塞，使断开状态延迟反映、看门狗迟迟不重连。
+        // _sessionId / State 均为 volatile，跨线程写对读方立即可见。
+        Interlocked.Increment(ref _sessionGeneration);
         _sessionId = null;
+        State = FxConnectorState.Disconnected;
         _logger.LogWarning("FxSdk 断开 device={DeviceId}", _deviceId);
     }
 
@@ -433,8 +490,12 @@ public sealed class FxSdkConnector : IFxConnector
         decimal? explicitRefTempC = null,
         CancellationToken cancellationToken = default)
     {
-        if (_sessionId is null)
-            throw new InvalidOperationException("Not connected");
+        // 整个重标定序列（ReadChannelParam LEchoWave → 整组写 RefTime）在会话锁内串行执行，
+        // 避免与波形采样 ReadChannelParam / 看门狗重连并发使用同一 session。
+        await _sessionLock.WaitAsync(cancellationToken);
+        try
+        {
+        var session = _sessionId ?? throw new InvalidOperationException("Not connected");
 
         // 1. 决定 RefTime / RefTemp 的来源：
         //    - 显式参数优先（运维强制指定，比如设备当前测不出 TOF 时）
@@ -473,7 +534,7 @@ public sealed class FxSdkConnector : IFxConnector
 
             try
             {
-                await _client.ReadChannelParamAsync(_sessionId, "LEchoWave", channel, address);
+                await _client.ReadChannelParamAsync(session, "LEchoWave", channel, address);
 
                 // 二次检查：发请求过程中如果数据已到，直接用
                 if (_latestEchoWave.TryGetValue(channel, out latestWave))
@@ -532,7 +593,7 @@ public sealed class FxSdkConnector : IFxConnector
             "重标定通道 {Ch}: RefTime={Rt}ns RefTemp={Rtemp}°C LEchoWave.pts={Pts}",
             channel, cfg.RefTime, cfg.RefTemp, latestWave.WaveData?.Count ?? 0);
 
-        await _client.ConfigureChannelAsync(_sessionId, cfg, nameof(cfg.RefTime), sendCommand: true);
+        await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.RefTime), sendCommand: true);
 
         return new RecalibrateResult(
             Channel: channel,
@@ -541,6 +602,11 @@ public sealed class FxSdkConnector : IFxConnector
             NewRefTempC: refTemp,
             EchoWaveBytes: latestWave.WaveData?.Count ?? 0,
             Timestamp: DateTimeOffset.UtcNow);
+        }
+        finally
+        {
+            _sessionLock.Release();
+        }
     }
 
     private FxDecodedEnvelope? ConvertResult(DecodedResult result, DateTimeOffset now)
@@ -651,6 +717,6 @@ public sealed class FxSdkConnector : IFxConnector
         // FxClient 没实现 IDisposable，用 StopAllAsync 做清理（停所有监听器 + 关所有会话）
         try { await _client.StopAllAsync(); } catch { /* swallow on dispose */ }
         _channel.Writer.TryComplete();
-        _connectLock.Dispose();
+        _sessionLock.Dispose();
     }
 }
