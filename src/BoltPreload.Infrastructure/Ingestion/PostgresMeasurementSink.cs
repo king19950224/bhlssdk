@@ -407,9 +407,18 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         // 喂状态机会用过期数据误触发或误恢复。但 DB 故障窗口内真实发生的脱落 / 严重越限不能漏报，
         // 故重放路径改走无状态 critical 安全网（C1）补判一次。数据照常补写入库。
         if (evaluateAlarms)
-            await EvaluateAndDispatchAlarmsAsync(route, envelope, cr, pre, ct);
+        {
+            // 仅在真正写入新行时才推进「有状态」告警状态机：ON CONFLICT DO NOTHING 命中（rowsAffected==0）
+            // 说明该 (channel_id, ts) 是重复投递、已在首次入库时评估过；再评估会重复累加 on/off-delay 连续计数，
+            // 导致提前触发或提前恢复。重复样本直接跳过评估。
+            if (rowsAffected > 0)
+                await EvaluateAndDispatchAlarmsAsync(route, envelope, cr, pre, ct);
+        }
         else
+        {
+            // 重放路径走无状态 critical 安全网（内部按 (bolt,type) 去重），重复投递时幂等，无需再按 rowsAffected 判。
             await EvaluateReplayCriticalSafetyNetAsync(route, envelope, cr, pre, ct);
+        }
     }
 
     // 接收 FxEchoWaveDto（而非整条 cr），让随测量上报的波形与主动读回的 LEchoWave 共用同一套特征提取。
@@ -598,6 +607,15 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
 
         foreach (var ev in events)
         {
+            // 维护抑制(shelve)：命中未取消、未过期的 (bolt,type) 抑制时，跳过触发的落库/推送，
+            // 并回滚状态机转移——使抑制到期后同向样本仍能重新触发，不会因内存状态已 active 而永久静默。
+            if (ev.Action == AlarmAction.Trigger && await IsAlarmShelvedAsync(ev.BoltId, ev.Type, ct))
+            {
+                _alarmEvaluator.RollbackTransition(ev);
+                _logger.LogInformation("告警被维护抑制(shelve)拦截 bolt={Bolt} type={Type}", ev.BoltId, ev.Type);
+                continue;
+            }
+
             var persisted = true;
             if (_alarmSink is not null)
             {
@@ -621,6 +639,20 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 _ = SafePublishAlarmAsync(ev, ct);
             }
         }
+    }
+
+    // 是否存在命中该 (bolt,type) 的生效抑制（未取消且未过期）。bolt_id / alarm_type 为 NULL 表示通配。
+    private async Task<bool> IsAlarmShelvedAsync(long boltId, string alarmType, CancellationToken ct)
+    {
+        await using var cmd = _dataSource.CreateCommand(@"
+            SELECT 1 FROM alarm_shelvings
+            WHERE cancelled_at IS NULL AND expires_at > now()
+              AND (bolt_id IS NULL OR bolt_id = @bolt)
+              AND (alarm_type IS NULL OR alarm_type = @type)
+            LIMIT 1");
+        cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, boltId);
+        cmd.Parameters.AddWithValue("type", NpgsqlDbType.Varchar, alarmType);
+        return await cmd.ExecuteScalarAsync(ct) is not null;
     }
 
     /// <summary>
@@ -724,6 +756,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             cr.LowAi, cr.HighAi, cr.Angle
         }, JsonOpts);
 
+        // ON CONFLICT (channel_id, ts) DO NOTHING：与 measurements 热路径同口径，保证 WAL 重放幂等
+        //（0022 迁移加了 ux_unbound_channel_ts 唯一索引）。rowsAffected==0 表示已存在，用于清理孤儿波形。
         const string sql = @"
             INSERT INTO unbound_measurements (
                 device_id, channel_id, channel_no, ts, ingested_at,
@@ -731,7 +765,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             ) VALUES (
                 @device_id, @channel_id, @channel_no, @ts, @ingested_at,
                 @echo_time_ns, @delta_tof_ns, @sp_temp_c, @gain, @status_code, @wave_url, @raw::jsonb
-            )";
+            )
+            ON CONFLICT (channel_id, ts) DO NOTHING";
 
         await using var cmd = _dataSource.CreateCommand(sql);
         cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, envelope.DeviceId);
@@ -747,8 +782,17 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         cmd.Parameters.AddWithValue("wave_url", NpgsqlDbType.Varchar, (object?)waveUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("raw", NpgsqlDbType.Jsonb, rawJson);
 
-        await cmd.ExecuteNonQueryAsync(ct);
-        if (waveUrl is not null && cr.EchoWave is not null)
+        var rowsAffected = await cmd.ExecuteNonQueryAsync(ct);
+        if (rowsAffected == 0)
+        {
+            // ON CONFLICT (channel_id, ts) 命中（重复投递 / WAL 重放）：本次未插入，先前落盘的波形成孤儿，删掉。
+            if (waveUrl is not null)
+            {
+                try { await _waveStore!.DeleteAsync(waveUrl, ct); }
+                catch (Exception ex) { _logger.LogWarning(ex, "删除冲突孤儿未绑定波形失败 url={Url}", waveUrl); }
+            }
+        }
+        else if (waveUrl is not null && cr.EchoWave is not null)
         {
             await WriteWaveFeaturesAsync(null, channelId, envelope, cr.EchoWave!, waveUrl, ct);
         }

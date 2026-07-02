@@ -109,8 +109,11 @@ public sealed class IngestionService : BackgroundService
         {
             await foreach (var envelope in connector.Results.ReadAllAsync(stoppingToken))
             {
+                // 新鲜度按【收包时刻】(ReceiveTime，connector 收到即打的 UtcNow) 计，而非出队/入库时刻。
+                // 否则设备已断但 Channel 仍有积压时，消费线程会用"当前时间"持续刷新 LastChannelResultAt，
+                // 让看门狗误以为"仍有数据"而延迟重连（积压越大延迟越久）。
                 runtimeStatus.MarkEnvelope(
-                    DateTimeOffset.UtcNow,
+                    envelope.ReceiveTime,
                     envelope.ResultType is FxResultType.ChannelResult or FxResultType.MultiChannelResult);
 
                 if (envelope.ResultType == FxResultType.DeviceParameter && envelope.DeviceParameter is not null)
@@ -122,6 +125,8 @@ public sealed class IngestionService : BackgroundService
                 }
 
                 var persisted = false;
+                // 标记"正在写库"：让 Watchdog 在慢 DB 写入期间不要把该设备误判为"无数据"而重连（见 finally 清标记）
+                runtimeStatus.MarkWriteStart();
                 try
                 {
                     await _sink.WriteAsync(envelope, stoppingToken);
@@ -161,6 +166,10 @@ public sealed class IngestionService : BackgroundService
                             "入库写失败 device={DeviceId} ts={Ts} 累计写失败={Failures}（非测量信封或 WAL 未启用，不兜底）",
                             envelope.DeviceId, envelope.ReceiveTime, runtimeStatus.WriteFailureCount);
                     }
+                }
+                finally
+                {
+                    runtimeStatus.MarkWriteEnd();
                 }
 
                 // 实时推送：仅在【成功落库】后推送，避免前端展示从未持久化的数据（数据完整性）。
