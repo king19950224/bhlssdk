@@ -100,6 +100,10 @@ function fmt(iso: string | null) {
     </div>
 
     <div class="panel panel--glow">
+      <div class="panel-hd">
+        <span class="panel-title"><i class="hd-mark hd-mark--warn" />变更队列</span>
+        <span class="hd-sub mono">{{ items.length }} 条{{ statusFilter === 'pending' ? '待办' : '' }}</span>
+      </div>
       <div class="tbl">
         <div class="tr th"><span>#</span><span>设备/通道</span><span>变更参数</span><span>状态</span><span>提交</span><span>审批</span><span>操作</span></div>
         <div v-for="c in items" :key="c.id" class="tr">
@@ -124,7 +128,7 @@ function fmt(iso: string | null) {
     </div>
 
     <div class="flow-note panel">
-      <span class="panel-title">变更流程</span>
+      <span class="panel-title"><i class="hd-mark" />变更流程</span>
       <div class="flow">
         <span class="fl">提交</span><el-icon><ArrowRight /></el-icon>
         <span class="fl">审批<i>异人复核</i></span><el-icon><ArrowRight /></el-icon>
@@ -160,12 +164,15 @@ function fmt(iso: string | null) {
 .cc-head { display: flex; align-items: center; gap: 16px; }
 .seg { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 4px; }
 .seg-tab { font-size: 13px; padding: 6px 16px; border-radius: 7px; cursor: pointer; color: var(--text-3); }
-.seg-tab.active { color: #04121a; background: linear-gradient(135deg, var(--accent), var(--accent-2)); font-weight: 600; }
+.seg-tab.active { color: var(--accent); background: rgba(34, 211, 238, 0.1); font-weight: 600; }
 .hint { display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12px; margin-left: auto; }
 
-.tbl { padding: 6px 18px 16px; }
-.tr { display: grid; grid-template-columns: 50px 150px 1fr 90px 150px 90px 150px; align-items: center; padding: 11px 6px; border-bottom: 1px solid var(--hairline); font-size: 13px; }
-.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; }
+.panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px 9px; }
+.tbl { padding: 4px 12px 14px; }
+.tr { display: grid; grid-template-columns: 44px 128px minmax(0, 1.4fr) 80px 128px 80px 120px; align-items: center; padding: 10px 8px; border-radius: 8px; font-size: 13px; }
+.tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
+.tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
+.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
 .params { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .st { font-size: 11px; padding: 2px 9px; border: 1px solid; border-radius: 10px; }
 .who { font-size: 12px; }

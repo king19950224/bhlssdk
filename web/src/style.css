@@ -90,13 +90,12 @@ body {
   font-family: var(--font-sans);
   color: var(--text-1);
   background-color: var(--bg-base);
-  /* 指挥中心：极淡网格 + 顶部径向辉光 */
+  /* 沉稳工程底：极淡网格为主，顶部径向辉光收到几乎不可见（去"指挥中心秀"感） */
   background-image:
-    radial-gradient(1200px 600px at 80% -10%, rgba(34, 211, 238, 0.08), transparent 60%),
-    radial-gradient(900px 500px at 0% 0%, rgba(129, 140, 248, 0.06), transparent 55%),
+    radial-gradient(1200px 600px at 80% -10%, rgba(34, 211, 238, 0.03), transparent 60%),
     linear-gradient(var(--grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
-  background-size: 100% 100%, 100% 100%, 44px 44px, 44px 44px;
+  background-size: 100% 100%, 44px 44px, 44px 44px;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -162,6 +161,8 @@ body {
   border-radius: 50%;
   position: relative;
 }
+/* 只有告警态(crit/high)才脉冲——正常/预警/离线保持静态。
+   工程监控界面以"异常才吸引注意"为准，而非满屏绿点齐跳的演示感。 */
 .led::after {
   content: '';
   position: absolute;
@@ -169,20 +170,22 @@ body {
   border-radius: 50%;
   background: inherit;
   opacity: 0.5;
-  animation: led-pulse 2s ease-out infinite;
+  display: none;
 }
-.led--ok { background: var(--ok); box-shadow: 0 0 10px var(--ok-glow); }
-.led--warn { background: var(--warn); box-shadow: 0 0 10px var(--warn-glow); }
-.led--crit { background: var(--crit); box-shadow: 0 0 10px var(--crit-glow); }
-.led--high { background: #a78bfa; box-shadow: 0 0 10px rgba(167, 139, 250, 0.55); }
+.led--crit::after,
+.led--high::after { display: block; animation: led-pulse 2s ease-out infinite; }
+.led--ok { background: var(--ok); }
+.led--warn { background: var(--warn); }
+.led--crit { background: var(--crit); box-shadow: 0 0 8px var(--crit-glow); }
+.led--high { background: #a78bfa; box-shadow: 0 0 8px rgba(167, 139, 250, 0.5); }
 .led--off { background: var(--text-3); }
 @keyframes led-pulse {
   0% { transform: scale(0.8); opacity: 0.6; }
   100% { transform: scale(2.4); opacity: 0; }
 }
 
-/* 辉光文字 */
-.glow-accent { color: var(--accent); text-shadow: 0 0 18px var(--accent-glow); }
+/* 数据强调：用强调色即可，不加辉光描边（工程读数以清晰为先） */
+.glow-accent { color: var(--accent); }
 
 /* 滚动条 */
 ::-webkit-scrollbar { width: 10px; height: 10px; }

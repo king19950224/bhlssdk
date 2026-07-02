@@ -67,40 +67,14 @@ const counts = computed(() => {
   for (const b of props.bolts) c[b.status] = (c[b.status] ?? 0) + 1
   return c
 })
-// 扫描扇形（40°）路径，整体旋转
-const sweepPath = (() => {
-  const [x0, y0] = pol(-90, OUTER)
-  const [x1, y1] = pol(-50, OUTER)
-  return `M ${C} ${C} L ${x0.toFixed(1)} ${y0.toFixed(1)} A ${OUTER} ${OUTER} 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)} Z`
-})()
 const labelPos = (res: number) => pol(-90, radiusOf(res))
 </script>
 
 <template>
   <div class="radar">
     <svg :viewBox="`0 0 ${SIZE} ${SIZE}`" class="radar-svg">
-      <defs>
-        <radialGradient id="sweepGrad" cx="0%" cy="0%" r="100%">
-          <stop offset="0%" stop-color="rgba(34,211,238,0.32)" />
-          <stop offset="100%" stop-color="rgba(34,211,238,0)" />
-        </radialGradient>
-        <radialGradient id="coreGlow">
-          <stop offset="0%" stop-color="rgba(56,189,248,0.18)" />
-          <stop offset="100%" stop-color="rgba(56,189,248,0)" />
-        </radialGradient>
-      </defs>
-
-      <circle :cx="C" :cy="C" :r="OUTER" fill="url(#coreGlow)" />
-
       <!-- 保持率栅格环 -->
       <circle v-for="g in gridRings" :key="'g' + g" :cx="C" :cy="C" :r="radiusOf(g)" fill="none" stroke="rgba(148,163,184,0.09)" stroke-width="1" />
-
-      <!-- 扫描扇形 -->
-      <g>
-        <path :d="sweepPath" fill="url(#sweepGrad)" opacity="0.9">
-          <animateTransform attributeName="transform" type="rotate" :from="`0 ${C} ${C}`" :to="`360 ${C} ${C}`" dur="5s" repeatCount="indefinite" />
-        </path>
-      </g>
 
       <!-- 辐条 -->
       <line v-for="(n, i) in nodes" :key="'sp' + i" :x1="C" :y1="C" :x2="n.sx" :y2="n.sy" stroke="rgba(148,163,184,0.07)" stroke-width="1" />
@@ -148,8 +122,8 @@ const labelPos = (res: number) => pol(-90, radiusOf(res))
 .node-no { font-family: var(--font-mono); font-size: 11px; font-weight: 600; fill: #04121a; }
 .node:hover circle { stroke: #fff; stroke-width: 2; }
 .node.alert .node-no { fill: #fff; }
-.halo { animation: halo 1.8s ease-out infinite; transform-origin: center; transform-box: fill-box; }
-@keyframes halo { 0% { transform: scale(0.7); opacity: 0.45; } 100% { transform: scale(1.7); opacity: 0; } }
+/* 告警节点用静态柔环标注（去掉呼吸缩放动画的"游戏感"，工程界面以清晰为先） */
+.halo { opacity: 0.22; }
 .ring-lb { font-size: 10px; font-family: var(--font-mono); opacity: 0.9; }
 .c-num { font-family: var(--font-mono); font-size: 38px; font-weight: 700; fill: var(--text-1); }
 .c-cap { font-size: 12px; fill: var(--text-3); }

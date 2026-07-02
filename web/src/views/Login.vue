@@ -181,7 +181,7 @@ async function submit() {
   transform: translateY(-50%);
   width: 460px;
   height: 460px;
-  opacity: 0.5;
+  opacity: 0.28;
   pointer-events: none;
 }
 .ring {
@@ -191,9 +191,10 @@ async function submit() {
   border-radius: 50%;
   border: 1px solid rgba(34, 211, 238, 0.25);
 }
-.r1 { width: 100%; height: 100%; animation: spin 18s linear infinite; border-style: dashed; }
-.r2 { width: 70%; height: 70%; border-color: rgba(34, 211, 238, 0.4); }
-.r3 { width: 40%; height: 40%; animation: spin 9s linear infinite reverse; border-style: dashed; }
+/* 静态同心环装饰（去掉旋转动画的演示感，仅作沉稳背景纹样） */
+.r1 { width: 100%; height: 100%; border-style: dashed; }
+.r2 { width: 70%; height: 70%; border-color: rgba(34, 211, 238, 0.28); }
+.r3 { width: 40%; height: 40%; border-style: dashed; }
 .core {
   position: absolute;
   inset: 0;
@@ -203,7 +204,6 @@ async function submit() {
   border-radius: 50%;
   background: radial-gradient(circle, var(--accent), transparent 70%);
 }
-@keyframes spin { to { transform: rotate(360deg); } }
 
 /* 表单 */
 .form-wrap {

@@ -74,6 +74,16 @@ const sortedBoltCells = computed(() => {
   return [...cells].sort((a, b) => (a.b.preloadRatio ?? 99) - (b.b.preloadRatio ?? 99))
 })
 
+// 部位级工程摘要：状态计数 + 目标/下限参考值（工程视图先给统计与基准，再看单根）
+const STATUS_SUMMARY = ['loose', 'warn', 'high', 'normal', 'uncalibrated', 'nodata'] as const
+const boltSummary = computed(() => {
+  const c: Record<string, number> = { total: bolts.value.length, normal: 0, warn: 0, loose: 0, high: 0, uncalibrated: 0, nodata: 0 }
+  for (const b of bolts.value) c[b.status] = (c[b.status] ?? 0) + 1
+  return c
+})
+const groupTargetN = computed(() => num(sel.value.group?.targetPreloadN ?? null))
+const kn = (n: number | null) => (n == null ? '—' : (n / 1000).toFixed(0) + ' kN')
+
 // 请求序号：快速切换风场/风机/部位时，后发先至的旧响应不得覆盖当前视图（与 GroupTrend 同一防护）。
 let loadSeq = 0
 
@@ -236,6 +246,20 @@ function onProjectChange() {
 
     <!-- 螺栓层：法兰圈 / 网格 -->
     <template v-else>
+      <!-- 部位工程摘要：目标/下限基准 + 状态分布计数（密集、可对比，先统计后单根） -->
+      <div class="grp-summary panel" v-if="bolts.length">
+        <div class="gs-refs">
+          <div class="gs-ref"><span class="gs-k">监测</span><b class="mono">{{ boltSummary.total }}</b><span class="gs-u">颗</span></div>
+          <div class="gs-ref"><span class="gs-k">组目标</span><b class="mono">{{ kn(groupTargetN) }}</b></div>
+        </div>
+        <div class="gs-stats">
+          <span v-for="k in STATUS_SUMMARY" :key="k" class="gs-stat" :class="{ zero: !boltSummary[k] }">
+            <i class="gs-dot" :style="`background:${STATUS[k].color}`" />{{ STATUS[k].label }}
+            <b class="mono">{{ boltSummary[k] }}</b>
+          </span>
+        </div>
+      </div>
+
       <div class="bolt-bar">
         <div class="bolt-toggle">
           <span class="bv-tab" :class="{ active: boltView === 'radar' }" @click="boltView = 'radar'"><el-icon><Aim /></el-icon> 法兰雷达</span>
@@ -344,13 +368,27 @@ function onProjectChange() {
 .bolt-toggle { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 4px; width: fit-content; }
 .bv-tab { display: flex; align-items: center; gap: 6px; font-size: 13px; padding: 6px 16px; border-radius: 7px; cursor: pointer; color: var(--text-3); transition: color 0.15s, background 0.15s; }
 .bv-tab:hover { color: var(--text-1); }
-.bv-tab.active { color: #04121a; background: linear-gradient(135deg, var(--accent), var(--accent-2)); font-weight: 600; }
+/* 克制强调：选中态用低饱和填充 + 强调色文字，不用高亮霓虹渐变 */
+.bv-tab.active { color: var(--accent); background: rgba(34, 211, 238, 0.1); font-weight: 600; }
 
 /* 可视化面板：统一面板头（hd-mark + 标题 + 副标题） */
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px 9px; }
 .ring-panel { display: flex; flex-direction: column; }
 .ring-body { display: flex; justify-content: center; padding: 18px 20px 26px; }
 .trend-panel { padding: 18px 20px; }
+
+/* 部位工程摘要条：左基准值 + 右状态分布，密集单行 */
+.grp-summary { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 11px 16px; flex-wrap: wrap; }
+.gs-refs { display: flex; align-items: center; gap: 22px; }
+.gs-ref { display: flex; align-items: baseline; gap: 6px; }
+.gs-ref .gs-k { font-size: 11px; color: var(--text-3); letter-spacing: 0.06em; }
+.gs-ref b { font-size: 17px; font-weight: 700; color: var(--text-1); }
+.gs-ref .gs-u { font-size: 11px; color: var(--text-3); }
+.gs-stats { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.gs-stat { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
+.gs-stat b { color: var(--text-1); font-size: 13px; }
+.gs-stat.zero { opacity: 0.4; }
+.gs-dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
 
 .crumb-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .unbound-link { font-size: 12px; white-space: nowrap; }
