@@ -3,135 +3,155 @@ import { computed } from 'vue'
 import type { GroupBolt } from '../api'
 import { pct, STATUS_META } from '../utils/preload'
 
-const props = defineProps<{ bolts: GroupBolt[] }>()
+// 法兰螺栓布置图（俯视 bolt circle）：
+// - 螺栓按【现场位号】(position_label "N号"）顺时针均匀落在螺栓圆上，1 号位于 12 点方向；
+// - 总孔位数取 组 expected_bolt_count / 最大位号 / 监测数 的最大值，未监测位号画成空心孔——
+//   与真实法兰一一对应，回答"现场哪一颗"；
+// - 点色 = 状态（正常/预警/松动/偏高/未标定/无数据），外侧小字 = 保持率%；
+// - 不再用"半径=保持率"的雷达半径编码（视觉不均匀且无位置语义）。
+const props = defineProps<{ bolts: GroupBolt[]; totalHoles?: number | null }>()
 const emit = defineEmits<{ (e: 'select', boltId: number): void }>()
 
-// 状态颜色/文案统一来自 STATUS_META（含 high 偏高/超张力），不再本组件另写一份
 const STATUS: Record<string, { label: string; color: string; cls: string }> = STATUS_META
 
-const SIZE = 460
+// 画布比法兰大一圈：给外圈保持率标签留边距，避免左右边缘的 "149%" 被 viewBox 裁成 "9%"
+const SIZE = 532
 const C = SIZE / 2
-const OUTER = 182
-const INNER = 48
-const R_LO = 0.6 // 保持率域下界
-const R_HI = 1.1 // 保持率域上界
+const R_OUT = 196   // 法兰外缘
+const R_IN = 118    // 法兰内缘
+const R_BOLT = 157  // 螺栓圆
+const R_LABEL = R_OUT + 22 // 保持率标签半径
 
-function radiusOf(res: number | null) {
-  if (res == null) return OUTER
-  const c = Math.max(R_LO, Math.min(R_HI, res))
-  return INNER + ((c - R_LO) / (R_HI - R_LO)) * (OUTER - INNER)
-}
-function angleOf(i: number, n: number) {
-  return -90 + (i * 360) / Math.max(n, 1)
-}
 function pol(angDeg: number, r: number): [number, number] {
   const a = (angDeg * Math.PI) / 180
   return [C + r * Math.cos(a), C + r * Math.sin(a)]
 }
-// 节点编号用通道号：组内螺栓同设备、通道号唯一，不会像"取 code 末尾数字"那样把
-// FLANGE-CH1 与 M20-001 都标成 "1"（编号碰撞，运维分不清）。缺通道号才回退序号。
-function boltNo(b: GroupBolt, i: number) {
-  return b.channelNo != null ? String(b.channelNo) : String(i + 1)
+
+// 现场位号：position_label 数字（"5号"→5）优先，其次 code 尾数，最后数组序。
+function seqOf(b: GroupBolt, i: number): number {
+  const fromPos = b.positionLabel?.match(/(\d+)/)
+  if (fromPos) return Number(fromPos[1])
+  const fromCode = b.code.match(/(\d+)\s*$/)
+  if (fromCode) return Number(fromCode[1])
+  return i + 1
 }
 
-const limitRatio = computed(() => {
-  const rs = props.bolts
-    .map((b) => (b.minPreloadN != null && b.targetPreloadN ? Number(b.minPreloadN) / Number(b.targetPreloadN) : null))
-    .filter((x): x is number => x != null)
-  return rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : 0.8
+interface Hole {
+  seq: number
+  x: number
+  y: number
+  bolt: GroupBolt | null
+  res: number | null
+  color: string
+  alert: boolean
+  lx: number
+  ly: number
+  anchor: 'start' | 'middle' | 'end'
+}
+
+const holes = computed<Hole[]>(() => {
+  const seqs = props.bolts.map((b, i) => ({ b, seq: seqOf(b, i) }))
+  const maxSeq = Math.max(props.totalHoles ?? 0, props.bolts.length, ...seqs.map((s) => s.seq), 1)
+  const bySeq = new Map(seqs.map((s) => [s.seq, s.b]))
+  return Array.from({ length: maxSeq }, (_, k) => {
+    const seq = k + 1
+    const ang = -90 + (k * 360) / maxSeq // 1 号 12 点起，顺时针
+    const [x, y] = pol(ang, R_BOLT)
+    const [lx, ly] = pol(ang, R_LABEL)
+    const cos = Math.cos((ang * Math.PI) / 180)
+    const anchor: Hole['anchor'] = cos > 0.35 ? 'start' : cos < -0.35 ? 'end' : 'middle'
+    const bolt = bySeq.get(seq) ?? null
+    const res = bolt?.preloadRatio != null ? Number(bolt.preloadRatio) : null
+    return {
+      seq, x, y, bolt, res,
+      color: bolt ? STATUS[bolt.status]?.color ?? '#5b6b82' : 'transparent',
+      alert: bolt ? bolt.status === 'loose' || bolt.status === 'warn' || bolt.status === 'high' : false,
+      lx, ly, anchor,
+    }
+  })
 })
 
-const nodes = computed(() =>
-  props.bolts.map((b, i) => {
-    const res = b.preloadRatio != null ? Number(b.preloadRatio) : null
-    const ang = angleOf(i, props.bolts.length)
-    const r = radiusOf(res)
-    const [x, y] = pol(ang, r)
-    const [sx, sy] = pol(ang, OUTER)
-    return {
-      b, no: boltNo(b, i), res, ang, x, y, sx, sy,
-      color: STATUS[b.status]?.color ?? '#5b6b82',
-      alert: b.status === 'loose' || b.status === 'warn',
-      hasData: res != null,
-    }
-  }),
-)
-const profilePts = computed(() => nodes.value.filter((n) => n.hasData).map((n) => `${n.x.toFixed(1)},${n.y.toFixed(1)}`).join(' '))
-const targetR = radiusOf(1.0)
-const limitR = computed(() => radiusOf(limitRatio.value))
-const warnR = computed(() => radiusOf(limitRatio.value * 1.1))
-const gridRings = [0.7, 0.8, 0.9, 1.0]
+// 孔位多时外圈不标保持率（挤成一团反而不专业），悬停/网格视图看数值
+const showPct = computed(() => holes.value.length <= 16)
 
 const counts = computed(() => {
   const c: Record<string, number> = { normal: 0, warn: 0, loose: 0, high: 0, uncalibrated: 0, nodata: 0 }
   for (const b of props.bolts) c[b.status] = (c[b.status] ?? 0) + 1
   return c
 })
-const labelPos = (res: number) => pol(-90, radiusOf(res))
+const unmonitored = computed(() => holes.value.filter((h) => !h.bolt).length)
+
+// 方位刻度（12 点起顺时针 0/90/180/270）
+const ticks = [-90, 0, 90, 180].map((a) => {
+  const [x1, y1] = pol(a, R_OUT + 3)
+  const [x2, y2] = pol(a, R_OUT + 10)
+  return { x1, y1, x2, y2 }
+})
 </script>
 
 <template>
-  <div class="radar">
-    <svg :viewBox="`0 0 ${SIZE} ${SIZE}`" class="radar-svg">
-      <!-- 保持率栅格环 -->
-      <circle v-for="g in gridRings" :key="'g' + g" :cx="C" :cy="C" :r="radiusOf(g)" fill="none" stroke="rgba(148,163,184,0.09)" stroke-width="1" />
+  <div class="flange">
+    <svg :viewBox="`0 0 ${SIZE} ${SIZE}`" class="flange-svg">
+      <!-- 法兰环带（外缘/内缘） -->
+      <circle :cx="C" :cy="C" :r="R_OUT" fill="rgba(148,163,184,0.035)" stroke="rgba(148,163,184,0.28)" stroke-width="1.5" />
+      <circle :cx="C" :cy="C" :r="R_IN" fill="var(--bg-elev-1, #0d1320)" stroke="rgba(148,163,184,0.2)" stroke-width="1" />
+      <!-- 螺栓圆（点位所在的分度圆） -->
+      <circle :cx="C" :cy="C" :r="R_BOLT" fill="none" stroke="rgba(148,163,184,0.14)" stroke-width="1" stroke-dasharray="3 6" />
+      <!-- 方位刻度 -->
+      <line v-for="(t, i) in ticks" :key="'t' + i" :x1="t.x1" :y1="t.y1" :x2="t.x2" :y2="t.y2" stroke="rgba(148,163,184,0.3)" stroke-width="1" />
 
-      <!-- 辐条 -->
-      <line v-for="(n, i) in nodes" :key="'sp' + i" :x1="C" :y1="C" :x2="n.sx" :y2="n.sy" stroke="rgba(148,163,184,0.07)" stroke-width="1" />
-
-      <!-- 参考环：下限(红) / 预警(琥珀) / 目标(青) -->
-      <circle :cx="C" :cy="C" :r="limitR" fill="none" stroke="rgba(244,63,94,0.7)" stroke-width="1.5" stroke-dasharray="3 5" />
-      <circle :cx="C" :cy="C" :r="warnR" fill="none" stroke="rgba(245,158,11,0.5)" stroke-width="1" stroke-dasharray="2 6" />
-      <circle :cx="C" :cy="C" :r="targetR" fill="none" stroke="rgba(34,211,238,0.7)" stroke-width="1.5" />
-
-      <!-- 预紧力剖面多边形 -->
-      <polygon v-if="profilePts" :points="profilePts" fill="rgba(34,211,238,0.1)" stroke="rgba(34,211,238,0.45)" stroke-width="1.5" stroke-linejoin="round" />
-
-      <!-- 螺栓节点 -->
-      <g v-for="n in nodes" :key="n.b.id" class="node" :class="{ alert: n.alert }" @click="emit('select', n.b.id)">
-        <circle v-if="n.alert" :cx="n.x" :cy="n.y" r="15" :fill="n.color" opacity="0.18" class="halo" />
-        <circle :cx="n.x" :cy="n.y" r="11" :fill="n.color" :opacity="n.hasData ? 0.95 : 0.5" stroke="rgba(4,18,26,0.6)" stroke-width="1" />
-        <text :x="n.x" :y="n.y + 3.5" text-anchor="middle" class="node-no">{{ n.no }}</text>
-        <title>{{ n.b.code }} · {{ STATUS[n.b.status]?.label }}{{ n.res != null ? ' · 保持 ' + pct(n.res) : '' }}</title>
+      <!-- 孔位：未监测 = 空心孔；监测 = 状态色实心点 + 位号 -->
+      <g v-for="h in holes" :key="h.seq">
+        <template v-if="h.bolt">
+          <g class="node" :class="{ alert: h.alert }" @click="emit('select', h.bolt!.id)">
+            <circle v-if="h.alert" :cx="h.x" :cy="h.y" r="17" :fill="h.color" opacity="0.18" />
+            <circle :cx="h.x" :cy="h.y" r="12" :fill="h.color" stroke="rgba(4,18,26,0.55)" stroke-width="1" />
+            <text :x="h.x" :y="h.y + 3.5" text-anchor="middle" class="node-no">{{ h.seq }}</text>
+            <title>{{ h.bolt.positionLabel || h.seq + '号' }} · {{ h.bolt.code }} · {{ STATUS[h.bolt.status]?.label }}{{ h.res != null ? ' · 保持 ' + pct(h.res) : '' }} · CH{{ h.bolt.channelNo }}</title>
+          </g>
+          <text v-if="showPct && h.res != null" :x="h.lx" :y="h.ly + 3.5" :text-anchor="h.anchor" class="pct-lb" :fill="h.color">{{ pct(h.res) }}</text>
+        </template>
+        <template v-else>
+          <circle :cx="h.x" :cy="h.y" r="8" fill="none" stroke="rgba(148,163,184,0.3)" stroke-width="1.2" />
+          <text :x="h.x" :y="h.y + 3" text-anchor="middle" class="hole-no">{{ h.seq }}</text>
+          <title>{{ h.seq }}号 · 未监测孔位</title>
+        </template>
       </g>
 
-      <!-- 参考环标注 -->
-      <text :x="labelPos(1.0)[0] + 4" :y="labelPos(1.0)[1] + 3" class="ring-lb" fill="#22d3ee">目标</text>
-      <text :x="pol(-90, limitR)[0] + 4" :y="pol(-90, limitR)[1] + 3" class="ring-lb" fill="#f43f5e">下限</text>
-
-      <!-- 中心 -->
-      <text :x="C" :y="C - 6" text-anchor="middle" class="c-num">{{ bolts.length }}</text>
-      <text :x="C" :y="C + 14" text-anchor="middle" class="c-cap">螺栓</text>
-      <text v-if="counts.loose + counts.warn + counts.high > 0" :x="C" :y="C + 38" text-anchor="middle" class="c-alert">{{ counts.loose }} 松动 · {{ counts.warn }} 预警 · {{ counts.high }} 偏高</text>
-      <text v-else :x="C" :y="C + 38" text-anchor="middle" class="c-ok">预紧力均衡</text>
+      <!-- 中心统计 -->
+      <text :x="C" :y="C - 8" text-anchor="middle" class="c-num">{{ bolts.length }}<tspan class="c-den">/{{ holes.length }}</tspan></text>
+      <text :x="C" :y="C + 12" text-anchor="middle" class="c-cap">监测 / 孔位</text>
+      <text v-if="counts.loose + counts.warn + counts.high > 0" :x="C" :y="C + 34" text-anchor="middle" class="c-alert">{{ counts.loose }} 松动 · {{ counts.warn }} 预警 · {{ counts.high }} 偏高</text>
+      <text v-else :x="C" :y="C + 34" text-anchor="middle" class="c-ok">预紧力均衡</text>
     </svg>
 
-    <div class="radar-legend">
-      <span class="lg"><i class="ring-c" style="border-color:#22d3ee" /> 目标环 (100%)</span>
-      <span class="lg"><i class="ring-c" style="border-color:#f43f5e;border-style:dashed" /> 下限环</span>
+    <div class="flange-legend">
       <span v-for="k in ['normal', 'warn', 'loose', 'high']" :key="k" class="lg"><i :style="`background:${STATUS[k].color}`" /> {{ STATUS[k].label }} {{ counts[k] }}</span>
+      <span v-if="counts.uncalibrated" class="lg"><i :style="`background:${STATUS.uncalibrated.color}`" /> 未标定 {{ counts.uncalibrated }}</span>
+      <span v-if="counts.nodata" class="lg"><i :style="`background:${STATUS.nodata.color}`" /> 无数据 {{ counts.nodata }}</span>
+      <span v-if="unmonitored" class="lg"><i class="hole-c" /> 未监测孔位 {{ unmonitored }}</span>
     </div>
-    <div class="radar-hint">节点离圆心越近 = 预紧力保持率越低；跌破红色下限环即松动</div>
+    <div class="flange-hint">按现场位号顺时针排布（1 号位于 12 点方向）· 点内数字 = 位号 · 外圈 = 保持率 · 点击节点查看详情</div>
   </div>
 </template>
 
 <style scoped>
-.radar { display: flex; flex-direction: column; align-items: center; gap: 12px; }
-.radar-svg { width: 100%; max-width: 480px; height: auto; }
+.flange { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.flange-svg { width: 100%; max-width: 480px; height: auto; }
 .node { cursor: pointer; }
 .node-no { font-family: var(--font-mono); font-size: 11px; font-weight: 600; fill: #04121a; }
 .node:hover circle { stroke: #fff; stroke-width: 2; }
 .node.alert .node-no { fill: #fff; }
-/* 告警节点用静态柔环标注（去掉呼吸缩放动画的"游戏感"，工程界面以清晰为先） */
-.halo { opacity: 0.22; }
-.ring-lb { font-size: 10px; font-family: var(--font-mono); opacity: 0.9; }
-.c-num { font-family: var(--font-mono); font-size: 38px; font-weight: 700; fill: var(--text-1); }
-.c-cap { font-size: 12px; fill: var(--text-3); }
+.hole-no { font-family: var(--font-mono); font-size: 9px; fill: rgba(148, 163, 184, 0.45); }
+.pct-lb { font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; }
+.c-num { font-family: var(--font-mono); font-size: 36px; font-weight: 700; fill: var(--text-1); }
+.c-den { font-size: 16px; fill: var(--text-3); font-weight: 500; }
+.c-cap { font-size: 11px; fill: var(--text-3); letter-spacing: 0.1em; }
 .c-alert { font-size: 12px; fill: var(--crit); font-weight: 600; }
 .c-ok { font-size: 12px; fill: var(--ok); }
-.radar-legend { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; font-size: 12px; color: var(--text-2); }
-.radar-legend .lg { display: flex; align-items: center; gap: 6px; }
-.radar-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-.radar-legend .ring-c { background: none; border: 1.5px solid; border-radius: 50%; }
-.radar-hint { font-size: 11.5px; color: var(--text-3); }
+.flange-legend { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; font-size: 12px; color: var(--text-2); }
+.flange-legend .lg { display: flex; align-items: center; gap: 6px; }
+.flange-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.flange-legend .hole-c { background: none; border: 1.2px solid rgba(148, 163, 184, 0.45); }
+.flange-hint { font-size: 11.5px; color: var(--text-3); }
 </style>

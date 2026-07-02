@@ -262,7 +262,7 @@ function onProjectChange() {
 
       <div class="bolt-bar">
         <div class="bolt-toggle">
-          <span class="bv-tab" :class="{ active: boltView === 'radar' }" @click="boltView = 'radar'"><el-icon><Aim /></el-icon> 法兰雷达</span>
+          <span class="bv-tab" :class="{ active: boltView === 'radar' }" @click="boltView = 'radar'"><el-icon><Aim /></el-icon> 法兰布置</span>
           <span class="bv-tab" :class="{ active: boltView === 'trend' }" @click="boltView = 'trend'"><el-icon><TrendCharts /></el-icon> 趋势对比</span>
           <span class="bv-tab" :class="{ active: boltView === 'grid' }" @click="boltView = 'grid'"><el-icon><Grid /></el-icon> 网格</span>
         </div>
@@ -279,11 +279,16 @@ function onProjectChange() {
 
       <div v-if="boltView === 'radar'" class="panel panel--glow ring-panel">
         <div class="panel-hd">
-          <span class="panel-title"><i class="hd-mark" />法兰预紧力雷达</span>
-          <span class="hd-sub mono">{{ sel.group?.name }} · {{ bolts.length }} 颗</span>
+          <span class="panel-title"><i class="hd-mark" />法兰螺栓布置（俯视）</span>
+          <span class="hd-sub mono">{{ sel.group?.name }} · 监测 {{ bolts.length }} 颗</span>
         </div>
         <div class="ring-body">
-          <FlangeRadar v-if="bolts.length" :bolts="bolts" @select="(id) => router.push({ name: 'boltDetail', params: { boltId: id } })" />
+          <FlangeRadar
+            v-if="bolts.length"
+            :bolts="bolts"
+            :total-holes="sel.group?.expectedBoltCount ?? null"
+            @select="(id) => router.push({ name: 'boltDetail', params: { boltId: id } })"
+          />
           <div v-else-if="!loading" class="empty">该部位暂无螺栓</div>
         </div>
       </div>
