@@ -19,14 +19,18 @@ public static class AlarmEndpoints
             CancellationToken ct) =>
         {
             var n = Math.Clamp(limit ?? 100, 1, 1000);
+            // 带确认/闭合责任人（用户名）——告警处置责任链在列表可见（可追溯）
             var sql = @"
                 SELECT a.id, a.bolt_id, b.code AS bolt_code, a.channel_id, a.type, a.severity,
                        a.triggered_at, a.acknowledged_at, a.cleared_at,
                        a.preload_n_at_trigger, a.preload_ratio_at_trigger, a.target_preload_n,
                        a.threshold_low_ratio, a.threshold_high_ratio,
-                       a.consecutive_count, a.message, a.cleared_reason
+                       a.consecutive_count, a.message, a.cleared_reason,
+                       au.username AS acked_by, cu.username AS cleared_by, a.acknowledged_note
                 FROM alarms a
-                JOIN bolts b ON b.id = a.bolt_id
+                JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
+                LEFT JOIN users au ON au.id = a.acknowledged_by
+                LEFT JOIN users cu ON cu.id = a.cleared_by
                 WHERE 1=1"
                 + (includeCleared == true ? "" : " AND a.cleared_at IS NULL")
                 + (severity is null ? "" : " AND a.severity = @sev")
@@ -59,6 +63,9 @@ public static class AlarmEndpoints
                     consecutive = r.GetInt32(14),
                     message = r.IsDBNull(15) ? null : r.GetString(15),
                     clearedReason = r.IsDBNull(16) ? null : r.GetString(16),
+                    ackedBy = r.IsDBNull(17) ? null : r.GetString(17),
+                    clearedBy = r.IsDBNull(18) ? null : r.GetString(18),
+                    ackedNote = r.IsDBNull(19) ? null : r.GetString(19),
                     isOpen = r.IsDBNull(8),
                     isAcked = !r.IsDBNull(7)
                 });
@@ -172,6 +179,38 @@ public static class AlarmEndpoints
         .RequireAuthorization(AuthPolicies.WriteAccess)
         .WithName("ShelveAlarm")
         .WithSummary("抑制某 bolt+type 的告警直到 expires_at");
+
+        // 生效中的抑制列表：抑制必须可见可管理（否则"被静默的告警"成为治理盲区，EEMUA 191 反模式）
+        grp.MapGet("/shelvings", async (NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            const string sql = @"
+                SELECT s.id, s.bolt_id, b.code, s.alarm_type, s.shelved_at, s.expires_at, s.reason,
+                       s.shelved_by, u.username
+                FROM alarm_shelvings s
+                LEFT JOIN bolts b ON b.id = s.bolt_id
+                LEFT JOIN users u ON u.id = s.shelved_by
+                WHERE s.cancelled_at IS NULL AND s.expires_at > now()
+                ORDER BY s.expires_at";
+            await using var cmd = ds.CreateCommand(sql);
+            var items = new List<object>();
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                items.Add(new
+                {
+                    id = r.GetInt64(0),
+                    boltId = r.IsDBNull(1) ? (long?)null : r.GetInt64(1),
+                    boltCode = r.IsDBNull(2) ? null : r.GetString(2),
+                    alarmType = r.IsDBNull(3) ? null : r.GetString(3),
+                    shelvedAt = r.GetDateTime(4),
+                    expiresAt = r.GetDateTime(5),
+                    reason = r.GetString(6),
+                    shelvedBy = r.IsDBNull(7) ? (long?)null : r.GetInt64(7),
+                    shelvedByName = r.IsDBNull(8) ? null : r.GetString(8),
+                });
+            return Results.Ok(new { count = items.Count, items });
+        })
+        .WithName("ListActiveShelvings")
+        .WithSummary("生效中的告警抑制（未取消且未过期）");
 
         // 取消抑制
         grp.MapPost("/shelve/{id:long}/cancel", async (long id, HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>

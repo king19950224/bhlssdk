@@ -60,7 +60,15 @@ export interface AlarmItem {
   clearedAt: string | null
   preloadN: number | null
   preloadRatio: number | null
+  targetPreloadN: number | null
+  thresholdLow: number | null
+  thresholdHigh: number | null
+  consecutive: number
   message: string | null
+  clearedReason: string | null
+  ackedBy: string | null
+  clearedBy: string | null
+  ackedNote: string | null
   isOpen: boolean
   isAcked: boolean
 }
@@ -71,6 +79,17 @@ export interface AlarmSummaryRow {
   openUnacked: number
   total: number
 }
+export interface AlarmShelving {
+  id: number
+  boltId: number | null
+  boltCode: string | null
+  alarmType: string | null
+  shelvedAt: string
+  expiresAt: string
+  reason: string
+  shelvedBy: number | null
+  shelvedByName: string | null
+}
 export const alarmApi = {
   list: (params = '') => http.get<{ count: number; items: AlarmItem[] }>(`/api/alarms/${params}`),
   summary: () => http.get<{ items: AlarmSummaryRow[] }>('/api/alarms/summary'),
@@ -79,6 +98,9 @@ export const alarmApi = {
   // 维护时段抑制某 bolt+type 的告警（hours 1..168，reason ≥5 字）
   shelve: (body: { boltId?: number; alarmType?: string; hours: number; reason: string }) =>
     http.post<{ shelvingId: number; expiresAt: string }>('/api/alarms/shelve', body),
+  // 生效中的抑制（可见可管理，避免"被静默的告警"成为盲区）
+  shelvings: () => http.get<{ count: number; items: AlarmShelving[] }>('/api/alarms/shelvings'),
+  cancelShelve: (id: number) => http.post(`/api/alarms/shelve/${id}/cancel`),
 }
 
 // ---- 参数变更审批 ----
