@@ -14,13 +14,16 @@ const hasMore = ref(false)
 const loading = ref(false)
 
 const ACTION_LABEL: Record<string, string> = {
-  load_calibrate_submit: '提交正式标定', load_calibrate_countersign: '标定会签',
-  quick_calibrate: '快速标定', torque_calibrate: '扭矩标定', apply_torque_fit: '应用扭矩拟合',
+  load_calibrate_submit: '提交正式标定', load_calibrate_countersign: '标定会签', load_calibrate_reject: '标定驳回',
+  quick_calibrate: '快速标定', torque_calibrate: '扭矩标定', apply_torque_fit: '应用扭矩拟合', torque_point_capture: '采集扭矩点',
   config_change_approve: '参数审批', config_change_reject: '参数驳回', config_change_execute: '参数执行', config_change_verify: '参数验证',
-  alarm_ack: '告警确认', alarm_clear: '告警闭合',
-  sync_channel_config: '同步通道配置', move_bolt_channel: '螺栓换通道', update_bolt_spec: '更新螺栓规格', update_target_preload: '更新目标预紧力',
+  alarm_ack: '告警确认', alarm_clear: '告警闭合', alarm_shelve: '告警抑制', alarm_shelve_cancel: '取消抑制',
+  sync_channel_config: '同步通道配置', move_bolt_channel: '螺栓换通道', bolt_move_channel: '螺栓换通道', channel_bind: '绑定通道', channel_unbind: '解绑通道',
+  update_bolt_spec: '更新螺栓规格', update_target_preload: '更新目标预紧力', update_group_config: '更新部位配置', create_bolt: '螺栓建档',
+  channel_commission: '调试期直发参数', channel_recalibrate: '重标定基线', channel_rename: '通道重命名',
+  report_sign: '报告签发', user_create: '创建/重置用户', user_toggle: '启停用户',
 }
-const TYPE_LABEL: Record<string, string> = { channel: '通道', alarm: '告警', bolt: '螺栓', calibration: '标定' }
+const TYPE_LABEL: Record<string, string> = { channel: '通道', alarm: '告警', bolt: '螺栓', calibration: '标定', report: '报告', user: '用户', monitor_group: '监测部位' }
 
 function qs() {
   const p = new URLSearchParams()
@@ -57,7 +60,15 @@ function prevPage() {
 }
 async function exportCsv() {
   try {
-    const res = await fetch(`/api/audit-log/export.csv${qs().replace(/&?offset=\d+/, '')}`, {
+    // 导出不分页：用当前筛选条件重建 query（不能字符串替换 offset,边界情况会拼坏 query）
+    const p = new URLSearchParams()
+    if (action.value) p.set('action', action.value)
+    if (range.value) {
+      p.set('from', range.value[0].toISOString())
+      p.set('to', range.value[1].toISOString())
+    }
+    const q = p.toString()
+    const res = await fetch(`/api/audit-log/export.csv${q ? '?' + q : ''}`, {
       headers: { Authorization: `Bearer ${getAuthToken()}` },
     })
     if (!res.ok) throw new Error(String(res.status))
@@ -89,12 +100,16 @@ onMounted(async () => {
         <el-option v-for="a in actions" :key="a.action" :label="`${ACTION_LABEL[a.action] || a.action} (${a.count})`" :value="a.action" />
       </el-select>
       <el-date-picker v-model="range" type="datetimerange" range-separator="至" start-placeholder="开始" end-placeholder="结束" size="default" />
-      <el-button type="primary" @click="apply"><el-icon><Search /></el-icon> 查询</el-button>
+      <el-button type="primary" :loading="loading" @click="apply"><el-icon><Search /></el-icon> 查询</el-button>
       <el-button @click="exportCsv"><el-icon><Download /></el-icon> 导出 CSV</el-button>
     </div>
 
     <div class="panel panel--glow">
-      <div class="tbl">
+      <div class="panel-hd">
+        <span class="panel-title"><i class="hd-mark" />审计日志</span>
+        <span class="hd-sub mono">{{ items.length }} 条</span>
+      </div>
+      <div class="tbl" v-loading="loading">
         <div class="tr th"><span>时间</span><span>操作人</span><span>动作</span><span>对象</span><span>说明</span></div>
         <div v-for="e in items" :key="e.id" class="tr">
           <span class="mono dim">{{ fmt(e.at) }}</span>
@@ -107,7 +122,7 @@ onMounted(async () => {
       </div>
       <div class="pager">
         <el-button size="small" :disabled="offset === 0" @click="prevPage">上一页</el-button>
-        <span class="pg-info mono">第 {{ Math.floor(offset / limit) + 1 }} 页</span>
+        <span class="pg-info mono">第 {{ Math.floor(offset / limit) + 1 }} 页 · 本页 {{ items.length }} 条{{ hasMore ? ' · 还有更多' : '' }}</span>
         <el-button size="small" :disabled="!hasMore" @click="nextPage">下一页</el-button>
       </div>
     </div>
@@ -115,16 +130,21 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.audit { display: flex; flex-direction: column; gap: 16px; }
-.filters { display: flex; gap: 12px; align-items: center; padding: 16px 20px; flex-wrap: wrap; }
+.audit { display: flex; flex-direction: column; gap: 14px; }
+.filters { display: flex; gap: 12px; align-items: center; padding: 14px 16px; flex-wrap: wrap; }
 .f-action { width: 200px; }
-.tbl { padding: 6px 18px 8px; }
-.tr { display: grid; grid-template-columns: 180px 120px 140px 130px 1fr; align-items: center; padding: 10px 6px; border-bottom: 1px solid var(--hairline); font-size: 13px; }
+
+.panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px 9px; }
+
+.tbl { padding: 4px 10px 12px; overflow-x: auto; }
+.tr { display: grid; grid-template-columns: 180px 120px 140px 130px 1fr; align-items: center; padding: 10px 8px; border-radius: 8px; font-size: 13px; min-width: 700px; }
+.tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
+.tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
 .tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; }
 .dim { color: var(--text-3); }
-.act { font-size: 12px; padding: 2px 9px; border-radius: 9px; background: rgba(56, 189, 248, 0.1); color: var(--accent-2); border: 1px solid var(--panel-border); }
+.act { font-size: 12px; padding: 2px 9px; border-radius: 8px; background: rgba(56, 189, 248, 0.1); color: var(--accent-2); border: 1px solid var(--panel-border); }
 .note { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tbl-empty { text-align: center; padding: 30px; color: var(--text-3); }
-.pager { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 14px; border-top: 1px solid var(--hairline); }
+.pager { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 12px 14px; border-top: 1px solid var(--hairline); }
 .pg-info { font-size: 12px; color: var(--text-3); }
 </style>

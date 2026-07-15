@@ -1,4 +1,5 @@
 using BoltPreload.Application.Alarm;
+using BoltPreload.Application.Devices.ProbeScan;
 using BoltPreload.Application.Realtime;
 using Microsoft.Extensions.Options;
 using Npgsql;
@@ -30,16 +31,19 @@ public sealed class SignalHealthService : BackgroundService
     private readonly NpgsqlDataSource _ds;
     private readonly IAlarmSink _sink;
     private readonly IAlarmPublisher _publisher;
+    private readonly ProbeScanState _probeScan;
     private readonly SignalHealthOptions _opt;
     private readonly ILogger<SignalHealthService> _logger;
 
     public SignalHealthService(
         NpgsqlDataSource ds, IAlarmSink sink, IAlarmPublisher publisher,
+        ProbeScanState probeScan,
         IOptions<SignalHealthOptions> opt, ILogger<SignalHealthService> logger)
     {
         _ds = ds;
         _sink = sink;
         _publisher = publisher;
+        _probeScan = probeScan;
         _opt = opt.Value;
         _logger = logger;
     }
@@ -63,7 +67,8 @@ public sealed class SignalHealthService : BackgroundService
         }
     }
 
-    private async Task CheckAsync(CancellationToken ct)
+    // internal 供集成测试直调单轮检查（BoltPreload.Tests，见 csproj InternalsVisibleTo）
+    internal async Task CheckAsync(CancellationToken ct)
     {
         // 1) 当前已开启的 signal_lost 告警（按 bolt 去重）
         var open = new HashSet<long>();
@@ -74,21 +79,29 @@ public sealed class SignalHealthService : BackgroundService
         // 2) 监测中的螺栓（近 MonitoredWindow 有过测量）+ 距最近一条测量的秒数
         await using var q = _ds.CreateCommand(@"
             SELECT b.id, b.channel_id, b.code,
-                   EXTRACT(EPOCH FROM (now() - mx.last_ts))::double precision AS idle_secs
+                   EXTRACT(EPOCH FROM (now() - mx.last_ts))::double precision AS idle_secs,
+                   c.device_id
             FROM bolts b
+            LEFT JOIN channels c ON c.id = b.channel_id
             JOIN LATERAL (SELECT max(ts) AS last_ts FROM measurements m WHERE m.bolt_id = b.id) mx ON true
             WHERE b.deleted_at IS NULL AND b.enabled
               AND mx.last_ts IS NOT NULL
               AND mx.last_ts > now() - (@win * interval '1 minute')");
         q.Parameters.AddWithValue("win", NpgsqlDbType.Integer, _opt.MonitoredWindowMinutes);
 
-        var rows = new List<(long boltId, long channelId, string code, double idle)>();
+        var rows = new List<(long boltId, long channelId, string code, double idle, long? deviceId)>();
         await using (var r = await q.ExecuteReaderAsync(ct))
             while (await r.ReadAsync(ct))
-                rows.Add((r.GetInt64(0), r.GetInt64(1), r.GetString(2), r.IsDBNull(3) ? 0 : r.GetDouble(3)));
+                rows.Add((r.GetInt64(0), r.GetInt64(1), r.GetString(2), r.IsDBNull(3) ? 0 : r.GetDouble(3),
+                          r.IsDBNull(4) ? (long?)null : r.GetInt64(4)));
 
-        foreach (var (boltId, channelId, code, idle) in rows)
+        foreach (var (boltId, channelId, code, idle, deviceId) in rows)
         {
+            // 扫描期：该设备通道被扫描器独占工作模式、正常测量暂停，跳过以免误报 signal_lost
+            // （与 IngestionWatchdogService / WaveSamplingService 同一不变量）。
+            if (deviceId is { } dev && _probeScan.IsRunning(dev))
+                continue;
+
             // 单个螺栓的告警持久化失败不应中断本轮其它螺栓的检查。PersistAsync 失败现在会抛（不再静默吞），
             // 这里捕获并记录；下一轮重新查询 open 集合后会自动重试（signal_lost 未入库则仍判 silent）。
             try
@@ -97,6 +110,14 @@ public sealed class SignalHealthService : BackgroundService
                 var isOpen = open.Contains(boltId);
                 if (silent && !isOpen)
                 {
+                    // 维护抑制（shelve）：换探头等维护窗口内拔线必然静默，命中生效抑制时不触发。
+                    // 此前抑制检查只在测量管线（PostgresMeasurementSink），signal_lost 从这里直发、完全绕过
+                    // ——而"更换探头"恰是抑制的标准场景。本路径无内存状态机，跳过即可，无需回滚。
+                    if (await IsShelvedAsync(boltId, ct))
+                    {
+                        _logger.LogInformation("signal_lost 被维护抑制(shelve)拦截 bolt={Bolt} ch={Ch}", code, channelId);
+                        continue;
+                    }
                     var ev = MakeEvent(AlarmAction.Trigger, boltId, channelId, "warn",
                         $"通道信号丢失：{code} 已 {(int)idle}s 无回波数据（探头脱落 / 接头松动 / 设备异常?）");
                     await _sink.PersistAsync(ev, ct);
@@ -110,6 +131,14 @@ public sealed class SignalHealthService : BackgroundService
                     try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
                     _logger.LogInformation("信号恢复，闭合 signal_lost：bolt={Bolt} ch={Ch}", code, channelId);
                 }
+                else if (silent && isOpen)
+                {
+                    // 条件仍在命中（依旧静默）：刷新 last_active_at，让"开启中的告警是否仍在持续命中"可判断。
+                    await using var touch = _ds.CreateCommand(
+                        "UPDATE alarms SET last_active_at = now() WHERE bolt_id = @b AND type = 'signal_lost' AND cleared_at IS NULL");
+                    touch.Parameters.AddWithValue("b", NpgsqlDbType.Bigint, boltId);
+                    await touch.ExecuteNonQueryAsync(ct);
+                }
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -117,6 +146,20 @@ public sealed class SignalHealthService : BackgroundService
                 _logger.LogError(ex, "signal_lost 告警写入失败 bolt={Bolt} ch={Ch}（下一轮重试）", code, channelId);
             }
         }
+    }
+
+    /// <summary>是否存在命中该 bolt 的 signal_lost 生效抑制（未取消且未过期；bolt_id / alarm_type 为 NULL 表示通配），
+    /// 与 PostgresMeasurementSink.IsAlarmShelvedAsync 同一判定口径。</summary>
+    private async Task<bool> IsShelvedAsync(long boltId, CancellationToken ct)
+    {
+        await using var cmd = _ds.CreateCommand(@"
+            SELECT 1 FROM alarm_shelvings
+            WHERE cancelled_at IS NULL AND expires_at > now()
+              AND (bolt_id IS NULL OR bolt_id = @bolt)
+              AND (alarm_type IS NULL OR alarm_type = 'signal_lost')
+            LIMIT 1");
+        cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, boltId);
+        return await cmd.ExecuteScalarAsync(ct) is not null;
     }
 
     private static AlarmEvent MakeEvent(AlarmAction action, long boltId, long channelId, string severity, string message) =>

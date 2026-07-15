@@ -2,7 +2,7 @@
 
 ## 来源
 
-厂家原版位置：`/Users/kong/bhlssdk/FxSDK C#+Java源码+使用示例/c#/1.4.0 源码/`
+厂家原版位置：`/Users/kong/bhlssdk/资料/FxSDK C#+Java源码+使用示例/c#/1.4.0 源码/`
 
 由北京 iFast Technology Co., Ltd. 提供。
 
@@ -18,7 +18,13 @@
 |---|---|---|---|
 | `FxSDK.csproj` 的 `TargetFramework` | `net6.0` | `net8.0` | .NET 6 已 EOL（2024-11），全项目统一 .NET 8 LTS |
 | `FxSDK.csproj` 的 `GeneratePackageOnBuild` | `true` | `false` | 我们不分发 SDK 包，每次 build 不需要生成 .nupkg |
+| `FxSDK.csproj` 的 NLog | `5.3.4` | `6.1.3` | 依赖升级（2026-07），与 `tools/DeviceSmokeTest` 统一版本 |
+| `FxSDK.csproj` 的 System.IO.Ports | `8.0.0` | `10.0.9` | 依赖升级（2026-07） |
 | 新增 `Directory.Build.props` | 无 | 局部覆盖严格警告 | 不强迫修改厂家代码消除警告 |
+
+未升级的依赖：`MathNet.Symbolics` 保持 0.24.0——0.25.0 强制依赖 `MathNet.Numerics 6.0.0-beta1`（预发布版），
+与 `MathNet.Filtering 0.7.0`（要求 Numerics 5.x）冲突，也不应把 beta 数学库带进生产。
+`MathNet.Numerics 5.0.0`、`MathNet.Filtering 0.7.0`、`K4os.Compression.LZ4.Streams 1.3.8` 已是最新稳定版。
 
 `.cs` 源代码文件**一行未改**。
 
@@ -26,7 +32,7 @@
 
 1. 备份当前 `external/FxSDK/`
 2. 把厂家新版的 `.cs` 文件全量替换到 `external/FxSDK/`（路径保持一致）
-3. 重新应用上表中的三处改动（TargetFramework / GeneratePackageOnBuild / Directory.Build.props）
+3. 重新应用上表中的改动（TargetFramework / GeneratePackageOnBuild / 依赖版本 / Directory.Build.props）
 4. `dotnet build` 验证编译
 5. 跑回归测试集（包括算法回归数据、协议解码用例）
 6. 记录版本变更到 `docs/sdk-changelog.md`

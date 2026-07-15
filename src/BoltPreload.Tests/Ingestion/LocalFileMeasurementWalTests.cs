@@ -129,7 +129,7 @@ public class LocalFileMeasurementWalTests : IDisposable
     }
 
     [Fact]
-    public async Task Replay_round_trips_multichannel_with_wave()
+    public async Task Replay_round_trips_multichannel_and_strips_wave()
     {
         var wal = NewWal();
         var ts = new DateTimeOffset(2026, 5, 21, 8, 30, 0, TimeSpan.Zero);
@@ -155,7 +155,8 @@ public class LocalFileMeasurementWalTests : IDisposable
         g9.EchoTimeNs.Should().Be(32000m);
         g9.SpTempC.Should().Be(16.7m);
         g9.MidResults.Should().Equal(1.5m, 2.5m);
-        g9.EchoWave!.WaveData.Should().Equal(wave);
+        // WAL 只兜底测量元数据：波形在落盘前被剥离（避免 DB 故障窗口把磁盘/CPU 打爆），不随重放恢复
+        g9.EchoWave.Should().BeNull();
         got.MultiChannelResult.Channels[10].StatusCode.Should().Be((short)-1);
     }
 

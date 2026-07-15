@@ -143,7 +143,8 @@ public static class WaveDiagnostics
 
         return new WaveComparison(
             Similarity: best,
-            BestLagNs: bestLag * clk,
+            // ΔTOF = 采样内平移(bestLag×clk) + 两波窗口起点之差；漏掉后者会在 EchoStart 变化时给出假平移。
+            BestLagNs: bestLag * clk + (current.EchoStartNs - reference.EchoStartNs),
             ZeroLagCorrelation: zeroLag,
             AttenuationRatio: atten,
             SnrDb: snrDb,

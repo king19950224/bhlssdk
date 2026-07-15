@@ -19,9 +19,10 @@ namespace BoltPreload.Api.Runtime;
 /// 否则多设备会静默路由到主设备。
 /// </para>
 /// </summary>
-public sealed class DeviceConnectorManager : IDeviceConnectorManager
+public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisposable
 {
     private readonly Dictionary<long, DeviceRuntimeContext> _runtimes;
+    private readonly ILogger<DeviceConnectorManager> _log;
 
     public DeviceConnectorManager(
         IConfiguration configuration,
@@ -30,6 +31,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager
     {
         var fxMode = configuration["Fx:Mode"] ?? "Simulated";
         var log = loggerFactory.CreateLogger<DeviceConnectorManager>();
+        _log = log;
 
         var runtimes = string.Equals(fxMode, "Real", StringComparison.OrdinalIgnoreCase)
             ? BuildRealRuntimes(configuration, dataSource, loggerFactory, log)
@@ -57,6 +59,27 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager
 
     public DeviceRuntimeContext? Find(long deviceId)
         => _runtimes.TryGetValue(deviceId, out var runtime) ? runtime : null;
+
+    /// <summary>
+    /// 停机时释放所有设备连接器（DI 容器对单例 IAsyncDisposable 自动调用）。
+    /// 不释放会让 SDK 的 TCP 会话/解码循环残留到进程强杀,设备端留下半开连接,
+    /// 重启后的新连接可能被设备拒绝或踢线。
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var rt in _runtimes.Values)
+        {
+            try
+            {
+                await rt.Connector.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "停机释放设备连接器失败 device={DeviceId}", rt.DeviceId);
+            }
+        }
+        _log.LogInformation("已释放全部设备连接器（{Count} 个）", _runtimes.Count);
+    }
 
     // ===================== Real（真机，多设备 DB 驱动） =====================
 

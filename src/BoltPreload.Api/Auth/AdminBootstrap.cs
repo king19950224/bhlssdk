@@ -52,6 +52,7 @@ public static class AdminBootstrap
                 SET password_hash = EXCLUDED.password_hash,
                     role          = 'admin',
                     enabled       = true,
+                    deleted_at    = NULL,
                     failed_attempts = 0,
                     locked_until = NULL,
                     token_version = users.token_version + 1";

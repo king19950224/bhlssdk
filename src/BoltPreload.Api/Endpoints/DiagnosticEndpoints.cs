@@ -173,7 +173,10 @@ public static class DiagnosticEndpoints
             ushort[] channels;
             if (body?.Channels is { Length: > 0 })
             {
-                channels = body.Channels.Distinct().OrderBy(x => x).ToArray();
+                // 与默认分支同一 1..48 硬件边界：否则可对任意大通道号发起海量设备读，阻塞请求线程/冲击设备
+                channels = body.Channels.Where(x => x is >= 1 and <= 48).Distinct().OrderBy(x => x).ToArray();
+                if (channels.Length == 0)
+                    return Results.BadRequest(new { error = "channels 必须在 1..48 范围内" });
             }
             else
             {
@@ -297,29 +300,36 @@ public static class DiagnosticEndpoints
                 cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
                 cmd.Parameters.AddWithValue("channel_no", NpgsqlDbType.Smallint, (short)channel);
 
-                await using var reader = await cmd.ExecuteReaderAsync(ct);
-                if (!await reader.ReadAsync(ct))
+                // reader 先读完关闭再回滚（开着 reader 回滚会抛异常，把 400 变 500）
+                long channelId = 0;
+                object? synced = null;
+                string afterJson = "";
+                await using (var reader = await cmd.ExecuteReaderAsync(ct))
+                {
+                    if (await reader.ReadAsync(ct))
+                    {
+                        channelId = reader.GetInt64(0);
+                        synced = new
+                        {
+                            id = channelId,
+                            deviceId = reader.GetInt64(1),
+                            channelNo = reader.GetInt16(2),
+                            probeFreqMhz = reader.GetDecimal(3),
+                            gain = reader.GetFloat(4),
+                            threshold = reader.GetInt16(5),
+                            measMode = reader.GetInt16(6),
+                            refTimeNs = reader.IsDBNull(7) ? null : (decimal?)reader.GetDecimal(7),
+                            refTempC = reader.IsDBNull(8) ? null : (decimal?)reader.GetDecimal(8),
+                            tcMode = reader.GetInt16(9)
+                        };
+                        afterJson = reader.GetString(10);
+                    }
+                }
+                if (synced is null)
                 {
                     await tx.RollbackAsync(ct);
                     return Results.BadRequest(new { error = "没有可同步的通道参数历史", deviceId, channel });
                 }
-
-                var channelId = reader.GetInt64(0);
-                var synced = new
-                {
-                    id = channelId,
-                    deviceId = reader.GetInt64(1),
-                    channelNo = reader.GetInt16(2),
-                    probeFreqMhz = reader.GetDecimal(3),
-                    gain = reader.GetFloat(4),
-                    threshold = reader.GetInt16(5),
-                    measMode = reader.GetInt16(6),
-                    refTimeNs = reader.IsDBNull(7) ? null : (decimal?)reader.GetDecimal(7),
-                    refTempC = reader.IsDBNull(8) ? null : (decimal?)reader.GetDecimal(8),
-                    tcMode = reader.GetInt16(9)
-                };
-                var afterJson = reader.GetString(10);
-                await reader.DisposeAsync();
 
                 await using (var audit = new NpgsqlCommand(@"
                     INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
@@ -350,7 +360,7 @@ public static class DiagnosticEndpoints
             {
                 await tx.RollbackAsync(ct);
                 logger.LogError(ex, "同步通道配置失败 device={DeviceId} ch={Channel}", deviceId, channel);
-                return Results.Problem(detail: ex.Message, statusCode: 500);
+                return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
             }
         })
         .WithName("SyncChannelConfigFromHistory")
@@ -363,7 +373,7 @@ public static class DiagnosticEndpoints
         {
             var config = await service.GetAsync(channelId, ct);
             return config is null
-                ? Results.NotFound(new { error = "channel not found", channelId })
+                ? Results.NotFound(new { error = "通道不存在", channelId })
                 : Results.Ok(config);
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)
@@ -401,38 +411,95 @@ public static class DiagnosticEndpoints
             ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var logger = loggerFactory.CreateLogger("Diagnostic");
-            var userId = UserContext.Require(http).UserId;
+            var actor = UserContext.Require(http);
+            var userId = actor.UserId;
+            // 管理员修改免审批：admin 提交的变更直接落 approved（approved_by=本人），跳过异人复核，
+            // 可直接 /execute 下发；operator/reviewer 仍走 requested→approved(异人)→executed→verified。
+            // approved_by 落库 + 下方审计条目让"管理员免审批"可追溯（不因免审批而丢失责任链）。
+            var isAdmin = actor.Role == AuthRoles.Admin;
+            var status = isAdmin ? "approved" : "requested";
 
-            await using var cmd = ds.CreateCommand(@"
-                INSERT INTO channel_config_change_requests (
-                    device_id, channel_id, channel_no, requested_by, requested_jsonb, status, note
-                )
-                SELECT @device_id, c.id, @channel_no, @user_id, @updates::jsonb, 'requested', 'configure-channel 提交'
-                FROM channels c
-                WHERE c.device_id = @device_id AND c.channel_no = @channel_no AND c.deleted_at IS NULL
-                RETURNING id");
-            cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
-            cmd.Parameters.AddWithValue("channel_no", NpgsqlDbType.Smallint, (short)channel);
-            cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
-            cmd.Parameters.AddWithValue("updates", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(updates));
-            var scalar = await cmd.ExecuteScalarAsync(ct);
-            if (scalar is null or DBNull)
-                return Results.NotFound(new { error = "通道不存在", deviceId, channel });
-            var requestId = (long)scalar;
+            long requestId = 0;
+            long channelId = 0;
+            // 请求写入 + 管理员免审批的审计条目放在同一事务：避免"已自动批准的变更"落库但审计丢失（§0 责任链不可断）
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            try
+            {
+                await using (var cmd = new NpgsqlCommand(@"
+                    INSERT INTO channel_config_change_requests (
+                        device_id, channel_id, channel_no, requested_by, requested_jsonb, status, note,
+                        approved_by, approved_at
+                    )
+                    SELECT @device_id, c.id, @channel_no, @user_id, @updates::jsonb, @status, @note,
+                           @approved_by, CASE WHEN @approved_by IS NULL THEN NULL ELSE now() END
+                    FROM channels c
+                    WHERE c.device_id = @device_id AND c.channel_no = @channel_no AND c.deleted_at IS NULL
+                    RETURNING id, channel_id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
+                    cmd.Parameters.AddWithValue("channel_no", NpgsqlDbType.Smallint, (short)channel);
+                    cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("updates", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(updates));
+                    cmd.Parameters.AddWithValue("status", NpgsqlDbType.Varchar, status);
+                    cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, isAdmin ? "configure-channel 提交（管理员免审批，自动批准）" : "configure-channel 提交");
+                    cmd.Parameters.AddWithValue("approved_by", NpgsqlDbType.Bigint, isAdmin ? userId : (object)DBNull.Value);
+                    // reader 先读完关闭再回滚（开着 reader 回滚会抛异常，把 404 变 500）
+                    var inserted = false;
+                    await using (var r = await cmd.ExecuteReaderAsync(ct))
+                    {
+                        if (await r.ReadAsync(ct))
+                        {
+                            inserted = true;
+                            requestId = r.GetInt64(0);
+                            channelId = r.GetInt64(1);
+                        }
+                    }
+                    if (!inserted)
+                    {
+                        await tx.RollbackAsync(ct);
+                        return Results.NotFound(new { error = "通道不存在", deviceId, channel });
+                    }
+                }
 
-            logger.LogInformation(
-                "已提交通道参数变更请求 #{ReqId} device={DeviceId} ch={Ch} updates={Updates} by user={UserId}",
-                requestId, deviceId, channel, updates, userId);
+                if (isAdmin)
+                {
+                    // 责任链：管理员免审批也要留痕（谁、何时、批了哪条）
+                    await using var audit = new NpgsqlCommand(@"
+                        INSERT INTO audit_log (user_id, action, target_type, target_id, after_jsonb, note, at)
+                        VALUES (@uid, 'config_change_approve', 'channel', @cid, @after::jsonb, @note, now())", conn, tx);
+                    audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
+                    audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                    audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb,
+                        System.Text.Json.JsonSerializer.Serialize(new { requestId, autoApproved = true, by = userId, role = actor.Role }));
+                    audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"管理员免审批：变更 #{requestId} 提交即自动批准");
+                    await audit.ExecuteNonQueryAsync(ct);
+                }
+
+                await tx.CommitAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync(ct);
+                logger.LogError(ex, "提交通道参数变更失败 device={DeviceId} ch={Ch}", deviceId, channel);
+                return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
+            }
+
+            logger.LogWarning(
+                "已提交通道参数变更请求 #{ReqId} device={DeviceId} ch={Ch} status={Status} updates={Updates} by user={UserId}",
+                requestId, deviceId, channel, status, updates, userId);
 
             return Results.Ok(new
             {
                 submitted = true,
                 requestId,
-                status = "requested",
+                status,
                 deviceId,
                 channel,
                 applied = updates,
-                note = $"已提交变更【请求】#{requestId}，未下发设备。需另一名 reviewer 调 POST /api/config-changes/{requestId}/approve 审批，再 /execute 下发、/verify 读回验证。"
+                note = isAdmin
+                    ? $"管理员免审批：变更【请求】#{requestId} 已自动批准，可直接 POST /api/config-changes/{requestId}/execute 下发，再 /verify 读回验证。"
+                    : $"已提交变更【请求】#{requestId}，未下发设备。需另一名 reviewer 调 POST /api/config-changes/{requestId}/approve 审批，再 /execute 下发、/verify 读回验证。"
             });
         })
         .WithName("ConfigureChannel")
@@ -454,11 +521,16 @@ public static class DiagnosticEndpoints
         // 调试期直发（仅未标定通道）：现场对回波/增益时，逐次审批不现实。
         // 安全模型：未标定通道（未出具正式预紧力）允许工程师直发非安全基线参数（增益/探头频率/回波窗/回波宽度）；
         // 已标定（在产）通道一律走 configure-channel 审批工作流。基线类（阈值/测量模式/RefTime/RefTemp）一律走 /recalibrate。
+        // M3 拍板：随组策略走 reviewer+（见组级 ReviewerAccess），不再单独放宽到 WriteAccess——
+        // 初调工程师本来就需要本组其他端点（读参/对波形/set-mode，均 reviewer+）才能完成初调闭环，
+        // 单留一个 operator 可直写设备的口子只剩绕过审批的风险，没有独立价值。
         group.MapPost("/configure-channel/{channel}/commission", async (
             long deviceId, ushort channel,
             ChannelConfigUpdate updates,
             IDeviceConnectorManager deviceManager,
             NpgsqlDataSource ds,
+            IChannelResolver resolver,
+            ProbeScanState probeScanState,
             HttpContext http,
             ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
@@ -468,6 +540,9 @@ public static class DiagnosticEndpoints
             if (updates.Threshold.HasValue || updates.MeasMode.HasValue || updates.RefTimeNs.HasValue
                 || updates.RefTempC.HasValue || updates.TcMode.HasValue || updates.TempCoefficient.HasValue)
                 return Results.BadRequest(new { error = "阈值/测量模式/RefTime/RefTemp/温补 属标定基线，请走 /recalibrate；调试直发仅支持 增益/探头频率/回波窗/回波宽度。" });
+            // 与 set-mode/MCR 同一互斥：扫描期间不下发通道配置，避免与扫描器抢设备
+            if (probeScanState.IsRunning(deviceId))
+                return Results.Conflict(new { error = "通道自动检测进行中，不能并发下发通道配置", deviceId });
 
             long channelId;
             bool calibrated;
@@ -493,24 +568,29 @@ public static class DiagnosticEndpoints
             {
                 await runtime.Connector.ConfigureChannelAsync(channel, updates, runtime.Options.Address, ct);
 
-                await using (var u = ds.CreateCommand(@"
+                // DB 同步与审计同事务；echo_width_us 也随下发同步（此前允许下发却不落库，设备与库漂移）
+                await using var conn = await ds.OpenConnectionAsync(ct);
+                await using var tx = await conn.BeginTransactionAsync(ct);
+                await using (var u = new NpgsqlCommand(@"
                     UPDATE channels SET
                         gain = COALESCE(@gain, gain),
                         probe_freq_mhz = COALESCE(@pf, probe_freq_mhz),
                         echo_win_ns = COALESCE(@ew, echo_win_ns),
+                        echo_width_us = COALESCE(@ewd, echo_width_us),
                         updated_at = now()
-                    WHERE id=@id"))
+                    WHERE id=@id", conn, tx))
                 {
                     u.Parameters.AddWithValue("gain", NpgsqlDbType.Real, (object?)(updates.Gain.HasValue ? (float)updates.Gain.Value : (float?)null) ?? DBNull.Value);
                     u.Parameters.AddWithValue("pf", NpgsqlDbType.Numeric, (object?)updates.ProbeFreqMhz ?? DBNull.Value);
                     u.Parameters.AddWithValue("ew", NpgsqlDbType.Numeric, (object?)updates.EchoWinNs ?? DBNull.Value);
+                    u.Parameters.AddWithValue("ewd", NpgsqlDbType.Smallint, (object?)(short?)updates.EchoWidthUs ?? DBNull.Value);
                     u.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, channelId);
                     await u.ExecuteNonQueryAsync(ct);
                 }
 
-                await using (var audit = ds.CreateCommand(@"
+                await using (var audit = new NpgsqlCommand(@"
                     INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                    VALUES (@uid, 'channel_commission', 'channel', @cid, NULL, @after::jsonb, @note, now())"))
+                    VALUES (@uid, 'channel_commission', 'channel', @cid, NULL, @after::jsonb, @note, now())", conn, tx))
                 {
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
                     audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
@@ -518,20 +598,23 @@ public static class DiagnosticEndpoints
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"调试直发通道参数 device={deviceId} ch={channel}（未标定）");
                     await audit.ExecuteNonQueryAsync(ct);
                 }
+                await tx.CommitAsync(ct);
+
+                // 失效路由缓存：热路径/前端立刻读到新配置（此前漏调，缓存最长滞后 5 分钟）
+                resolver.Invalidate(deviceId, channel);
 
                 logger.LogWarning("调试直发通道参数 device={Dev} ch={Ch} updates={Updates} by user={User}",
                     deviceId, channel, updates, userId);
-                return Results.Ok(new { commissioned = true, deviceId, channel, applied = updates, note = "已直发设备（未标定通道，调试期）。观察波形/声时确认锁到真实回波后，用 /recalibrate 设基线。" });
+                return Results.Ok(new { commissioned = true, deviceId, channel, applied = updates, note = "已直发设备（未标定通道，调试期）。观察波形/声时确认锁到真实回波后，请执行重标定设置基线。" });
             }
             catch (Exception ex)
             {
                 logger.LogError(ex, "调试直发失败 device={Dev} ch={Ch}", deviceId, channel);
-                return Results.BadRequest(new { error = ex.Message, deviceId, channel });
+                return Results.BadRequest(new { error = "参数下发失败（设备离线或通信超时），详情见系统日志。", deviceId, channel });
             }
         })
-        .RequireAuthorization(AuthPolicies.WriteAccess)
         .WithName("CommissionChannel")
-        .WithSummary("调试期直发通道参数（仅未标定通道：增益/探头频率/回波窗；已标定走审批）");
+        .WithSummary("调试期直发通道参数（仅未标定通道：增益/探头频率/回波窗；已标定走审批）；随组策略 reviewer+");
 
         // 设备工作模式控制（Standby/MultiMeas/...）
         group.MapPost("/set-mode/{mode}", async (
@@ -591,7 +674,8 @@ public static class DiagnosticEndpoints
             r.InvalidateAll();
             return Results.Ok(new { reset = true });
         })
-        .RequireAuthorization(AuthPolicies.WriteAccess)
+        // 清空路由缓存会引发短时全量回源查库,属运维干预动作,与其他诊断操作同级(reviewer+)
+        .RequireAuthorization(AuthPolicies.ReviewerAccess)
         .WithTags("Diagnostic")
         .WithName("CacheReset")
         .WithSummary("清空通道路由缓存（强制下次重新查库）");
@@ -608,7 +692,7 @@ public static class DiagnosticEndpoints
             if (connector is null)
                 return Results.NotFound(new { error = $"设备未加载到运行时：{deviceId}", deviceId });
             if (channel is null)
-                return Results.BadRequest(new { error = "channel query parameter is required" });
+                return Results.BadRequest(new { error = "必须指定 channel 参数" });
 
             var windowMinutes = Math.Clamp(minutes ?? 1, 1, 60);
             var ch = channel.Value;

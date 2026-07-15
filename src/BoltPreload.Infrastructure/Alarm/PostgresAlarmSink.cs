@@ -28,17 +28,18 @@ public sealed class PostgresAlarmSink : IAlarmSink
         // 契约（C2）：失败不再 catch-all 吞掉，直接抛给调用方，由其回滚状态机 / 重试，杜绝静默漏报。
         if (ev.Action == AlarmAction.Trigger)
         {
+            // last_active_at 初始化为触发时刻，此后由"条件仍命中"路径刷新（测量管线节流刷 / SignalHealth 每轮刷）
             const string insertSql = @"
                 INSERT INTO alarms (
                     bolt_id, channel_id, type, severity, triggered_at,
                     preload_n_at_trigger, preload_ratio_at_trigger, target_preload_n,
                     threshold_low_ratio, threshold_high_ratio,
-                    consecutive_count, message
+                    consecutive_count, message, last_active_at
                 ) VALUES (
                     @bolt, @chan, @type, @sev, @ts,
                     @pn, @pr, @target,
                     @lo, @hi,
-                    @cnt, @msg
+                    @cnt, @msg, @ts
                 )";
 
             await using var cmd = _dataSource.CreateCommand(insertSql);
@@ -83,13 +84,13 @@ public sealed class PostgresAlarmSink : IAlarmSink
                 bolt_id, channel_id, type, severity, triggered_at,
                 preload_n_at_trigger, preload_ratio_at_trigger, target_preload_n,
                 threshold_low_ratio, threshold_high_ratio,
-                consecutive_count, message
+                consecutive_count, message, last_active_at
             )
             SELECT
                 @bolt, @chan, @type, @sev, @ts,
                 @pn, @pr, @target,
                 @lo, @hi,
-                @cnt, @msg
+                @cnt, @msg, @ts
             WHERE NOT EXISTS (
                 SELECT 1 FROM alarms
                 WHERE bolt_id = @bolt AND type = @type AND cleared_at IS NULL)";

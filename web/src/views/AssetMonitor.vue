@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import HealthBar from '../components/HealthBar.vue'
 import FlangeRadar from '../components/FlangeRadar.vue'
 import GroupTrend from '../components/GroupTrend.vue'
 import PreloadScale from '../components/PreloadScale.vue'
+import BoltCreateDialog from '../components/BoltCreateDialog.vue'
 import { computePreloadHealth, pct, STATUS_META } from '../utils/preload'
 import { useNow } from '../utils/useNow'
-import { assetApi, reportApi, type ProjectNode, type TurbineNode, type GroupNode, type GroupBolt } from '../api'
+import { assetApi, channelApi, reportApi, type ProjectNode, type TurbineNode, type GroupNode, type GroupBolt, type UnboundSummaryRow } from '../api'
 import { onRealtime } from '../api/realtime'
 import { useAuth } from '../stores/auth'
 
@@ -74,6 +75,60 @@ const sortedBoltCells = computed(() => {
   return [...cells].sort((a, b) => (a.b.preloadRatio ?? 99) - (b.b.preloadRatio ?? 99))
 })
 
+// 未绑定出数通道（现场"多接/新接探头"的信号）：进入螺栓层时加载，
+// 按该组螺栓所在设备过滤；组内暂无螺栓时无从判定设备，显示全部设备的堆积。
+const unboundRows = ref<UnboundSummaryRow[]>([])
+async function loadUnbound() {
+  try {
+    unboundRows.value = (await channelApi.unboundSummary()).items
+  } catch { /* 引导信息，尽力加载 */ }
+}
+const groupUnbound = computed<UnboundSummaryRow[]>(() => {
+  if (!unboundRows.value.length) return []
+  const devIds = new Set(bolts.value.map((b) => b.deviceId))
+  return devIds.size ? unboundRows.value.filter((u) => devIds.has(u.deviceId)) : unboundRows.value
+})
+const unboundTotal = computed(() => groupUnbound.value.reduce((s, u) => s + u.count, 0))
+// 展示用：按通道号去重（历史自动发现可能给同一物理通道留多条记录）、堆积多的在前、最多列 8 路
+const unboundChNos = computed(() => {
+  const byNo = new Map<number, number>()
+  for (const u of groupUnbound.value) byNo.set(u.channelNo, (byNo.get(u.channelNo) ?? 0) + u.count)
+  return [...byNo.entries()].sort((a, b) => b[1] - a[1]).map(([no]) => no)
+})
+const unboundChLabel = computed(() => {
+  const nos = unboundChNos.value
+  const head = nos.slice(0, 8).map((n) => 'CH' + n).join('、')
+  return nos.length > 8 ? `${head} 等 ${nos.length} 路` : head
+})
+
+// 建档并绑定对话框（预填当前组 + 堆积最多的未绑定通道）
+const createOpen = ref(false)
+
+// 配置孔位数编辑：法兰实际孔数与配置不符（多接/扩容）时现场自助修正，俯视图等分角度才对得上
+async function editHoles() {
+  const g = sel.value.group
+  if (!g) return
+  let value: string
+  try {
+    ({ value } = await ElMessageBox.prompt(
+      '法兰实际螺栓孔总数（俯视图按此数等分角度排布）。现场孔数与配置不符时在此修正。',
+      '配置孔位数',
+      {
+        confirmButtonText: '保存', cancelButtonText: '取消',
+        inputValue: String(g.expectedBoltCount ?? (bolts.value.length || '')),
+        inputPattern: /^(12[0-8]|1[01]\d|[1-9]\d?)$/,
+        inputErrorMessage: '请输入 1..128 的整数',
+      }))
+  } catch { return /* 取消 */ }
+  try {
+    const r = await assetApi.patchGroup(g.id, { expectedBoltCount: Number(value) })
+    g.expectedBoltCount = r.expectedBoltCount
+    ElMessage.success(`配置孔位数已改为 ${r.expectedBoltCount}${r.previous != null ? `（原 ${r.previous}）` : ''}`)
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '保存失败')
+  }
+}
+
 // 部位级工程摘要：状态计数 + 目标/下限参考值（工程视图先给统计与基准，再看单根）
 const STATUS_SUMMARY = ['loose', 'warn', 'high', 'normal', 'uncalibrated', 'nodata'] as const
 const boltSummary = computed(() => {
@@ -82,7 +137,8 @@ const boltSummary = computed(() => {
   return c
 })
 const groupTargetN = computed(() => num(sel.value.group?.targetPreloadN ?? null))
-const kn = (n: number | null) => (n == null ? '—' : (n / 1000).toFixed(0) + ' kN')
+// kN 全页统一 1 位小数(与螺栓行一致,避免同页 100 kN / 95.4 kN 两种精度并存)
+const kn = (n: number | null) => (n == null ? '—' : (n / 1000).toFixed(1) + ' kN')
 
 // 请求序号：快速切换风场/风机/部位时，后发先至的旧响应不得覆盖当前视图（与 GroupTrend 同一防护）。
 let loadSeq = 0
@@ -117,9 +173,9 @@ async function openGroup(g: GroupNode) {
   const seq = ++loadSeq
   loading.value = true
   try {
-    const items = (await assetApi.groupBolts(g.id)).items
+    const [res] = await Promise.all([assetApi.groupBolts(g.id), loadUnbound()])
     if (seq !== loadSeq) return
-    bolts.value = items
+    bolts.value = res.items
     level.value = 'bolts'
   } finally {
     if (seq === loadSeq) loading.value = false
@@ -140,8 +196,8 @@ async function refreshCurrent() {
       const items = (await assetApi.groups(sel.value.turbine.id)).items
       if (seq === loadSeq) groups.value = items
     } else if (level.value === 'bolts' && sel.value.group) {
-      const items = (await assetApi.groupBolts(sel.value.group.id)).items
-      if (seq === loadSeq) bolts.value = items
+      const [res] = await Promise.all([assetApi.groupBolts(sel.value.group.id), loadUnbound()])
+      if (seq === loadSeq) bolts.value = res.items
     }
   } catch { /* 尽力刷新 */ }
 }
@@ -153,15 +209,19 @@ function scheduleRefresh() {
 let unsubAlarm: (() => void) | undefined
 let unsubMeas: (() => void) | undefined
 
+let pollTimer: number | undefined
 onMounted(async () => {
   projects.value = (await assetApi.projects()).items
   projectId.value = projects.value[0]?.id ?? null
   await loadTurbines()
   unsubAlarm = onRealtime('OnAlarm', scheduleRefresh)
   unsubMeas = onRealtime('OnMeasurement', () => { if (level.value === 'bolts') scheduleRefresh() })
+  // 30s 轮询兜底：SignalR 断线期间页面不能冻结在旧数据(资产页此前是全站唯一无轮询的页面)
+  pollTimer = window.setInterval(() => { if (!document.hidden) refreshCurrent() }, 30000)
 })
 onUnmounted(() => {
   if (debounceTimer) clearTimeout(debounceTimer)
+  if (pollTimer) clearInterval(pollTimer)
   unsubAlarm?.()
   unsubMeas?.()
 })
@@ -246,10 +306,27 @@ function onProjectChange() {
 
     <!-- 螺栓层：法兰圈 / 网格 -->
     <template v-else>
+      <!-- 未绑定通道引导条：现场接了探头但系统没建档，主动提示而不是"装看不见" -->
+      <div v-if="groupUnbound.length" class="unbound-banner panel">
+        <el-icon class="ub-ic"><WarningFilled /></el-icon>
+        <div class="ub-text">
+          检测到 <b class="mono">{{ unboundChLabel }}</b> 有信号但未绑定螺栓
+          <span class="ub-sub">共 {{ unboundTotal.toLocaleString() }} 条数据已暂存，建档绑定后自动回填，一条不丢</span>
+        </div>
+        <div class="ub-actions">
+          <el-button size="small" @click="router.push({ name: 'identify' })">敲击识别</el-button>
+          <el-button size="small" type="primary" @click="createOpen = true">建档绑定</el-button>
+        </div>
+      </div>
+
       <!-- 部位工程摘要：目标/下限基准 + 状态分布计数（密集、可对比，先统计后单根） -->
       <div class="grp-summary panel" v-if="bolts.length">
         <div class="gs-refs">
           <div class="gs-ref"><span class="gs-k">监测</span><b class="mono">{{ boltSummary.total }}</b><span class="gs-u">颗</span></div>
+          <div class="gs-ref gs-holes" title="修改法兰配置孔位数（多接/扩容后在此修正）" @click="editHoles">
+            <span class="gs-k">配置孔位</span><b class="mono">{{ sel.group?.expectedBoltCount ?? '—' }}</b>
+            <el-icon class="gs-edit"><Edit /></el-icon>
+          </div>
           <div class="gs-ref"><span class="gs-k">组目标</span><b class="mono">{{ kn(groupTargetN) }}</b></div>
         </div>
         <div class="gs-stats">
@@ -307,28 +384,40 @@ function onProjectChange() {
             <!-- 安全状态正常但松弛显著（损失≥10%，风电常见复拧阈）时加一枚次级提示，调和"绿灯却在掉力"的观感 -->
             <span v-if="b.status === 'normal' && h.relax && h.relax.band === 'significant'" class="bolt-subtag" :style="`color:${h.relax.color}`">松弛</span>
           </div>
+          <!-- 未标定/无数据不显示保持率数字:回填的历史 ratio 会造成"待标定却显示 85%"的口径打架 -->
           <div class="bolt-ratio metric" :style="`color:${STATUS[b.status]?.color}`">
-            {{ ratioStr(b.preloadRatio) }}<span class="bolt-ratio-cap">保持</span>
+            <template v-if="b.status === 'uncalibrated' || b.status === 'nodata'">—</template>
+            <template v-else>{{ ratioStr(b.preloadRatio) }}<span class="bolt-ratio-cap">保持</span></template>
           </div>
           <PreloadScale :current="num(b.preloadN)" :target="num(b.targetPreloadN)" :min="num(b.minPreloadN)" :height="6" compact />
           <div class="bolt-margin">
+            <!-- 状态以服务端 b.status 为准：未标定/无数据时不展示裕度损失，避免"标签未标定、却算出 85% 裕度"的口径打架 -->
+            <span v-if="b.status === 'uncalibrated' || b.status === 'nodata'" class="mono">{{ b.status === 'uncalibrated' ? '待标定' : '无近期数据' }}</span>
             <!-- 偏高/超张力：主指标改显"超目标 +X%"，避免"裕度 240%"这种看着很安全实则过张力的误导 -->
-            <span v-if="b.status === 'high'">超目标 <b style="color:#a78bfa">+{{ pct((h.residualRatio ?? 1) - 1) }}</b></span>
+            <span v-else-if="b.status === 'high'">超目标 <b style="color:#a78bfa">+{{ pct((h.residualRatio ?? 1) - 1) }}</b></span>
             <span v-else>裕度 <b :style="marginStyle(h.safetyMargin)">{{ pct(h.safetyMargin) }}</b></span>
-            <span v-if="h.relax && h.relax.band !== 'good' && b.status !== 'high'" :style="`color:${h.relax.color}`">损失 {{ pct(h.lossPct) }}</span>
-            <span v-else class="mono">{{ b.preloadN ? (Number(b.preloadN) / 1000).toFixed(1) + 'kN' : '—' }}</span>
+            <span v-if="h.relax && h.relax.band !== 'good' && b.status !== 'high' && b.status !== 'uncalibrated' && b.status !== 'nodata'" :style="`color:${h.relax.color}`">损失 {{ pct(h.lossPct) }}</span>
+            <span v-else-if="b.status !== 'uncalibrated' && b.status !== 'nodata'" class="mono">{{ b.preloadN ? (Number(b.preloadN) / 1000).toFixed(1) + 'kN' : '—' }}</span>
           </div>
           <div class="bolt-foot mono">{{ b.nominalDiam }}·{{ b.grade }} · CH{{ b.channelNo }}</div>
         </div>
         <div v-if="!loading && !sortedBoltCells.length" class="empty panel">{{ search ? '无匹配螺栓' : '该部位暂无螺栓' }}</div>
       </div>
     </template>
+
+    <BoltCreateDialog
+      v-model="createOpen"
+      :channel-id="groupUnbound[0]?.channelId ?? null"
+      :group-id="sel.group?.id ?? null"
+      @done="refreshCurrent"
+    />
   </div>
 </template>
 
 <style scoped>
 .asset { display: flex; flex-direction: column; gap: 14px; }
-.crumbs { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.crumbs { display: flex; align-items: center; gap: 10px; font-size: 14px; flex-wrap: wrap; }
+.crumbs .crumb-link { white-space: nowrap; }
 .proj-sel { width: 180px; }
 .crumb-link { color: var(--text-2); cursor: pointer; transition: color 0.15s; }
 .crumb-link:hover { color: var(--text-1); }
@@ -382,6 +471,14 @@ function onProjectChange() {
 .ring-body { display: flex; justify-content: center; padding: 18px 20px 26px; }
 .trend-panel { padding: 18px 20px; }
 
+/* 未绑定通道引导条：琥珀警示 + 两个动作（敲击识别 / 建档绑定） */
+.unbound-banner { display: flex; align-items: center; gap: 12px; padding: 11px 16px; border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.06); flex-wrap: wrap; }
+.ub-ic { color: var(--warn); font-size: 18px; flex-shrink: 0; }
+.ub-text { flex: 1; min-width: 240px; font-size: 13px; color: var(--text-1); }
+.ub-text b { color: var(--warn); }
+.ub-sub { display: block; font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+.ub-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
 /* 部位工程摘要条：左基准值 + 右状态分布，密集单行 */
 .grp-summary { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 11px 16px; flex-wrap: wrap; }
 .gs-refs { display: flex; align-items: center; gap: 22px; }
@@ -389,6 +486,10 @@ function onProjectChange() {
 .gs-ref .gs-k { font-size: 11px; color: var(--text-3); letter-spacing: 0.06em; }
 .gs-ref b { font-size: 17px; font-weight: 700; color: var(--text-1); }
 .gs-ref .gs-u { font-size: 11px; color: var(--text-3); }
+.gs-holes { cursor: pointer; border-radius: 6px; padding: 2px 6px; margin: -2px -6px; transition: background 0.15s; }
+.gs-holes:hover { background: rgba(56, 189, 248, 0.08); }
+.gs-holes:hover .gs-edit { color: var(--accent); }
+.gs-edit { font-size: 12px; color: var(--text-3); margin-left: 2px; }
 .gs-stats { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 .gs-stat { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
 .gs-stat b { color: var(--text-1); font-size: 13px; }

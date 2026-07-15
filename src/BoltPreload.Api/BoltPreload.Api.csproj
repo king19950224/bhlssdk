@@ -34,6 +34,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- 集成测试直调 internal（如 SignalHealthService.CheckAsync 单轮检查） -->
+    <InternalsVisibleTo Include="BoltPreload.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\BoltPreload.Domain\BoltPreload.Domain.csproj" />
     <ProjectReference Include="..\BoltPreload.Algorithms\BoltPreload.Algorithms.csproj" />
     <ProjectReference Include="..\BoltPreload.Application\BoltPreload.Application.csproj" />
@@ -41,5 +46,22 @@
     <ProjectReference Include="..\BoltPreload.Calibration\BoltPreload.Calibration.csproj" />
     <ProjectReference Include="..\BoltPreload.Fx\BoltPreload.Fx.csproj" />
   </ItemGroup>
+
+  <!-- 发布时自动携带前端构建产物 web/dist → wwwroot。
+       此前靠人工拷贝，漏拷则客户现场打开是空白页；改为 publish 硬校验：
+       dist 缺失直接编译期报错，提示先 npm run build。仅影响 dotnet publish，不影响日常 build/run。 -->
+  <Target Name="CopyWebDistOnPublish" BeforeTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <WebDistFiles Include="$(MSBuildProjectDirectory)\..\..\web\dist\**\*" />
+    </ItemGroup>
+    <Error Condition="'@(WebDistFiles)' == ''"
+           Text="web/dist 为空：请先在 web/ 目录执行 npm run build，再 dotnet publish（前端产物需打进 wwwroot）。" />
+    <ItemGroup>
+      <ResolvedFileToPublish Include="@(WebDistFiles)">
+        <RelativePath>wwwroot\%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 
 </Project>

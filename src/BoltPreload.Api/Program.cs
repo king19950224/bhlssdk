@@ -153,7 +153,12 @@ builder.Services.AddBoltPreloadAuth(builder.Configuration, isDevelopment);
 // 后台服务异常行为：单个 HostedService 抛未捕获异常时【不拖停整个进程】。
 // 采集 / 看门狗 / WAL 重放 / 信号健康各自独立，一个崩不应让整机停摆（默认 StopHost 对监测系统太脆）。
 builder.Services.Configure<HostOptions>(o =>
-    o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore);
+{
+    o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
+    // 默认 5s 停机窗对采集系统太短：设备断开/DB 尾部 flush/连接器释放需要时间,
+    // 超时会被强杀导致设备侧残留半开会话(下次连接被踢)。放宽到 30s。
+    o.ShutdownTimeout = TimeSpan.FromSeconds(30);
+});
 
 // IngestionService 作为 BackgroundService 跑
 builder.Services.AddHostedService<IngestionService>();
@@ -187,7 +192,7 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// 静态文件（实时演示页 wwwroot/realtime.html）
+// 静态文件（Vue 前端构建产物拷贝到 wwwroot 后由此提供）
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
@@ -222,30 +227,46 @@ app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorMana
     }
     catch (Exception ex)
     {
+        // 匿名探针接口：异常详情只写日志，不外泄（Npgsql 报错可能含主机/库名）
+        app.Logger.LogError(ex, "/api/health/ready DB 探测失败");
         return Results.Json(
-            new { status = "degraded", db = "down", error = ex.Message, timestamp = DateTimeOffset.UtcNow },
+            new { status = "degraded", db = "down", timestamp = DateTimeOffset.UtcNow },
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 
-    // 2) 采集新鲜度（M1）：暴露各设备最近一次信封/通道结果的时间与空闲秒数，
-    //    让运维探针/监控能发现"进程在、但采集已停"的静默失效（区别于仅探 DB 的旧实现）。
-    //    不因空闲武断 503（真机本就可能阶段性空闲），由调用方按 idleSeconds 设阈值告警。
+    // 2) 采集新鲜度（M1）：匿名探针只给聚合指标（在线数/最大空闲秒），
+    //    设备明细（ID/状态/计数）走已登录的 /api/runtime/devices——匿名端点不外泄拓扑细节。
+    //    不因空闲武断 503（真机本就可能阶段性空闲），由调用方按 maxIdleSeconds 设阈值告警。
     var now = DateTimeOffset.UtcNow;
-    var ingestion = manager.Runtimes.Select(rt =>
+    var deviceTotal = manager.Runtimes.Count;
+    var deviceConnected = manager.Runtimes.Count(rt => rt.Connector.State == BoltPreload.Fx.FxConnectorState.Connected);
+    double? maxIdle = null;
+    foreach (var rt in manager.Runtimes)
     {
         var last = rt.RuntimeStatus.LastEnvelopeAt;
-        return new
-        {
-            rt.DeviceId,
-            state = rt.Connector.State.ToString(),
-            lastEnvelopeAt = last,
-            idleSeconds = last is null ? (double?)null : Math.Round((now - last.Value).TotalSeconds, 1),
-            rt.RuntimeStatus.EnvelopeCount,
-            rt.RuntimeStatus.ChannelResultCount
-        };
-    }).ToArray();
+        if (last is null) continue;
+        var idle = Math.Round((now - last.Value).TotalSeconds, 1);
+        if (maxIdle is null || idle > maxIdle) maxIdle = idle;
+    }
 
-    return Results.Ok(new { status = "ready", db = "up", ingestion, timestamp = now });
+    // 3) 磁盘余量：WAL/波形/日志都靠本地盘,磁盘满会静默丢数——纳入 readiness 观测
+    double? freeDiskGb = null;
+    try
+    {
+        var drive = new DriveInfo(Path.GetPathRoot(AppContext.BaseDirectory) ?? "/");
+        freeDiskGb = Math.Round(drive.AvailableFreeSpace / 1024.0 / 1024 / 1024, 1);
+    }
+    catch { /* 探测尽力 */ }
+
+    return Results.Ok(new
+    {
+        status = "ready",
+        db = "up",
+        devices = new { total = deviceTotal, connected = deviceConnected },
+        maxIdleSeconds = maxIdle,
+        freeDiskGb,
+        timestamp = now
+    });
 })
 .AllowAnonymous()
 .WithTags("Health");

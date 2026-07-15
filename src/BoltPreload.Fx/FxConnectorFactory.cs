@@ -5,8 +5,8 @@ using Microsoft.Extensions.Logging;
 namespace BoltPreload.Fx;
 
 /// <summary>
-/// 真机设备的连接参数（plain，对应 devices 表行或 Fx:Real:* 配置）。
-/// 上层（Api 组合根）只构造本记录，<b>不直接 new 厂家 SDK 的 DeviceConfig</b>。
+/// 设备的连接参数（plain，对应 devices 表行或 Fx:Real:* 配置）。
+/// 上层（Api 组合根）只构造本记录，<b>不直接 new SDK 的 DeviceConfig</b>。
 /// </summary>
 public sealed record FxRealDeviceSpec(
     long DeviceId,
@@ -18,7 +18,7 @@ public sealed record FxRealDeviceSpec(
     ushort ChannelCount);
 
 /// <summary>
-/// 单通道初始会话参数（plain DTO，不暴露厂家 SDK 的 <c>ChannelConfig</c> 给上层）。
+/// 单通道初始会话参数（plain DTO， <c>ChannelConfig</c> ）。
 /// <para>
 /// 字段名与默认值【刻意对齐】<c>FxSDK.Models.ChannelConfig</c>（ProbeFreq=2.0 / EchoWidth=40 / Gain=10 /
 /// MeasMode=2 / TcMode=1 ...），保证经 <see cref="FxConnectorFactory"/> 映射回 SDK 类型时行为与历史一致。
@@ -42,7 +42,7 @@ public sealed class FxChannelInit
 
 /// <summary>
 /// 在 <c>BoltPreload.Fx</c> 内集中构造厂家 SDK 配置对象与连接器，把「FxSDK 组合」从 Api 收回到适配层，
-/// 使上层不再 <c>using FxSDK.*</c>（商用底线：业务/组合层与厂家 SDK 解耦，便于换型号/换供应商）。
+/// 使上层不再 <c>using FxSDK.*</c>
 /// <para>初始通道会话由上层从 DB/配置加载为 plain 的 <see cref="FxChannelInit"/> 后传入，DB/配置访问不进适配层。</para>
 /// </summary>
 public static class FxConnectorFactory

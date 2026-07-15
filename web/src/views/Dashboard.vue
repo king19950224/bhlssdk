@@ -122,7 +122,7 @@ onUnmounted(() => {
 })
 
 // ── 趋势主图（唯一趋势可视化，去掉 KPI 里重复的 sparkline） ──
-const hasTrend = computed(() => trend.value.length > 1)
+const hasTrend = computed(() => trend.value.length >= 1)
 const trendOption = computed<Record<string, unknown>>(() => {
   const pts = trend.value
   const avg = pts.map((p) => [new Date(p.ts).getTime(), p.avgRatio == null ? null : +(p.avgRatio * 100).toFixed(1)])
@@ -130,7 +130,10 @@ const trendOption = computed<Record<string, unknown>>(() => {
   const nums: number[] = []
   for (const p of pts) { if (p.avgRatio != null) nums.push(p.avgRatio * 100); if (p.minRatio != null) nums.push(p.minRatio * 100) }
   const lo = nums.length ? Math.min(...nums) : 70
+  const hi = nums.length ? Math.max(...nums) : 100
   const yMin = Math.max(0, Math.floor((Math.min(lo, 90) - 4) / 5) * 5)
+  // 上界随数据自适应（预紧力偏高时曲线可能远超 105%,固定 max 会把曲线削顶画断）
+  const yMax = Math.ceil((Math.max(hi, 101) + 4) / 5) * 5
   return {
     grid: { left: 44, right: 16, top: 30, bottom: 26 },
     legend: { data: ['平均保持率', '最低保持率'], top: 2, right: 6, icon: 'roundRect', itemWidth: 14, itemHeight: 4, textStyle: { color: '#9fb2cc', fontSize: 11 }, inactiveColor: '#3b4659' },
@@ -143,11 +146,15 @@ const trendOption = computed<Record<string, unknown>>(() => {
     xAxis: {
       type: 'time',
       axisLine: { lineStyle: { color: 'rgba(148,163,184,0.18)' } },
-      axisLabel: { color: '#61748f', fontSize: 11, hideOverlap: true },
+      // 跨天刻度默认只显示日号(孤立的"8"),统一成可读的层级格式
+      axisLabel: {
+        color: '#61748f', fontSize: 11, hideOverlap: true,
+        formatter: { year: '{yyyy}', month: '{MM}-{dd}', day: '{MM}-{dd}', hour: '{HH}:{mm}', minute: '{HH}:{mm}', second: '{HH}:{mm}' },
+      },
       axisTick: { show: false }, splitLine: { show: false },
     },
     yAxis: {
-      type: 'value', min: yMin, max: 105, interval: 5,
+      type: 'value', min: yMin, max: yMax,
       name: '保持率 %', nameTextStyle: { color: '#61748f', fontSize: 11, padding: [0, 0, 0, 18] },
       axisLabel: { color: '#61748f', fontSize: 11, formatter: '{value}' },
       splitLine: { lineStyle: { color: 'rgba(148,163,184,0.06)' } },
@@ -166,7 +173,8 @@ const trendOption = computed<Record<string, unknown>>(() => {
           silent: true, symbol: 'none',
           data: [
             { yAxis: 100, lineStyle: { color: '#10b981', type: 'dashed', width: 1 }, label: { formatter: '目标 100%', color: '#10b981', fontSize: 10, position: 'insideStartTop' } },
-            { yAxis: 90, lineStyle: { color: 'rgba(245,158,11,0.7)', type: 'dashed', width: 1 }, label: { formatter: '预警 90%', color: '#f59e0b', fontSize: 10, position: 'insideStartBottom' } },
+            // 90% 是"损失 10% 需复拧关注"的行业经验线(与松弛分级口径一致),不是告警阈值——标注避免与告警 70% 混淆
+            { yAxis: 90, lineStyle: { color: 'rgba(245,158,11,0.7)', type: 'dashed', width: 1 }, label: { formatter: '复拧关注线 90%', color: '#f59e0b', fontSize: 10, position: 'insideStartBottom' } },
           ],
         },
       },
@@ -195,7 +203,7 @@ const donutOption = computed(() => {
 const distBuckets = computed(() => {
   const r = residualDist.value
   const items = [
-    { key: 'b100', label: '≥100% 超张力', count: r.b100, color: '#a78bfa' },
+    { key: 'b100', label: '≥100% 达标及以上', count: r.b100, color: '#a78bfa' },
     { key: 'b90', label: '90–100%', count: r.b90, color: '#10b981' },
     { key: 'b80', label: '80–90%', count: r.b80, color: '#f59e0b' },
     { key: 'b70', label: '70–80%', count: r.b70, color: '#fb923c' },

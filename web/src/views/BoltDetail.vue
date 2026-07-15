@@ -4,10 +4,12 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import EChart from '../components/EChart.vue'
 import PreloadScale from '../components/PreloadScale.vue'
-import { computePreloadHealth, pct, signedN, fmtAgo } from '../utils/preload'
+import CalibrationWizard from '../components/CalibrationWizard.vue'
+import { computePreloadHealth, pct, signedN, fmtAgo, STATUS_META } from '../utils/preload'
 import { useNow } from '../utils/useNow'
 import { analyzeAscan } from '../utils/ascan'
 import { boltApi, alarmApi, auditApi, waveApi, configChangeApi, deviceApi, calibrationApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction } from '../api'
+import { ApiError } from '../api/client'
 import { onRealtime } from '../api/realtime'
 import { useAuth } from '../stores/auth'
 
@@ -27,9 +29,15 @@ const baselining = ref(false)
 // 实时预紧力滚动序列（拧松/拧紧肉眼可见升降）；livePreloadN/liveRatio 在 tightness 下方按 echo 连续计算
 const liveSeries = ref<{ t: number; v: number }[]>([])
 let lastLiveTs = ''
+// 实时最新测量时刻（SignalR/轮询驱动）：让头部 KPI 与陈旧度判定随实时数据更新,而非停在页面加载那一刻
+const liveTs = ref<string | null>(null)
 
 const MEAS_MODE: Record<number, string> = { 0: '自动峰值', 1: '位置法(RefTime)', 2: '阈值法' }
 const TC_MODE: Record<number, string> = { 0: '不补偿', 1: '材料补偿', 2: '自定义系数' }
+// 设备测量状态码（SDK ChannelResult 口径）：0 正常,负值为各类信号异常
+const STATUS_CODE: Record<number, string> = {
+  0: '正常', [-1]: '信号过小', [-2]: '阈值异常', [-3]: '信号溢出', [-4]: '相似度低', [-5]: '未知异常', [-6]: '信噪比低',
+}
 
 const bolt = ref<BoltListItem | null>(null)
 const trend = ref<TrendPoint[]>([])
@@ -48,6 +56,15 @@ const adjust = reactive({ visible: false, saving: false })
 const adjForm = reactive({ gain: null as number | null, probeFreqMhz: null as number | null, echoWinNs: null as number | null })
 
 const settings = reactive({ visible: false, saving: false })
+// 引导式标定向导(默认入口);标定完成后重载档案与配置
+const wizardOpen = ref(false)
+async function onWizardDone() {
+  try {
+    bolt.value = await boltApi.get(boltId)
+    chCfg.value = await boltApi.channelConfig(boltId)
+    if (bolt.value) calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items
+  } catch { /* 刷新尽力 */ }
+}
 const form = reactive({
   targetPreloadN: null as number | null,
   minPreloadN: null as number | null,
@@ -60,21 +77,27 @@ const form = reactive({
   crossSectionMm2: null as number | null,
 })
 
-const STATUS: Record<string, { label: string; color: string; cls: string }> = {
-  normal: { label: '正常', color: '#10b981', cls: 'led--ok' },
-  warn: { label: '预警', color: '#f59e0b', cls: 'led--warn' },
-  loose: { label: '松动', color: '#f43f5e', cls: 'led--crit' },
-  uncalibrated: { label: '未标定', color: '#61748f', cls: 'led--off' },
-  nodata: { label: '无数据', color: '#3b4659', cls: 'led--off' },
-}
+// 状态元数据用全局共享表（含 high/偏高——本地副本曾缺 high，凡偏高螺栓详情页渲染即崩、卡死在加载遮罩）
+const STATUS = STATUS_META
 // 标定方法枚举的中文映射（与标定中心/标定弹窗保持一致，未知值回退原值）
 const METHOD_LABEL: Record<string, string> = {
   load_calibrated: '正式载荷标定', gb_single_wave: 'GB 单波法', gb_bi_wave: 'GB 双波法',
-  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定', sim_baseline: '仿真基线（演示）',
+  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定', sim_baseline: '初始基线',
 }
 // 通道标定生命周期状态：仅在「过期/停用」时覆盖标签（避免把仍有 K_L、在出数的临时标定误标为未标定），
 // 其余回退到 calibrated 布尔。让「标定过期」不再笼统显示为「已标定」，与总览「未标定/过期」桶口径一致。
 const STATE_LABEL: Record<string, string> = { expired: '标定过期', disabled: '已停用' }
+// 告警类型中文映射（与告警中心一致；履历时间线用）
+const ALARM_TYPE_LABEL: Record<string, string> = {
+  preload_low: '预紧力偏低', preload_loss: '预紧力脱落', preload_high: '预紧力偏高',
+  signal_lost: '信号丢失', no_data: '数据中断',
+}
+// 趋势时段 Tab 的中文标签
+const RANGE_LABEL: Record<string, string> = { '1h': '1 小时', '24h': '24 小时', '7d': '7 天' }
+// 通道配置来源枚举的中文映射
+const CONFIG_SOURCE: Record<string, string> = {
+  device_readback: '设备读回', config_change: '参数审批下发', database: '数据库配置', manual: '人工录入',
+}
 const num = (v: number | string | null | undefined) => {
   if (v == null) return null
   const n = Number(v)
@@ -83,12 +106,19 @@ const num = (v: number | string | null | undefined) => {
 
 // 让 stale/nodata 判定与「N 分钟前」随时间刷新（离线后不再卡在最后一次加载的判定）
 const now = useNow(30000)
+// 展示值：实时链路有新读数时用实时值,否则用加载时的最后已知值——
+// 修掉"头部 KPI 停在加载瞬间、下方实时区块却在跳"的同页两套数值问题。
+// 未标定通道不显示预紧力数字(历史回填值会与"未标定"标签打架),温度不受标定影响可照常显示。
+const effLastTs = computed(() => liveTs.value ?? bolt.value?.lastTs ?? null)
+const displayPreloadN = computed(() => (bolt.value?.calibrated ? livePreloadN.value ?? num(bolt.value?.lastPreloadN) : null))
+const displayRatio = computed(() => (bolt.value?.calibrated ? liveRatio.value ?? num(bolt.value?.lastRatio) : null))
+const displayTempC = computed(() => liveTempC.value ?? num(bolt.value?.lastSpTempC))
 // 统一的"状态 + 变化程度"模型（与服务端 bolt_status 口径一致）
 const health = computed(() =>
   computePreloadHealth({
     calibrated: bolt.value?.calibrated,
-    lastTs: bolt.value?.lastTs ?? null,
-    current: bolt.value?.lastPreloadN ?? null,
+    lastTs: effLastTs.value,
+    current: displayPreloadN.value,
     target: bolt.value?.targetPreloadN ?? null,
     min: bolt.value?.minPreloadN ?? null,
   }, now.value),
@@ -99,7 +129,7 @@ const isStale = computed(() => status.value === 'nodata')
 const liveLabel = computed(() => (isStale.value ? '最后已知' : '当前'))
 // 区分两类 nodata：设备失联（>10min 无测量）vs 信号丢失（有测量但无有效预紧力读数），文案分别表述
 const offlineStale = computed(() => {
-  const t = bolt.value?.lastTs
+  const t = effLastTs.value
   return !t || now.value - new Date(t).getTime() > 10 * 60000
 })
 
@@ -122,10 +152,14 @@ const prediction = computed(() => {
   return { trend: p.trend, perDay: p.ratePerDay ?? 0, days: p.daysToLimit, r2: p.r2, windowDays: p.windowDays, samples: p.sampleCount }
 })
 
+let trendSeq = 0
 async function loadTrend() {
   const hours = rangeKey.value === '1h' ? 1 : rangeKey.value === '24h' ? 24 : 168
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
-  trend.value = (await boltApi.preloadTrend(boltId, `?bucket=auto&since=${since}`)).items
+  const seq = ++trendSeq
+  const items = (await boltApi.preloadTrend(boltId, `?bucket=auto&since=${since}`)).items
+  // 快速切换 1h/24h/7d 时丢弃过期响应，避免旧时段数据覆盖新选择
+  if (seq === trendSeq) trend.value = items
 }
 
 async function loadWave() {
@@ -149,6 +183,7 @@ function applyLiveMeasurement(tsIso: string, echoNs: number | null, tempC: numbe
   // 新测量到达 → 推入滚动序列（livePreloadN 已随 liveEchoNs 重算；按 ts 去重避免重复累计）
   if (tsIso && tsIso !== lastLiveTs) {
     lastLiveTs = tsIso
+    liveTs.value = tsIso
     if (livePreloadN.value != null) {
       liveSeries.value.push({ t: new Date(tsIso).getTime(), v: livePreloadN.value })
       if (liveSeries.value.length > 90) liveSeries.value.shift()
@@ -280,13 +315,19 @@ async function countersign(c: CalibRecord) {
   }
 }
 
-onMounted(async () => {
-  if (!Number.isFinite(boltId)) {
-    ElMessage.error('无效的螺栓 ID')
-    return
-  }
+// 接口失败 ≠ 螺栓不存在：网络/服务异常时要给"加载失败+重试",不能误报"已删除"
+const loadErr = ref<string | null>(null)
+async function init() {
+  loading.value = true
+  loadErr.value = null
   try {
-    bolt.value = (await boltApi.list()).items.find((b) => b.id === boltId) ?? null
+    try {
+      bolt.value = await boltApi.get(boltId)
+    } catch (e) {
+      bolt.value = null
+      if (!(e instanceof ApiError && e.status === 404))
+        loadErr.value = (e as Error)?.message || '加载失败'
+    }
     await loadTrend()
     try { pred.value = await boltApi.prediction(boltId) } catch { /* 预测不可用 */ }
     measurements.value = (await boltApi.measurements(boltId, 24)).items
@@ -305,7 +346,7 @@ onMounted(async () => {
       for (const c of calibrations.value)
         ev.push({ at: c.createdAt, kind: 'calib', title: `标定 · ${c.method}`, note: c.passed ? '通过' : '未通过', color: c.passed ? '#10b981' : '#f43f5e' })
       for (const a of al.items.filter((x) => x.boltId === boltId))
-        ev.push({ at: a.triggeredAt, kind: 'alarm', title: `告警 · ${a.type}`, note: a.message || '', color: '#f59e0b' })
+        ev.push({ at: a.triggeredAt, kind: 'alarm', title: `告警 · ${ALARM_TYPE_LABEL[a.type] || a.type}`, note: a.message || '', color: '#f59e0b' })
       for (const e of auditItems)
         ev.push({ at: e.at, kind: 'audit', title: e.action, note: e.note || '', color: '#38bdf8' })
       events.value = ev.sort((x, y) => new Date(y.at).getTime() - new Date(x.at).getTime())
@@ -321,15 +362,28 @@ onMounted(async () => {
       liveTempC.value = measurements.value[0]?.spTempC != null ? Number(measurements.value[0].spTempC) : null
       startLive()
       // SignalR 实时：仅处理本通道的测量，立即更新 echo/温度/实时预紧力（替代纯轮询）
+      unsubMeas?.()
       unsubMeas = onRealtime('OnMeasurement', (m) => {
         if (!live.value || !chCfg.value) return
         if (m.deviceId === chCfg.value.deviceId && m.channel === chCfg.value.channelNo)
           applyLiveMeasurement(m.ts, m.echoTimeNs, m.spTempC)
       })
     }
+  } catch (e) {
+    // 兜底：任一必需接口失败都归入"加载失败"可重试,不让异常静默飘走
+    loadErr.value = (e as Error)?.message || '加载失败'
   } finally {
     loading.value = false
   }
+}
+
+onMounted(() => {
+  if (!Number.isFinite(boltId)) {
+    ElMessage.error('无效的螺栓 ID')
+    loading.value = false
+    return
+  }
+  init()
 })
 
 onUnmounted(() => {
@@ -370,7 +424,7 @@ const ascanOption = computed(() => {
     lines.push({ yAxis: -s.thr, lineStyle: { color: '#f59e0b', type: 'dashed', opacity: 0.65 }, label: { show: false } })
   }
   lines.push({ xAxis: s.detNs, lineStyle: { color: '#f43f5e', width: 1.4 }, label: { formatter: '检出', color: '#f43f5e', position: 'insideEndTop', fontSize: 10 } })
-  if (s.refInWin) lines.push({ xAxis: s.refNs, lineStyle: { color: '#22d3ee', type: 'dashed', width: 1.4 }, label: { formatter: 'RefTime', color: '#22d3ee', position: 'insideEndBottom', fontSize: 10 } })
+  if (s.refInWin) lines.push({ xAxis: s.refNs, lineStyle: { color: '#22d3ee', type: 'dashed', width: 1.4 }, label: { formatter: '基线', color: '#22d3ee', position: 'insideEndBottom', fontSize: 10 } })
   const areas: Record<string, unknown>[][] = []
   if (s.thr != null && s.thr > 0) areas.push([{ yAxis: -s.thr, itemStyle: { color: 'rgba(245,158,11,0.05)' } }, { yAxis: s.thr }])
   if (s.gate) areas.push([{ xAxis: s.gate[0], itemStyle: { color: 'rgba(34,211,238,0.13)', borderColor: 'rgba(34,211,238,0.35)', borderWidth: 1 } }, { xAxis: s.gate[1] }])
@@ -431,7 +485,7 @@ async function saveSettings() {
     })
     ElMessage.success('预紧力设置已保存')
     settings.visible = false
-    bolt.value = (await boltApi.list()).items.find((b) => b.id === boltId) ?? bolt.value
+    bolt.value = await boltApi.get(boltId).catch(() => bolt.value)
   } catch (e) {
     ElMessage.error((e as Error)?.message || '保存失败')
   } finally {
@@ -547,11 +601,37 @@ const trendOption = computed(() => {
 function fmtN(n: number | null | undefined) {
   return n == null ? '—' : Number(n).toLocaleString('en-US', { maximumFractionDigits: 0 })
 }
-function fmtTime(iso: string) {
-  return new Date(iso).toLocaleString('zh-CN', { hour12: false })
+function fmtTime(iso: string | null | undefined) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString('zh-CN', { hour12: false })
 }
 function ratioStr(r: number | null | undefined) {
   return r == null ? '—' : (Number(r) * 100).toFixed(1) + '%'
+}
+
+// 导出当前时段趋势 CSV（月报/年报原始数据；带 token 的接口用 fetch+blob 下载）
+async function exportTrendCsv() {
+  const hours = rangeKey.value === '1h' ? 1 : rangeKey.value === '24h' ? 24 : 168
+  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
+  const until = new Date().toISOString()
+  try {
+    const { getAuthToken } = await import('../api/client')
+    const res = await fetch(
+      `/api/bolts/${boltId}/preload-trend/export.csv?since=${since}&until=${until}&bucket=auto`,
+      { headers: { Authorization: `Bearer ${getAuthToken()}` } })
+    if (!res.ok) throw new Error(String(res.status))
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `趋势-${bolt.value?.code || boltId}-${RANGE_LABEL[rangeKey.value]}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+    ElMessage.success('趋势数据已导出')
+  } catch {
+    ElMessage.error('导出失败')
+  }
 }
 </script>
 
@@ -559,7 +639,20 @@ function ratioStr(r: number | null | undefined) {
   <div class="bd rise" v-loading="loading">
     <div class="bd-top">
       <div class="bd-back" @click="router.back()"><el-icon><ArrowLeft /></el-icon> 返回</div>
-      <el-button v-if="bolt" size="small" @click="openSettings"><el-icon><Setting /></el-icon> 编辑预紧力设置</el-button>
+      <div class="bd-top-right">
+        <el-button v-if="bolt && auth.isReviewer" size="small" :type="bolt.calibrated ? 'default' : 'primary'" @click="wizardOpen = true">
+          <el-icon><Aim /></el-icon> {{ bolt.calibrated ? '重新标定' : '开始标定' }}
+        </el-button>
+        <el-button v-if="bolt" size="small" @click="openSettings"><el-icon><Setting /></el-icon> 编辑预紧力设置</el-button>
+      </div>
+    </div>
+
+    <!-- 未标定引导横幅:告诉客户"下一步做什么",而不是让页面停在一排 — -->
+    <div v-if="bolt && !bolt.calibrated && !loading" class="calib-cta">
+      <el-icon><InfoFilled /></el-icon>
+      <span>该螺栓尚未标定,暂无法显示预紧力。完成标定后自动开始监测(现场约 3~5 分钟)。</span>
+      <el-button v-if="auth.isReviewer" size="small" type="primary" @click="wizardOpen = true">开始标定</el-button>
+      <span v-else class="dim">请联系复核员执行标定</span>
     </div>
 
     <!-- 头部 -->
@@ -578,11 +671,11 @@ function ratioStr(r: number | null | undefined) {
     <div class="kpi-row" v-if="bolt">
       <div class="stat panel" :class="status === 'loose' ? 'stat--crit' : status === 'normal' ? 'stat--ok' : ''">
         <div class="stat-hd"><span class="stat-label">{{ liveLabel }}预紧力</span><span class="led" :class="STATUS[status].cls" /></div>
-        <div class="stat-val metric" :style="`color:${STATUS[status].color}`">{{ fmtN(bolt.lastPreloadN) }}<i>N</i></div>
+        <div class="stat-val metric" :style="`color:${STATUS[status].color}`">{{ fmtN(displayPreloadN) }}<i>N</i></div>
       </div>
       <div class="stat panel">
         <div class="stat-hd"><span class="stat-label">{{ liveLabel }}比值</span><el-icon class="stat-ic"><Odometer /></el-icon></div>
-        <div class="stat-val metric">{{ ratioStr(bolt.lastRatio) }}</div>
+        <div class="stat-val metric">{{ ratioStr(displayRatio) }}</div>
       </div>
       <div class="stat panel">
         <div class="stat-hd"><span class="stat-label">目标 / 下限</span><el-icon class="stat-ic"><Aim /></el-icon></div>
@@ -590,14 +683,14 @@ function ratioStr(r: number | null | undefined) {
       </div>
       <div class="stat panel">
         <div class="stat-hd"><span class="stat-label">温度</span><el-icon class="stat-ic"><Sunny /></el-icon></div>
-        <div class="stat-val metric stat-val--sm">{{ bolt.lastSpTempC != null ? Number(bolt.lastSpTempC).toFixed(1) + '°C' : '—' }}</div>
+        <div class="stat-val metric stat-val--sm">{{ displayTempC != null ? displayTempC.toFixed(1) + '°C' : '—' }}</div>
       </div>
     </div>
 
     <!-- 失联 / 数据陈旧横幅：明确标出数值为「最后已知」、趋势预测暂不可信，避免误读为实时 -->
     <div v-if="bolt && isStale" class="stale-banner">
       <el-icon><WarningFilled /></el-icon>
-      <span v-if="offlineStale">该通道已 <b>{{ fmtAgo(bolt.lastTs, now) }}</b> 无新测量（设备离线 / 失联）。下列数值为<b>最后已知值</b>，趋势预测已暂停。</span>
+      <span v-if="offlineStale">该通道已 <b>{{ fmtAgo(effLastTs, now) }}</b> 无新测量（设备离线 / 失联）。下列数值为<b>最后已知值</b>，趋势预测已暂停。</span>
       <span v-else>最近一次测量<b>未得到有效预紧力读数</b>（信号丢失：探头脱落 / 接头松动 / 无回波）。下列为<b>最后已知值</b>，趋势预测已暂停。</span>
     </div>
 
@@ -640,26 +733,40 @@ function ratioStr(r: number | null | undefined) {
             </span>
           </div>
         </div>
-        <PreloadScale :current="num(bolt.lastPreloadN)" :target="num(bolt.targetPreloadN)" :min="num(bolt.minPreloadN)" :height="14" />
+        <PreloadScale :current="displayPreloadN" :target="num(bolt.targetPreloadN)" :min="num(bolt.minPreloadN)" :height="14" />
       </div>
     </div>
 
+    <!-- 加载失败(网络/服务异常)与"螺栓不存在"分开表述 -->
+    <div v-if="loadErr && !loading" class="panel bolt-missing">
+      <el-icon><WarningFilled /></el-icon>
+      <p>加载失败：{{ loadErr }}</p>
+      <el-button type="primary" @click="init">重试</el-button>
+    </div>
+    <!-- 螺栓不存在：整页空态,不再渲染下方空壳区块 -->
+    <div v-else-if="!bolt && !loading" class="panel bolt-missing">
+      <el-icon><WarningFilled /></el-icon>
+      <p>螺栓不存在或已被删除</p>
+      <el-button type="primary" @click="router.push({ name: 'assets' })">返回资产监测</el-button>
+    </div>
+
     <!-- 趋势 -->
-    <div class="panel panel--glow">
+    <div class="panel panel--glow" v-if="bolt">
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />预紧力趋势</span>
         <div class="trend-ctrls">
+          <span class="temp-toggle" @click="exportTrendCsv"><el-icon><Download /></el-icon> 导出</span>
           <span class="temp-toggle" :class="{ active: showTemp }" @click="showTemp = !showTemp"><el-icon><Sunny /></el-icon> 温度</span>
           <div class="range-tabs">
-            <span v-for="k in (['1h', '24h', '7d'] as const)" :key="k" class="range-tab" :class="{ active: rangeKey === k }" @click="setRange(k)">{{ k }}</span>
+            <span v-for="k in (['1h', '24h', '7d'] as const)" :key="k" class="range-tab" :class="{ active: rangeKey === k }" @click="setRange(k)">{{ RANGE_LABEL[k] }}</span>
           </div>
         </div>
       </div>
-      <EChart :option="trendOption" height="280px" />
+      <EChart v-if="trend.length" :option="trendOption" height="280px" />
       <div v-if="!loading && !trend.length" class="chart-empty">该时段无测量数据</div>
       <div v-if="isStale && !loading && trend.length" class="predict stale">
         <el-icon><WarningFilled /></el-icon>
-        <span v-if="offlineStale">数据已陈旧（{{ fmtAgo(bolt?.lastTs, now) }}无新测量），趋势预测已暂停，恢复采集后自动恢复。</span>
+        <span v-if="offlineStale">数据已陈旧（{{ fmtAgo(effLastTs, now) }}无新测量），趋势预测已暂停，恢复采集后自动恢复。</span>
         <span v-else>无近期有效读数（信号丢失），趋势预测已暂停，恢复有效采集后自动恢复。</span>
       </div>
       <div v-else-if="prediction && prediction.trend !== 'insufficient'" class="predict" :class="prediction.trend === 'falling' ? (prediction.days != null && prediction.days < 30 ? 'crit' : 'warn') : 'ok'">
@@ -675,7 +782,7 @@ function ratioStr(r: number | null | undefined) {
     </div>
 
     <!-- 实时回波波形 A-Scan + 松紧状态 -->
-    <div class="panel panel--glow">
+    <div class="panel panel--glow" v-if="bolt">
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />实时回波波形 A-Scan <span v-if="live" class="live-dot" /></span>
         <div class="ascan-hd">
@@ -712,10 +819,10 @@ function ratioStr(r: number | null | undefined) {
         <span v-if="waveStats.zeroNs != null" class="lg"><i class="lg-dot" style="background:#a78bfa" />零交叉 {{ waveStats.zeroNs.toFixed(1) }}ns</span>
         <span class="lg"><i class="lg-line" style="background:#a78bfa" />包络</span>
         <span class="lg"><i class="lg-line" style="background:#f59e0b" />阈值带 ±{{ waveStats.thr ?? '—' }}</span>
-        <span v-if="waveStats.refInWin" class="lg"><i class="lg-line" style="background:#22d3ee;border-top:1px dashed #22d3ee;background:none" />RefTime {{ Number(waveStats.refNs).toFixed(0) }}ns</span>
+        <span v-if="waveStats.refInWin" class="lg"><i class="lg-line" style="background:#22d3ee;border-top:1px dashed #22d3ee;background:none" />基线 {{ Number(waveStats.refNs).toFixed(0) }}ns</span>
         <span v-if="waveStats.gate" class="lg"><i class="lg-area" />测量闸门</span>
       </div>
-      <div v-if="!wave" class="chart-empty">该通道暂无回波波形(仅采样通道上传 EchoWave)</div>
+      <div v-if="!wave" class="chart-empty">该通道暂无回波波形(仅开启波形采样的通道上传波形)</div>
     </div>
 
     <!-- 通道超声参数 + 标定基线 -->
@@ -739,12 +846,12 @@ function ratioStr(r: number | null | undefined) {
       </div>
       <div class="cfg-note">
         <el-icon><InfoFilled /></el-icon>
-        增益 / 探头频率 / 回波窗可在线调整(经审批下发);<b>阈值、测量模式、RefTime/RefTemp/K_L 为标定基线,须经重标定流程变更</b>。配置来源:{{ chCfg.configSource || '—' }}
+        增益 / 探头频率 / 回波窗可在线调整(经审批下发);<b>阈值、测量模式、RefTime/RefTemp/K_L 为标定基线,须经重标定流程变更</b>。配置来源:{{ CONFIG_SOURCE[chCfg.configSource || ''] || chCfg.configSource || '—' }}
       </div>
     </div>
 
     <!-- 测量 + 标定 -->
-    <div class="two-col">
+    <div class="two-col" v-if="bolt">
       <div class="panel panel--glow">
         <div class="panel-hd"><span class="panel-title"><i class="hd-mark" />近期测量</span></div>
         <div class="tbl">
@@ -753,7 +860,7 @@ function ratioStr(r: number | null | undefined) {
             <span class="mono">{{ fmtTime(m.ts) }}</span>
             <span class="mono">{{ m.echoTimeNs != null ? Number(m.echoTimeNs).toFixed(0) : '—' }}</span>
             <span class="mono">{{ m.spTempC != null ? Number(m.spTempC).toFixed(1) + '°C' : '—' }}</span>
-            <span><span class="led" :class="m.statusCode >= 0 ? 'led--ok' : 'led--crit'" /></span>
+            <span class="mono"><span class="led" :class="m.statusCode >= 0 ? 'led--ok' : 'led--crit'" /> {{ STATUS_CODE[m.statusCode] || (m.statusCode >= 0 ? '正常' : `异常(${m.statusCode})`) }}</span>
           </div>
           <div v-if="!loading && !measurements.length" class="tbl-empty">无测量记录</div>
         </div>
@@ -778,6 +885,8 @@ function ratioStr(r: number | null | undefined) {
             </div>
             <div class="cl-right">
               <el-button v-if="c.reviewState === 'pending' && auth.isReviewer" size="small" type="primary" text
+                :disabled="c.operatorUserId === auth.userId"
+                :title="c.operatorUserId === auth.userId ? '不能会签自己提交的标定（两人四眼）' : ''"
                 :loading="countersigning === c.id" @click="countersign(c)">会签</el-button>
               <span class="cl-pass" :class="c.passed ? 'ok' : 'no'">{{ c.passed ? '通过' : '未过' }}</span>
               <span class="cl-date mono">{{ new Date(c.createdAt).toLocaleDateString('zh-CN') }}</span>
@@ -789,7 +898,7 @@ function ratioStr(r: number | null | undefined) {
     </div>
 
     <!-- 螺栓履历 -->
-    <div class="panel panel--glow">
+    <div class="panel panel--glow" v-if="bolt">
       <div class="panel-hd"><span class="panel-title"><i class="hd-mark" />螺栓履历</span></div>
       <ul class="timeline">
         <li v-for="(e, i) in events" :key="i">
@@ -840,14 +949,31 @@ function ratioStr(r: number | null | undefined) {
         <el-button type="primary" :loading="adjust.saving" @click="submitAdjust">提交变更请求</el-button>
       </template>
     </el-dialog>
+
+    <CalibrationWizard
+      v-model="wizardOpen"
+      :bolt-id="bolt?.id ?? null"
+      :channel-id="bolt?.channelId ?? null"
+      :bolt-code="bolt?.code ?? ''"
+      @done="onWizardDone"
+    />
   </div>
 </template>
 
 <style scoped>
 .bd { display: flex; flex-direction: column; gap: 16px; }
 .bd-top { display: flex; align-items: center; justify-content: space-between; }
+.bd-top-right { display: flex; gap: 8px; }
 .bd-back { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); cursor: pointer; font-size: 13px; width: fit-content; }
 .bd-back:hover { color: var(--accent); }
+.calib-cta {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 16px; border-radius: var(--radius-sm);
+  border: 1px solid var(--panel-border-strong); background: rgba(34, 211, 238, 0.06);
+  color: var(--text-2); font-size: 13px;
+}
+.calib-cta .el-icon { color: var(--accent); font-size: 17px; }
+.calib-cta span:first-of-type { flex: 1; }
 .form-sec { font-size: 12px; color: var(--accent-2); letter-spacing: 0.06em; margin: 2px 0 14px; padding-bottom: 7px; border-bottom: 1px solid var(--hairline); }
 
 .stale-banner {
@@ -890,6 +1016,9 @@ function ratioStr(r: number | null | undefined) {
 .range-tab:hover { color: var(--text-1); }
 .range-tab.active { color: var(--accent); border-color: var(--panel-border-strong); background: rgba(34, 211, 238, 0.08); }
 .chart-empty { text-align: center; color: var(--text-3); padding: 16px; font-size: 13px; }
+.bolt-missing { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 60px 20px; color: var(--text-2); }
+.bolt-missing .el-icon { font-size: 34px; color: var(--warn); }
+.bolt-missing p { margin: 0; font-size: 15px; }
 .hd-right .dt-pos { color: var(--ok); }
 .hd-right .dt-neg { color: var(--crit); }
 .ascan-hd { display: flex; align-items: center; gap: 12px; }

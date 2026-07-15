@@ -21,9 +21,19 @@ public static class LicenseEndpoints
         .WithName("GetMachineCode")
         .WithSummary("获取本机机器码");
 
+        // 匿名版：只回答"授权装好了没"——安装/排障时未登录也要能自检。
+        // 客户名/授权号/容量等业务信息不对匿名暴露,走下面的已登录 detail。
         group.MapGet("/status", (ILicenseService service) =>
         {
-            // 不直接暴露完整 Document（含 signature / 客户公司等），只返回核心字段。
+            var s = service.GetStatus();
+            return Results.Ok(new { s.Found, s.Valid, s.Expired, s.MachineCode, s.Warning });
+        })
+        .WithName("GetLicenseStatus")
+        .WithSummary("获取授权状态（匿名精简版：仅有效性与机器码）");
+
+        // 登录版：完整脱敏字段（不含 signature / Document 全文）
+        group.MapGet("/detail", (ILicenseService service) =>
+        {
             var s = service.GetStatus();
             return Results.Ok(new
             {
@@ -40,8 +50,9 @@ public static class LicenseEndpoints
                 s.Warning
             });
         })
-        .WithName("GetLicenseStatus")
-        .WithSummary("获取授权状态（脱敏；不含 signature / Document 全文）");
+        .RequireAuthorization(Auth.AuthPolicies.LoggedIn)
+        .WithName("GetLicenseDetail")
+        .WithSummary("获取授权详情（需登录；不含 signature / Document 全文）");
 
         return app;
     }

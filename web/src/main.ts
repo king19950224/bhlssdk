@@ -30,7 +30,7 @@ function forceLogout() {
   handlingUnauthorized = true
   const auth = useAuth(pinia)
   void stopRealtime()
-  auth.logout()
+  auth.clearLocal()
   if (router.currentRoute.value.name !== 'login')
     router.replace({ name: 'login', query: { r: router.currentRoute.value.fullPath } })
   // 跳转完成后复位，允许下次会话再次触发

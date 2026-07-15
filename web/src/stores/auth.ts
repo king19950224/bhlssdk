@@ -77,8 +77,7 @@ export const useAuth = defineStore('auth', {
     isAdmin: (s) => s.role === 'admin',
     roleLabel: (s) =>
       ({ admin: '管理员', reviewer: '复核员', operator: '操作员' } as Record<string, string>)[s.role || ''] ||
-      s.role ||
-      '—',
+      (s.role ? '未知角色' : '—'),
     // 按角色默认落地：操作员→资产监测,复核员→参数审批,管理员→总览
     homeName: (s) => (s.role === 'operator' ? 'assets' : s.role === 'reviewer' ? 'configChanges' : 'dashboard'),
   },
@@ -93,7 +92,13 @@ export const useAuth = defineStore('auth', {
       this.username = c.username ?? r.username
       this.role = c.role ?? r.role
     },
-    logout() {
+    async logout() {
+      // 先请求服务端吊销(token_version 自增,已签发令牌立即失效),后端不可达也照常本地登出
+      try { await authApi.logout() } catch { /* 尽力吊销 */ }
+      this.clearLocal()
+    },
+    // 仅清本地状态：401 强制登出路径用（令牌已失效,再发吊销请求只会又吃一个 401）
+    clearLocal() {
       this.token = null
       this.userId = null
       this.username = null

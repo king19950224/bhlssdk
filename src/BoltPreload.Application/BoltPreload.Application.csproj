@@ -12,6 +12,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- 让测试项目可见 internal 成员（如 Watchdog 的纯判定方法），便于对并发/时序逻辑做单测 -->
+    <InternalsVisibleTo Include="BoltPreload.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\BoltPreload.Domain\BoltPreload.Domain.csproj" />
     <ProjectReference Include="..\BoltPreload.Algorithms\BoltPreload.Algorithms.csproj" />
     <ProjectReference Include="..\BoltPreload.Calibration\BoltPreload.Calibration.csproj" />

@@ -1,4 +1,5 @@
 using BoltPreload.Api.Auth;
+using BoltPreload.Application.Alarm;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -6,6 +7,10 @@ namespace BoltPreload.Api.Endpoints;
 
 public static class AlarmEndpoints
 {
+    /// <summary>可抑制/可闭合的告警类型白名单。拼错的 type 会生成一条永远匹配不上的抑制（操作者误以为已静默），必须挡在入口。</summary>
+    private static readonly HashSet<string> KnownAlarmTypes =
+        new(StringComparer.Ordinal) { "preload_low", "preload_high", "preload_loss", "signal_lost" };
+
     public static IEndpointRouteBuilder MapAlarmEndpoints(this IEndpointRouteBuilder app)
     {
         // 读告警 logged_in 即可；ack / shelve 需 write_access（operator+）
@@ -26,7 +31,8 @@ public static class AlarmEndpoints
                        a.preload_n_at_trigger, a.preload_ratio_at_trigger, a.target_preload_n,
                        a.threshold_low_ratio, a.threshold_high_ratio,
                        a.consecutive_count, a.message, a.cleared_reason,
-                       au.username AS acked_by, cu.username AS cleared_by, a.acknowledged_note
+                       au.username AS acked_by, cu.username AS cleared_by, a.acknowledged_note,
+                       a.last_active_at
                 FROM alarms a
                 JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
                 LEFT JOIN users au ON au.id = a.acknowledged_by
@@ -66,6 +72,8 @@ public static class AlarmEndpoints
                     ackedBy = r.IsDBNull(17) ? null : r.GetString(17),
                     clearedBy = r.IsDBNull(18) ? null : r.GetString(18),
                     ackedNote = r.IsDBNull(19) ? null : r.GetString(19),
+                    // 条件最近一次命中时刻（NULL=旧数据或触发后再未确认命中）——区分"仍在越限"与"已缓解未闭合"
+                    lastActiveAt = r.IsDBNull(20) ? null : (DateTime?)r.GetDateTime(20),
                     isOpen = r.IsDBNull(8),
                     isAcked = !r.IsDBNull(7)
                 });
@@ -75,7 +83,8 @@ public static class AlarmEndpoints
         .WithName("ListAlarms")
         .WithSummary("告警列表（默认只列开启的）");
 
-        // 确认告警（operator+，user_id 强制取 HttpContext，不接客户端伪造）
+        // 确认告警（operator+，user_id 强制取 HttpContext，不接客户端伪造）。
+        // 状态更新与审计同事务：不允许出现"已 ack 但 audit_log 缺条"的断链。
         grp.MapPost("/{id:long}/ack", async (
             long id, HttpContext http, AckRequest? body, NpgsqlDataSource ds, CancellationToken ct) =>
         {
@@ -85,24 +94,34 @@ public static class AlarmEndpoints
                 WHERE id = @id AND acknowledged_at IS NULL
                 RETURNING id, type, severity, triggered_at";
 
-            long ackId; string ackType, ackSeverity; DateTime ackTriggeredAt;
-            await using (var cmd = ds.CreateCommand(sql))
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            long ackId = 0; string? ackType = null, ackSeverity = null; DateTime ackTriggeredAt = default;
+            await using (var cmd = new NpgsqlCommand(sql, conn, tx))
             {
                 cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, currentUser.UserId);
                 cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, (object?)body?.Note ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
 
                 await using var r = await cmd.ExecuteReaderAsync(ct);
-                if (!await r.ReadAsync(ct))
-                    return Results.NotFound(new { error = "告警不存在或已 ack", id });
-                ackId = r.GetInt64(0);
-                ackType = r.GetString(1);
-                ackSeverity = r.GetString(2);
-                ackTriggeredAt = r.GetDateTime(3);
+                if (await r.ReadAsync(ct))
+                {
+                    ackId = r.GetInt64(0);
+                    ackType = r.GetString(1);
+                    ackSeverity = r.GetString(2);
+                    ackTriggeredAt = r.GetDateTime(3);
+                }
+            }
+            if (ackType is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "告警不存在或已 ack", id });
             }
 
-            await WriteAlarmAuditAsync(ds, currentUser.UserId, "alarm_ack", ackId,
+            await WriteAlarmAuditAsync(conn, tx, currentUser.UserId, "alarm_ack", ackId,
                 $"确认告警 #{ackId}（{ackType}）", ct);
+            await tx.CommitAsync(ct);
 
             return Results.Ok(new
             {
@@ -118,11 +137,17 @@ public static class AlarmEndpoints
         .WithName("AckAlarm")
         .WithSummary("确认告警（不闭合，仅标记已读）");
 
-        // 手动闭合告警（operator+）— 配合 0011_safety_fixes.sql 的 partial unique 索引
+        // 手动闭合告警（operator+）— 配合 0011_safety_fixes.sql 的 partial unique 索引。闭合与审计同事务。
         grp.MapPost("/{id:long}/clear", async (
-            long id, HttpContext http, ClearRequest? body, NpgsqlDataSource ds, CancellationToken ct) =>
+            long id, HttpContext http, ClearRequest? body, NpgsqlDataSource ds,
+            IAlarmEvaluator evaluator, CancellationToken ct) =>
         {
             var u = UserContext.Require(http);
+            var reason = body?.Reason?.Trim();
+            if (string.IsNullOrEmpty(reason)) reason = null;
+            if (reason is { Length: > 500 })
+                return Results.BadRequest(new { error = "闭合原因最多 500 字符", length = reason.Length });
+
             // cleared_by 持久化到库（安全动作可追责）；NULL 才是系统自动闭合
             const string sql = @"
                 UPDATE alarms
@@ -130,55 +155,117 @@ public static class AlarmEndpoints
                        cleared_by = @uid,
                        cleared_reason = COALESCE(@reason, 'manual_reset')
                  WHERE id = @id AND cleared_at IS NULL
-                 RETURNING type, cleared_reason";
-            string alarmType, clearedReason;
-            await using (var cmd = ds.CreateCommand(sql))
+                 RETURNING type, cleared_reason, bolt_id, channel_id";
+
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            string? alarmType = null, clearedReason = null;
+            long boltId = 0, channelId = 0;
+            await using (var cmd = new NpgsqlCommand(sql, conn, tx))
             {
                 cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, u.UserId);
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
-                cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Varchar, (object?)body?.Reason ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, (object?)reason ?? DBNull.Value);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
-                if (!await r.ReadAsync(ct))
-                    return Results.NotFound(new { error = "告警不存在或已闭合", id });
-                alarmType = r.GetString(0);
-                clearedReason = r.GetString(1);
+                if (await r.ReadAsync(ct))
+                {
+                    alarmType = r.GetString(0);
+                    clearedReason = r.GetString(1);
+                    boltId = r.GetInt64(2);
+                    channelId = r.GetInt64(3);
+                }
+            }
+            if (alarmType is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "告警不存在或已闭合", id });
             }
 
-            await WriteAlarmAuditAsync(ds, u.UserId, "alarm_clear", id,
+            await WriteAlarmAuditAsync(conn, tx, u.UserId, "alarm_clear", id,
                 $"手动闭合告警 #{id}（{alarmType}）原因：{clearedReason}", ct);
+            await tx.CommitAsync(ct);
+
+            // 复位评估器状态机（重臂）：手动闭合时条件可能仍在越限——若不复位，内存槽位停在 active，
+            // 后续持续越限样本不会再触发任何新告警（要等完整恢复周期或进程重启），告警中心长期"无告警"
+            // 而螺栓实际仍越限。RollbackTransition(Trigger) 恰好把槽位退到"差一条样本即可重触发"：
+            // 条件仍在 → 下一条样本立即重报；条件已缓解 → 计数自然归零，不产生误报。
+            // signal_lost 无内存状态机（按 DB open 集合判定），RollbackTransition 对其为 no-op。
+            evaluator.RollbackTransition(new AlarmEvent(
+                AlarmAction.Trigger, boltId, channelId, alarmType, "info", DateTimeOffset.UtcNow,
+                PreloadN: null, PreloadRatio: null, TargetPreloadN: null,
+                ThresholdLowRatio: 0m, ThresholdHighRatio: 0m, ConsecutiveCount: 0, Message: ""));
+
             return Results.Ok(new { id, type = alarmType, cleared = true, by = u.UserId });
         })
         .RequireAuthorization(AuthPolicies.WriteAccess)
         .WithName("ClearAlarm")
-        .WithSummary("手动闭合告警");
+        .WithSummary("手动闭合告警（闭合后复位状态机：条件仍越限会立即重新触发）");
 
-        // 抑制 / shelve（维护时段屏蔽某 bolt+type，带过期时间）
+        // 抑制 / shelve（维护时段屏蔽某 bolt+type，带过期时间）。
+        // boltId 必填：入库判定把 NULL 当通配符（PostgresMeasurementSink），若放行 bolt/type 双空，
+        // operator 一次请求即可静默全站告警 7 天——监测系统不允许存在这种"全局静音键"。
+        // alarmType 仍可空 = 抑制该螺栓全部类型（更换探头等整颗维护是合理场景）。
         grp.MapPost("/shelve", async (
             HttpContext http, ShelveRequest req, NpgsqlDataSource ds, CancellationToken ct) =>
         {
             var u = UserContext.Require(http);
             if (req.Hours <= 0 || req.Hours > 168)
                 return Results.BadRequest(new { error = "Hours 必须在 1..168（即 1 小时 ~ 7 天）" });
-            if (string.IsNullOrWhiteSpace(req.Reason) || req.Reason.Length < 5)
-                return Results.BadRequest(new { error = "Reason 至少 5 字" });
+            var reason = req.Reason?.Trim();
+            if (string.IsNullOrEmpty(reason) || reason.Length < 5)
+                return Results.BadRequest(new { error = "Reason 至少 5 个有效字符" });
+            if (req.BoltId is not > 0)
+                return Results.BadRequest(new { error = "boltId 必填：抑制必须锁定到具体螺栓，不允许全局抑制" });
+            // type 白名单：拼错的 type 会生成一条永远匹配不上的抑制，操作者却以为已静默（null=抑制全部类型，合法）
+            if (req.AlarmType is not null && !KnownAlarmTypes.Contains(req.AlarmType))
+                return Results.BadRequest(new
+                {
+                    error = $"未知告警类型 '{req.AlarmType}'，可选：{string.Join(" / ", KnownAlarmTypes)}；或不传 = 抑制该螺栓全部类型"
+                });
+
+            string boltCode;
+            await using (var check = ds.CreateCommand(
+                "SELECT code FROM bolts WHERE id = @id AND deleted_at IS NULL"))
+            {
+                check.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, req.BoltId.Value);
+                var scalar = await check.ExecuteScalarAsync(ct);
+                if (scalar is not string code)
+                    return Results.NotFound(new { error = "螺栓不存在或已删除", boltId = req.BoltId });
+                boltCode = code;
+            }
 
             const string sql = @"
                 INSERT INTO alarm_shelvings (bolt_id, alarm_type, shelved_by, expires_at, reason)
                 VALUES (@bolt, @type, @by, @exp, @reason)
                 RETURNING id, expires_at";
-            await using var cmd = ds.CreateCommand(sql);
-            cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, (object?)req.BoltId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("type", NpgsqlDbType.Varchar, (object?)req.AlarmType ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("by", NpgsqlDbType.Bigint, u.UserId);
-            cmd.Parameters.AddWithValue("exp", NpgsqlDbType.TimestampTz, DateTimeOffset.UtcNow.AddHours(req.Hours));
-            cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, req.Reason);
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            await r.ReadAsync(ct);
-            return Results.Ok(new { shelvingId = r.GetInt64(0), expiresAt = r.GetDateTime(1) });
+            long shelvingId;
+            DateTime expiresAt;
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            await using (var cmd = new NpgsqlCommand(sql, conn, tx))
+            {
+                cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, req.BoltId.Value);
+                cmd.Parameters.AddWithValue("type", NpgsqlDbType.Varchar, (object?)req.AlarmType ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("by", NpgsqlDbType.Bigint, u.UserId);
+                cmd.Parameters.AddWithValue("exp", NpgsqlDbType.TimestampTz, DateTimeOffset.UtcNow.AddHours(req.Hours));
+                cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, reason);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                await r.ReadAsync(ct);
+                shelvingId = r.GetInt64(0);
+                expiresAt = r.GetDateTime(1);
+            }
+
+            await WriteAlarmAuditAsync(conn, tx, u.UserId, "alarm_shelve", shelvingId,
+                $"抑制告警 {boltCode} · {req.AlarmType ?? "全部类型"} {req.Hours} 小时，原因：{reason}",
+                ct, targetType: "alarm_shelving");
+            await tx.CommitAsync(ct);
+
+            return Results.Ok(new { shelvingId, expiresAt });
         })
         .RequireAuthorization(AuthPolicies.WriteAccess)
         .WithName("ShelveAlarm")
-        .WithSummary("抑制某 bolt+type 的告警直到 expires_at");
+        .WithSummary("抑制某 bolt+type 的告警直到 expires_at（boltId 必填，写审计）");
 
         // 生效中的抑制列表：抑制必须可见可管理（否则"被静默的告警"成为治理盲区，EEMUA 191 反模式）
         grp.MapGet("/shelvings", async (NpgsqlDataSource ds, CancellationToken ct) =>
@@ -212,32 +299,58 @@ public static class AlarmEndpoints
         .WithName("ListActiveShelvings")
         .WithSummary("生效中的告警抑制（未取消且未过期）");
 
-        // 取消抑制
+        // 取消抑制（取消与审计同事务）
         grp.MapPost("/shelve/{id:long}/cancel", async (long id, HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
         {
             var u = UserContext.Require(http);
-            await using var cmd = ds.CreateCommand(@"
-                UPDATE alarm_shelvings SET cancelled_at = now(), cancelled_by = @uid
-                 WHERE id = @id AND cancelled_at IS NULL");
-            cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
-            cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, u.UserId);
-            var n = await cmd.ExecuteNonQueryAsync(ct);
-            return n == 0 ? Results.NotFound(new { error = "抑制不存在或已取消", id }) : Results.Ok(new { id, cancelled = true });
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            var found = false;
+            string? boltCode = null;
+            string? alarmType = null;
+            await using (var cmd = new NpgsqlCommand(@"
+                UPDATE alarm_shelvings s SET cancelled_at = now(), cancelled_by = @uid
+                 WHERE s.id = @id AND s.cancelled_at IS NULL
+                RETURNING (SELECT code FROM bolts WHERE id = s.bolt_id), s.alarm_type", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
+                cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, u.UserId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (await r.ReadAsync(ct))
+                {
+                    found = true;
+                    boltCode = r.IsDBNull(0) ? null : r.GetString(0);
+                    alarmType = r.IsDBNull(1) ? null : r.GetString(1);
+                }
+            }
+            if (!found)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "抑制不存在或已取消", id });
+            }
+
+            await WriteAlarmAuditAsync(conn, tx, u.UserId, "alarm_shelve_cancel", id,
+                $"取消抑制 #{id}（{boltCode ?? "全部螺栓"} · {alarmType ?? "全部类型"}）",
+                ct, targetType: "alarm_shelving");
+            await tx.CommitAsync(ct);
+            return Results.Ok(new { id, cancelled = true });
         })
         .RequireAuthorization(AuthPolicies.WriteAccess)
         .WithName("CancelShelve");
 
-        // 汇总统计
+        // 汇总统计（排除已软删螺栓的告警，与列表/总览同一软删口径）
         grp.MapGet("/summary", async (NpgsqlDataSource ds, CancellationToken ct) =>
         {
             const string sql = @"
-                SELECT severity, type,
-                       COUNT(*) FILTER (WHERE cleared_at IS NULL) AS open_count,
-                       COUNT(*) FILTER (WHERE cleared_at IS NULL AND acknowledged_at IS NULL) AS open_unacked,
+                SELECT a.severity, a.type,
+                       COUNT(*) FILTER (WHERE a.cleared_at IS NULL) AS open_count,
+                       COUNT(*) FILTER (WHERE a.cleared_at IS NULL AND a.acknowledged_at IS NULL) AS open_unacked,
                        COUNT(*) AS total_count
-                FROM alarms
-                GROUP BY severity, type
-                ORDER BY severity DESC, type";
+                FROM alarms a
+                JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
+                GROUP BY a.severity, a.type
+                ORDER BY a.severity DESC, a.type";
             await using var cmd = ds.CreateCommand(sql);
             var items = new List<object>();
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -261,18 +374,21 @@ public static class AlarmEndpoints
     }
 
     /// <summary>
-    /// 把告警确认/闭合动作写入 audit_log（append-only 轨迹）。
+    /// 把告警确认/闭合/抑制动作写入 audit_log（append-only 轨迹），与状态更新共享同一事务。
     /// alarms 行本身的 acknowledged_by/cleared_by 是当前态；audit_log 是不可篡改的历史，满足「可追责」。
     /// </summary>
     private static async Task WriteAlarmAuditAsync(
-        NpgsqlDataSource ds, long userId, string action, long alarmId, string note, CancellationToken ct)
+        NpgsqlConnection conn, NpgsqlTransaction tx,
+        long userId, string action, long targetId, string note, CancellationToken ct,
+        string targetType = "alarm")
     {
-        await using var cmd = ds.CreateCommand(@"
+        await using var cmd = new NpgsqlCommand(@"
             INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@user_id, @action, 'alarm', @target_id, NULL, NULL, @note, now())");
+            VALUES (@user_id, @action, @target_type, @target_id, NULL, NULL, @note, now())", conn, tx);
         cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
-        cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, alarmId);
+        cmd.Parameters.AddWithValue("target_type", NpgsqlDbType.Varchar, targetType);
+        cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, targetId);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
         await cmd.ExecuteNonQueryAsync(ct);
     }

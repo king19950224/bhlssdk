@@ -136,7 +136,13 @@ public static class AuditLogEndpoints
     {
         if (userId is not null) { sql.Append(" AND a.user_id=@user_id"); cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId.Value); }
         if (!string.IsNullOrWhiteSpace(action)) { sql.Append(" AND a.action=@action"); cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action); }
-        if (!string.IsNullOrWhiteSpace(actionPrefix)) { sql.Append(" AND a.action LIKE @ap"); cmd.Parameters.AddWithValue("ap", NpgsqlDbType.Varchar, actionPrefix + "%"); }
+        if (!string.IsNullOrWhiteSpace(actionPrefix))
+        {
+            // 转义 LIKE 通配符：actionPrefix 是"前缀"语义，传 '%'/'_' 不应变成任意匹配（Postgres 默认转义符 \）
+            var escaped = actionPrefix.Replace(@"\", @"\\").Replace("%", @"\%").Replace("_", @"\_");
+            sql.Append(" AND a.action LIKE @ap");
+            cmd.Parameters.AddWithValue("ap", NpgsqlDbType.Varchar, escaped + "%");
+        }
         if (!string.IsNullOrWhiteSpace(targetType)) { sql.Append(" AND a.target_type=@tt"); cmd.Parameters.AddWithValue("tt", NpgsqlDbType.Varchar, targetType); }
         if (targetId is not null) { sql.Append(" AND a.target_id=@tid"); cmd.Parameters.AddWithValue("tid", NpgsqlDbType.Bigint, targetId.Value); }
         if (from is not null) { sql.Append(" AND a.at >= @from"); cmd.Parameters.AddWithValue("from", NpgsqlDbType.TimestampTz, from.Value); }
@@ -146,6 +152,9 @@ public static class AuditLogEndpoints
     private static string Csv(string? value)
     {
         if (string.IsNullOrEmpty(value)) return "";
+        // CSV 公式注入防护：note 等字段含用户输入（告警备注/驳回原因），
+        // 以 = + - @ 开头的值在 Excel 打开时会被当公式执行，前置单引号中和
+        if (value[0] is '=' or '+' or '-' or '@') value = "'" + value;
         // 始终加引号并把内部引号翻倍，避免逗号/换行/引号破坏列
         return "\"" + value.Replace("\"", "\"\"") + "\"";
     }

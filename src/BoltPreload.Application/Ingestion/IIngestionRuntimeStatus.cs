@@ -21,6 +21,11 @@ public interface IIngestionRuntimeStatus
 
     /// <summary>记录一次入库写失败（该 measurement 已丢失，无 WAL 兜底）。</summary>
     void MarkWriteFailure();
+
+    /// <summary>消费者是否正在执行一次入库写入。Watchdog 用它在慢 DB 写入期间避免把设备误判为"无数据"而重连。</summary>
+    bool IsWriting { get; }
+    void MarkWriteStart();
+    void MarkWriteEnd();
 }
 
 public sealed class IngestionRuntimeStatus : IIngestionRuntimeStatus
@@ -50,6 +55,11 @@ public sealed class IngestionRuntimeStatus : IIngestionRuntimeStatus
     }
 
     public void MarkWriteFailure() => Interlocked.Increment(ref _writeFailureCount);
+
+    private long _writing;
+    public bool IsWriting => Interlocked.Read(ref _writing) != 0;
+    public void MarkWriteStart() => Interlocked.Exchange(ref _writing, 1);
+    public void MarkWriteEnd() => Interlocked.Exchange(ref _writing, 0);
 
     private static DateTimeOffset? ReadTicks(long ticks)
         => ticks <= 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero);

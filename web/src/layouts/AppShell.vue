@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuth } from '../stores/auth'
-import { alarmApi } from '../api'
+import { alarmApi, authApi } from '../api'
 import { useRuntime } from '../stores/runtime'
 import { startRealtime, stopRealtime, onRealtime, realtimeState } from '../api/realtime'
 
@@ -56,7 +56,9 @@ function visibleItems(items: { name: string; label: string; icon: string; adminO
 const titleMap: Record<string, string> = Object.fromEntries(
   navGroups.flatMap((g) => g.items).map((n) => [n.name, n.label]),
 )
-const pageTitle = computed(() => titleMap[route.name as string] ?? (route.name === 'boltDetail' ? '螺栓详情' : '总览'))
+const pageTitle = computed(() =>
+  titleMap[route.name as string]
+  ?? (route.name === 'boltDetail' ? '螺栓详情' : route.name === 'reportDetail' ? '报告详情' : '总览'))
 
 function isActive(name: string) {
   if (route.name === name) return true
@@ -87,6 +89,37 @@ const realtimeLabel = computed(() =>
   realtimeState.value === 'connected' ? '实时已连' : realtimeState.value === 'connecting' ? '实时连接中' : '实时断开',
 )
 
+// ---- 新告警提示音:监控值班场景不能只靠角标变红(可开关,默认开;偏好存本地) ----
+const soundOn = ref(localStorage.getItem('bp_alarm_sound') !== 'off')
+function toggleSound() {
+  soundOn.value = !soundOn.value
+  localStorage.setItem('bp_alarm_sound', soundOn.value ? 'on' : 'off')
+  if (soundOn.value) beep() // 开启时试听一声
+}
+let audioCtx: AudioContext | null = null
+let lastBeepAt = 0
+function beep() {
+  // 用 WebAudio 合成"嘟-嘟"双音,不依赖音频资源文件;5s 节流防告警风暴时连环响
+  const now = Date.now()
+  if (now - lastBeepAt < 5000) return
+  lastBeepAt = now
+  try {
+    audioCtx ??= new AudioContext()
+    for (const [offset, freq] of [[0, 880], [0.22, 660]] as const) {
+      const osc = audioCtx.createOscillator()
+      const gain = audioCtx.createGain()
+      osc.type = 'sine'
+      osc.frequency.value = freq
+      gain.gain.setValueAtTime(0.0001, audioCtx.currentTime + offset)
+      gain.gain.exponentialRampToValueAtTime(0.28, audioCtx.currentTime + offset + 0.02)
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + offset + 0.18)
+      osc.connect(gain).connect(audioCtx.destination)
+      osc.start(audioCtx.currentTime + offset)
+      osc.stop(audioCtx.currentTime + offset + 0.2)
+    }
+  } catch { /* 浏览器未授权音频时静默 */ }
+}
+
 onMounted(() => {
   // 设备状态轮询由 runtime store 统一负责（含可见性暂停与实时刷新）
   runtime.start()
@@ -95,7 +128,10 @@ onMounted(() => {
   timer = window.setInterval(refresh, 30000)
   // 实时推送：连上 Hub；收到告警立即刷新顶栏角标，不再纯靠轮询
   startRealtime()
-  unsubAlarm = onRealtime('OnAlarm', () => { refresh() })
+  unsubAlarm = onRealtime('OnAlarm', (a) => {
+    refresh()
+    if (soundOn.value && a.action === 'trigger') beep()
+  })
 })
 onUnmounted(() => {
   if (timer) clearInterval(timer)
@@ -106,12 +142,43 @@ onUnmounted(() => {
 async function logout() {
   try {
     await ElMessageBox.confirm('确认退出登录？', '退出', { type: 'warning', confirmButtonText: '退出', cancelButtonText: '取消' })
-    await stopRealtime()
-    auth.logout()
-    router.replace({ name: 'login' })
   } catch {
-    /* 取消 */
+    return /* 取消 */
   }
+  await stopRealtime()
+  await auth.logout()
+  router.replace({ name: 'login' })
+}
+
+// ---- 自助改密 ----
+const pwd = reactive({ visible: false, saving: false, oldPassword: '', newPassword: '', confirm: '' })
+function openChangePwd() {
+  Object.assign(pwd, { visible: true, saving: false, oldPassword: '', newPassword: '', confirm: '' })
+}
+async function submitChangePwd() {
+  if (!pwd.oldPassword || !pwd.newPassword) return ElMessage.warning('请填写旧密码与新密码')
+  if (pwd.newPassword.length < 8) return ElMessage.warning('新密码至少 8 位')
+  if (pwd.newPassword !== pwd.confirm) return ElMessage.warning('两次输入的新密码不一致')
+  pwd.saving = true
+  try {
+    await authApi.changePassword(pwd.oldPassword, pwd.newPassword)
+    pwd.visible = false
+    ElMessage.success('密码已修改,请用新密码重新登录')
+    // 改密后服务端已吊销全部旧令牌,本地直接清会话回登录页
+    await stopRealtime()
+    auth.clearLocal()
+    router.replace({ name: 'login' })
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '修改失败')
+  } finally {
+    pwd.saving = false
+  }
+}
+
+function onUserCommand(c: string) {
+  if (c === 'logout') logout()
+  else if (c === 'changePwd') openChangePwd()
+  else if (c === 'sound') toggleSound()
 }
 </script>
 
@@ -197,7 +264,7 @@ async function logout() {
         </div>
       </div>
 
-        <el-dropdown trigger="click" @command="(c: string) => c === 'logout' && logout()">
+        <el-dropdown trigger="click" @command="onUserCommand">
           <div class="user-chip">
             <div class="avatar">{{ (auth.username || '?').slice(0, 1).toUpperCase() }}</div>
             <div class="user-meta">
@@ -208,10 +275,13 @@ async function logout() {
           </div>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item command="logout"><el-icon><SwitchButton /></el-icon> 退出登录</el-dropdown-item>
+              <el-dropdown-item command="changePwd"><el-icon><Lock /></el-icon> 修改密码</el-dropdown-item>
+              <el-dropdown-item command="sound"><el-icon><BellFilled /></el-icon> 告警提示音:{{ soundOn ? '开' : '关' }}</el-dropdown-item>
+              <el-dropdown-item command="logout" divided><el-icon><SwitchButton /></el-icon> 退出登录</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+
       </header>
 
       <main class="content">
@@ -222,6 +292,24 @@ async function logout() {
         </router-view>
       </main>
     </div>
+
+    <el-dialog v-model="pwd.visible" title="修改密码" width="420px" append-to-body>
+      <el-form label-width="92px" label-position="left">
+        <el-form-item label="旧密码">
+          <el-input v-model="pwd.oldPassword" type="password" show-password autocomplete="current-password" />
+        </el-form-item>
+        <el-form-item label="新密码">
+          <el-input v-model="pwd.newPassword" type="password" show-password placeholder="至少 8 位" autocomplete="new-password" />
+        </el-form-item>
+        <el-form-item label="确认新密码">
+          <el-input v-model="pwd.confirm" type="password" show-password autocomplete="new-password" @keyup.enter="submitChangePwd" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pwd.visible = false">取消</el-button>
+        <el-button type="primary" :loading="pwd.saving" @click="submitChangePwd">确认修改</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -284,12 +372,15 @@ async function logout() {
   height: 72px; flex-shrink: 0; display: flex; align-items: center; gap: 20px; padding: 0 28px;
   border-bottom: 1px solid var(--panel-border); background: rgba(8, 11, 20, 0.5); backdrop-filter: blur(10px);
 }
-.topbar-title h1 { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: 0.01em; }
-.crumb { font-size: 11px; color: var(--text-3); margin-top: 2px; }
-.topbar-stats { display: flex; gap: 12px; margin-left: auto; }
+/* 标题列允许收缩并省略，防止窄窗口把面包屑挤成竖排字 */
+.topbar-title { min-width: 0; flex-shrink: 1; overflow: hidden; }
+.topbar-title h1 { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: 0.01em; white-space: nowrap; }
+.crumb { font-size: 11px; color: var(--text-3); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar-stats { display: flex; gap: 12px; margin-left: auto; flex-shrink: 0; }
 .stat-chip {
   display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 14px; border-radius: 10px;
   background: var(--panel); border: 1px solid var(--panel-border); font-size: 13px; color: var(--text-2);
+  white-space: nowrap;
 }
 .stat-chip.alert { border-color: var(--crit); color: #fff; box-shadow: 0 0 18px -6px var(--crit-glow); }
 .stat-chip--btn { cursor: pointer; transition: border-color 0.18s, color 0.18s; }

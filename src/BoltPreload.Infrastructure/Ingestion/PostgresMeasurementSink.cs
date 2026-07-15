@@ -43,6 +43,11 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     private readonly ConcurrentDictionary<long, (DateTimeOffset LastLog, long Count)> _waveFailThrottle = new();
     private static readonly TimeSpan WaveFeatureFailLogInterval = TimeSpan.FromMinutes(1);
 
+    // alarms.last_active_at 刷新节流（按 boltId）：开启中的告警若条件仍在命中，最多每分钟刷一次，
+    // 让"仍在越限"与"已缓解未闭合"可区分，又不给热路径加每样本一次的写放大。
+    private readonly ConcurrentDictionary<long, DateTimeOffset> _lastActiveTouch = new();
+    private static readonly TimeSpan LastActiveTouchInterval = TimeSpan.FromSeconds(60);
+
     /// <summary>单设备的未路由通道丢弃聚合状态（每通道累计计数 + 节流时间戳）。</summary>
     private sealed class UnroutedDeviceState
     {
@@ -602,6 +607,10 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             TargetPreloadN: route.TargetPreloadN,
             SdkStatusCode: cr.StatusCode);
 
+        // 条件仍命中时刷新开启告警的 last_active_at（节流，与是否产生转移事件无关：
+        // 稳定越限期状态机不产生任何事件，恰是最需要"仍在命中"证据的阶段）
+        await TouchOpenAlarmsIfStillHitAsync(input, ct);
+
         var events = _alarmEvaluator.Evaluate(input);
         if (events.Count == 0) return;
 
@@ -638,6 +647,39 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             {
                 _ = SafePublishAlarmAsync(ev, ct);
             }
+        }
+    }
+
+    /// <summary>
+    /// 开启中的告警若本样本仍命中其触发条件（按告警行自身的阈值快照判定），刷新 last_active_at。
+    /// 每 bolt 至多每 <see cref="LastActiveTouchInterval"/> 刷一次；无开启告警时 UPDATE 匹配 0 行（走 bolt_id 索引，代价可忽略）。
+    /// 失败仅记 Debug——这是可观测性辅助字段，不允许影响入库主链路。
+    /// </summary>
+    private async Task TouchOpenAlarmsIfStillHitAsync(AlarmInput input, CancellationToken ct)
+    {
+        if (!input.PreloadRatio.HasValue) return;
+
+        var now = DateTimeOffset.UtcNow;
+        if (_lastActiveTouch.TryGetValue(input.BoltId, out var last) && now - last < LastActiveTouchInterval)
+            return;
+        _lastActiveTouch[input.BoltId] = now;
+
+        try
+        {
+            await using var cmd = _dataSource.CreateCommand(@"
+                UPDATE alarms SET last_active_at = @ts
+                WHERE bolt_id = @bolt AND cleared_at IS NULL
+                  AND ( (type IN ('preload_low','preload_loss') AND @ratio < threshold_low_ratio)
+                     OR (type = 'preload_high' AND @ratio > threshold_high_ratio) )");
+            cmd.Parameters.AddWithValue("ts", NpgsqlDbType.TimestampTz, input.Ts);
+            cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, input.BoltId);
+            cmd.Parameters.AddWithValue("ratio", NpgsqlDbType.Numeric, input.PreloadRatio.Value);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "刷新 last_active_at 失败 bolt={Bolt}（下轮节流窗口重试）", input.BoltId);
         }
     }
 

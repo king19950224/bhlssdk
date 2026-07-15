@@ -94,7 +94,10 @@ function fmt(iso: string) {
   <div class="rep rise">
     <div class="panel panel--glow">
       <div class="panel-hd">
-        <span class="panel-title">报告</span>
+        <div class="hd-left">
+          <span class="panel-title"><i class="hd-mark" />报告</span>
+          <span class="hd-sub mono">{{ items.length }} 份</span>
+        </div>
         <div class="hd-right">
           <el-button v-if="auth.isReviewer" size="small" type="primary" @click="openGen">
             <el-icon><Document /></el-icon> 生成扭矩阶梯报告
@@ -127,7 +130,7 @@ function fmt(iso: string) {
     <el-dialog v-model="genVisible" title="生成扭矩阶梯报告" width="460px">
       <p class="dlg-sub">选择已采集扭矩阶梯实验点的通道，生成可追溯的 HTML 报告（法兰验收报告在「资产监测」按部位生成）。</p>
       <el-select v-model="genChannelId" placeholder="选择通道" filterable style="width: 100%">
-        <el-option v-for="c in channels" :key="c.id" :label="`CH${c.channelNo} · ${c.boltCode}（dev${c.deviceId}）`" :value="c.id" />
+        <el-option v-for="c in channels" :key="c.id" :label="`CH${c.channelNo} · ${c.boltCode}（设备${c.deviceId}）`" :value="c.id" />
       </el-select>
       <template #footer>
         <el-button @click="genVisible = false">取消</el-button>
@@ -138,18 +141,21 @@ function fmt(iso: string) {
 </template>
 
 <style scoped>
-.rep { display: flex; flex-direction: column; gap: 16px; }
-.panel-hd { padding: 16px 20px 6px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.rep { display: flex; flex-direction: column; gap: 14px; }
+.panel-hd { padding: 13px 18px 9px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.hd-left { display: flex; align-items: center; gap: 10px; }
 .hd-right { display: flex; align-items: center; gap: 10px; }
 .dlg-sub { font-size: 13px; color: var(--text-2); margin: 0 0 14px; line-height: 1.6; }
-.tbl { padding: 4px 18px 16px; }
-.tr { display: grid; grid-template-columns: 1fr 180px 120px 100px 180px 110px; align-items: center; padding: 11px 6px; border-bottom: 1px solid var(--hairline); font-size: 13px; }
+.tbl { padding: 4px 10px 14px; overflow-x: auto; }
+.tr { display: grid; grid-template-columns: minmax(0, 1.5fr) 140px 90px 84px 150px 88px; align-items: center; gap: 10px; padding: 10px 8px; border-radius: 8px; font-size: 13px; min-width: 760px; }
+.tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
+.tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
 .tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; }
-.title { font-weight: 600; }
+.title { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .title.link { cursor: pointer; }
 .title.link:hover { color: var(--accent); }
-.type-tag { font-size: 11px; padding: 2px 9px; border-radius: 9px; background: rgba(56, 189, 248, 0.1); color: var(--accent-2); border: 1px solid var(--panel-border); }
-.st { font-size: 12px; font-weight: 600; }
+.type-tag { font-size: 11px; padding: 2px 9px; border-radius: 8px; background: rgba(56, 189, 248, 0.1); color: var(--accent-2); border: 1px solid var(--panel-border); }
+.st { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 8px; border: 1px solid currentColor; }
 .dim { color: var(--text-3); }
 .tbl-empty { display: flex; align-items: center; gap: 10px; justify-content: center; padding: 36px; color: var(--text-3); }
 .tbl-empty .el-icon { font-size: 22px; opacity: 0.5; }

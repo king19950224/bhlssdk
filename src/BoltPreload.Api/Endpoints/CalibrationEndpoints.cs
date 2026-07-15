@@ -35,6 +35,7 @@ public static class CalibrationEndpoints
 
         app.MapGet("/api/calibration-center/summary", async (NpgsqlDataSource ds, CancellationToken ct) =>
         {
+            // JOIN bolts 排除已软删螺栓的档案：删掉的资产不应再撑大标定中心 KPI
             const string sql = @"
                 SELECT
                     cr.method,
@@ -43,6 +44,7 @@ public static class CalibrationEndpoints
                     COUNT(*) FILTER (WHERE cr.expires_at < CURRENT_DATE) AS expired_count,
                     ROUND(AVG(cr.r_squared), 4) AS avg_r2
                 FROM calibration_records cr
+                JOIN bolts b ON b.id = cr.bolt_id AND b.deleted_at IS NULL
                 GROUP BY cr.method
                 ORDER BY cr.method";
 
@@ -114,7 +116,7 @@ public static class CalibrationEndpoints
                 await using var r = await cmd.ExecuteReaderAsync(ct);
                 if (!await r.ReadAsync(ct))
                 {
-                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                    return Results.NotFound(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
                 }
                 boltId = r.GetInt64(0);
                 deviceId = r.GetInt64(1);
@@ -130,12 +132,18 @@ public static class CalibrationEndpoints
             if (ValidateKLMagnitude(req.KL, req.RefTimeNs, YieldForceN(rp02Mpa, crossSectionMm2), targetPreloadN) is { } klReject)
                 return klReject;
 
-            // 2. 一个事务里：superseded 旧记录 + INSERT 新 + UPDATE channels + audit_log
+            // 2. 一个事务里：锁通道行 + superseded 旧记录 + INSERT 新 + UPDATE channels + audit_log
             await using var conn = await ds.OpenConnectionAsync(ct);
             await using var tx = await conn.BeginTransactionAsync(ct);
 
             try
             {
+                if (!await LockChannelForCalibrationAsync(conn, tx, channelId, ct))
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.NotFound(new { error = "通道不存在或已删除", channelId });
+                }
+
                 var newCalibId = Guid.NewGuid();
 
                 // 先 INSERT 新记录（superseded_by=NULL），再 UPDATE 旧记录指向它
@@ -250,7 +258,7 @@ public static class CalibrationEndpoints
             {
                 await tx.RollbackAsync(ct);
                 logger.LogError(ex, "快速标定失败 channelId={Ch}", channelId);
-                return Results.Problem(detail: ex.Message, statusCode: 500);
+                return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
             }
         })
         .WithName("QuickCalibrate")
@@ -304,7 +312,7 @@ public static class CalibrationEndpoints
                 cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
                 if (!await r.ReadAsync(ct))
-                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                    return Results.NotFound(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
 
                 boltId = r.GetInt64(0);
                 deviceId = r.GetInt64(1);
@@ -377,6 +385,12 @@ public static class CalibrationEndpoints
             await using var tx = await conn.BeginTransactionAsync(ct);
             try
             {
+                if (!await LockChannelForCalibrationAsync(conn, tx, channelId, ct))
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.NotFound(new { error = "通道不存在或已删除", channelId });
+                }
+
                 var pointsJson = System.Text.Json.JsonSerializer.Serialize(new[]
                 {
                     new
@@ -432,10 +446,12 @@ public static class CalibrationEndpoints
 
                 await SupersedeActiveCalibrationsAsync(conn, tx, boltId, newCalibId, ct);
 
+                // target_preload_n 是设计/合同目标，不能被扭矩法估算值悄悄覆写——
+                // 否则后续保持率永远相对"估算目标"自洽，掩盖真实偏差。仅在原本为空时兜底填入。
                 await using (var cmd = new NpgsqlCommand(@"
                     UPDATE bolts SET
                         install_torque_nm = @torque,
-                        target_preload_n = @target,
+                        target_preload_n = COALESCE(target_preload_n, @target),
                         nominal_diam = @nominal,
                         effective_length_mm = COALESCE(@effective_len, effective_length_mm),
                         total_length_mm = COALESCE(@total_len, total_length_mm),
@@ -513,7 +529,7 @@ public static class CalibrationEndpoints
             {
                 await tx.RollbackAsync(ct);
                 logger.LogError(ex, "扭矩法临时标定失败 channelId={ChannelId}", channelId);
-                return Results.Problem(detail: ex.Message, statusCode: 500);
+                return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
             }
         })
         .WithName("TorqueCalibrate")
@@ -539,7 +555,7 @@ public static class CalibrationEndpoints
                 cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
                 if (!await r.ReadAsync(ct))
-                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                    return Results.NotFound(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
 
                 boltId = r.GetInt64(0);
                 nominalDiam = r.GetString(1);
@@ -652,6 +668,23 @@ public static class CalibrationEndpoints
                 pointId = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
             }
 
+            // 标定实验数据写入必须可追溯（同文件 quick/torque/load 均有审计，此前唯独采点漏了）
+            await using (var audit = ds.CreateCommand(@"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+                VALUES (@uid, 'torque_point_capture', 'channel', @cid, NULL, @after::jsonb, @note, now())"))
+            {
+                audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
+                audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    pointId, boltId, req.TorqueNm, nutFactor, diameterMm,
+                    estimatedPreloadN, sampleCount, deltaTofNs = deltaTof
+                }));
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                    $"采集扭矩阶梯点 #{pointId}：{req.TorqueNm} N·m，估算预紧力 {estimatedPreloadN:0} N（bolt #{boltId}）");
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+
             return Results.Ok(new
             {
                 id = pointId,
@@ -680,6 +713,7 @@ public static class CalibrationEndpoints
 
         grp.MapGet("/torque-test-points", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
         {
+            // 上限护栏：拟合展示用最近 500 点足够（正常阶梯实验 4~20 点）
             const string sql = @"
                 SELECT id, torque_nm, nut_factor, nominal_diameter_mm, estimated_preload_n,
                        sample_count, window_start, window_end,
@@ -688,7 +722,8 @@ public static class CalibrationEndpoints
                        excluded, exclude_reason
                 FROM torque_test_points
                 WHERE channel_id = @channel_id
-                ORDER BY created_at DESC";
+                ORDER BY created_at DESC
+                LIMIT 500";
 
             await using var cmd = ds.CreateCommand(sql);
             cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
@@ -774,114 +809,150 @@ public static class CalibrationEndpoints
             var logger = lf.CreateLogger("Calibration");
             var userId = UserContext.Require(http).UserId;  // 操作人/审核人/审计一律取自 JWT，不信任客户端 user_id
 
-            long boltId, deviceId;
-            short channelNo;
-            decimal refTime, refTemp;
-            decimal? rp02Mpa, crossSectionMm2, targetPreloadN;
-            await using (var cmd = ds.CreateCommand(@"
-                SELECT b.id, c.device_id, c.channel_no, c.ref_time_ns, c.ref_temp_c,
-                       b.rp02_mpa, b.cross_section_mm2, b.target_preload_n
-                FROM channels c
-                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
-                WHERE c.id = @cid AND c.deleted_at IS NULL"))
-            {
-                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
-                await using var r = await cmd.ExecuteReaderAsync(ct);
-                if (!await r.ReadAsync(ct))
-                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
-                if (r.IsDBNull(3) || r.IsDBNull(4))
-                    return Results.BadRequest(new { error = "缺少 RefTime/RefTemp，无法应用拟合标定" });
-
-                boltId = r.GetInt64(0);
-                deviceId = r.GetInt64(1);
-                channelNo = r.GetInt16(2);
-                refTime = r.GetDecimal(3);
-                refTemp = r.GetDecimal(4);
-                rp02Mpa = r.IsDBNull(5) ? null : r.GetDecimal(5);
-                crossSectionMm2 = r.IsDBNull(6) ? null : r.GetDecimal(6);
-                targetPreloadN = r.IsDBNull(7) ? null : r.GetDecimal(7);
-            }
-
             var minPoints = req?.MinPoints ?? 3;
-            decimal slope, intercept, rSquared;
-            long pointCount;
-            string pointsJson;
-            await using (var cmd = ds.CreateCommand(@"
-                WITH valid AS (
-                    SELECT *
-                    FROM torque_test_points
-                    WHERE channel_id = @channel_id AND excluded = false
-                ),
-                fit AS (
-                    SELECT
-                        COUNT(*) AS n,
-                        regr_slope(delta_tof_ns::double precision, estimated_preload_n::double precision) AS slope,
-                        regr_intercept(delta_tof_ns::double precision, estimated_preload_n::double precision) AS intercept,
-                        regr_r2(delta_tof_ns::double precision, estimated_preload_n::double precision) AS r2
-                    FROM valid
-                ),
-                pts AS (
-                    SELECT jsonb_agg(jsonb_build_object(
-                        'id', id,
-                        'torqueNm', torque_nm,
-                        'estimatedPreloadN', estimated_preload_n,
-                        'avgEchoTimeNs', avg_echo_time_ns,
-                        'stddevEchoTimeNs', stddev_echo_time_ns,
-                        'avgTempC', avg_temp_c,
-                        'deltaTofNs', delta_tof_ns,
-                        'sampleCount', sample_count
-                    ) ORDER BY torque_nm, id) AS points_jsonb
-                    FROM valid
-                )
-                SELECT fit.n, fit.slope, fit.intercept, fit.r2, pts.points_jsonb
-                FROM fit CROSS JOIN pts"))
-            {
-                cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
-                await using var r = await cmd.ExecuteReaderAsync(ct);
-                await r.ReadAsync(ct);
 
-                pointCount = r.GetInt64(0);
-                if (pointCount < minPoints || r.IsDBNull(1) || r.IsDBNull(2) || r.IsDBNull(3))
-                    return Results.BadRequest(new { error = "有效扭矩实验点不足，无法应用拟合", pointCount, minPoints });
-
-                slope = Convert.ToDecimal(r.GetDouble(1));
-                intercept = Convert.ToDecimal(r.GetDouble(2));
-                rSquared = Convert.ToDecimal(r.GetDouble(3));
-                pointsJson = r.GetString(4);
-            }
-
-            if (slope <= 0)
-                return Results.BadRequest(new { error = "拟合 K_L <= 0，拒绝应用", slope });
-            // 拟合得到的 kL 过量级护栏（ns/N，~1e-4）
-            if (ValidateKLMagnitude(slope, refTime, YieldForceN(rp02Mpa, crossSectionMm2), targetPreloadN) is { } klReject)
-                return klReject;
-
-            // R² 拟合优度门槛（plan §8.5 / 附录 B 步骤 5）。
-            // 0.98（合格）/ 0.95（拒绝下限）为工程经验阈值——GB/T 43232 对拟合 R² 无规定，
-            // 取值依据程芳玲 2024 实测（纵波 R²=0.9998）+ 通用测量学经验（见 plan §8.5）。
-            //   R² ≥ 0.98          → 通过（passed=true）
-            //   0.95 ≤ R² < 0.98   → 警告：作为"现场临时"标定可用，但 passed=false（建议补采载荷点重拟合）
-            //   R² < 0.95          → 拒绝：线性度不达标，必须补点或全部重做
-            const decimal R2PassThreshold = 0.98m;
-            const decimal R2RejectThreshold = 0.95m;
-            if (rSquared < R2RejectThreshold)
-                return Results.BadRequest(new
-                {
-                    error = $"拟合优度 R² = {rSquared} 低于拒绝下限 {R2RejectThreshold}，线性度不达标，拒绝应用为标定。请补采载荷点或全部重做（plan §8.5 / 附录 B）。",
-                    rSquared, pointCount, slope, intercept
-                });
-            var passed = rSquared >= R2PassThreshold;
-
-            var newCalibId = Guid.NewGuid();
-            var uncertaintyRatio = req?.UncertaintyRatio ?? 0.30m;
-            var kLUncertainty = slope * uncertaintyRatio;
-            var note = req?.Note ??
-                $"应用扭矩阶梯拟合：有效点 {pointCount} 个，K_L={slope}, intercept={intercept}ns, R²={rSquared}。临时扭矩法拟合，非正式载荷标定。";
-
+            // M3：绑定预读与拟合聚合全部在事务内、拿到通道锁之后执行——
+            // 锁前读取在并发采点/排除点/换绑下可能过期（TOCTOU），入库的 K_L 与
+            // points_jsonb 快照会跟实际点集对不上；通道锁把这些窗口统一串行化。
             await using var conn = await ds.OpenConnectionAsync(ct);
             await using var tx = await conn.BeginTransactionAsync(ct);
             try
             {
+                if (!await LockChannelForCalibrationAsync(conn, tx, channelId, ct))
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.NotFound(new { error = "通道不存在或已删除", channelId });
+                }
+
+                long boltId = 0, deviceId = 0;
+                short channelNo = 0;
+                decimal? refTimeRaw = null, refTempRaw = null;
+                decimal? rp02Mpa = null, crossSectionMm2 = null, targetPreloadN = null;
+                var bound = false;
+                await using (var cmd = new NpgsqlCommand(@"
+                    SELECT b.id, c.device_id, c.channel_no, c.ref_time_ns, c.ref_temp_c,
+                           b.rp02_mpa, b.cross_section_mm2, b.target_preload_n
+                    FROM channels c
+                    JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                    WHERE c.id = @cid AND c.deleted_at IS NULL", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    if (await r.ReadAsync(ct))
+                    {
+                        bound = true;
+                        boltId = r.GetInt64(0);
+                        deviceId = r.GetInt64(1);
+                        channelNo = r.GetInt16(2);
+                        refTimeRaw = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                        refTempRaw = r.IsDBNull(4) ? null : r.GetDecimal(4);
+                        rp02Mpa = r.IsDBNull(5) ? null : r.GetDecimal(5);
+                        crossSectionMm2 = r.IsDBNull(6) ? null : r.GetDecimal(6);
+                        targetPreloadN = r.IsDBNull(7) ? null : r.GetDecimal(7);
+                    }
+                }
+                if (!bound)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.NotFound(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                }
+                if (refTimeRaw is null || refTempRaw is null)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new { error = "缺少 RefTime/RefTemp，无法应用拟合标定" });
+                }
+                var refTime = refTimeRaw.Value;
+                var refTemp = refTempRaw.Value;
+
+                decimal slope = 0, intercept = 0, rSquared = 0;
+                long pointCount;
+                string? pointsJson = null;
+                await using (var cmd = new NpgsqlCommand(@"
+                    WITH valid AS (
+                        SELECT *
+                        FROM torque_test_points
+                        WHERE channel_id = @channel_id AND excluded = false
+                    ),
+                    fit AS (
+                        SELECT
+                            COUNT(*) AS n,
+                            regr_slope(delta_tof_ns::double precision, estimated_preload_n::double precision) AS slope,
+                            regr_intercept(delta_tof_ns::double precision, estimated_preload_n::double precision) AS intercept,
+                            regr_r2(delta_tof_ns::double precision, estimated_preload_n::double precision) AS r2
+                        FROM valid
+                    ),
+                    pts AS (
+                        SELECT jsonb_agg(jsonb_build_object(
+                            'id', id,
+                            'torqueNm', torque_nm,
+                            'estimatedPreloadN', estimated_preload_n,
+                            'avgEchoTimeNs', avg_echo_time_ns,
+                            'stddevEchoTimeNs', stddev_echo_time_ns,
+                            'avgTempC', avg_temp_c,
+                            'deltaTofNs', delta_tof_ns,
+                            'sampleCount', sample_count
+                        ) ORDER BY torque_nm, id) AS points_jsonb
+                        FROM valid
+                    )
+                    SELECT fit.n, fit.slope, fit.intercept, fit.r2, pts.points_jsonb
+                    FROM fit CROSS JOIN pts", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    await r.ReadAsync(ct);
+
+                    pointCount = r.GetInt64(0);
+                    if (pointCount >= minPoints && !r.IsDBNull(1) && !r.IsDBNull(2) && !r.IsDBNull(3))
+                    {
+                        slope = Convert.ToDecimal(r.GetDouble(1));
+                        intercept = Convert.ToDecimal(r.GetDouble(2));
+                        rSquared = Convert.ToDecimal(r.GetDouble(3));
+                        pointsJson = r.GetString(4);
+                    }
+                }
+                if (pointsJson is null)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new { error = "有效扭矩实验点不足，无法应用拟合", pointCount, minPoints });
+                }
+
+                if (slope <= 0)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new { error = "拟合 K_L <= 0，拒绝应用", slope });
+                }
+                // 拟合得到的 kL 过量级护栏（ns/N，~1e-4）
+                if (ValidateKLMagnitude(slope, refTime, YieldForceN(rp02Mpa, crossSectionMm2), targetPreloadN) is { } klReject)
+                {
+                    await tx.RollbackAsync(ct);
+                    return klReject;
+                }
+
+                // R² 拟合优度门槛（plan §8.5 / 附录 B 步骤 5）。
+                // 0.98（合格）/ 0.95（拒绝下限）为工程经验阈值——GB/T 43232 对拟合 R² 无规定，
+                // 取值依据程芳玲 2024 实测（纵波 R²=0.9998）+ 通用测量学经验（见 plan §8.5）。
+                //   R² ≥ 0.98          → 通过（passed=true）
+                //   0.95 ≤ R² < 0.98   → 警告：作为"现场临时"标定可用，但 passed=false（建议补采载荷点重拟合）
+                //   R² < 0.95          → 拒绝：线性度不达标，必须补点或全部重做
+                const decimal R2PassThreshold = 0.98m;
+                const decimal R2RejectThreshold = 0.95m;
+                if (rSquared < R2RejectThreshold)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new
+                    {
+                        error = $"拟合优度 R² = {rSquared} 低于拒绝下限 {R2RejectThreshold}，线性度不达标，拒绝应用为标定。请补采载荷点或全部重做。",
+                        rSquared, pointCount, slope, intercept
+                    });
+                }
+                var passed = rSquared >= R2PassThreshold;
+
+                var newCalibId = Guid.NewGuid();
+                var uncertaintyRatio = req?.UncertaintyRatio ?? 0.30m;
+                var kLUncertainty = slope * uncertaintyRatio;
+                var note = req?.Note ??
+                    $"应用扭矩阶梯拟合：有效点 {pointCount} 个，K_L={slope}, intercept={intercept}ns, R²={rSquared}。临时扭矩法拟合，非正式载荷标定。";
+
                 await using (var cmd = new NpgsqlCommand(@"
                     INSERT INTO calibration_records (
                         id, bolt_id, method, operator_user_id, reviewer_user_id,
@@ -990,7 +1061,7 @@ public static class CalibrationEndpoints
             {
                 await tx.RollbackAsync(ct);
                 logger.LogError(ex, "应用 torque_fit 失败 channelId={ChannelId}", channelId);
-                return Results.Problem(detail: ex.Message, statusCode: 500);
+                return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
             }
         })
         .WithName("ApplyTorqueFit")
@@ -1008,7 +1079,11 @@ public static class CalibrationEndpoints
             var userId = UserContext.Require(http).UserId;
 
             if (req?.Points is null || req.Points.Count < 4)
-                return Results.BadRequest(new { error = "正式载荷标定至少需要 4 个已知载荷点（plan §7 路径 B/C）。" });
+                return Results.BadRequest(new { error = "正式载荷标定至少需要 4 个已知载荷点。" });
+            if (req.Points.Any(p => p.ForceN <= 0))
+                return Results.BadRequest(new { error = "载荷点的力值必须为正数（N），请检查输入。" });
+            if (req.Points.GroupBy(p => p.ForceN).Any(g => g.Count() > 1))
+                return Results.BadRequest(new { error = "存在重复力值的载荷点，请核对后重新录入。" });
             if (req.RefTimeNs <= 0m)
                 return Results.BadRequest(new { error = "refTimeNs（基线声时 t₀）必须 > 0。" });
 
@@ -1024,7 +1099,7 @@ public static class CalibrationEndpoints
                 cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
                 if (!await r.ReadAsync(ct))
-                    return Results.BadRequest(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                    return Results.NotFound(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
                 boltId = r.GetInt64(0);
                 rp02Mpa = r.IsDBNull(1) ? null : r.GetDecimal(1);
                 crossSectionMm2 = r.IsDBNull(2) ? null : r.GetDecimal(2);
@@ -1054,7 +1129,7 @@ public static class CalibrationEndpoints
             if (rSquared < r2PassThreshold)
                 return Results.BadRequest(new
                 {
-                    error = $"拟合优度 R²={rSquared} 低于正式载荷标定合格线 {r2PassThreshold}，请补采载荷点或重做（plan §8.5）。",
+                    error = $"拟合优度 R²={rSquared} 低于正式载荷标定合格线 {r2PassThreshold}，请补采载荷点或重做。",
                     rSquared, pointCount = fit.PointCount, kL = fit.KL
                 });
 
@@ -1139,7 +1214,7 @@ public static class CalibrationEndpoints
             {
                 await tx.RollbackAsync(ct);
                 logger.LogError(ex, "提交正式载荷标定失败 channel={Ch}", channelId);
-                return Results.Problem(detail: ex.Message, statusCode: 500);
+                return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
             }
 
             logger.LogWarning("提交正式载荷标定 channel={Ch} calibId={Id} KL={KL} R²={R2} U={U}（待会签）",
@@ -1172,49 +1247,60 @@ public static class CalibrationEndpoints
             await using var tx = await conn.BeginTransactionAsync(ct);
             try
             {
-                long boltId, deviceId;
-                short channelNo;
+                // FOR UPDATE OF c：锁通道行把并发标定激活串行化（与 quick/torque/拟合同一把锁）。
+                // reader 先读完再关闭、之后才回滚——开着 reader 回滚会抛异常把 404 变 500。
+                long boltId = 0, deviceId = 0;
+                short channelNo = 0;
+                var channelFound = false;
                 await using (var cmd = new NpgsqlCommand(@"
                     SELECT b.id, c.device_id, c.channel_no
                     FROM channels c
                     JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
-                    WHERE c.id = @cid AND c.deleted_at IS NULL", conn, tx))
+                    WHERE c.id = @cid AND c.deleted_at IS NULL
+                    FOR UPDATE OF c", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                     await using var r = await cmd.ExecuteReaderAsync(ct);
-                    if (!await r.ReadAsync(ct))
+                    if (await r.ReadAsync(ct))
                     {
-                        await tx.RollbackAsync(ct);
-                        return Results.NotFound(new { error = "通道不存在或未绑定 bolt", channelId });
+                        channelFound = true;
+                        boltId = r.GetInt64(0);
+                        deviceId = r.GetInt64(1);
+                        channelNo = r.GetInt16(2);
                     }
-                    boltId = r.GetInt64(0);
-                    deviceId = r.GetInt64(1);
-                    channelNo = r.GetInt16(2);
+                }
+                if (!channelFound)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.NotFound(new { error = "通道不存在或未绑定 bolt", channelId });
                 }
 
-                long operatorId, calibBoltId;
-                string reviewState;
-                decimal kl, klu, refTime, refTemp;
-                decimal? intercept;
+                long operatorId = 0, calibBoltId = 0;
+                string? reviewState = null;
+                decimal kl = 0, klu = 0, refTime = 0, refTemp = 0;
+                decimal? intercept = null;
                 await using (var cmd = new NpgsqlCommand(@"
                     SELECT operator_user_id, review_state, bolt_id, k_l, k_l_uncertainty, k_l_intercept_ns, ref_time_ns, ref_temp_c
                     FROM calibration_records WHERE id = @id FOR UPDATE", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, calibrationId);
                     await using var r = await cmd.ExecuteReaderAsync(ct);
-                    if (!await r.ReadAsync(ct))
+                    if (await r.ReadAsync(ct))
                     {
-                        await tx.RollbackAsync(ct);
-                        return Results.NotFound(new { error = "标定档案不存在", calibrationId });
+                        operatorId = r.GetInt64(0);
+                        reviewState = r.GetString(1);
+                        calibBoltId = r.GetInt64(2);
+                        kl = r.GetDecimal(3);
+                        klu = r.GetDecimal(4);
+                        intercept = r.IsDBNull(5) ? null : r.GetDecimal(5);
+                        refTime = r.GetDecimal(6);
+                        refTemp = r.GetDecimal(7);
                     }
-                    operatorId = r.GetInt64(0);
-                    reviewState = r.GetString(1);
-                    calibBoltId = r.GetInt64(2);
-                    kl = r.GetDecimal(3);
-                    klu = r.GetDecimal(4);
-                    intercept = r.IsDBNull(5) ? null : r.GetDecimal(5);
-                    refTime = r.GetDecimal(6);
-                    refTemp = r.GetDecimal(7);
+                }
+                if (reviewState is null)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.NotFound(new { error = "标定档案不存在", calibrationId });
                 }
 
                 if (calibBoltId != boltId)
@@ -1289,7 +1375,7 @@ public static class CalibrationEndpoints
             {
                 await tx.RollbackAsync(ct);
                 logger.LogError(ex, "会签失败 channel={Ch} calibId={Id}", channelId, calibrationId);
-                return Results.Problem(detail: ex.Message, statusCode: 500);
+                return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
             }
         })
         .WithName("CountersignCalibration")
@@ -1320,16 +1406,20 @@ public static class CalibrationEndpoints
                     channelBoltId = (long)v;
                 }
 
-                long calibBoltId; string reviewState;
+                // reader 先关闭再回滚（否则 404 变 500）
+                long calibBoltId = 0; string? reviewState = null;
                 await using (var q = new NpgsqlCommand(
                     "SELECT bolt_id, review_state FROM calibration_records WHERE id = @id FOR UPDATE", conn, tx))
                 {
                     q.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, calibrationId);
                     await using var r = await q.ExecuteReaderAsync(ct);
-                    if (!await r.ReadAsync(ct)) { await tx.RollbackAsync(ct); return Results.NotFound(new { error = "标定档案不存在", calibrationId }); }
-                    calibBoltId = r.GetInt64(0);
-                    reviewState = r.GetString(1);
+                    if (await r.ReadAsync(ct))
+                    {
+                        calibBoltId = r.GetInt64(0);
+                        reviewState = r.GetString(1);
+                    }
                 }
+                if (reviewState is null) { await tx.RollbackAsync(ct); return Results.NotFound(new { error = "标定档案不存在", calibrationId }); }
                 if (calibBoltId != channelBoltId) { await tx.RollbackAsync(ct); return Results.BadRequest(new { error = "该标定不属于此通道绑定的螺栓", calibrationId, channelId }); }
                 if (reviewState != "pending") { await tx.RollbackAsync(ct); return Results.Conflict(new { error = $"标定当前状态为 {reviewState}，仅 pending 可驳回", calibrationId }); }
 
@@ -1358,7 +1448,7 @@ public static class CalibrationEndpoints
             {
                 await tx.RollbackAsync(ct);
                 logger.LogError(ex, "驳回失败 channel={Ch} calibId={Id}", channelId, calibrationId);
-                return Results.Problem(detail: ex.Message, statusCode: 500);
+                return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
             }
         })
         .WithName("RejectCalibration")
@@ -1367,15 +1457,18 @@ public static class CalibrationEndpoints
         // 查通道标定历史
         grp.MapGet("/calibrations", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
         {
+            // 软删过滤 + 上限护栏（单通道档案通常几十条，200 足够展示；防长期运行后无界膨胀）
             const string sql = @"
                 SELECT cr.id, cr.method, cr.k_l, cr.k_l_uncertainty, cr.k_l_intercept_ns, cr.r_squared,
                        cr.ref_time_ns, cr.ref_temp_c, cr.passed,
-                       cr.created_at, cr.expires_at, cr.superseded_by, cr.notes, cr.review_state
+                       cr.created_at, cr.expires_at, cr.superseded_by, cr.notes, cr.review_state,
+                       cr.operator_user_id
                 FROM calibration_records cr
-                JOIN bolts b ON b.id = cr.bolt_id
-                JOIN channels c ON c.id = b.channel_id
+                JOIN bolts b ON b.id = cr.bolt_id AND b.deleted_at IS NULL
+                JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
                 WHERE c.id = @cid
-                ORDER BY cr.created_at DESC";
+                ORDER BY cr.created_at DESC
+                LIMIT 200";
 
             await using var cmd = ds.CreateCommand(sql);
             cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
@@ -1402,7 +1495,9 @@ public static class CalibrationEndpoints
                     notes = r.IsDBNull(12) ? null : r.GetString(12),
                     reviewState = r.GetString(13),
                     // 两人四眼：仅 approved 表示经【另一名】reviewer 会签；self_signed 为操作人自签的临时标定
-                    countersigned = r.GetString(13) == "approved"
+                    countersigned = r.GetString(13) == "approved",
+                    // 提交人 id：前端据此把"会签"按钮对提交人本人禁用（后端仍强制校验）
+                    operatorUserId = r.IsDBNull(14) ? null : (long?)r.GetInt64(14)
                 });
             }
             return Results.Ok(new { channelId, count = items.Count, items });
@@ -1439,7 +1534,7 @@ public static class CalibrationEndpoints
     private static IResult? ValidateKLMagnitude(decimal kL, decimal refTimeNs, decimal? yieldForceN, decimal? targetPreloadN)
     {
         if (kL <= 0m)
-            return Results.BadRequest(new { error = "kL 必须 > 0。本系统约定 K_L=Δt/F（单位 ns/N，量级约 1e-4）；勿照标定证书/plan 附录C 的 1/N（约 1e-11）填，那是另一套约定（相差一个 t₀）。", kL });
+            return Results.BadRequest(new { error = "kL 必须 > 0。本系统约定 K_L=Δt/F（单位 ns/N，量级约 1e-4）；勿按标定证书的 1/N 约定（约 1e-11）填写，两者相差一个 t₀。", kL });
         if (refTimeNs <= 0m)
             return Results.BadRequest(new { error = "refTimeNs（基线声时 t₀）必须 > 0。", refTimeNs });
         if (yieldForceN is > 0m && kL * yieldForceN.Value >= refTimeNs)
@@ -1492,6 +1587,22 @@ public static class CalibrationEndpoints
             "UPDATE bolts SET state='calibrated', updated_at=now() WHERE id=@id AND state <> 'calibrated'", conn, tx);
         cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
         await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// 事务内锁定通道行（含软删守卫），把并发标定激活串行化。
+    /// 激活路径（quick / torque / apply-torque-fit / 会签）都会 UPDATE channels 的
+    /// k_l / active_calibration_id 冗余字段——不加锁时两个并发标定的后提交者可能把冗余
+    /// 写回已被 superseded 的旧档案，热路径用错参数算预紧力（安全攸关）。
+    /// 返回 false = 通道不存在或已软删（调用方回滚并返回业务错误）。
+    /// </summary>
+    private static async Task<bool> LockChannelForCalibrationAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx, long channelId, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand(
+            "SELECT 1 FROM channels WHERE id = @id AND deleted_at IS NULL FOR UPDATE", conn, tx);
+        cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, channelId);
+        return await cmd.ExecuteScalarAsync(ct) is not null;
     }
 
     /// <summary>

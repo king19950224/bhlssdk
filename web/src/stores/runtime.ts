@@ -69,6 +69,9 @@ export const useRuntime = defineStore('runtime', {
         this.error = null
       } catch (e) {
         this.error = e instanceof Error ? e.message : '设备状态刷新失败'
+        // 拉不到运行时状态就不能继续宣称设备在线——顶栏"1/1 在线"挂着而后端已死是假安全
+        this.online = 0
+        this.rate = 0
       } finally {
         this.loaded = true
         inFlight = false

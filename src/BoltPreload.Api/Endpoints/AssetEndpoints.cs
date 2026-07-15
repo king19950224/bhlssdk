@@ -1,4 +1,5 @@
 using BoltPreload.Api.Auth;
+using BoltPreload.Application.Ingestion;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -66,7 +67,8 @@ public static class AssetEndpoints
                        COALESCE(bs.total,0), COALESCE(bs.normal,0), COALESCE(bs.warn,0), COALESCE(bs.loose,0),
                        COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0),
                        (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id AND b2.deleted_at IS NULL
-                          JOIN monitor_groups mg2 ON mg2.id=b2.group_id JOIN turbines t2 ON t2.id=mg2.turbine_id
+                          JOIN monitor_groups mg2 ON mg2.id=b2.group_id AND mg2.deleted_at IS NULL
+                          JOIN turbines t2 ON t2.id=mg2.turbine_id AND t2.deleted_at IS NULL
                         WHERE t2.project_id=p.id AND a.cleared_at IS NULL) AS open_alarms
                 FROM projects p
                 LEFT JOIN (SELECT project_id, {StatusAgg} FROM bolt_status GROUP BY project_id) bs ON bs.project_id=p.id
@@ -96,7 +98,7 @@ public static class AssetEndpoints
                        COALESCE(bs.total,0), COALESCE(bs.normal,0), COALESCE(bs.warn,0), COALESCE(bs.loose,0),
                        COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0),
                        (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id AND b2.deleted_at IS NULL
-                          JOIN monitor_groups mg2 ON mg2.id=b2.group_id
+                          JOIN monitor_groups mg2 ON mg2.id=b2.group_id AND mg2.deleted_at IS NULL
                         WHERE mg2.turbine_id=t.id AND a.cleared_at IS NULL) AS open_alarms
                 FROM turbines t
                 LEFT JOIN (SELECT turbine_id, {StatusAgg} FROM bolt_status GROUP BY turbine_id) bs ON bs.turbine_id=t.id
@@ -189,6 +191,350 @@ public static class AssetEndpoints
             return Results.Ok(new { count = items.Count, items });
         }).WithName("ListGroupBolts");
 
+        // 新建螺栓建档并绑定通道——现场"多接/新接探头"的处理闭环。
+        // bolts.channel_id NOT NULL 且每通道唯一活跃螺栓（ux_bolts_active_channel），
+        // 因此建档必须带通道，一个事务完成：INSERT bolt → 通道置 bound →（可选）回填
+        // unbound_measurements → channel_binding_history + audit_log → resolver 缓存失效。
+        grp.MapPost("/monitor-groups/{groupId:long}/bolts", async (
+            long groupId, BoltCreateRequest? body, HttpContext http,
+            NpgsqlDataSource ds, IChannelResolver resolver, CancellationToken ct) =>
+        {
+            if (body is null || body.ChannelId <= 0)
+                return Results.BadRequest(new { error = "channelId 必填且为正数" });
+            if (body.Code is { Length: > 64 })
+                return Results.BadRequest(new { error = "code 长度不能超过 64 字符" });
+            if (body.PositionLabel is { Length: > 64 })
+                return Results.BadRequest(new { error = "positionLabel 长度不能超过 64 字符" });
+            if (body.TargetPreloadN is < 0 || body.MinPreloadN is < 0)
+                return Results.BadRequest(new { error = "目标预紧力 / 报警下限不能为负" });
+            if (body.MinPreloadN is > 0 && body.TargetPreloadN is > 0 && body.MinPreloadN > body.TargetPreloadN)
+                return Results.BadRequest(new { error = "报警下限不能大于目标预紧力" });
+            if (body.CrossSectionMm2 is <= 0 || body.EffectiveLengthMm is <= 0 || body.TotalLengthMm is <= 0
+                || body.ElasticModulusGpa is <= 0 || body.Rp02Mpa is <= 0 || body.SoundVelocityMs is <= 0)
+                return Results.BadRequest(new { error = "规格参数必须为正数" });
+
+            // 规格预设：截面积按 GB/T 3098.1 应力截面积；未知规格必须显式给 crossSectionMm2
+            var nominal = string.IsNullOrWhiteSpace(body.NominalDiam) ? "M20" : body.NominalDiam.Trim().ToUpperInvariant();
+            var csa = body.CrossSectionMm2 ?? (BoltSpecPresets.StressAreaMm2.TryGetValue(nominal, out var a) ? a : (decimal?)null);
+            if (csa is null)
+                return Results.BadRequest(new { error = $"未知螺栓规格 {nominal}，请显式提供 crossSectionMm2", knownSpecs = BoltSpecPresets.StressAreaMm2.Keys });
+            var grade = string.IsNullOrWhiteSpace(body.Grade) ? "8.8" : body.Grade.Trim();
+            var rp02 = body.Rp02Mpa ?? (BoltSpecPresets.GradeRp02Mpa.TryGetValue(grade, out var rp) ? rp : 640m);
+
+            var user = UserContext.Require(http);
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            string? groupCode = null;
+            long groupProjectId = 0;
+            await using (var cmd = new NpgsqlCommand(
+                "SELECT code, project_id FROM monitor_groups WHERE id = @gid AND deleted_at IS NULL", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (await r.ReadAsync(ct))
+                {
+                    groupCode = r.GetString(0);
+                    groupProjectId = r.GetInt64(1);
+                }
+            }
+            if (groupCode is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "监测组不存在", groupId });
+            }
+
+            // 通道行锁：与 bind-bolt/move-channel 同一把锁，防并发抢同一通道。
+            // 注意：必须先关 reader 再 Rollback（同一连接上开着 reader 时回滚会抛，404 变 500）
+            long deviceId = 0, deviceProjectId = 0;
+            short channelNo = 0;
+            var channelFound = false;
+            await using (var cmd = new NpgsqlCommand(@"
+                SELECT c.device_id, c.channel_no, d.project_id
+                FROM channels c
+                JOIN devices d ON d.id = c.device_id
+                WHERE c.id = @cid AND c.deleted_at IS NULL
+                FOR UPDATE OF c", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, body.ChannelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (await r.ReadAsync(ct))
+                {
+                    channelFound = true;
+                    deviceId = r.GetInt64(0);
+                    channelNo = r.GetInt16(1);
+                    deviceProjectId = r.GetInt64(2);
+                }
+            }
+            if (!channelFound)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "通道不存在或已删除", channelId = body.ChannelId });
+            }
+
+            // 项目边界：通道所属设备与监测组必须同项目，否则会把 A 项目的通道错绑进 B 项目的法兰
+            //（bind-bolt/move-channel 只防跨设备，建档是唯一"从零建立归属"的入口，必须在这里拦）
+            if (deviceProjectId != groupProjectId)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.BadRequest(new
+                {
+                    error = "通道所属设备与监测组不在同一项目，禁止跨项目绑定",
+                    channelId = body.ChannelId, deviceProjectId, groupProjectId
+                });
+            }
+
+            long existingBoltId = 0;
+            string? existingBoltCode = null;
+            await using (var cmd = new NpgsqlCommand(@"
+                SELECT id, code FROM bolts
+                WHERE channel_id = @cid AND deleted_at IS NULL
+                LIMIT 1", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, body.ChannelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (await r.ReadAsync(ct))
+                {
+                    existingBoltId = r.GetInt64(0);
+                    existingBoltCode = r.GetString(1);
+                }
+            }
+            if (existingBoltCode is not null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.Conflict(new
+                {
+                    error = "通道已绑定其他螺栓",
+                    channelId = body.ChannelId,
+                    existingBoltId,
+                    existingBoltCode
+                });
+            }
+
+            // code 缺省自动生成 {组code}-CH{NN}；与既有（含软删）冲突时追加 -2/-3…
+            // （UNIQUE(group_id, code) 不排除软删行，解绑后重建同通道螺栓是常见场景）
+            string code;
+            if (string.IsNullOrWhiteSpace(body.Code))
+            {
+                var baseCode = $"{groupCode}-CH{channelNo:D2}";
+                var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                await using (var cmd = new NpgsqlCommand(@"
+                    SELECT code FROM bolts
+                    WHERE group_id = @gid AND (code = @base OR code LIKE @base || '-%')", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                    cmd.Parameters.AddWithValue("base", NpgsqlDbType.Varchar, baseCode);
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    while (await r.ReadAsync(ct)) taken.Add(r.GetString(0));
+                }
+                code = baseCode;
+                for (var n = 2; taken.Contains(code); n++) code = $"{baseCode}-{n}";
+            }
+            else
+            {
+                code = body.Code.Trim();
+            }
+
+            long boltId;
+            await using (var cmd = new NpgsqlCommand(@"
+                INSERT INTO bolts (
+                    group_id, channel_id, code, nominal_diam, grade, rp02_mpa, material,
+                    elastic_modulus_gpa, effective_length_mm, total_length_mm, cross_section_mm2,
+                    sound_velocity_ms, target_preload_n, min_preload_n, position_label,
+                    install_date, gb_compliant, state, enabled)
+                VALUES (@gid, @cid, @code, @nd, @grade, @rp02, @material,
+                        @e, @eff_len, @total_len, @csa,
+                        @v, @target, @min, @pos,
+                        CURRENT_DATE, true, 'uncalibrated', true)
+                ON CONFLICT (group_id, code) DO NOTHING
+                RETURNING id", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, body.ChannelId);
+                cmd.Parameters.AddWithValue("code", NpgsqlDbType.Varchar, code);
+                cmd.Parameters.AddWithValue("nd", NpgsqlDbType.Varchar, nominal);
+                cmd.Parameters.AddWithValue("grade", NpgsqlDbType.Varchar, grade);
+                cmd.Parameters.AddWithValue("rp02", NpgsqlDbType.Numeric, rp02);
+                cmd.Parameters.AddWithValue("material", NpgsqlDbType.Varchar, string.IsNullOrWhiteSpace(body.Material) ? "42CrMo" : body.Material.Trim());
+                cmd.Parameters.AddWithValue("e", NpgsqlDbType.Numeric, body.ElasticModulusGpa ?? 206m);
+                cmd.Parameters.AddWithValue("eff_len", NpgsqlDbType.Numeric, body.EffectiveLengthMm ?? 200m);
+                cmd.Parameters.AddWithValue("total_len", NpgsqlDbType.Numeric, body.TotalLengthMm ?? 220m);
+                cmd.Parameters.AddWithValue("csa", NpgsqlDbType.Numeric, csa.Value);
+                cmd.Parameters.AddWithValue("v", NpgsqlDbType.Numeric, body.SoundVelocityMs ?? 5890m);
+                cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, (object?)body.TargetPreloadN ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("min", NpgsqlDbType.Numeric, (object?)body.MinPreloadN ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("pos", NpgsqlDbType.Varchar, (object?)(string.IsNullOrWhiteSpace(body.PositionLabel) ? null : body.PositionLabel.Trim()) ?? DBNull.Value);
+                var scalar = await cmd.ExecuteScalarAsync(ct);
+                if (scalar is not long id)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.Conflict(new { error = "该组已存在同编号螺栓", groupId, code });
+                }
+                boltId = id;
+            }
+
+            await using (var cmd = new NpgsqlCommand(@"
+                UPDATE channels
+                   SET business_state = 'bound', updated_at = now()
+                 WHERE id = @cid", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, body.ChannelId);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            // 暂存数据回填：与 bind-bolt 的回填完全同构（measurements 迁入 + wave_features 归属 + 清空暂存）
+            long backfilled = 0;
+            if (body.BackfillUnbound ?? true)
+            {
+                await using (var cmd = new NpgsqlCommand(@"
+                    INSERT INTO measurements (
+                        bolt_id, channel_id, ts, ingested_at,
+                        echo_time_ns, delta_tof_ns, sp_temp_c, gain, status_code,
+                        wave_blob_url, algo_version
+                    )
+                    SELECT @bolt_id, channel_id, ts, ingested_at,
+                           echo_time_ns, delta_tof_ns, sp_temp_c, COALESCE(gain, 0), status_code,
+                           wave_blob_url, 'phase1:raw:backfilled'
+                    FROM unbound_measurements
+                    WHERE channel_id = @channel_id
+                    ON CONFLICT (channel_id, ts) DO NOTHING", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, body.ChannelId);
+                    backfilled = await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE wave_features
+                       SET bolt_id = @bolt_id
+                     WHERE channel_id = @channel_id
+                       AND bolt_id IS NULL", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, body.ChannelId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await using (var cmd = new NpgsqlCommand(
+                    "DELETE FROM unbound_measurements WHERE channel_id = @channel_id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, body.ChannelId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+            }
+
+            // 绑定历史：action='bind'（首次建档无源通道），不动通道既有标定（keep_uncomputed）——
+            // 建档前若已对该通道做过标定（如先标定后建档的调试流），不能被静默清掉
+            await using (var cmd = new NpgsqlCommand(@"
+                INSERT INTO channel_binding_history (
+                    bolt_id, from_channel_id, to_channel_id, action, calibration_action,
+                    moved_by, before_jsonb, after_jsonb, note
+                )
+                SELECT @bolt_id, NULL, @channel_id, 'bind', 'keep_uncomputed',
+                       @user_id, NULL, to_jsonb(b), @note
+                FROM bolts b
+                WHERE b.id = @bolt_id", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
+                cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, body.ChannelId);
+                cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, user.UserId);
+                cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, (object?)body.Note ?? DBNull.Value);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            await using (var audit = new NpgsqlCommand(@"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+                SELECT @uid, 'create_bolt', 'bolt', @id, NULL, to_jsonb(b), @note, now()
+                FROM bolts b WHERE b.id = @id", conn, tx))
+            {
+                audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
+                audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                    $"新建螺栓 {code} 并绑定 CH{channelNo}（设备 {deviceId}，回填 {backfilled} 条暂存数据）");
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+
+            await tx.CommitAsync(ct);
+            resolver.Invalidate(deviceId, (ushort)channelNo);
+
+            return Results.Ok(new
+            {
+                boltId, code, groupId,
+                channelId = body.ChannelId, channelNo, deviceId,
+                positionLabel = string.IsNullOrWhiteSpace(body.PositionLabel) ? null : body.PositionLabel.Trim(),
+                backfilled
+            });
+        })
+        .RequireAuthorization(AuthPolicies.WriteAccess)
+        .WithName("CreateGroupBolt")
+        .WithSummary("新建螺栓建档并绑定通道（规格预设 + 暂存数据回填 + 审计，一个事务）");
+
+        // 组孔位数编辑：法兰实际孔数与配置不符时（多接/扩容），现场自助修正，俯视图等分角度才对得上
+        grp.MapPatch("/monitor-groups/{groupId:long}", async (
+            long groupId, GroupPatchRequest? body, HttpContext http,
+            NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            if (body?.ExpectedBoltCount is not { } n || n < 1 || n > 128)
+                return Results.BadRequest(new { error = "expectedBoltCount 必填且在 1..128 范围内" });
+
+            var user = UserContext.Require(http);
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            // 先关 reader 再决定是否 Rollback（同一连接上开着 reader 时回滚会抛，404 变 500）
+            string? groupCode = null;
+            short? oldCount = null;
+            await using (var cmd = new NpgsqlCommand(@"
+                SELECT code, expected_bolt_count FROM monitor_groups
+                WHERE id = @gid AND deleted_at IS NULL
+                FOR UPDATE", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (await r.ReadAsync(ct))
+                {
+                    groupCode = r.GetString(0);
+                    oldCount = r.IsDBNull(1) ? null : r.GetInt16(1);
+                }
+            }
+            if (groupCode is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "监测组不存在", groupId });
+            }
+
+            await using (var cmd = new NpgsqlCommand(@"
+                UPDATE monitor_groups
+                   SET expected_bolt_count = @n, updated_at = now()
+                 WHERE id = @gid", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("n", NpgsqlDbType.Smallint, (short)n);
+                cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            await using (var audit = new NpgsqlCommand(@"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+                VALUES (@uid, 'update_group_config', 'monitor_group', @gid,
+                        jsonb_build_object('expectedBoltCount', @old::int),
+                        jsonb_build_object('expectedBoltCount', @new::int),
+                        @note, now())", conn, tx))
+            {
+                audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
+                audit.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                audit.Parameters.AddWithValue("old", NpgsqlDbType.Integer, (object?)(int?)oldCount ?? DBNull.Value);
+                audit.Parameters.AddWithValue("new", NpgsqlDbType.Integer, n);
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"修改监测组 {groupCode} 孔位数 {oldCount?.ToString() ?? "—"} → {n}");
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+
+            await tx.CommitAsync(ct);
+            return Results.Ok(new { groupId, code = groupCode, expectedBoltCount = n, previous = oldCount });
+        })
+        .RequireAuthorization(AuthPolicies.WriteAccess)
+        .WithName("PatchMonitorGroup")
+        .WithSummary("修改监测组配置孔位数（expected_bolt_count，审计）");
+
         return app;
     }
 
@@ -204,3 +550,55 @@ public static class AssetEndpoints
         high = r.GetInt64(offset + 6),
     };
 }
+
+/// <summary>
+/// 螺栓规格预设：建档时按公称直径/等级预填必填规格，现场可在螺栓设置里修正。
+/// 与 dev 种子（deploy/sql/dev/0003）的占位规格取值一致。
+/// </summary>
+internal static class BoltSpecPresets
+{
+    /// <summary>GB/T 3098.1 粗牙螺纹应力截面积 As（mm²）</summary>
+    public static readonly IReadOnlyDictionary<string, decimal> StressAreaMm2 =
+        new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["M12"] = 84.3m,
+            ["M16"] = 157m,
+            ["M20"] = 245m,
+            ["M24"] = 353m,
+            ["M30"] = 561m,
+            ["M36"] = 817m,
+            ["M42"] = 1121m,
+            ["M48"] = 1473m,
+        };
+
+    /// <summary>性能等级 → Rp0.2 规定塑性延伸强度（MPa）</summary>
+    public static readonly IReadOnlyDictionary<string, decimal> GradeRp02Mpa =
+        new Dictionary<string, decimal>
+        {
+            ["8.8"] = 640m,
+            ["10.9"] = 940m,
+            ["12.9"] = 1080m,
+        };
+}
+
+/// <summary>新建螺栓建档请求。规格字段可空——按 NominalDiam/Grade 预设补齐。</summary>
+public sealed record BoltCreateRequest(
+    long ChannelId,
+    string? Code = null,
+    string? NominalDiam = null,
+    string? Grade = null,
+    decimal? Rp02Mpa = null,
+    string? Material = null,
+    decimal? ElasticModulusGpa = null,
+    decimal? EffectiveLengthMm = null,
+    decimal? TotalLengthMm = null,
+    decimal? CrossSectionMm2 = null,
+    decimal? SoundVelocityMs = null,
+    decimal? TargetPreloadN = null,
+    decimal? MinPreloadN = null,
+    string? PositionLabel = null,
+    bool? BackfillUnbound = null,
+    string? Note = null);
+
+/// <summary>监测组配置修改请求（当前仅孔位数）。</summary>
+public sealed record GroupPatchRequest(int? ExpectedBoltCount = null);

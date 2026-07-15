@@ -61,6 +61,7 @@ public static class ChannelEndpoints
         grp.MapPatch("/{channelNo:int}/name", async (
             long deviceId, int channelNo,
             ChannelNamePatchRequest? body,
+            HttpContext http,
             NpgsqlDataSource ds,
             IChannelResolver resolver,
             ILoggerFactory loggerFactory,
@@ -75,25 +76,60 @@ public static class ChannelEndpoints
             if (newName is not null && newName.Length > 64)
                 return Results.BadRequest(new { error = "name 长度不能超过 64 字符" });
 
-            const string sql = @"
-                UPDATE channels
-                   SET name = @name, updated_at = now()
-                 WHERE device_id = @device_id
-                   AND channel_no = @ch
-                   AND deleted_at IS NULL
-                RETURNING id, channel_no, name";
-            await using var cmd = ds.CreateCommand(sql);
-            cmd.Parameters.AddWithValue("name", NpgsqlDbType.Varchar, (object?)newName ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
-            cmd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channelNo);
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            if (!await r.ReadAsync(ct))
-                return Results.NotFound(new { error = "通道不存在或已删除", deviceId, channelNo });
+            // 改名 + 审计放同一事务（类注释承诺"改名走 audit_log"，此前只打了进程日志，UI 无法追溯）
+            long updatedId;
+            string? oldName = null;
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
 
-            var updatedId = r.GetInt64(0);
-            // 关闭 reader 后才能再用同一 connection 做下个 query；
+            const string sql = @"
+                UPDATE channels c
+                   SET name = @name, updated_at = now()
+                  FROM (SELECT id, name AS old_name FROM channels
+                        WHERE device_id = @device_id AND channel_no = @ch AND deleted_at IS NULL) prev
+                 WHERE c.id = prev.id
+                RETURNING c.id, prev.old_name";
+            await using (var cmd = new NpgsqlCommand(sql, conn, tx))
+            {
+                cmd.Parameters.AddWithValue("name", NpgsqlDbType.Varchar, (object?)newName ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
+                cmd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channelNo);
+                var found = false;
+                await using (var r = await cmd.ExecuteReaderAsync(ct))
+                {
+                    if (await r.ReadAsync(ct))
+                    {
+                        found = true;
+                        updatedId = r.GetInt64(0);
+                        oldName = r.IsDBNull(1) ? null : r.GetString(1);
+                    }
+                    else updatedId = 0;
+                }
+                if (!found)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.NotFound(new { error = "通道不存在或已删除", deviceId, channelNo });
+                }
+            }
+
+            var user = UserContext.Require(http);
+            await using (var audit = new NpgsqlCommand(@"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+                VALUES (@uid, 'channel_rename', 'channel', @cid,
+                        jsonb_build_object('name', @old::text), jsonb_build_object('name', @new::text),
+                        @note, now())", conn, tx))
+            {
+                audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
+                audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, updatedId);
+                audit.Parameters.AddWithValue("old", NpgsqlDbType.Text, (object?)oldName ?? DBNull.Value);
+                audit.Parameters.AddWithValue("new", NpgsqlDbType.Text, (object?)newName ?? DBNull.Value);
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                    $"通道改名 device={deviceId} CH{channelNo}：'{oldName ?? "(空)"}' → '{newName ?? "(空)"}'");
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+            await tx.CommitAsync(ct);
+
             // resolver 缓存按 (deviceId, channelNo) 失效一下，下次解析就拿到新 name
-            await r.DisposeAsync();
             resolver.Invalidate(deviceId, (ushort)channelNo);
 
             var logger = loggerFactory.CreateLogger("ChannelName");

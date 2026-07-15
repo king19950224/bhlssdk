@@ -19,6 +19,9 @@ public static class ReportEndpoints
 
     public static IEndpointRouteBuilder MapReportEndpoints(this IEndpointRouteBuilder app)
     {
+        // M3 拍板：列表/详情/下载维持 LoggedIn（不收紧到 reviewer+）。
+        // 报告快照里的预紧力/标定数据，任何已登录角色在总览、螺栓详情页本来就全部可见，
+        // 收紧只会堵死"现场对着验收报告核数据"的场景，换不来保密收益；生成/签发仍是 reviewer+。
         var group = app.MapGroup("/api/reports")
             .WithTags("Reports")
             .RequireAuthorization(AuthPolicies.LoggedIn);
@@ -168,7 +171,7 @@ public static class ReportEndpoints
             cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, reportId);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             if (!await r.ReadAsync(ct))
-                return Results.NotFound(new { error = "report not found", reportId });
+                return Results.NotFound(new { error = "报告不存在", reportId });
 
             return Results.Ok(new
             {
@@ -211,38 +214,46 @@ public static class ReportEndpoints
             if (generatedBy == user.UserId)
                 return Results.BadRequest(new { error = "签发人必须与编制人不同（两人复核底线）。", generatedBy });
 
-            await using (var cmd = ds.CreateCommand(@"
-                UPDATE reports SET status='signed', signed_by=@uid, signed_at=now() WHERE id=@id AND status='generated'"))
+            // 签发与审计同事务：不允许出现"已签发但审计缺条"的断链
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            await using (var cmd = new NpgsqlCommand(@"
+                UPDATE reports SET status='signed', signed_by=@uid, signed_at=now() WHERE id=@id AND status='generated'", conn, tx))
             {
                 cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, reportId);
                 if (await cmd.ExecuteNonQueryAsync(ct) == 0)
+                {
+                    await tx.RollbackAsync(ct);
                     return Results.Conflict(new { error = "状态已变更，签发未生效", reportId });
+                }
             }
-            await using (var cmd = ds.CreateCommand(@"
+            await using (var cmd = new NpgsqlCommand(@"
                 INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'report_sign', 'report', @id, NULL, NULL, @note, now())"))
+                VALUES (@uid, 'report_sign', 'report', @id, NULL, NULL, @note, now())", conn, tx))
             {
                 cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, reportId);
                 cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"审核签发报告 #{reportId}");
                 await cmd.ExecuteNonQueryAsync(ct);
             }
+            await tx.CommitAsync(ct);
             return Results.Ok(new { reportId, status = "signed", signedBy = user.UserId });
         })
         .RequireAuthorization(AuthPolicies.ReviewerAccess)
         .WithName("SignReport")
         .WithSummary("审核签发报告并锁定（reviewer+,异人）");
 
-        group.MapGet("/{reportId:long}/download", async (long reportId, NpgsqlDataSource ds, IWebHostEnvironment env, CancellationToken ct) =>
+        group.MapGet("/{reportId:long}/download", async (long reportId, NpgsqlDataSource ds, IWebHostEnvironment env, ILoggerFactory lf, CancellationToken ct) =>
         {
+            var logger = lf.CreateLogger("Reports");
             await using var cmd = ds.CreateCommand("SELECT file_url, title, file_sha256 FROM reports WHERE id=@id");
             cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, reportId);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             if (!await r.ReadAsync(ct))
-                return Results.NotFound(new { error = "report not found", reportId });
+                return Results.NotFound(new { error = "报告不存在", reportId });
             if (r.IsDBNull(0))
-                return Results.NotFound(new { error = "report has no file", reportId });
+                return Results.NotFound(new { error = "该报告没有可下载的文件", reportId });
 
             var relative = r.GetString(0);
             var expectedSha = r.IsDBNull(2) ? null : r.GetString(2);
@@ -253,17 +264,26 @@ public static class ReportEndpoints
             if (!rootAbs.EndsWith(Path.DirectorySeparatorChar)) rootAbs += Path.DirectorySeparatorChar;
 
             if (relative.Contains("..", StringComparison.Ordinal) || Path.IsPathRooted(relative) || relative.Contains(':'))
-                return Results.NotFound(new { error = "report path invalid", reportId });
+            {
+                logger.LogWarning("报告 {ReportId} file_url 非法：{Relative}", reportId, relative);
+                return Results.NotFound(new { error = "报告文件不可用", reportId });
+            }
 
             string fullPath;
             try { fullPath = Path.GetFullPath(Path.Combine(rootAbs, relative.Replace('/', Path.DirectorySeparatorChar))); }
-            catch { return Results.NotFound(new { error = "report path invalid", reportId }); }
+            catch { return Results.NotFound(new { error = "报告文件不可用", reportId }); }
 
             if (!fullPath.StartsWith(rootAbs, StringComparison.Ordinal))
-                return Results.NotFound(new { error = "report path escaped sandbox", reportId });
+            {
+                logger.LogWarning("报告 {ReportId} file_url 越界：{Relative}", reportId, relative);
+                return Results.NotFound(new { error = "报告文件不可用", reportId });
+            }
 
             if (!File.Exists(fullPath))
-                return Results.NotFound(new { error = "report file missing", reportId, relative });
+            {
+                logger.LogWarning("报告 {ReportId} 文件缺失：{Relative}", reportId, relative);
+                return Results.NotFound(new { error = "报告文件不存在，可能已被清理", reportId });
+            }
 
             var bytes = await File.ReadAllBytesAsync(fullPath, ct);
 
@@ -272,11 +292,10 @@ public static class ReportEndpoints
             {
                 var actualSha = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
                 if (!string.Equals(actualSha, expectedSha, StringComparison.OrdinalIgnoreCase))
-                    return Results.BadRequest(new
-                    {
-                        error = "report file integrity check failed",
-                        reportId, expectedSha, actualSha
-                    });
+                {
+                    logger.LogError("报告 {ReportId} 完整性校验失败 expected={Expected} actual={Actual}", reportId, expectedSha, actualSha);
+                    return Results.BadRequest(new { error = "报告文件完整性校验未通过，文件可能已被篡改", reportId });
+                }
             }
 
             return Results.File(bytes, "text/html; charset=utf-8", Path.GetFileName(fullPath));
@@ -312,7 +331,7 @@ public static class ReportEndpoints
             }
 
             var bolts = new List<FlangeLine>();
-            int total = 0, calibrated = 0, passed = 0;
+            int total = 0, calibrated = 0, passed = 0, failed = 0, uncal = 0, nodata = 0, tempPassed = 0;
             await using (var cmd = ds.CreateCommand(@"
                 SELECT b.code, b.nominal_diam, b.grade, b.position_label, b.target_preload_n, b.min_preload_n, b.state,
                        c.channel_no, c.k_l,
@@ -341,20 +360,30 @@ public static class ReportEndpoints
                     var method = r.IsDBNull(12) ? null : r.GetString(12);
                     if (isCal) calibrated++;
 
-                    string result;
-                    if (!isCal) result = "未标定";
-                    else if (pre is null) result = "无数据";
-                    else if (min is not null && pre < min) result = "不合格";
-                    else result = "合格";
-                    if (result == "合格") passed++;
-
                     var trust = method switch
                     {
                         "load_calibrated" or "gb_single_wave" or "gb_bi_wave" => "正式",
                         "torque_fit" => "工程估算",
                         "quick" or "torque_estimate" => "临时",
+                        "sim_baseline" => "参考",
                         _ => "—",
                     };
+                    var isFormal = trust == "正式";
+
+                    // 验收结论必须区分标定可信等级：临时/工程估算标定测出的"达标"只能记"合格*"，
+                    // 不能与正式载荷标定的合格混为一谈（报告脚注说明 * 含义）
+                    string result;
+                    if (!isCal) result = "未标定";
+                    else if (pre is null) result = "无数据";
+                    else if (min is not null && pre < min) result = "不合格";
+                    else result = isFormal ? "合格" : "合格*";
+                    switch (result)
+                    {
+                        case "合格": case "合格*": passed++; if (!isFormal) tempPassed++; break;
+                        case "不合格": failed++; break;
+                        case "未标定": uncal++; break;
+                        default: nodata++; break;
+                    }
 
                     bolts.Add(new FlangeLine(
                         Code: r.GetString(0),
@@ -374,22 +403,27 @@ public static class ReportEndpoints
                 }
             }
 
-            var overall = total > 0 && passed == total ? "合格" : "不合格";
+            // 总体结论：有低于下限 → 不合格；有未标定/无数据 → 未完成；全部达标但含临时标定 → 有条件合格
+            var overall = total == 0 ? "无螺栓"
+                : failed > 0 ? "不合格"
+                : uncal + nodata > 0 ? "未完成（存在未标定或无数据螺栓）"
+                : tempPassed > 0 ? "有条件合格（含临时/工程估算标定）"
+                : "合格";
             var snapshot = new
             {
                 generatedAt = DateTimeOffset.UtcNow,
                 generatedBy = user.UserId,
-                standard = "GB/T 43232 超声法螺栓轴向应力测量 · JJF 1059.1 测量不确定度评定",
+                standard = "GB/T 43232-2023 紧固件轴向应力超声测量方法 · JJF 1059.1-2012 测量不确定度评定与表示",
                 project,
                 turbine,
                 flange = new { name = flangeName, code = flangeCode, structureType, targetPreloadN = groupTarget },
-                summary = new { total, calibrated, passed, failed = total - passed, overall },
+                summary = new { total, calibrated, passed, failed, uncalibrated = uncal, nodata, tempPassed, overall },
                 bolts,
             };
             var title = req?.Title ?? $"{turbine} {flangeName} 螺栓预紧力验收报告";
 
             // 生成可下载的归档 HTML（与扭矩阶梯报告同一套：原子写 + sha256 防篡改），不再只存 JSON 快照。
-            var html = RenderFlangeHtml(title, project, turbine, flangeName, flangeCode, groupTarget, total, calibrated, passed, overall, bolts);
+            var html = RenderFlangeHtml(title, project, turbine, flangeName, flangeCode, groupTarget, total, calibrated, passed, failed, uncal, nodata, overall, bolts);
             var reportDir = Path.Combine(env.ContentRootPath, "data", "reports", "flange");
             Directory.CreateDirectory(reportDir);
             var fileName = $"flange-group-{groupId}-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}.html";
@@ -528,13 +562,30 @@ public static class ReportEndpoints
             }
         }
 
+        // 结论按实际数据生成（扭矩范围、R² 分档），不写死——报告结论必须与数据一致
+        var valid = points.Where(p => !p.Excluded).ToList();
+        string conclusion;
+        if (fit is null || valid.Count < 2)
+        {
+            conclusion = "有效实验点不足，无法给出线性度结论；请补采扭矩阶梯点后重新生成。本报告为工程验证，非正式载荷标定。";
+        }
+        else
+        {
+            var tMin = valid.Min(p => p.TorqueNm);
+            var tMax = valid.Max(p => p.TorqueNm);
+            var linearity = fit.RSquared >= 0.98 ? "线性关系良好"
+                : fit.RSquared >= 0.95 ? "线性关系较好"
+                : "线性度不足（建议补采载荷点或排查耦合/过渡过程数据）";
+            conclusion = $"{tMin:F0}~{tMax:F0} N·m 范围内，超声声时差 Δt 与扭矩法估算预紧力{linearity}（R²={fit.RSquared:F4}，有效点 {valid.Count} 个）。本报告为工程验证，非正式载荷标定。";
+        }
+
         return new TorqueStepReportSnapshot(
             GeneratedAt: DateTimeOffset.UtcNow,
             Channel: channel,
             Bolt: bolt,
             Points: points,
             Fit: fit,
-            Conclusion: "50~200 N·m 范围内超声 Δt 与扭矩估算预紧力呈较好线性；本报告为工程验证，非正式载荷标定。");
+            Conclusion: conclusion);
     }
 
     private static string RenderTorqueStepHtml(string title, TorqueStepReportSnapshot snapshot)
@@ -569,29 +620,33 @@ public static class ReportEndpoints
         </head>
         <body>
           <h1>{{H(title)}}</h1>
-          <div class="muted">生成时间：{{snapshot.GeneratedAt:yyyy-MM-dd HH:mm:ss zzz}}</div>
+          <div class="muted">测量依据：GB/T 43232-2023《紧固件 轴向应力超声测量方法》 · 生成时间：{{snapshot.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}}（当地时间）</div>
           <h2>对象</h2>
           <table>
             <tr><th>螺栓</th><td>{{H(snapshot.Bolt.Code)}} / {{H(snapshot.Bolt.NominalDiameter)}}</td></tr>
-            <tr><th>设备/通道</th><td>device {{snapshot.Channel.DeviceId}} / channel {{snapshot.Channel.ChannelNo}}</td></tr>
-            <tr><th>当前标定</th><td>{{snapshot.Channel.ActiveCalibrationId}} / K_L={{snapshot.Channel.KL}} / b={{snapshot.Channel.KLInterceptNs}} ns</td></tr>
+            <tr><th>设备 / 通道</th><td>设备 {{snapshot.Channel.DeviceId}} / 通道 {{snapshot.Channel.ChannelNo}}</td></tr>
+            <tr><th>当前生效标定</th><td>K_L = {{snapshot.Channel.KL?.ToString("E4") ?? "—"}} ns/N，截距 b = {{snapshot.Channel.KLInterceptNs?.ToString("F2") ?? "—"}} ns（标定记录 {{snapshot.Channel.ActiveCalibrationId?.ToString() ?? "—"}}）</td></tr>
           </table>
           <h2>有效性说明</h2>
           <div class="warn">本报告基于扭矩法估算预紧力，不是载荷传感器或拉伸机正式标定结果。不得作为安全验收唯一依据。</div>
           <h2>扭矩实验点</h2>
           <table>
-            <thead><tr><th>ID</th><th>扭矩 N·m</th><th>估算预紧力 N</th><th>样本</th><th>EchoTime ns</th><th>标准差 ns</th><th>温度 °C</th><th>Δt ns</th><th>状态</th><th>备注</th></tr></thead>
+            <thead><tr><th>记录号</th><th>扭矩 (N·m)</th><th>估算预紧力 (N)</th><th>样本数</th><th>回波声时 (ns)</th><th>标准差 (ns)</th><th>温度 (°C)</th><th>Δt (ns)</th><th>状态</th><th>备注</th></tr></thead>
             <tbody>{{rows}}</tbody>
           </table>
           <h2>拟合结果</h2>
-          <div class="ok">
+          <div class="{{(snapshot.Fit?.RSquared >= 0.95 ? "ok" : "warn")}}">
             有效点：{{snapshot.Fit?.PointCount ?? 0}}；
-            K_L：{{snapshot.Fit?.KL.ToString("F12") ?? "-"}} ns/N；
-            截距 b：{{snapshot.Fit?.InterceptNs.ToString("F4") ?? "-"}} ns；
-            R²：{{snapshot.Fit?.RSquared.ToString("F6") ?? "-"}}
+            K_L：{{snapshot.Fit?.KL.ToString("E4") ?? "—"}} ns/N；
+            截距 b：{{snapshot.Fit?.InterceptNs.ToString("F2") ?? "—"}} ns；
+            R²：{{snapshot.Fit?.RSquared.ToString("F4") ?? "—"}}{{(snapshot.Fit is { RSquared: < 0.95 } ? "（线性度不足，建议补点重测）" : "")}}
           </div>
           <h2>结论</h2>
           <p>{{H(snapshot.Conclusion)}}</p>
+          <table style="margin-top:36px">
+            <tr><th style="width:20%">编制（签字）</th><td style="width:30%"></td><th style="width:20%">审核（签字）</th><td style="width:30%"></td></tr>
+            <tr><th>日期</th><td></td><th>日期</th><td></td></tr>
+          </table>
         </body>
         </html>
         """;
@@ -599,15 +654,28 @@ public static class ReportEndpoints
 
     private static string RenderFlangeHtml(
         string title, string project, string turbine, string flangeName, string flangeCode,
-        decimal? groupTarget, int total, int calibrated, int passed, string overall, List<FlangeLine> bolts)
+        decimal? groupTarget, int total, int calibrated, int passed, int failed, int uncal, int nodata, string overall, List<FlangeLine> bolts)
     {
         static string H(string? v) => WebUtility.HtmlEncode(v ?? "");
         static string N(decimal? v) => v.HasValue ? v.Value.ToString("F0") : "—";
         static string R(decimal? v) => v.HasValue ? (v.Value * 100).ToString("F1") + "%" : "—";
+        // 归档文书里标定方法必须是中文，不能把 load_calibrated 之类枚举原样打给客户
+        static string M(string? method) => method switch
+        {
+            "load_calibrated" => "正式载荷标定",
+            "gb_single_wave" => "GB 单波法",
+            "gb_bi_wave" => "GB 双波法",
+            "torque_fit" => "扭矩阶梯拟合",
+            "torque_estimate" => "扭矩估算",
+            "quick" => "快速标定",
+            "sim_baseline" => "初始基线",
+            null or "" => "—",
+            _ => method,
+        };
         var rows = string.Join("\n", bolts.Select((b, i) => $"""
             <tr><td>{i + 1}</td><td>{H(b.Code)}</td><td>{H(b.Spec)}</td><td>{H(b.Position)}</td>
             <td>{N(b.TargetN)}</td><td>{N(b.MinN)}</td><td>{N(b.PreloadN)}</td><td>{R(b.Ratio)}</td>
-            <td>{H(b.CalibMethod)}</td><td>{H(b.Trust)}</td><td>{(b.RSquared.HasValue ? b.RSquared.Value.ToString("F3") : "—")}</td>
+            <td>{M(b.CalibMethod)}</td><td>{H(b.Trust)}</td><td>{(b.RSquared.HasValue ? b.RSquared.Value.ToString("F3") : "—")}</td>
             <td>{H(b.Result)}</td></tr>
             """));
         var verdictClass = overall == "合格" ? "ok" : "warn";
@@ -630,20 +698,24 @@ public static class ReportEndpoints
         </head>
         <body>
           <h1>{{H(title)}}</h1>
-          <div class="muted">标准依据：GB/T 43232 · JJF 1059.1 · 生成时间 {{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss zzz}}</div>
+          <div class="muted">测量依据：GB/T 43232-2023《紧固件 轴向应力超声测量方法》 · JJF 1059.1-2012《测量不确定度评定与表示》 · 生成时间 {{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}}（当地时间）</div>
           <h2>对象</h2>
           <table>
             <tr><th>风场</th><td>{{H(project)}}</td><th>风机</th><td>{{H(turbine)}}</td></tr>
             <tr><th>监测部位</th><td>{{H(flangeName)}}（{{H(flangeCode)}}）</td><th>组目标预紧力</th><td>{{N(groupTarget)}} N</td></tr>
           </table>
           <h2>验收结论</h2>
-          <div class="{{verdictClass}}">总体：{{H(overall)}}；螺栓总数 {{total}}，已标定 {{calibrated}}，合格 {{passed}}，不合格 {{total - passed}}。</div>
+          <div class="{{verdictClass}}">总体：{{H(overall)}}；螺栓总数 {{total}}，已标定 {{calibrated}}，合格 {{passed}}，不合格 {{failed}}{{(uncal > 0 ? $"，未标定 {uncal}" : "")}}{{(nodata > 0 ? $"，无数据 {nodata}" : "")}}。</div>
           <h2>逐螺栓结果</h2>
           <table>
-            <thead><tr><th>#</th><th>螺栓</th><th>规格</th><th>位置</th><th>目标 N</th><th>下限 N</th><th>当前 N</th><th>比值</th><th>标定方法</th><th>可信</th><th>R²</th><th>结论</th></tr></thead>
+            <thead><tr><th>#</th><th>螺栓</th><th>规格</th><th>位置</th><th>目标 (N)</th><th>下限 (N)</th><th>当前 (N)</th><th>保持率</th><th>标定方法</th><th>可信等级</th><th>R²</th><th>结论</th></tr></thead>
             <tbody>{{rows}}</tbody>
           </table>
-          <p class="muted">本报告由系统自动生成，数据快照已归档可追溯。标定可信等级为"临时/工程估算"的螺栓不作为正式安全验收依据。</p>
+          <p class="muted">本报告由系统自动生成，数据快照已归档可追溯。「合格*」表示该螺栓预紧力达标但其标定为临时/工程估算等级，不作为正式安全验收依据；正式验收须以载荷标定（正式等级）为准。</p>
+          <table style="margin-top:36px">
+            <tr><th style="width:20%">编制（签字）</th><td style="width:30%"></td><th style="width:20%">审核（签字）</th><td style="width:30%"></td></tr>
+            <tr><th>日期</th><td></td><th>日期</th><td></td></tr>
+          </table>
         </body>
         </html>
         """;

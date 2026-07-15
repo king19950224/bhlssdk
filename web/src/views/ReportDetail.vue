@@ -19,6 +19,7 @@ const generatedBy = ref<number | null>(null)
 const generatedByName = ref<string | null>(null)
 const signedAt = ref<string | null>(null)
 const signedByName = ref<string | null>(null)
+const fileUrl = ref<string | null>(null)
 const snap = ref<FlangeSnapshot | TorqueStepSnapshot | null>(null)
 const loading = ref(true)
 const signing = ref(false)
@@ -32,15 +33,31 @@ const flange = computed<FlangeSnapshot | null>(() => {
 })
 const torque = computed<TorqueStepSnapshot | null>(() => {
   const s = snap.value as Record<string, unknown> | null
-  return s && 'points' in s && 'channel' in s ? (snap.value as TorqueStepSnapshot) : null
+  if (!s || !('points' in s) || !('channel' in s)) return null
+  const t = snap.value as TorqueStepSnapshot
+  // 后端快照里拟合字段历史上存的是小写 kl(camelCase 策略把 KL 整体小写);兼容两种大小写,
+  // 否则 t.fit.kL 为 undefined,模板 .toExponential 直接崩(报告详情白屏的根因)
+  if (t.fit) {
+    const raw = t.fit as unknown as Record<string, number>
+    t.fit = {
+      pointCount: raw.pointCount ?? raw.PointCount ?? 0,
+      kL: raw.kL ?? raw.kl ?? raw.KL ?? 0,
+      interceptNs: raw.interceptNs ?? raw.InterceptNs ?? 0,
+      rSquared: raw.rSquared ?? raw.RSquared ?? 0,
+    }
+  }
+  return t
 })
 
 const RESULT: Record<string, string> = { 合格: '#10b981', 不合格: '#f43f5e', 未标定: '#61748f', 无数据: '#3b4659' }
+// 报告状态徽标（与列表页口径一致；archived 等不再一律显示"待签发"）
+const STATUS_LABEL: Record<string, string> = { signed: '已签发 · 已锁定', generated: '已生成 · 待签发', archived: '已归档' }
 const METHOD: Record<string, string> = {
   load_calibrated: '正式载荷标定', gb_single_wave: 'GB单波', gb_bi_wave: 'GB双波',
-  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定',
+  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定', sim_baseline: '初始基线',
 }
 
+const loadError = ref<string | null>(null)
 async function load() {
   if (!Number.isFinite(id)) {
     loading.value = false
@@ -57,11 +74,16 @@ async function load() {
   generatedByName.value = d.generatedByName
   signedAt.value = d.signedAt
   signedByName.value = d.signedByName
+  fileUrl.value = d.fileUrl
   snap.value = d.snapshot
 }
 onMounted(async () => {
   try {
     await load()
+    loadError.value = null
+  } catch (e) {
+    // 加载失败与"报告不存在"是两回事,不能混为一谈
+    loadError.value = e instanceof Error ? e.message : '报告加载失败'
   } finally {
     loading.value = false
   }
@@ -88,8 +110,53 @@ function ratio(v: number | null) {
 function fmt(iso: string | null) {
   return iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '—'
 }
-function doPrint() {
-  window.print()
+// 取归档 HTML 文本（带 token 的受保护接口不能用裸 <a href>）
+async function fetchArchivedHtml(): Promise<string | null> {
+  try {
+    const { getAuthToken } = await import('../api/client')
+    const res = await fetch(reportApi.downloadUrl(id), { headers: { Authorization: `Bearer ${getAuthToken()}` } })
+    if (!res.ok) throw new Error(String(res.status))
+    return await res.text()
+  } catch {
+    return null
+  }
+}
+
+// 导出 PDF：优先用后端白底归档 HTML(规范验收件),在新窗口打开并触发打印 → 用户"另存为 PDF"。
+// 无归档文件的旧报告回退到当前页打印(有 @media print 白化样式兜底)。
+const exporting = ref(false)
+async function exportPdf() {
+  exporting.value = true
+  try {
+    const html = fileUrl.value ? await fetchArchivedHtml() : null
+    if (html) {
+      const w = window.open('', '_blank')
+      if (!w) { ElMessage.warning('浏览器拦截了新窗口，请允许弹窗后重试，或使用「下载」'); return }
+      w.document.open()
+      w.document.write(html)
+      w.document.close()
+      // 等资源渲染完再唤起打印对话框
+      w.onload = () => { w.focus(); w.print() }
+      setTimeout(() => { try { w.focus(); w.print() } catch { /* onload 已触发 */ } }, 600)
+    } else {
+      window.print()
+    }
+  } finally {
+    exporting.value = false
+  }
+}
+
+// 下载归档 HTML（与列表页一致）
+async function download() {
+  const html = await fetchArchivedHtml()
+  if (html == null) { ElMessage.error('下载失败，报告文件可能不可用'); return }
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${title.value || 'report-' + id}.html`
+  a.click()
+  URL.revokeObjectURL(url)
 }
 </script>
 
@@ -98,10 +165,17 @@ function doPrint() {
     <div class="rd-toolbar no-print">
       <span class="back" @click="router.back()"><el-icon><ArrowLeft /></el-icon> 返回</span>
       <div class="tb-right">
-        <span class="status-badge" :class="status === 'signed' ? 'signed' : 'draft'">{{ status === 'signed' ? '已签发 · 已锁定' : '已生成 · 待签发' }}</span>
+        <span class="status-badge" :class="status === 'signed' ? 'signed' : 'draft'">{{ STATUS_LABEL[status] || status }}</span>
         <el-button v-if="canSign" :loading="signing" @click="sign"><el-icon><Select /></el-icon> 审核签发</el-button>
-        <el-button type="primary" @click="doPrint"><el-icon><Printer /></el-icon> 打印 / 导出 PDF</el-button>
+        <el-button v-if="fileUrl" @click="download"><el-icon><Download /></el-icon> 下载 HTML</el-button>
+        <el-button type="primary" :loading="exporting" @click="exportPdf"><el-icon><Printer /></el-icon> 导出 PDF / 打印</el-button>
       </div>
+    </div>
+
+    <div v-if="loadError" class="rd-error panel">
+      <el-icon><WarningFilled /></el-icon>
+      <span>报告加载失败：{{ loadError }}</span>
+      <el-button size="small" type="primary" text @click="loading = true; load().catch((e) => { loadError = (e as Error)?.message || '报告加载失败' }).finally(() => { loading = false })">重试</el-button>
     </div>
 
     <div v-if="flange" class="sheet panel panel--glow">
@@ -133,12 +207,14 @@ function doPrint() {
           <div><b>{{ flange.summary.calibrated }}</b><span>已标定</span></div>
           <div><b style="color:var(--ok)">{{ flange.summary.passed }}</b><span>合格</span></div>
           <div><b :style="flange.summary.failed > 0 ? 'color:var(--crit)' : ''">{{ flange.summary.failed }}</b><span>不合格</span></div>
+          <div v-if="(flange.summary.uncalibrated ?? 0) > 0"><b style="color:var(--text-3)">{{ flange.summary.uncalibrated }}</b><span>未标定</span></div>
+          <div v-if="(flange.summary.nodata ?? 0) > 0"><b style="color:var(--text-3)">{{ flange.summary.nodata }}</b><span>无数据</span></div>
         </div>
       </div>
 
       <table class="rt">
         <thead>
-          <tr><th>#</th><th>螺栓编号</th><th>规格</th><th>位置</th><th>目标 N</th><th>下限 N</th><th>当前预紧力 N</th><th>比值</th><th>标定方法</th><th>可信</th><th>R²</th><th>结论</th></tr>
+          <tr><th>#</th><th>螺栓编号</th><th>规格</th><th>位置</th><th>目标 (N)</th><th>下限 (N)</th><th>当前预紧力 (N)</th><th>保持率</th><th>标定方法</th><th>可信等级</th><th>R²</th><th>结论</th></tr>
         </thead>
         <tbody>
           <tr v-for="(b, i) in flange.bolts" :key="i">
@@ -241,7 +317,7 @@ function doPrint() {
       <div class="rd-note">本报告为扭矩法临时拟合的线性度验证，<b>非正式载荷标定</b>，不作为安全验收依据；正式验收须用已知载荷多点标定（load-calibrate + 双人会签）。数据快照已归档，可追溯复现。</div>
     </div>
 
-    <div v-else-if="!loading" class="empty panel">报告不存在或快照为空</div>
+    <div v-else-if="!loading && !loadError" class="empty panel">报告不存在或快照为空</div>
   </div>
 </template>
 
@@ -295,4 +371,5 @@ function doPrint() {
 .sig-date { margin-left: auto; color: var(--text-2); font-size: 13px; align-self: flex-end; }
 .rd-note { margin-top: 18px; font-size: 11px; color: var(--text-3); line-height: 1.6; border-top: 1px solid var(--hairline); padding-top: 12px; }
 .empty { padding: 40px; text-align: center; color: var(--text-3); }
+.rd-error { display: flex; align-items: center; gap: 10px; padding: 14px 18px; color: var(--crit); font-size: 13px; }
 </style>

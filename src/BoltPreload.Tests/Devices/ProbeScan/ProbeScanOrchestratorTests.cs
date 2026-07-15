@@ -186,6 +186,68 @@ public class ProbeScanOrchestratorTests
         ex.Which.ExistingScanRunId.Should().Be(99);
     }
 
+    [Fact]
+    public async Task RunAsync_McrSingle_SnapshotLoadFails_AbortsWithoutRewritingMcr()
+    {
+        var connector = new FakeConnector(deviceId: 1);
+        var deviceManager = new FakeDeviceManager(connector);
+        // 读取原始 MCR 通道快照失败：mcr_single 若继续扫描会把 MCR 改成单通道且事后无法恢复
+        var repo = new FakeRepository { ThrowOnLoadEnabledChannels = true };
+        var state = new ProbeScanState();
+        var options = Options.Create(new ProbeScanOptions
+        {
+            DefaultSampleSeconds = 1, DefaultSettleSeconds = 0, DefaultMinSamples = 1
+        });
+
+        var orchestrator = new ProbeScanOrchestrator(
+            deviceManager, repo, state, options, NullLogger<ProbeScanOrchestrator>.Instance);
+
+        var req = new ProbeScanRequest(
+            DeviceId: 1, Channels: new ushort[] { 3, 5 },
+            SettleSeconds: 0, SampleSeconds: 1, Strategy: "mcr_single",
+            Thresholds: new ProbeScanThresholds(1, 20, 5, 600));
+
+        var view = await orchestrator.StartAsync(req, null, CancellationToken.None);
+        await WaitForAsync(() => repo.GetStatus(view.ScanRunId) is "completed" or "failed" or "aborted",
+            TimeSpan.FromSeconds(8));
+
+        // 关键：必须在改动任何 MCR 之前失败，绝不能留下"扫描后只监测最后一个通道"的隐患
+        repo.GetStatus(view.ScanRunId).Should().Be("failed");
+        connector.McrConfigCalls.Should().BeEmpty();
+        state.IsRunning(1).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task StartAsync_ThenImmediateAbort_StillReleasesStateAndRestoresMultiMeas()
+    {
+        var connector = new FakeConnector(deviceId: 1);
+        var deviceManager = new FakeDeviceManager(connector);
+        var repo = new FakeRepository();
+        var state = new ProbeScanState();
+        var options = Options.Create(new ProbeScanOptions
+        {
+            DefaultSampleSeconds = 2, DefaultSettleSeconds = 0, DefaultMinSamples = 1
+        });
+
+        var orchestrator = new ProbeScanOrchestrator(
+            deviceManager, repo, state, options, NullLogger<ProbeScanOrchestrator>.Instance);
+
+        var req = new ProbeScanRequest(
+            DeviceId: 1, Channels: new ushort[] { 1, 2, 3 },
+            SettleSeconds: 0, SampleSeconds: 2, Strategy: "single_meas",
+            Thresholds: new ProbeScanThresholds(1, 20, 5, 600));
+
+        var view = await orchestrator.StartAsync(req, null, CancellationToken.None);
+        // 启动后立刻中止：Task.Run(CancellationToken.None) 保证主体仍执行、finally 一定清理占位（不会永久卡 IsRunning）
+        orchestrator.TryAbort(1, view.ScanRunId).Should().BeTrue();
+
+        await WaitForAsync(() => repo.GetStatus(view.ScanRunId) is "completed" or "failed" or "aborted",
+            TimeSpan.FromSeconds(8));
+
+        state.IsRunning(1).Should().BeFalse();
+        connector.WorkModeCalls.Last().Mode.Should().Be(FxWorkMode.MultiMeas);
+    }
+
     private static async Task WaitForAsync(Func<bool> predicate, TimeSpan timeout)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -319,7 +381,10 @@ public class ProbeScanOrchestratorTests
         public Task<int> CleanStaleRunsAsync(CancellationToken ct) => Task.FromResult(0);
 
         public IReadOnlyList<ushort> OriginalEnabledChannels { get; set; } = Array.Empty<ushort>();
+        public bool ThrowOnLoadEnabledChannels { get; set; }
         public Task<IReadOnlyList<ushort>> LoadEnabledChannelsAsync(long deviceId, CancellationToken ct)
-            => Task.FromResult(OriginalEnabledChannels);
+            => ThrowOnLoadEnabledChannels
+                ? Task.FromException<IReadOnlyList<ushort>>(new InvalidOperationException("模拟读取 MCR 快照失败"))
+                : Task.FromResult(OriginalEnabledChannels);
     }
 }

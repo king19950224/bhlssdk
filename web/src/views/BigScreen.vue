@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'
 import { dashboardApi, alarmApi, type PreloadHealth, type LooseBolt, type ApproachingBolt, type AlarmItem } from '../api'
 import { useRuntime } from '../stores/runtime'
-import { onRealtime } from '../api/realtime'
+import { onRealtime, startRealtime, realtimeState } from '../api/realtime'
 import { pctParts } from '../utils/preload'
 
 const router = useRouter()
@@ -32,31 +32,43 @@ const STATUS: Record<string, { label: string; color: string; cls: string }> = {
 }
 const ORDER = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata'] as const
 const SEV: Record<string, string> = { critical: '#f43f5e', crit: '#f43f5e', warn: '#f59e0b', warning: '#f59e0b', info: '#38bdf8' }
+// 告警类型兜底文案：message 为空时不能把 preload_low 之类英文枚举打上大屏
+const ALARM_TYPE_LABEL: Record<string, string> = {
+  preload_low: '预紧力偏低', preload_loss: '预紧力脱落', preload_high: '预紧力偏高',
+  signal_lost: '信号丢失', no_data: '数据中断',
+}
 // 各状态整数百分比（最大余数法，合计恰为 100%）
 const healthPct = computed<Record<string, number>>(() => {
   const parts = pctParts(ORDER.map((k) => health.value[k]), health.value.total)
   return Object.fromEntries(ORDER.map((k, i) => [k, parts[i]]))
 })
 
+let disposed = false
 async function refresh() {
+  if (document.hidden) return
   try {
     const d = await dashboardApi.preloadHealth()
+    if (disposed) return
     health.value = d.global
     byGroup.value = d.byGroup
     topLoose.value = d.topLoose
     approaching.value = d.approachingLimit
     openAlarms.value = d.openAlarms
-    recentAlarms.value = (await alarmApi.list('?includeCleared=false&limit=10')).items
+    const alarms = (await alarmApi.list('?includeCleared=false&limit=10')).items
+    if (!disposed) recentAlarms.value = alarms
   } catch { /* 尽力刷新 */ }
 }
 onMounted(() => {
   runtime.start()
+  // 大屏是独立全屏路由,不经过 AppShell：需自行建立实时连接,告警才能秒级上屏
+  startRealtime()
   refresh()
   timer = window.setInterval(refresh, 5000)
   clock = window.setInterval(() => { now.value = new Date() }, 1000)
   unsub = onRealtime('OnAlarm', () => refresh())
 })
 onUnmounted(() => {
+  disposed = true
   if (timer) clearInterval(timer)
   if (clock) clearInterval(clock)
   unsub?.()
@@ -92,6 +104,7 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
       <div class="bs-sys">
         <span><span class="led" :class="sys.online > 0 ? 'led--ok' : 'led--off'" /> 设备在线 <b class="mono">{{ sys.online }}/{{ sys.total }}</b></span>
         <span>采集速率 <b class="mono glow-accent">{{ sys.rate }}</b> 条/秒</span>
+        <span><span class="led" :class="realtimeState === 'connected' ? 'led--ok' : realtimeState === 'connecting' ? 'led--warn' : 'led--off'" /> {{ realtimeState === 'connected' ? '实时已连' : realtimeState === 'connecting' ? '实时连接中' : '实时断开' }}</span>
         <el-button size="small" text class="bs-exit" @click="router.push({ name: 'dashboard' })">退出大屏</el-button>
       </div>
     </header>
@@ -99,7 +112,7 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
     <div class="bs-grid">
       <!-- 左：健康分布 + KPI -->
       <section class="bs-card">
-        <h3>预紧力健康分布</h3>
+        <h3>预紧力健康分布 <span class="h3-sub">全部监测螺栓（含待接入）</span></h3>
         <div class="donut-wrap">
           <EChart :option="donutOption" height="260px" />
           <div class="donut-center"><b class="mono">{{ health.total }}</b><span>监测螺栓</span></div>
@@ -131,7 +144,7 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
           <li v-for="a in recentAlarms" :key="a.id">
             <span class="led" :style="`background:${SEV[a.severity] || '#61748f'}`" />
             <span class="al-code mono">{{ a.boltCode }}</span>
-            <span class="al-msg">{{ a.message || a.type }}</span>
+            <span class="al-msg">{{ a.message || ALARM_TYPE_LABEL[a.type] || a.type }}</span>
           </li>
           <li v-if="!recentAlarms.length" class="bs-empty"><span class="led led--ok" /> 无未闭合告警</li>
         </ul>
@@ -156,7 +169,7 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
           <div v-for="b in approaching.slice(0, 6)" :key="b.boltId" class="rl">
             <span class="rl-code">{{ b.boltCode }}</span>
             <span class="rl-loc">{{ b.turbine }} · {{ b.group }}</span>
-            <span class="rl-rate mono">{{ b.ratePerDay != null ? Math.round(b.ratePerDay) + ' N/天' : '—' }}</span>
+            <span class="rl-rate mono">{{ b.ratePerDay != null ? '↓' + Math.abs(Math.round(b.ratePerDay)) + ' N/天' : '—' }}</span>
             <span class="rl-days mono" :style="b.daysToLimit != null && b.daysToLimit < 30 ? 'color:var(--crit)' : 'color:var(--warn)'">{{ b.daysToLimit != null ? Math.max(0, Math.round(b.daysToLimit)) + ' 天' : '—' }}</span>
           </div>
           <div v-if="!approaching.length" class="bs-empty"><span class="led led--ok" /> 无下降趋势螺栓</div>
@@ -180,6 +193,7 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
 .bs-grid { flex: 1; display: grid; grid-template-columns: 1fr 1.3fr 1fr; grid-template-rows: 1.4fr 1fr; gap: 16px; min-height: 0; }
 .bs-card { background: rgba(13,19,32,0.7); border: 1px solid var(--panel-border); border-radius: 14px; padding: 16px 20px; display: flex; flex-direction: column; min-height: 0; backdrop-filter: blur(6px); }
 .bs-card h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; color: var(--text-2); letter-spacing: 0.04em; }
+.h3-sub { font-size: 11px; color: var(--text-3); font-weight: 400; margin-left: 8px; }
 .bs-card.bs-wide { }
 .bs-alarms.alert { border-color: var(--crit); box-shadow: 0 0 30px -12px var(--crit-glow); }
 .cnt { font-size: 18px; margin-left: 8px; }
@@ -214,4 +228,6 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
 .rl-days { font-size: 15px; font-weight: 700; min-width: 56px; text-align: right; }
 .bs-empty { display: flex; align-items: center; gap: 8px; color: var(--text-3); font-size: 13px; padding: 8px 0; }
 @media (max-width: 1200px) { .bs-grid { grid-template-columns: 1fr 1fr; grid-template-rows: auto; } }
+/* 非全屏/矮窗口：放弃"两行铺满视口"，按内容自适应并整页滚动,避免固定高图表挤爆卡片 */
+@media (max-height: 820px) { .bs-grid { grid-template-rows: auto auto; } .bs-card { min-height: auto; } }
 </style>

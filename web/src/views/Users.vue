@@ -77,11 +77,15 @@ function fmt(iso: string | null) {
 <template>
   <div class="users rise">
     <div class="u-head">
-      <span class="panel-title">系统用户 · 角色与权限</span>
+      <span class="panel-title"><i class="hd-mark" />系统用户 · 角色与权限</span>
       <el-button type="primary" @click="openCreate"><el-icon><Plus /></el-icon> 新建用户</el-button>
     </div>
 
     <div class="panel panel--glow">
+      <div class="panel-hd">
+        <span class="panel-title"><i class="hd-mark" />用户列表</span>
+        <span class="hd-sub mono">{{ users.length }} 个</span>
+      </div>
       <div class="tbl">
         <div class="tr th"><span>用户名</span><span>姓名</span><span>角色</span><span>状态</span><span>最近登录</span><span>操作</span></div>
         <div v-for="u in users" :key="u.id" class="tr">
@@ -113,13 +117,17 @@ function fmt(iso: string | null) {
           <el-input v-model="form.fullName" placeholder="（可选）真实姓名" />
         </el-form-item>
         <el-form-item label="角色">
-          <el-select v-model="form.role" style="width: 100%">
+          <!-- 重置密码走的是 upsert：角色锁定为原角色,防止重置密码时被误改权限 -->
+          <el-select v-model="form.role" style="width: 100%" :disabled="dialog.mode === 'reset'">
             <el-option v-for="o in ROLE_OPTS" :key="o.value" :label="o.label" :value="o.value" />
           </el-select>
         </el-form-item>
         <el-form-item :label="dialog.mode === 'create' ? '密码' : '新密码'">
           <el-input v-model="form.password" type="password" show-password placeholder="至少 8 位" />
         </el-form-item>
+        <div v-if="dialog.mode === 'reset'" class="reset-hint">
+          重置后该账户将解除锁定并处于启用状态；若此前已停用，如仍需停用请重置后再次点「停用」。
+        </div>
       </el-form>
       <template #footer>
         <el-button @click="dialog.visible = false">取消</el-button>
@@ -132,9 +140,12 @@ function fmt(iso: string | null) {
 <style scoped>
 .users { display: flex; flex-direction: column; gap: 16px; }
 .u-head { display: flex; align-items: center; justify-content: space-between; }
-.tbl { padding: 6px 18px 16px; }
-.tr { display: grid; grid-template-columns: 160px 130px 110px 130px 1fr 180px; align-items: center; padding: 11px 6px; border-bottom: 1px solid var(--hairline); font-size: 13px; }
-.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; }
+.panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px 9px; }
+.tbl { padding: 4px 12px 14px; overflow-x: auto; }
+.tr { display: grid; grid-template-columns: 145px 110px 86px 80px minmax(0, 1fr) 150px; align-items: center; gap: 8px; padding: 10px 8px; border-radius: 8px; font-size: 13px; min-width: 700px; }
+.tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
+.tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
+.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
 .self { font-size: 10px; color: var(--accent); border: 1px solid var(--panel-border-strong); border-radius: 8px; padding: 1px 6px; margin-left: 8px; }
 .role { font-size: 12px; padding: 2px 10px; border: 1px solid; border-radius: 10px; }
 .st { display: flex; align-items: center; gap: 8px; }
@@ -142,4 +153,5 @@ function fmt(iso: string | null) {
 .dim { color: var(--text-3); }
 .ops { display: flex; gap: 2px; }
 .tbl-empty { padding: 30px; text-align: center; color: var(--text-3); }
+.reset-hint { font-size: 12px; color: var(--warn); line-height: 1.6; padding: 0 4px; }
 </style>

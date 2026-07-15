@@ -311,19 +311,28 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             ThresholdLowRatio: _opt.TriggerLowRatio,
             ThresholdHighRatio: _opt.TriggerHighRatio,
             ConsecutiveCount: 0,
-            Message: $"{type} 已恢复 (ratio={input.PreloadRatio})");
+            Message: $"{TypeLabel(type)}已恢复（当前为目标的 {(input.PreloadRatio != null ? (input.PreloadRatio.Value * 100m).ToString("F1") + "%" : "—")}）");
+
+    private static string TypeLabel(string type) => type switch
+    {
+        "preload_low" => "预紧力偏低",
+        "preload_high" => "预紧力偏高",
+        "preload_loss" => "预紧力脱落",
+        _ => type,
+    };
 
     private static string BuildMessage(string type, AlarmInput input)
     {
-        var ratioStr = input.PreloadRatio?.ToString("F3") ?? "—";
-        var preloadStr = input.PreloadN?.ToString("F1") ?? "—";
+        // message 直接展示给用户（告警中心/大屏/详情履历），用可读中文，不用 ratio=/target= 内部参数拼写
+        var pctStr = input.PreloadRatio != null ? (input.PreloadRatio.Value * 100m).ToString("F1") + "%" : "—";
+        var preloadStr = input.PreloadN?.ToString("F0") ?? "—";
         var targetStr = input.TargetPreloadN?.ToString("F0") ?? "—";
         return type switch
         {
-            "preload_low" => $"预紧力偏低: {preloadStr}N (ratio={ratioStr}, target={targetStr}N)",
-            "preload_high" => $"预紧力偏高: {preloadStr}N (ratio={ratioStr}, target={targetStr}N)",
-            "preload_loss" => $"预紧力疑似脱落: {preloadStr}N (ratio={ratioStr}, target={targetStr}N) — 立即停机巡检",
-            _ => $"告警 {type}: ratio={ratioStr}"
+            "preload_low" => $"预紧力偏低：当前 {preloadStr} N，为目标 {targetStr} N 的 {pctStr}",
+            "preload_high" => $"预紧力偏高：当前 {preloadStr} N，为目标 {targetStr} N 的 {pctStr}",
+            "preload_loss" => $"预紧力疑似脱落：当前 {preloadStr} N，仅为目标 {targetStr} N 的 {pctStr}，请立即停机巡检",
+            _ => $"告警 {type}：当前为目标的 {pctStr}"
         };
     }
 

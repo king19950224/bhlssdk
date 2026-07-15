@@ -80,12 +80,20 @@ public sealed class CachedChannelResolver : IChannelResolver
         // TTL 分两档：已绑 bolt 缓存 5 分钟（业务对象，几乎不变）；未绑缓存 30 秒（等业主绑）
         var ttl = route.BoltId > 0 ? BoundTtl : UnboundTtl;
         _knownKeys.TryAdd(key, 0);
-        _cache.Set(key, route, new MemoryCacheEntryOptions
+        var entryOptions = new MemoryCacheEntryOptions
         {
             AbsoluteExpirationRelativeToNow = ttl,
             SlidingExpiration = ttl > TimeSpan.FromMinutes(1) ? TimeSpan.FromMinutes(1) : null,
             Size = 1
-        });
+        };
+        // 条目 TTL 过期/被容量驱逐时同步移出 _knownKeys——否则 key 集合只增不减,多年运行缓慢膨胀
+        entryOptions.RegisterPostEvictionCallback(static (k, _, reason, state) =>
+        {
+            if (reason is EvictionReason.Expired or EvictionReason.Capacity or EvictionReason.TokenExpired
+                && state is ConcurrentDictionary<string, byte> keys && k is string sk)
+                keys.TryRemove(sk, out byte _);
+        }, _knownKeys);
+        _cache.Set(key, route, entryOptions);
 
         return route;
     }
@@ -157,7 +165,9 @@ public sealed class CachedChannelResolver : IChannelResolver
                         RefTempC: reader.IsDBNull(5) ? 20m : reader.GetDecimal(5),
                         InterceptNs: reader.IsDBNull(7) ? null : reader.GetDecimal(7),
                         ExpiresAt: reader.IsDBNull(17) ? null : reader.GetDateTime(17),
-                        Passed: reader.IsDBNull(18) || reader.GetBoolean(18));
+                        // passed 列 NOT NULL,此处 NULL 只可能是 active_calibration_id 悬空(标定记录被删的脏数据)——
+                        // 悬空引用不能当"合格标定"继续出正式预紧力,默认 false 让该通道停算并暴露问题
+                        Passed: !reader.IsDBNull(18) && reader.GetBoolean(18));
                 }
 
                 CachedBoltSpec? spec = null;

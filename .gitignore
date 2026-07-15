@@ -65,12 +65,9 @@ minio-data/
 data/
 src/BoltPreload.Api/data/
 
-# 厂家原始 SDK 资料（含 C#/Java 双语言、docx 文档）— 不进 git
-# 已经把 C# 1.4 源码净化拷到 external/FxSDK/（见 external/FxSDK/README.md）
-# Java SDK 暂不使用
-FxSDK C#+Java源码+使用示例/
-FxSDK C#+Java源码+使用示例.zip
+# 真机联调一键脚本的运行态（pid/日志），不进 git
+.dev-real/
 
-# 软著申请等业务/法务材料（非代码，不进 git）
-软著申请材料/
-软著申请表.docx
+# 非交付范围的资料（厂家原始 SDK 资料、软著申请、会议/申报材料等）— 不进 git
+# 厂家 C# 1.4 源码已净化拷到 external/FxSDK/（见 external/FxSDK/README.md）
+资料/

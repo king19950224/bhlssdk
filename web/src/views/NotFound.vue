@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
+import { useAuth } from '../stores/auth'
 const router = useRouter()
+const auth = useAuth()
 </script>
 
 <template>
@@ -9,7 +11,7 @@ const router = useRouter()
     <h2>页面不存在</h2>
     <p>你访问的路径不存在或已移除。</p>
     <div class="nf-actions">
-      <el-button type="primary" @click="router.replace({ name: 'dashboard' })">返回总览</el-button>
+      <el-button type="primary" @click="router.replace({ name: auth.homeName })">返回首页</el-button>
       <el-button @click="router.back()">返回上一页</el-button>
     </div>
   </div>

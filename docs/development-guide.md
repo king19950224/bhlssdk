@@ -89,7 +89,7 @@
 
 ### 3.2 SDK 交付物
 
-厂家原始交付物位于仓库根目录 `FxSDK C#+Java源码+使用示例/`：
+厂家原始交付物位于 `资料/FxSDK C#+Java源码+使用示例/`：
 
 | 交付物 | 说明 |
 |---|---|
@@ -454,7 +454,7 @@ bhlssdk/
 │   └── windows/ installer/          # 工控机部署、Inno Setup
 ├── tools/FxDeviceSimulator/         # 独立 TCP 层设备模拟器
 ├── docs/                            # 项目文档
-└── FxSDK C#+Java源码+使用示例/       # 厂家原始交付物（含官方使用说明）
+└── 资料/FxSDK C#+Java源码+使用示例/  # 厂家原始交付物（含官方使用说明）
 ```
 
 ## 8. 开发注意事项

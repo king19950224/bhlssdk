@@ -24,6 +24,13 @@ const limitRatio = computed(() => {
     .filter((x): x is number => x != null)
   return rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : 0.8
 })
+// 各螺栓下限比不一致时,这条参考线只是平均值——标注上说清楚,别让人当成每颗的精确下限
+const limitIsUniform = computed(() => {
+  const rs = props.bolts
+    .map((b) => (b.minPreloadN != null && b.targetPreloadN ? Number(b.minPreloadN) / Number(b.targetPreloadN) : null))
+    .filter((x): x is number => x != null)
+  return rs.length <= 1 || Math.max(...rs) - Math.min(...rs) < 0.005
+})
 
 let loadSeq = 0
 async function load() {
@@ -73,7 +80,7 @@ const option = computed(() => {
   })
   const markLines = [
     { yAxis: 100, lineStyle: { color: '#22d3ee', type: 'dashed' }, label: { formatter: '目标 100%', color: '#22d3ee', position: 'insideEndTop', fontSize: 10 } },
-    { yAxis: limitRatio.value * 100, lineStyle: { color: '#f43f5e', type: 'dashed' }, label: { formatter: '下限 ' + (limitRatio.value * 100).toFixed(0) + '%', color: '#f43f5e', position: 'insideEndBottom', fontSize: 10 } },
+    { yAxis: limitRatio.value * 100, lineStyle: { color: '#f43f5e', type: 'dashed' }, label: { formatter: (limitIsUniform.value ? '下限 ' : '平均下限 ') + (limitRatio.value * 100).toFixed(0) + '%', color: '#f43f5e', position: 'insideEndBottom', fontSize: 10 } },
   ]
   if (series.length) (series[series.length - 1] as Record<string, unknown>).markLine = { symbol: 'none', data: markLines, silent: true }
   return {
@@ -92,11 +99,12 @@ const option = computed(() => {
     <div class="gt-bar">
       <span class="gt-title">同部位预紧力保持率对比 <i>全圈齐降 = 系统性松弛；单根掉队 = 个别松动</i></span>
       <div class="range-tabs">
-        <span v-for="k in (['24h', '7d'] as const)" :key="k" class="range-tab" :class="{ active: range === k }" @click="range = k">{{ k }}</span>
+        <span v-for="k in (['24h', '7d'] as const)" :key="k" class="range-tab" :class="{ active: range === k }" @click="range = k">{{ k === '24h' ? '24 小时' : '7 天' }}</span>
       </div>
     </div>
     <EChart v-if="hasData" :option="option" height="370px" />
-    <div v-else-if="!loading" class="gt-empty">该部位暂无可对比的趋势数据</div>
+    <div v-else-if="loading" class="gt-empty" v-loading="true" style="min-height:120px" />
+    <div v-else class="gt-empty">该部位暂无可对比的趋势数据</div>
   </div>
 </template>
 

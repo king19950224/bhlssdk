@@ -10,6 +10,11 @@ export interface LoginResponse {
 export const authApi = {
   login: (username: string, password: string) =>
     http.post<LoginResponse>('/api/auth/login', { username, password }),
+  // 服务端吊销令牌（登出后旧令牌立即失效,而不是等自然过期）
+  logout: () => http.post<{ loggedOut: boolean }>('/api/auth/logout'),
+  // 自助改密（改后所有旧令牌失效,须重新登录）
+  changePassword: (oldPassword: string, newPassword: string) =>
+    http.post<{ changed: boolean }>('/api/auth/change-password', { oldPassword, newPassword }),
 }
 
 // ---- 运行时 / 设备 ----
@@ -69,6 +74,8 @@ export interface AlarmItem {
   ackedBy: string | null
   clearedBy: string | null
   ackedNote: string | null
+  // 条件最近一次命中时刻（null=旧数据）：区分"仍在越限"与"已缓解未闭合"
+  lastActiveAt: string | null
   isOpen: boolean
   isAcked: boolean
 }
@@ -120,14 +127,26 @@ export interface ConfigChange {
   failureReason: string | null
   note: string | null
   requested: string | null
+  requestedByName: string | null
+  approvedByName: string | null
+  executedByName: string | null
+}
+export interface ConfigVerifyResult {
+  id: number
+  status: string
+  verified?: boolean
+  note?: string
+  comparisons: { param: string; requested: number; actual: number | null; match: boolean }[]
 }
 export const configChangeApi = {
+  // 「全部」= 不传 status（后端把未知值当精确匹配,传 all 会永远查空）
   list: (status = 'pending') =>
-    http.get<{ count: number; items: ConfigChange[] }>(`/api/config-changes?status=${status}`),
+    http.get<{ count: number; items: ConfigChange[] }>(
+      `/api/config-changes${status && status !== 'all' ? `?status=${status}` : ''}`),
   approve: (id: number) => http.post(`/api/config-changes/${id}/approve`),
   reject: (id: number, reason: string) => http.post(`/api/config-changes/${id}/reject`, { reason }),
   execute: (id: number) => http.post(`/api/config-changes/${id}/execute`),
-  verify: (id: number) => http.post(`/api/config-changes/${id}/verify`),
+  verify: (id: number) => http.post<ConfigVerifyResult>(`/api/config-changes/${id}/verify`),
   // 提交通道超声参数变更（落审批队列：requested → approved → executed → verified）
   submit: (deviceId: number, channel: number, updates: Record<string, number | undefined>) =>
     http.post<{ submitted: boolean; requestId: number; status: string }>(
@@ -214,11 +233,38 @@ export interface GroupBolt {
   preloadN: number | null; preloadRatio: number | null; lastTs: string | null; status: string
   channelId: number; channelNo: number; deviceId: number; deviceCode: string; openAlarms: number
 }
+// 新建螺栓建档（规格字段可空，后端按 nominalDiam/grade 预设补齐）
+export interface BoltCreateBody {
+  channelId: number
+  code?: string
+  nominalDiam?: string
+  grade?: string
+  positionLabel?: string
+  targetPreloadN?: number
+  minPreloadN?: number
+  crossSectionMm2?: number
+  effectiveLengthMm?: number
+  totalLengthMm?: number
+  backfillUnbound?: boolean
+  note?: string
+}
+export interface BoltCreateResult {
+  boltId: number; code: string; groupId: number
+  channelId: number; channelNo: number; deviceId: number
+  positionLabel: string | null; backfilled: number
+}
 export const assetApi = {
   projects: () => http.get<{ count: number; items: ProjectNode[] }>('/api/projects'),
   turbines: (projectId: number) => http.get<{ count: number; items: TurbineNode[] }>(`/api/projects/${projectId}/turbines`),
   groups: (turbineId: number) => http.get<{ count: number; items: GroupNode[] }>(`/api/turbines/${turbineId}/groups`),
   groupBolts: (groupId: number) => http.get<{ count: number; items: GroupBolt[] }>(`/api/monitor-groups/${groupId}/bolts`),
+  // 建档并绑定通道（含暂存数据回填），一个事务
+  createBolt: (groupId: number, body: BoltCreateBody) =>
+    http.post<BoltCreateResult>(`/api/monitor-groups/${groupId}/bolts`, body),
+  // 修改组配置孔位数（法兰实际孔数与配置不符时现场自助修正）
+  patchGroup: (groupId: number, body: { expectedBoltCount: number }) =>
+    http.patch<{ groupId: number; code: string; expectedBoltCount: number; previous: number | null }>(
+      `/api/monitor-groups/${groupId}`, body),
 }
 
 // ---- 螺栓详情 ----
@@ -246,9 +292,13 @@ export interface CalibRecord {
   createdAt: string; expiresAt: string; supersededBy: string | null; isActive: boolean; notes: string | null
   // 复核状态：pending=待会签 / self_signed=自签临时 / approved=两人会签 / rejected
   reviewState: string; countersigned: boolean
+  // 提交人（会签必须异人,前端据此禁用本人会签按钮）
+  operatorUserId: number | null
 }
 export const boltApi = {
   list: () => http.get<{ count: number; items: BoltListItem[] }>('/api/bolts'),
+  // 详情页用单查（不存在 404 抛错），避免"全量拉列表再 find"在规模超过列表分页护栏后静默失配
+  get: (id: number) => http.get<BoltListItem>(`/api/bolts/${id}`),
   preloadTrend: (id: number, qs = '?bucket=auto') => http.get<{ items: TrendPoint[] }>(`/api/bolts/${id}/preload-trend${qs}`),
   measurements: (id: number, limit = 30) =>
     http.get<{ items: { ts: string; echoTimeNs: number | null; spTempC: number | null; statusCode: number; preloadN: number | null; preloadRatio: number | null }[] }>(
@@ -312,7 +362,13 @@ export interface UnboundSummaryRow {
   count: number; firstTs: string; lastTs: string; validEchoCount: number
 }
 export const channelApi = {
-  list: (state?: string) => http.get<{ count: number; items: ChannelRow[] }>(`/api/channels${state ? `?state=${state}` : ''}`),
+  list: (opts: { state?: string; deviceId?: number } = {}) => {
+    const qs = new URLSearchParams()
+    if (opts.state) qs.set('state', opts.state)
+    if (opts.deviceId != null) qs.set('deviceId', String(opts.deviceId))
+    const q = qs.toString()
+    return http.get<{ count: number; items: ChannelRow[] }>(`/api/channels${q ? `?${q}` : ''}`)
+  },
   unboundSummary: () => http.get<{ items: UnboundSummaryRow[] }>('/api/channels/unbound/summary'),
   bind: (channelId: number, body: { boltId: number; calibrationAction?: string; backfillUnbound?: boolean; note?: string }) =>
     http.post<{ bound?: boolean; moved?: boolean }>(`/api/channels/${channelId}/bind-bolt`, body),
@@ -371,7 +427,8 @@ export interface FlangeBoltRow {
 export interface FlangeSnapshot {
   generatedAt: string; generatedBy: number; standard: string; project: string; turbine: string
   flange: { name: string; code: string; structureType: string | null; targetPreloadN: number | null }
-  summary: { total: number; calibrated: number; passed: number; failed: number; overall: string }
+  // uncalibrated/nodata 为新版快照字段（旧报告快照无此字段,前端需兜底）
+  summary: { total: number; calibrated: number; passed: number; failed: number; uncalibrated?: number; nodata?: number; overall: string }
   bolts: FlangeBoltRow[]
 }
 // 扭矩阶梯报告快照（report_type='torque_step'）

@@ -8,14 +8,14 @@ using WorkMode = FxSDK.Models.WorkMode;
 namespace BoltPreload.Fx;
 
 /// <summary>
-/// 真实 FxSDK（C# 1.4）的适配器。
+/// 
 /// 把 SDK 的 <see cref="FxClient.OnResultReceived"/> 事件转成内部 <see cref="System.Threading.Channels.Channel{T}"/>。
 /// Phase 1 第二周开始接入实验室真机 192.168.0.7:23。
 /// </summary>
 /// <remarks>
 /// <para>本类只做"事件 → 通道"的桥接，不做业务计算。业务计算在 Application 层。</para>
 /// <para>断线重连由 <c>BoltPreload.Application.Ingestion.IngestionWatchdogService</c> 看门狗驱动，
-/// 调用 <see cref="ReconnectAsync"/> 重连并重发工作模式（按方案 §5.2 厂家重连示例落地）。</para>
+/// 调用 <see cref="ReconnectAsync"/> 重连并重发工作模式</para>
 /// </remarks>
 public sealed class FxSdkConnector : IFxConnector
 {
@@ -178,7 +178,7 @@ public sealed class FxSdkConnector : IFxConnector
         await _sessionLock.WaitAsync(ct);
         try
         {
-            var session = _sessionId ?? throw new InvalidOperationException("Not connected");
+            var session = _sessionId ?? throw new InvalidOperationException("设备未连接");
             await action(session);
         }
         finally
@@ -495,7 +495,7 @@ public sealed class FxSdkConnector : IFxConnector
         await _sessionLock.WaitAsync(cancellationToken);
         try
         {
-        var session = _sessionId ?? throw new InvalidOperationException("Not connected");
+        var session = _sessionId ?? throw new InvalidOperationException("设备未连接");
 
         // 1. 决定 RefTime / RefTemp 的来源：
         //    - 显式参数优先（运维强制指定，比如设备当前测不出 TOF 时）

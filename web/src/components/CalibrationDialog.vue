@@ -3,6 +3,9 @@ import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { calibrationApi, boltApi, reportApi, type CalibRecord, type TorqueTestPoint, type TorqueFitSummary } from '../api'
 import { getAuthToken } from '../api/client'
+import { useAuth } from '../stores/auth'
+
+const auth = useAuth()
 
 const props = withDefaults(defineProps<{
   modelValue: boolean
@@ -35,7 +38,7 @@ const busy = ref('')
 
 const METHOD_LABEL: Record<string, string> = {
   load_calibrated: '正式载荷', gb_single_wave: 'GB单波', gb_bi_wave: 'GB双波',
-  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速',
+  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速', sim_baseline: '初始基线',
 }
 const REVIEW: Record<string, { label: string; cls: string }> = {
   approved: { label: '两人会签', cls: 'rv-ok' },
@@ -103,9 +106,17 @@ async function run(key: string, fn: (cid: number) => Promise<unknown>, ok: strin
   }
 }
 
-function submitQuick() {
+async function submitQuick() {
   if (quick.kL == null || quick.refTimeNs == null || quick.refTempC == null)
     return ElMessage.warning('kL / 基线声时 / 基线温度 必填')
+  // 前端先拦一道量级错误（本系统 ns/N 约定量级约 1e-4;按证书 1/N 约定填会差 7 个量级）,后端仍有物理护栏
+  if (quick.kL < 1e-6 || quick.kL > 1e-2) {
+    try {
+      await ElMessageBox.confirm(
+        `kL=${quick.kL} 偏离常见量级(约 1e-4 ns/N)。请确认按本系统 ns/N 约定填写,而非标定证书的 1/N 约定。继续提交？`,
+        'kL 量级确认', { type: 'warning', confirmButtonText: '确认提交', cancelButtonText: '返回修改' })
+    } catch { return }
+  }
   run('quick', (cid) => calibrationApi.quickCalibrate(cid, {
     kL: quick.kL!, refTimeNs: quick.refTimeNs!, refTempC: quick.refTempC!,
     kLUncertainty: quick.kLUncertainty, note: quick.note || undefined,
@@ -144,6 +155,18 @@ async function countersign(c: CalibRecord) {
       '会签激活', { confirmButtonText: '会签激活', cancelButtonText: '取消', type: 'warning' })
   } catch { return }
   await run('cs' + c.id, () => calibrationApi.countersign(cid, c.id), '已会签激活')
+}
+async function reject(c: CalibRecord) {
+  const cid = guard(); if (cid == null) return
+  let reason = ''
+  try {
+    const r = await ElMessageBox.prompt(
+      '请填写驳回原因（记入审计与档案备注）。驳回后该标定置为 rejected，不激活、不影响当前生效标定。',
+      '驳回正式标定',
+      { confirmButtonText: '确认驳回', cancelButtonText: '取消', inputType: 'textarea', inputPlaceholder: '例如：载荷点分布不合理 / R² 偏低 / 加载设备证书缺失' })
+    reason = (r.value || '').trim()
+  } catch { return }
+  await run('rj' + c.id, () => calibrationApi.reject(cid, c.id, reason || undefined), '已驳回该 pending 标定')
 }
 function addLoadRow() { loadPoints.value.push({ forceN: undefined, deltaTofNs: undefined }) }
 function delLoadRow(i: number) { loadPoints.value.splice(i, 1) }
@@ -267,10 +290,17 @@ async function downloadReport(id: number) {
           <div v-for="c in history" :key="c.id" class="tr">
             <span>{{ METHOD_LABEL[c.method] || c.method }} <i v-if="c.isActive" class="active">生效</i></span>
             <span class="mono">{{ Number(c.kL).toExponential(2) }}</span>
-            <span class="mono">{{ Number(c.rSquared).toFixed(3) }}</span>
+            <!-- 单点法(快速/扭矩估算)无回归,R² 占位 0 显示成"0.000 拟合极差"会误导 → 显示 — -->
+            <span class="mono">{{ ['quick', 'torque_estimate', 'sim_baseline'].includes(c.method) && Number(c.rSquared) === 0 ? '—' : Number(c.rSquared).toFixed(3) }}</span>
             <span><i class="rv" :class="REVIEW[c.reviewState]?.cls">{{ REVIEW[c.reviewState]?.label || c.reviewState }}</i></span>
             <span class="mono dim">{{ new Date(c.expiresAt).toLocaleDateString('zh-CN') }}</span>
-            <span><el-button v-if="c.reviewState === 'pending'" size="small" type="primary" text :loading="busy === 'cs' + c.id" @click="countersign(c)">会签</el-button></span>
+            <span>
+              <el-button v-if="c.reviewState === 'pending'" size="small" type="primary" text :loading="busy === 'cs' + c.id"
+                :disabled="c.operatorUserId === auth.userId"
+                :title="c.operatorUserId === auth.userId ? '不能会签自己提交的标定（两人四眼）' : ''"
+                @click="countersign(c)">会签</el-button>
+              <el-button v-if="c.reviewState === 'pending'" size="small" type="danger" text :loading="busy === 'rj' + c.id" @click="reject(c)">驳回</el-button>
+            </span>
           </div>
           <div v-if="!loadingData && !history.length" class="tbl-empty">该通道暂无标定档案</div>
         </div>

@@ -33,6 +33,13 @@ const ST: Record<string, { label: string; color: string }> = {
   rejected: { label: '已驳回', color: '#61748f' },
   failed: { label: '执行失败', color: '#f43f5e' },
 }
+// 通道超声参数的中文名（与后端 ChannelConfigUpdate 字段一一对应；历史数据可能存 PascalCase,统一小写匹配）
+const PARAM_LABEL: Record<string, string> = {
+  probefreqmhz: '探头频率(MHz)', gain: '增益(dB)', threshold: '检波阈值', measmode: '测量模式',
+  echowinns: '回波窗(ns)', echowidthus: '回波宽度(μs)', tcmode: '温补模式', tempcoefficient: '温度系数',
+  reftimens: '参考声时(ns)', reftempc: '参考温度(°C)',
+}
+const paramName = (k: string) => PARAM_LABEL[k.toLowerCase()] || k
 
 async function load() {
   loading.value = true
@@ -44,42 +51,73 @@ async function load() {
 }
 onMounted(() => {
   load()
-  timer = window.setInterval(load, 8000)
+  timer = window.setInterval(() => { if (!document.hidden) load() }, 8000)
 })
 onUnmounted(() => timer && clearInterval(timer))
 
-async function act(fn: () => Promise<unknown>, ok: string) {
+// 行级操作锁：审批/执行是有副作用的动作,双击不能重复发
+const actingId = ref<number | null>(null)
+async function act(id: number, fn: () => Promise<unknown>, ok: string) {
+  if (actingId.value != null) return
+  actingId.value = id
   try {
     await fn()
     ElMessage.success(ok)
     load()
   } catch (e) {
     ElMessage.error((e as Error)?.message || '操作失败')
+  } finally {
+    actingId.value = null
   }
 }
 async function approve(c: ConfigChange) {
-  await ElMessageBox.confirm(`审批通过变更 #${c.id}?(须与提交人不同)`, '审批', { type: 'warning', confirmButtonText: '审批通过', cancelButtonText: '取消' })
-  act(() => configChangeApi.approve(c.id), '已审批')
+  try {
+    await ElMessageBox.confirm(`审批通过变更 #${c.id}?(须与提交人不同)`, '审批', { type: 'warning', confirmButtonText: '审批通过', cancelButtonText: '取消' })
+  } catch { return }
+  act(c.id, () => configChangeApi.approve(c.id), '已审批')
 }
 async function reject(c: ConfigChange) {
-  const { value } = await ElMessageBox.prompt(`驳回变更 #${c.id},请填写原因:`, '驳回', {
-    inputType: 'textarea', confirmButtonText: '驳回', cancelButtonText: '取消',
-    inputValidator: (v) => (v && v.trim() ? true : '请填写驳回原因'),
-  })
-  act(() => configChangeApi.reject(c.id, value), '已驳回')
+  let value: string
+  try {
+    ;({ value } = await ElMessageBox.prompt(`驳回变更 #${c.id},请填写原因:`, '驳回', {
+      inputType: 'textarea', confirmButtonText: '驳回', cancelButtonText: '取消',
+      inputValidator: (v) => (v && v.trim() ? true : '请填写驳回原因'),
+    }))
+  } catch { return }
+  act(c.id, () => configChangeApi.reject(c.id, value), '已驳回')
 }
 async function execute(c: ConfigChange) {
-  await ElMessageBox.confirm(`执行下发变更 #${c.id} 到设备?`, '执行', { type: 'warning', confirmButtonText: '执行下发', cancelButtonText: '取消' })
-  act(() => configChangeApi.execute(c.id), '已下发')
+  try {
+    await ElMessageBox.confirm(`执行下发变更 #${c.id} 到设备?`, '执行', { type: 'warning', confirmButtonText: '执行下发', cancelButtonText: '取消' })
+  } catch { return }
+  act(c.id, () => configChangeApi.execute(c.id), '已下发')
 }
 async function verify(c: ConfigChange) {
-  act(() => configChangeApi.verify(c.id), '已发起读回验证')
+  // 读回比对是同步返回结果的：必须区分"验证通过"与"读回未到位/不一致"，不能一律报成功
+  if (actingId.value != null) return
+  actingId.value = c.id
+  try {
+    const r = await configChangeApi.verify(c.id)
+    if (r.status === 'verified') {
+      ElMessage.success('读回验证通过，参数已确认生效')
+    } else {
+      const bad = r.comparisons?.filter((x) => !x.match) ?? []
+      ElMessage.warning(bad.length
+        ? `读回尚未一致（${bad.map((x) => x.param).join('、')}），设备读回可能未到位，请稍后重试`
+        : '读回数据未到位，请稍后重试验证')
+    }
+    load()
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '验证失败')
+  } finally {
+    actingId.value = null
+  }
 }
 function params(c: ConfigChange) {
   if (!c.requested) return '—'
   try {
     const o = JSON.parse(c.requested)
-    return Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => `${k}=${v}`).join(', ') || '—'
+    return Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => `${paramName(k)}=${v}`).join(', ') || '—'
   } catch {
     return c.requested
   }
@@ -108,19 +146,24 @@ function fmt(iso: string | null) {
         <div class="tr th"><span>#</span><span>设备/通道</span><span>变更参数</span><span>状态</span><span>提交</span><span>审批</span><span>操作</span></div>
         <div v-for="c in items" :key="c.id" class="tr">
           <span class="mono">{{ c.id }}</span>
-          <span class="mono">dev{{ c.deviceId }} · CH{{ c.channelNo }}</span>
+          <span class="mono">设备{{ c.deviceId }} · CH{{ c.channelNo }}</span>
           <span class="params mono">{{ params(c) }}</span>
           <span><span class="st" :style="`color:${ST[c.status]?.color};border-color:${ST[c.status]?.color}`">{{ ST[c.status]?.label || c.status }}</span></span>
-          <span class="who">用户{{ c.requestedBy ?? '—' }}<br /><span class="dim mono">{{ fmt(c.requestedAt) }}</span></span>
-          <span class="who">{{ c.approvedBy ? '用户' + c.approvedBy : '—' }}</span>
+          <span class="who">{{ c.requestedByName || (c.requestedBy != null ? `用户#${c.requestedBy}` : '—') }}<br /><span class="dim mono">{{ fmt(c.requestedAt) }}</span></span>
+          <span class="who">{{ c.approvedByName || (c.approvedBy != null ? `用户#${c.approvedBy}` : '—') }}</span>
           <span class="ops">
             <el-button size="small" text @click="openDetail(c)">详情</el-button>
             <template v-if="c.status === 'requested'">
-              <el-button size="small" type="primary" text :disabled="!auth.isReviewer" @click="approve(c)">审批</el-button>
-              <el-button size="small" type="danger" text :disabled="!auth.isReviewer" @click="reject(c)">驳回</el-button>
+              <!-- 后端强制审批人≠提交人：本人提交的直接禁用,避免点了吃 400 -->
+              <el-button size="small" type="primary" text
+                :disabled="!auth.isReviewer || c.requestedBy === auth.userId"
+                :title="c.requestedBy === auth.userId ? '不能审批自己提交的变更（两人复核）' : ''"
+                :loading="actingId === c.id"
+                @click="approve(c)">审批</el-button>
+              <el-button size="small" type="danger" text :disabled="!auth.isReviewer" :loading="actingId === c.id" @click="reject(c)">驳回</el-button>
             </template>
-            <el-button v-else-if="c.status === 'approved'" size="small" type="primary" text @click="execute(c)">执行</el-button>
-            <el-button v-else-if="c.status === 'executed'" size="small" text @click="verify(c)">验证</el-button>
+            <el-button v-else-if="c.status === 'approved'" size="small" type="primary" text :loading="actingId === c.id" @click="execute(c)">执行</el-button>
+            <el-button v-else-if="c.status === 'executed'" size="small" text :loading="actingId === c.id" @click="verify(c)">验证</el-button>
           </span>
         </div>
         <div v-if="!loading && !items.length" class="tbl-empty"><span class="led led--ok" /> {{ statusFilter === 'pending' ? '无待办变更' : '无变更记录' }}</div>
@@ -139,17 +182,17 @@ function fmt(iso: string | null) {
 
     <el-dialog v-model="detail.visible" :title="detail.item ? `变更请求 #${detail.item.id}` : '变更详情'" width="540px">
       <div v-if="detail.item" class="dd">
-        <div class="dd-row"><span class="dd-k">设备 / 通道</span><b class="mono">dev{{ detail.item.deviceId }} · CH{{ detail.item.channelNo }}</b></div>
+        <div class="dd-row"><span class="dd-k">设备 / 通道</span><b class="mono">设备{{ detail.item.deviceId }} · CH{{ detail.item.channelNo }}</b></div>
         <div class="dd-row"><span class="dd-k">状态</span><span class="st" :style="`color:${ST[detail.item.status]?.color};border-color:${ST[detail.item.status]?.color}`">{{ ST[detail.item.status]?.label || detail.item.status }}</span></div>
         <div class="dd-sec">变更参数</div>
         <div v-if="paramPairs(detail.item).length" class="dd-params">
-          <div v-for="[k, v] in paramPairs(detail.item)" :key="k" class="dd-param"><span class="mono dd-pk">{{ k }}</span><b class="mono">{{ v }}</b></div>
+          <div v-for="[k, v] in paramPairs(detail.item)" :key="k" class="dd-param"><span class="dd-pk">{{ paramName(k) }}</span><b class="mono">{{ v }}</b></div>
         </div>
         <div v-else class="dd-empty">无参数</div>
         <div class="dd-sec">流程时间线</div>
-        <div class="dd-row"><span class="dd-k">提交</span><span>用户{{ detail.item.requestedBy ?? '—' }} · <span class="mono dim">{{ fmt(detail.item.requestedAt) }}</span></span></div>
-        <div class="dd-row"><span class="dd-k">审批</span><span>{{ detail.item.approvedBy ? '用户' + detail.item.approvedBy : '—' }} · <span class="mono dim">{{ fmt(detail.item.approvedAt) }}</span></span></div>
-        <div class="dd-row"><span class="dd-k">执行</span><span>{{ detail.item.executedBy ? '用户' + detail.item.executedBy : '—' }} · <span class="mono dim">{{ fmt(detail.item.executedAt) }}</span></span></div>
+        <div class="dd-row"><span class="dd-k">提交</span><span>{{ detail.item.requestedByName || (detail.item.requestedBy != null ? `用户#${detail.item.requestedBy}` : '—') }} · <span class="mono dim">{{ fmt(detail.item.requestedAt) }}</span></span></div>
+        <div class="dd-row"><span class="dd-k">审批</span><span>{{ detail.item.approvedByName || (detail.item.approvedBy != null ? `用户#${detail.item.approvedBy}` : '—') }} · <span class="mono dim">{{ fmt(detail.item.approvedAt) }}</span></span></div>
+        <div class="dd-row"><span class="dd-k">执行</span><span>{{ detail.item.executedByName || (detail.item.executedBy != null ? `用户#${detail.item.executedBy}` : '—') }} · <span class="mono dim">{{ fmt(detail.item.executedAt) }}</span></span></div>
         <div class="dd-row"><span class="dd-k">验证</span><span class="mono dim">{{ fmt(detail.item.verifiedAt) }}</span></div>
         <div v-if="detail.item.failureReason" class="dd-row dd-fail"><span class="dd-k">失败原因</span><span>{{ detail.item.failureReason }}</span></div>
         <div v-if="detail.item.note" class="dd-row"><span class="dd-k">备注</span><span>{{ detail.item.note }}</span></div>
@@ -168,8 +211,8 @@ function fmt(iso: string | null) {
 .hint { display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12px; margin-left: auto; }
 
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px 9px; }
-.tbl { padding: 4px 12px 14px; }
-.tr { display: grid; grid-template-columns: 44px 128px minmax(0, 1.4fr) 80px 128px 80px 120px; align-items: center; padding: 10px 8px; border-radius: 8px; font-size: 13px; }
+.tbl { padding: 4px 12px 14px; overflow-x: auto; }
+.tr { display: grid; grid-template-columns: 44px 128px minmax(0, 1.4fr) 80px 128px 80px 120px; align-items: center; padding: 10px 8px; border-radius: 8px; font-size: 13px; min-width: 720px; }
 .tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
 .tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
 .tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }

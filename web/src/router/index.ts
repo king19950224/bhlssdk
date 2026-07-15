@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useAuth } from '../stores/auth'
 import AppShell from '../layouts/AppShell.vue'
 
@@ -11,6 +12,7 @@ const routes: RouteRecordRaw[] = [
     component: AppShell,
     children: [
       { path: '', name: 'dashboard', component: () => import('../views/Dashboard.vue') },
+      { path: 'live', name: 'live', component: () => import('../views/LivePreload.vue') },
       { path: 'assets', name: 'assets', component: () => import('../views/AssetMonitor.vue') },
       { path: 'bolts/:boltId', name: 'boltDetail', component: () => import('../views/BoltDetail.vue') },
       { path: 'alarms', name: 'alarms', component: () => import('../views/Alarms.vue') },
@@ -38,7 +40,11 @@ router.beforeEach((to) => {
   if (to.name === 'login' && auth.isAuthed) return { name: auth.homeName }
   // M3：角色守卫——meta.roles 指定允许角色；当前角色不满足则回各自首页（后端仍有 403 兜底，这里做纵深防御 + UX）
   const roles = to.meta.roles as string[] | undefined
-  if (roles && (!auth.role || !roles.includes(auth.role))) return { name: auth.homeName }
+  if (roles && (!auth.role || !roles.includes(auth.role))) {
+    // 不再静默弹回首页：告知无权限,避免"点了没反应"的困惑
+    ElMessage.warning('当前账号无权访问该页面（需复核员或管理员权限）')
+    return { name: auth.homeName }
+  }
   return true
 })
 

@@ -8,6 +8,8 @@ import {
 } from '../api'
 import { useAuth } from '../stores/auth'
 import EmptyState from '../components/EmptyState.vue'
+import BoltCreateDialog from '../components/BoltCreateDialog.vue'
+import CalibrationWizard from '../components/CalibrationWizard.vue'
 
 const router = useRouter()
 const auth = useAuth()
@@ -31,10 +33,17 @@ let scanTimer: number | undefined
 const chanRows = ref<ChannelRow[]>([])
 const unbound = ref<UnboundSummaryRow[]>([])
 
+const devicesLoaded = ref(false)
 async function loadDevices() {
-  const rt = await runtimeApi.devices()
-  devices.value = rt.items
-  if (!selected.value && rt.items.length) selectDevice(rt.items[0])
+  try {
+    const rt = await runtimeApi.devices()
+    devices.value = rt.items
+    if (!selected.value && rt.items.length) selectDevice(rt.items[0])
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '设备运行时加载失败')
+  } finally {
+    devicesLoaded.value = true
+  }
 }
 async function selectDevice(d: RuntimeDevice) {
   selected.value = d
@@ -59,15 +68,18 @@ async function loadScan() {
     if (selected.value?.deviceId !== did) return
     scan.value = v
     scanning.value = scan.value?.status === 'running' || scan.value?.status === 'pending'
+    // 页面刷新/切换设备时若有扫描在跑,自动恢复轮询(否则进度卡住不动)
+    if (scanning.value && !scanTimer) pollScan()
   } catch { if (selected.value?.deviceId === did) { scan.value = null; scanning.value = false } }
 }
 async function loadBinding() {
   const did = selected.value?.deviceId
   if (did == null) return
   try {
-    const [list, ub] = await Promise.all([channelApi.list(), channelApi.unboundSummary()])
+    // deviceId 过滤下推到后端（原先拉全库再客户端过滤，通道多时白传一堆）
+    const [list, ub] = await Promise.all([channelApi.list({ deviceId: did }), channelApi.unboundSummary()])
     if (selected.value?.deviceId !== did) return
-    chanRows.value = list.items.filter((c) => c.deviceId === did)
+    chanRows.value = list.items
     unbound.value = ub.items.filter((u) => u.deviceId === did)
   } catch { /* ignore */ }
 }
@@ -158,6 +170,29 @@ async function unbind(c: ChannelRow) {
   } catch { /* 取消 */ }
 }
 
+// 建档并绑定（新接入螺栓的闭环）：预选该行通道打开对话框
+const createOpen = ref(false)
+const createChannelId = ref<number | null>(null)
+function openCreate(channelId: number | null) {
+  createChannelId.value = channelId
+  createOpen.value = true
+}
+
+// 建档完成 → 无缝接标定向导(接入闭环最后一步),复核员权限才弹
+const wizardOpen = ref(false)
+const wizardSel = ref<{ boltId: number; channelId: number; code: string } | null>(null)
+async function onBoltCreated(payload?: { boltId: number; channelId: number; code: string }) {
+  await loadBinding()
+  if (!payload || !auth.isReviewer) return
+  try {
+    await ElMessageBox.confirm(
+      `螺栓 ${payload.code} 已建档绑定。现在就完成标定吗？(标定后才能显示预紧力)`,
+      '继续标定', { type: 'info', confirmButtonText: '开始标定', cancelButtonText: '稍后再说' })
+  } catch { return }
+  wizardSel.value = payload
+  wizardOpen.value = true
+}
+
 // 通道自动检测判定（probe-scan verdict）→ 中文 + 颜色
 const VERDICT: Record<string, { label: string; color: string }> = {
   active_good: { label: '良好', color: '#10b981' },
@@ -178,7 +213,8 @@ const HW_STATE: Record<string, { label: string; color: string }> = {
 const DEV_STATE: Record<string, string> = { Connected: '在线', Connecting: '连接中', Reconnecting: '重连中', Disconnected: '离线', Faulted: '故障' }
 const SCAN_STATUS: Record<string, string> = { pending: '排队中', running: '检测中', completed: '已完成', failed: '失败', aborted: '已中止' }
 const CH_STATE: Record<string, string> = { manual: '手动', auto_discovered: '自动发现', auto: '自动' }
-function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n) }
+// 测量计数用中文"万"做紧凑显示——原先的 1.2k 缩写易被误读成 kN
+function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : String(Math.round(n)) }
 </script>
 
 <template>
@@ -194,16 +230,20 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
         <div class="dc-metrics">
           <div><b class="metric">{{ d.sessionChannels?.length ?? 0 }}</b><span>通道</span></div>
           <div><b class="metric">{{ fmt(d.channelResultCount ?? 0) }}</b><span>测量</span></div>
-          <div><b class="metric" :style="d.writeFailureCount ? 'color:var(--warn)' : ''">{{ d.writeFailureCount ?? 0 }}</b><span>写失败</span></div>
+          <div><b class="metric" :style="d.writeFailureCount ? 'color:var(--warn)' : ''">{{ d.writeFailureCount ?? 0 }}</b><span>异常</span></div>
         </div>
       </div>
-      <EmptyState v-if="!devices.length" empty empty-text="暂无设备运行时" />
+      <EmptyState v-if="!devices.length" :loading="!devicesLoaded" :empty="devicesLoaded" empty-text="暂无设备运行时" />
     </div>
 
     <div class="panel panel--glow" v-if="selected">
       <div class="panel-hd">
-        <span class="panel-title"><i class="hd-mark" />{{ selected.name }} · 调试控制台</span>
-        <router-link :to="{ name: 'identify' }" class="hd-link">敲击识别 →</router-link>
+        <span class="panel-title"><i class="hd-mark" />{{ selected.name }} · 设备控制台</span>
+        <router-link :to="{ name: 'identify', query: { deviceId: selected.deviceId } }" class="hd-link">敲击识别 →</router-link>
+      </div>
+      <div v-if="selected.state !== 'Connected'" class="offline-note">
+        <el-icon><WarningFilled /></el-icon>
+        设备当前{{ DEV_STATE[selected.state] || selected.state }},以下为最后一次已知快照;模式下发/自动检测/重标定需设备在线后执行。
       </div>
       <el-tabs v-model="tab" class="dev-tabs">
         <!-- 通道健康 -->
@@ -212,15 +252,17 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
             <span class="mb-k">工作模式：</span>
             <!-- set-mode 整组后端要求 reviewer+：所有工作模式按钮对 operator 一律禁用（不止 Reboot），与后端一致 -->
             <el-button v-for="m in MODES" :key="m.mode" size="small" :type="m.type" :loading="busyMode === m.mode"
-              :disabled="!auth.isReviewer" @click="setMode(m.mode, m.label)">{{ m.label }}</el-button>
-            <span class="mb-hint">扫描进行中不可切换</span>
+              :disabled="!auth.isReviewer || scanning" @click="setMode(m.mode, m.label)">{{ m.label }}</el-button>
+            <span class="mb-hint" v-if="scanning">通道自动检测进行中，暂不可切换</span>
+            <span class="mb-hint" v-else-if="!auth.isReviewer">需复核员权限</span>
           </div>
           <div class="tbl">
             <div class="tr th"><span>CH</span><span>螺栓</span><span>链路</span><span>测量</span><span>回波声时</span><span>温度</span><span>SNR</span><span>峰峰</span><span>操作</span></div>
             <div v-for="c in channels" :key="c.channelId" class="tr">
               <span class="mono">{{ c.channelNo }}</span>
               <span class="mono">{{ c.bolt?.code || '未绑定' }}</span>
-              <span class="hw"><span class="led" :class="c.measurement.healthy ? 'led--ok' : (c.measurement.total > 0 ? 'led--warn' : 'led--off')" />{{ HW_STATE[c.hardwareState]?.label || c.hardwareState }}</span>
+              <!-- 灯与文字同源（都按 hardwareState），避免出现"绿灯 + 噪声"的自相矛盾显示 -->
+              <span class="hw"><span class="led" :style="`background:${HW_STATE[c.hardwareState]?.color || '#61748f'};box-shadow:0 0 8px ${HW_STATE[c.hardwareState]?.color || '#61748f'}`" />{{ HW_STATE[c.hardwareState]?.label || c.hardwareState }}</span>
               <span class="mono">{{ c.measurement.total }} <i class="dim">/ {{ c.measurement.echoRatePct }}%</i></span>
               <span class="mono">{{ c.measurement.avgEchoNs != null ? Number(c.measurement.avgEchoNs).toFixed(0) : '—' }}</span>
               <span class="mono">{{ c.measurement.avgTempC != null ? Number(c.measurement.avgTempC).toFixed(1) + '°C' : '—' }}</span>
@@ -262,7 +304,8 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
         <el-tab-pane label="通道与绑定" name="bind">
           <div v-if="unbound.length" class="unbound-note">
             <el-icon><WarningFilled /></el-icon>
-            {{ unbound.length }} 个通道有未绑定数据堆积（等待绑定螺栓）：{{ unbound.map(u => 'CH' + u.channelNo + '(' + u.count + ')').join('、') }}
+            <span class="un-text">{{ unbound.length }} 个通道有未绑定数据堆积（等待绑定螺栓）：{{ unbound.map(u => 'CH' + u.channelNo + '(' + u.count + ')').join('、') }}</span>
+            <el-button size="small" type="primary" @click="openCreate(unbound[0]?.channelId ?? null)">建档绑定</el-button>
           </div>
           <div class="tbl">
             <div class="tr th binds"><span>CH</span><span>状态</span><span>螺栓</span><span>K_L</span><span>参考声时</span><span>操作</span></div>
@@ -274,6 +317,7 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
               <span class="mono">{{ c.refTimeNs != null ? Number(c.refTimeNs).toFixed(0) + 'ns' : '—' }}</span>
               <span>
                 <el-button v-if="c.boltId" size="small" text @click="router.push({ name: 'boltDetail', params: { boltId: c.boltId } })">详情</el-button>
+                <el-button v-if="!c.boltId" size="small" text type="primary" @click="openCreate(c.id)">建档绑定</el-button>
                 <el-button v-if="auth.isReviewer && c.boltId" size="small" text type="danger" @click="unbind(c)">解绑</el-button>
               </span>
             </div>
@@ -282,6 +326,15 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
         </el-tab-pane>
       </el-tabs>
     </div>
+
+    <BoltCreateDialog v-model="createOpen" :channel-id="createChannelId" @done="onBoltCreated" />
+    <CalibrationWizard
+      v-model="wizardOpen"
+      :bolt-id="wizardSel?.boltId ?? null"
+      :channel-id="wizardSel?.channelId ?? null"
+      :bolt-code="wizardSel?.code ?? ''"
+      @done="loadBinding(); loadHealth()"
+    />
   </div>
 </template>
 
@@ -301,6 +354,7 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
 .dc-metrics span { font-size: 11px; color: var(--text-3); }
 
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; }
+.offline-note { display: flex; align-items: center; gap: 8px; margin: 10px 20px 0; padding: 8px 12px; border: 1px solid var(--warn); border-radius: 8px; color: var(--warn); font-size: 12.5px; }
 .hd-link { font-size: 12px; }
 .dev-tabs { padding: 0 18px 12px; }
 .modebar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0 14px; }
@@ -309,10 +363,11 @@ function fmt(n: number) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : Strin
 .scan-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 6px 0 14px; }
 .scan-st { font-size: 13px; color: var(--text-2); }
 .scan-st .st-run { color: var(--accent); }
-.unbound-note { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--warn); padding: 4px 0 12px; }
+.unbound-note { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--warn); padding: 4px 0 12px; flex-wrap: wrap; }
+.unbound-note .un-text { flex: 1; min-width: 200px; }
 
-.tbl { padding: 4px 4px 8px; }
-.tr { display: grid; grid-template-columns: 50px 110px 130px 110px 100px 80px 70px 70px 90px; align-items: center; padding: 10px 10px; border-radius: 8px; font-size: 12.5px; }
+.tbl { padding: 4px 4px 8px; overflow-x: auto; }
+.tr { display: grid; grid-template-columns: 50px 110px 130px 110px 100px 80px 70px 70px 90px; align-items: center; padding: 10px 10px; border-radius: 8px; font-size: 12.5px; min-width: 820px; }
 .tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
 .tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
 .tr.th.scan, .tr.scan { grid-template-columns: 60px 90px 80px 90px 80px 70px 1fr; }

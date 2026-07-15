@@ -60,7 +60,7 @@ export async function startRealtime(): Promise<void> {
   starting = connection
     .start()
     .then(() => { realtimeState.value = 'connected' })
-    .catch((e) => { realtimeState.value = 'disconnected'; console.warn('SignalR 连接失败', e) })
+    .catch((e) => { realtimeState.value = 'disconnected'; if (import.meta.env.DEV) console.warn('SignalR 连接失败', e) })
     .finally(() => { starting = null })
   return starting
 }

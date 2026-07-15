@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, computed } from 'vue'
-import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { useRouter, useRoute } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { deviceApi, runtimeApi, boltApi, type ChannelLive } from '../api'
 
 const router = useRouter()
@@ -25,6 +25,11 @@ async function poll() {
   try {
     const d = await deviceApi.channelsLive(deviceId.value)
     rows.value = d.items
+    // 输入框用现有位号预填（仅首次,不覆盖正在编辑的内容）,避免"没输入就点标注"把已有位号清空
+    for (const it of d.items) {
+      if (labelEdit.value[it.channelNo] === undefined && it.positionLabel)
+        labelEdit.value[it.channelNo] = it.positionLabel
+    }
     const score: Record<number, number> = {}
     for (const it of d.items) {
       const h = hist.get(it.channelNo) ?? { echo: [], p2p: [] }
@@ -52,11 +57,17 @@ async function poll() {
   }
 }
 
+const route = useRoute()
 onMounted(async () => {
   try {
     const rt = await runtimeApi.devices()
-    // 取主设备/第一个设备；无设备则留空（不再硬编码 deviceId=1 误轮询不存在的设备）
-    deviceId.value = rt.items.find((x) => x.isPrimary)?.deviceId ?? rt.items[0]?.deviceId ?? null
+    // 优先取路由参数（从设备页跳转时保持同一设备），否则主设备/第一个设备；无设备则留空
+    const fromQuery = Number(route.query.deviceId)
+    deviceId.value =
+      (Number.isFinite(fromQuery) && rt.items.some((x) => x.deviceId === fromQuery) ? fromQuery : null)
+      ?? rt.items.find((x) => x.isPrimary)?.deviceId
+      ?? rt.items[0]?.deviceId
+      ?? null
   } catch {
     deviceId.value = null
   }
@@ -65,7 +76,7 @@ onMounted(async () => {
     return
   }
   await poll()
-  timer = window.setInterval(poll, 1000)
+  timer = window.setInterval(() => { if (!document.hidden) poll() }, 1000)
 })
 onUnmounted(() => timer && clearInterval(timer))
 
@@ -88,6 +99,12 @@ function sigPct(p2p: number | null) {
 async function savePosition(it: ChannelLive) {
   if (it.boltId == null) return ElMessage.warning('该通道未绑定螺栓,无法标位置')
   const label = (labelEdit.value[it.channelNo] ?? '').trim()
+  // 清空已有位号必须是明确动作，不能因为没输入就静默清掉
+  if (!label && it.positionLabel) {
+    try {
+      await ElMessageBox.confirm(`输入为空，将清空 CH${it.channelNo} 的现有位号「${it.positionLabel}」，确认？`, '清空位号', { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' })
+    } catch { return }
+  }
   savingPos.value = it.channelNo
   try {
     await boltApi.updateSettings(it.boltId, { positionLabel: label })
@@ -103,13 +120,13 @@ async function savePosition(it: ChannelLive) {
 
 <template>
   <div class="ident rise" v-loading="loading">
-    <div class="ident-hd">
-      <div>
-        <h2>通道识别</h2>
-        <p class="sub">依次<b>轻敲或微动每一颗螺栓</b>,信号跳动的通道会高亮 → 这就是你正在碰的那颗,顺手填上它的位置。</p>
+    <div class="ident-hd panel">
+      <div class="ident-intro">
+        <span class="panel-title"><i class="hd-mark" />通道识别</span>
+        <p class="sub">依次<b>轻敲或微动每一颗螺栓</b>,信号跳动的通道会自动高亮,即为该螺栓对应的通道,可就地填写现场位号。</p>
       </div>
       <div class="legend">
-        <span><i class="dot moving" /> 正在跳动(你碰的)</span>
+        <span><i class="dot moving" /> 正在跳动(当前敲击)</span>
         <span><i class="dot probe" /> 有探头(强信号)</span>
         <span><i class="dot weak" /> 弱/无信号</span>
       </div>
@@ -118,7 +135,7 @@ async function savePosition(it: ChannelLive) {
     <div class="grid">
       <div
         v-for="it in sorted" :key="it.channelNo"
-        class="ch" :class="{ moving: topMover === it.channelNo, weak: !isProbe(it) }">
+        class="ch panel" :class="{ moving: topMover === it.channelNo, weak: !isProbe(it) }">
         <div class="ch-hd">
           <span class="ch-no">CH{{ it.channelNo }}</span>
           <span v-if="topMover === it.channelNo" class="moving-tag">← 正在动</span>
@@ -141,38 +158,40 @@ async function savePosition(it: ChannelLive) {
 
         <div class="ch-pos">
           <el-input v-model="labelEdit[it.channelNo]" :placeholder="it.positionLabel || '位置,如 12点'" size="small" :disabled="it.boltId == null" />
-          <el-button size="small" type="primary" :loading="savingPos === it.channelNo" :disabled="it.boltId == null" @click="savePosition(it)">标</el-button>
+          <el-button size="small" type="primary" :loading="savingPos === it.channelNo" :disabled="it.boltId == null" @click="savePosition(it)">标注</el-button>
         </div>
         <div v-if="it.positionLabel" class="ch-curpos">当前: {{ it.positionLabel }}</div>
         <div class="ch-open" @click="it.boltId && router.push({ name: 'boltDetail', params: { boltId: it.boltId } })">
           <span v-if="it.boltId">查看实时波形 →</span>
         </div>
       </div>
-      <div v-if="!loading && !rows.length" class="empty">暂无在出数的通道</div>
+      <div v-if="!loading && !rows.length" class="empty">
+        {{ deviceId == null ? '未找到采集设备运行时,请先到「采集设备」页确认设备已接入' : '暂无在出数的通道(设备可能离线或探头未接)' }}
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.ident { display: flex; flex-direction: column; gap: 18px; }
-.ident-hd { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
-.ident-hd h2 { margin: 0 0 6px; font-size: 22px; font-weight: 700; }
-.sub { font-size: 13px; color: var(--text-3); max-width: 640px; line-height: 1.6; }
+.ident { display: flex; flex-direction: column; gap: 16px; }
+.ident-hd { display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap; padding: 16px 20px; }
+.ident-intro { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.sub { margin: 0; font-size: 13px; color: var(--text-3); max-width: 640px; line-height: 1.6; }
 .sub b { color: var(--accent); }
 .legend { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--text-3); }
 .legend span { display: flex; align-items: center; gap: 7px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-.dot.moving { background: #f59e0b; }
-.dot.probe { background: #10b981; }
+.dot.moving { background: var(--warn); }
+.dot.probe { background: var(--ok); }
 .dot.weak { background: #3b4659; }
 
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
-.ch { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px; padding: 14px 16px; transition: all 0.2s; }
+.ch { padding: 14px 16px; transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s, opacity 0.2s; }
 .ch.weak { opacity: 0.5; }
-.ch.moving { border-color: #f59e0b; box-shadow: 0 0 24px -6px rgba(245, 158, 11, 0.6); transform: translateY(-2px); }
+.ch.moving { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn), 0 10px 28px -14px var(--warn-glow); transform: translateY(-1px); }
 .ch-hd { display: flex; align-items: center; gap: 8px; }
 .ch-no { font-size: 15px; font-weight: 700; }
-.moving-tag { font-size: 11px; color: #f59e0b; font-weight: 700; animation: blink 0.8s steps(2) infinite; }
+.moving-tag { font-size: 11px; color: var(--warn); font-weight: 700; animation: blink 0.8s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0.3; } }
 .ch-bolt { font-size: 11px; color: var(--text-3); margin-left: auto; }
 .ch-echo { font-size: 26px; font-weight: 700; margin: 8px 0 4px; color: var(--accent); }
@@ -180,9 +199,9 @@ async function savePosition(it: ChannelLive) {
 .noecho { font-size: 13px; color: var(--text-3); font-weight: 400; }
 .ch-sig { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
 .sig-bar { height: 6px; border-radius: 3px; background: rgba(148, 163, 184, 0.12); overflow: hidden; }
-.sig-fill { height: 100%; background: linear-gradient(90deg, #22d3ee, #10b981); border-radius: 3px; transition: width 0.4s; }
+.sig-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--ok)); border-radius: 3px; transition: width 0.4s; }
 .sig-txt { font-size: 10.5px; color: var(--text-3); }
-.ch-move { font-size: 11px; color: #f59e0b; height: 16px; }
+.ch-move { font-size: 11px; color: var(--warn); height: 16px; }
 .ch-pos { display: flex; gap: 6px; margin-top: 8px; }
 .ch-curpos { font-size: 11px; color: var(--accent-2); margin-top: 5px; }
 .ch-open { font-size: 11px; color: var(--accent); cursor: pointer; margin-top: 8px; height: 14px; }

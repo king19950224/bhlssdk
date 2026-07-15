@@ -78,6 +78,7 @@ const filtered = computed(() => {
 
 const openSelected = computed(() => filtered.value.filter((a) => a.isOpen && sel.value[a.id]))
 
+const loadError = ref<string | null>(null)
 async function load() {
   loading.value = true
   try {
@@ -90,8 +91,12 @@ async function load() {
     items.value = list.items
     summary.value = sum.items
     shelvings.value = shv.items
+    loadError.value = null
     const ids = new Set(items.value.map((a) => a.id))
     for (const k of Object.keys(sel.value)) if (!ids.has(Number(k))) delete sel.value[Number(k)]
+  } catch (e) {
+    // 拉取失败必须让用户知道列表是旧数据，不能静默装"无告警"
+    loadError.value = e instanceof Error ? e.message : '告警列表刷新失败'
   } finally {
     loading.value = false
   }
@@ -120,33 +125,45 @@ async function ack(a: AlarmItem) {
 }
 async function clear(a: AlarmItem) {
   try {
-    const { value } = await ElMessageBox.prompt('闭合表示"已恢复/处置完成"。请填写闭合原因（记入审计）:', `闭合告警 · ${a.boltCode}`, {
+    const { value } = await ElMessageBox.prompt('闭合表示"已恢复/处置完成"。请填写闭合原因（记入审计）。若测点仍越限，闭合后会立即重新触发。', `闭合告警 · ${a.boltCode}`, {
       confirmButtonText: '闭合', cancelButtonText: '取消', inputType: 'textarea',
-      inputValidator: (v) => (v && v.trim() ? true : '请填写闭合原因'),
+      inputValidator: (v) => {
+        if (!v || !v.trim()) return '请填写闭合原因'
+        if (v.trim().length > 500) return `闭合原因最多 500 字（当前 ${v.trim().length}）`
+        return true
+      },
     })
     await alarmApi.clear(a.id, value)
     ElMessage.success('已闭合')
     load()
   } catch { /* 取消 */ }
 }
+const bulkAcking = ref(false)
 async function bulkAck() {
+  if (bulkAcking.value) return
   const targets = openSelected.value.filter((a) => !a.isAcked)
   if (!targets.length) return ElMessage.warning('未选择待确认告警')
   try {
     await ElMessageBox.confirm(`批量确认 ${targets.length} 条告警？（备注统一记"批量确认"）`, '批量确认', { type: 'warning' })
   } catch { return }
-  for (const a of targets) {
-    try { await alarmApi.ack(a.id, '批量确认') } catch { /* 单条失败不阻断 */ }
+  bulkAcking.value = true
+  try {
+    for (const a of targets) {
+      try { await alarmApi.ack(a.id, '批量确认') } catch { /* 单条失败不阻断 */ }
+    }
+    ElMessage.success(`已确认 ${targets.length} 条`)
+    sel.value = {}
+    load()
+  } finally {
+    bulkAcking.value = false
   }
-  ElMessage.success(`已确认 ${targets.length} 条`)
-  sel.value = {}
-  load()
 }
 
 // ---- 抑制（shelve）：创建 + 生效列表 + 取消 ----
-const shelve = reactive({ visible: false, alarm: null as AlarmItem | null, hours: 24, reason: '', saving: false })
+// scope: type=仅该类型；bolt=该螺栓全部类型（换探头等整颗维护，后端 alarmType=null 通配）
+const shelve = reactive({ visible: false, alarm: null as AlarmItem | null, hours: 24, reason: '', scope: 'type' as 'type' | 'bolt', saving: false })
 function openShelve(a: AlarmItem) {
-  shelve.alarm = a; shelve.hours = 24; shelve.reason = ''; shelve.visible = true
+  shelve.alarm = a; shelve.hours = 24; shelve.reason = ''; shelve.scope = 'type'; shelve.visible = true
 }
 async function confirmShelve() {
   if (!shelve.alarm) return
@@ -154,7 +171,11 @@ async function confirmShelve() {
   if (!shelve.reason || shelve.reason.trim().length < 5) return ElMessage.warning('原因至少 5 字')
   shelve.saving = true
   try {
-    await alarmApi.shelve({ boltId: shelve.alarm.boltId, alarmType: shelve.alarm.type, hours: shelve.hours, reason: shelve.reason })
+    await alarmApi.shelve({
+      boltId: shelve.alarm.boltId,
+      alarmType: shelve.scope === 'type' ? shelve.alarm.type : undefined,
+      hours: shelve.hours, reason: shelve.reason,
+    })
     ElMessage.success(`已抑制 ${shelve.hours} 小时`)
     shelve.visible = false
     load()
@@ -201,10 +222,17 @@ function ago(iso: string | null) {
 function durationOf(a: AlarmItem) {
   const end = a.clearedAt ? new Date(a.clearedAt).getTime() : now.value
   const s = Math.max(0, Math.floor((end - new Date(a.triggeredAt).getTime()) / 1000))
-  if (s < 60) return `${s}s`
-  if (s < 3600) return `${Math.floor(s / 60)}m`
-  if (s < 86400) return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`
-  return `${Math.floor(s / 86400)}d${Math.floor((s % 86400) / 3600)}h`
+  if (s < 60) return `${s} 秒`
+  if (s < 3600) return `${Math.floor(s / 60)} 分`
+  if (s < 86400) return `${Math.floor(s / 3600)} 时 ${Math.floor((s % 3600) / 60)} 分`
+  return `${Math.floor(s / 86400)} 天 ${Math.floor((s % 86400) / 3600)} 时`
+}
+// 开启中的告警：条件最近一次命中距今（≤2 分钟视为"仍在越限"）。null=后端旧数据，无法判定。
+function lastHitOf(a: AlarmItem): { label: string; live: boolean } | null {
+  if (!a.isOpen || !a.lastActiveAt) return null
+  const s = Math.floor((now.value - new Date(a.lastActiveAt).getTime()) / 1000)
+  if (s <= 120) return { label: '仍在越限', live: true }
+  return { label: `最后命中 ${ago(a.lastActiveAt)}`, live: false }
 }
 // 触发值 vs 阈值（工程可追溯：告警行直接给"值/限"）
 function valueOf(a: AlarmItem) {
@@ -269,7 +297,7 @@ function limitOf(a: AlarmItem) {
       <el-input v-model="search" size="small" placeholder="搜索螺栓 / 信息" clearable style="width: 180px">
         <template #prefix><el-icon><Search /></el-icon></template>
       </el-input>
-      <el-button size="small" :disabled="!openSelected.length" @click="bulkAck">批量确认 ({{ openSelected.length }})</el-button>
+      <el-button size="small" :disabled="!openSelected.length" :loading="bulkAcking" @click="bulkAck">批量确认 ({{ openSelected.length }})</el-button>
     </div>
 
     <!-- 告警列表 -->
@@ -278,7 +306,11 @@ function limitOf(a: AlarmItem) {
         <span class="panel-title"><i class="hd-mark hd-mark--crit" />告警列表</span>
         <span class="hd-sub mono">{{ filtered.length }} 条</span>
       </div>
-      <div class="tbl">
+      <div v-if="loadError" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 告警列表刷新失败（显示的可能是旧数据）：{{ loadError }}
+        <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
+      <div class="tbl" v-loading="loading">
         <div class="tr th">
           <span></span><span>级别</span><span>类型</span><span>螺栓</span><span>触发值 / 限</span><span>信息</span><span>触发时间</span><span>持续</span><span>状态</span><span>操作</span>
         </div>
@@ -296,7 +328,10 @@ function limitOf(a: AlarmItem) {
           </span>
           <span class="msg" :title="a.message || ''">{{ a.message || '—' }}</span>
           <span class="mono time"><b>{{ fmtAbs(a.triggeredAt) }}</b><i>{{ ago(a.triggeredAt) }}</i></span>
-          <span class="mono dim">{{ durationOf(a) }}</span>
+          <span class="mono time dur">
+            <b>{{ durationOf(a) }}</b>
+            <i v-if="lastHitOf(a)" :class="{ hot: lastHitOf(a)!.live }">{{ lastHitOf(a)!.label }}</i>
+          </span>
           <span>
             <span v-if="!a.isOpen" class="st st-cleared" :title="`闭合原因：${a.clearedReason || '—'}${a.clearedBy ? ' · by ' + a.clearedBy : ''}`">已闭合<i v-if="a.clearedBy"> · {{ a.clearedBy }}</i></span>
             <span v-else-if="a.isAcked" class="st st-acked" :title="`确认备注：${a.ackedNote || '—'}`">已确认<i v-if="a.ackedBy"> · {{ a.ackedBy }}</i></span>
@@ -328,15 +363,22 @@ function limitOf(a: AlarmItem) {
           <span>{{ s.alarmType ? (TYPE_LABEL[s.alarmType] || s.alarmType) : '全部类型' }}</span>
           <span class="dim">{{ s.shelvedByName ?? '—' }}</span>
           <span class="msg" :title="s.reason">{{ s.reason }}</span>
-          <span class="mono time"><b>{{ fmtAbs(s.expiresAt) }}</b><i>{{ ago(s.shelvedAt) }}设</i></span>
+          <span class="mono time"><b>{{ fmtAbs(s.expiresAt) }}</b><i>设置于 {{ ago(s.shelvedAt) }}</i></span>
           <span><el-button size="small" text type="warning" @click="cancelShelving(s)">取消抑制</el-button></span>
         </div>
       </div>
     </div>
 
     <el-dialog v-model="shelve.visible" title="抑制告警（维护时段）" width="460px">
-      <p class="dlg-sub" v-if="shelve.alarm">抑制【{{ shelve.alarm.boltCode }} · {{ TYPE_LABEL[shelve.alarm.type] || shelve.alarm.type }}】在指定时长内不再触发；生效中的抑制在下方面板可见、可随时取消。</p>
+      <p class="dlg-sub" v-if="shelve.alarm">抑制【{{ shelve.alarm.boltCode }}】在指定时长内不再触发；生效中的抑制在下方面板可见、可随时取消。</p>
       <el-form label-width="90px" label-position="left">
+        <el-form-item label="范围">
+          <el-radio-group v-model="shelve.scope">
+            <el-radio value="type">仅 {{ shelve.alarm ? (TYPE_LABEL[shelve.alarm.type] || shelve.alarm.type) : '此类型' }}</el-radio>
+            <el-radio value="bolt">该螺栓全部类型</el-radio>
+          </el-radio-group>
+          <div v-if="shelve.scope === 'bolt'" class="scope-hint">整颗维护（如换探头）：同时静默信号丢失与预紧力类告警</div>
+        </el-form-item>
         <el-form-item label="时长(小时)"><el-input-number v-model="shelve.hours" :min="1" :max="168" :step="1" controls-position="right" style="width:100%" /></el-form-item>
         <el-form-item label="原因"><el-input v-model="shelve.reason" type="textarea" :rows="3" placeholder="≥5 字，记入档案" /></el-form-item>
       </el-form>
@@ -368,8 +410,8 @@ function limitOf(a: AlarmItem) {
 .seg-tab:hover { color: var(--text-1); }
 .seg-tab.active { color: var(--accent); background: rgba(34, 211, 238, 0.1); font-weight: 600; }
 
-.tbl { padding: 4px 12px 14px; }
-.tr { display: grid; grid-template-columns: 30px 76px 100px 104px 108px 1fr 148px 64px 130px 150px; align-items: center; padding: 9px 8px; border-radius: 8px; font-size: 13px; gap: 4px; }
+.tbl { padding: 4px 12px 14px; overflow-x: auto; }
+.tr { display: grid; grid-template-columns: 30px 76px 100px 104px 108px 1fr 148px 96px 130px 150px; align-items: center; padding: 9px 8px; border-radius: 8px; font-size: 13px; gap: 4px; min-width: 1080px; }
 .tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
 .tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
 .tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; }
@@ -379,6 +421,7 @@ function limitOf(a: AlarmItem) {
 .tr.unacked--warn { box-shadow: inset 3px 0 0 var(--warn), inset 0 -1px 0 var(--hairline); }
 .tr.unacked--info { box-shadow: inset 3px 0 0 var(--info), inset 0 -1px 0 var(--hairline); }
 .tr.shv { grid-template-columns: 120px 130px 100px 1fr 168px 100px; }
+.load-error { display: flex; align-items: center; gap: 8px; margin: 4px 16px 8px; padding: 8px 12px; border: 1px solid var(--crit); border-radius: 8px; color: var(--crit); font-size: 12.5px; }
 
 .sev { display: flex; align-items: center; gap: 8px; }
 .msg { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -390,6 +433,8 @@ function limitOf(a: AlarmItem) {
 .time { display: flex; flex-direction: column; line-height: 1.25; }
 .time b { font-weight: 500; font-size: 12px; }
 .time i { font-style: normal; font-size: 10.5px; color: var(--text-3); }
+.dur i.hot { color: var(--crit); font-weight: 600; }
+.scope-hint { font-size: 11.5px; color: var(--text-3); line-height: 1.4; margin-top: 2px; }
 .st { font-size: 11px; padding: 2px 9px; border-radius: 10px; white-space: nowrap; }
 .st i { font-style: normal; opacity: 0.85; }
 .st-open { color: var(--crit); border: 1px solid var(--crit); }
@@ -400,6 +445,6 @@ function limitOf(a: AlarmItem) {
 .dlg-sub { font-size: 13px; color: var(--text-2); margin: 0 0 14px; }
 
 @media (max-width: 1280px) {
-  .tr { grid-template-columns: 30px 70px 92px 96px 96px 1fr 130px 56px 116px 140px; font-size: 12.5px; }
+  .tr { grid-template-columns: 30px 70px 92px 96px 96px 1fr 130px 84px 116px 140px; font-size: 12.5px; }
 }
 </style>

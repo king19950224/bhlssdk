@@ -19,6 +19,7 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
     private const string FileExtension = ".json";
     private const string TmpSuffix = ".tmp";
     private const string CorruptSuffix = ".corrupt";
+    private const int MaxReplayPerRound = 500;
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -61,6 +62,10 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
         if (envelope.ResultType is not (FxResultType.ChannelResult or FxResultType.MultiChannelResult))
             return;
 
+        // WAL 的职责是断网期兜底补写测量“元数据”（声时/温度/状态码），不是波形归档：
+        // 带波形的条目单条可达数百 KB，DB 故障窗口内会把磁盘和序列化 CPU 打爆——落盘前剥离波形。
+        envelope = StripWaves(envelope);
+
         byte[] bytes;
         try
         {
@@ -101,6 +106,9 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
         try
         {
             var files = ListWalFilesSorted();
+            // 单轮限量：积压数万条时不无限持有 _gate（会把热路径 Append 卡死），剩余留给下一轮（15s 周期）
+            if (files.Count > MaxReplayPerRound)
+                files = files.Take(MaxReplayPerRound).ToList();
             var replayed = 0;
 
             for (var i = 0; i < files.Count; i++)
@@ -223,6 +231,23 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
         {
             _logger.LogWarning(ex, "删除 WAL 条目失败 file={File}", Path.GetFileName(path));
         }
+    }
+
+    private static FxDecodedEnvelope StripWaves(FxDecodedEnvelope envelope)
+    {
+        if (envelope.EchoWave is not null)
+            envelope = envelope with { EchoWave = null };
+        if (envelope.ChannelResult?.EchoWave is not null)
+            envelope = envelope with { ChannelResult = envelope.ChannelResult with { EchoWave = null } };
+        var mc = envelope.MultiChannelResult;
+        if (mc is not null && mc.Channels.Values.Any(c => c.EchoWave is not null))
+        {
+            var stripped = mc.Channels.ToDictionary(
+                kv => kv.Key,
+                kv => kv.Value.EchoWave is null ? kv.Value : kv.Value with { EchoWave = null });
+            envelope = envelope with { MultiChannelResult = new FxMultiChannelResultDto(stripped) };
+        }
+        return envelope;
     }
 
     public void Dispose() => _gate.Dispose();

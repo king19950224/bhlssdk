@@ -23,7 +23,7 @@ public static class AuthEndpoints
 
             const string sql = @"
                 SELECT id, username, role, password_hash, enabled, locked_until, failed_attempts, token_version
-                FROM users WHERE username = @u";
+                FROM users WHERE username = @u AND deleted_at IS NULL";
             await using var cmd = ds.CreateCommand(sql);
             cmd.Parameters.AddWithValue("u", NpgsqlDbType.Varchar, req.Username);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -47,6 +47,8 @@ public static class AuthEndpoints
 
             if (!enabled)
             {
+                // 与"用户不存在"分支同延时同状态码：否则响应时序差异可区分"存在但被禁用"，辅助账号枚举
+                await Task.Delay(120, ct);
                 logger.LogWarning("登录失败 username={U}（账号已禁用）", username);
                 return Results.Unauthorized();
             }
@@ -57,6 +59,7 @@ public static class AuthEndpoints
             }
             if (string.IsNullOrEmpty(hash))
             {
+                await Task.Delay(120, ct);  // 同上：拉平时序差异
                 logger.LogWarning("登录失败 username={U}（无 password_hash，账号待设置）", username);
                 return Results.Unauthorized();
             }
@@ -105,6 +108,21 @@ public static class AuthEndpoints
         .WithName("CurrentUser")
         .WithSummary("当前登录用户");
 
+        // 登出：服务端吊销。仅前端清 localStorage 挡不住已泄露/被窥的令牌继续用到过期(默认 8h)；
+        // token_version 自增让该用户全部已签发令牌立即失效(共享工控机/离岗场景的硬性要求)。
+        grp.MapPost("/logout", async (HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            var user = UserContext.Require(http);
+            await using var cmd = ds.CreateCommand(
+                "UPDATE users SET token_version = token_version + 1 WHERE id = @id AND deleted_at IS NULL");
+            cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, user.UserId);
+            await cmd.ExecuteNonQueryAsync(ct);
+            return Results.Ok(new { loggedOut = true });
+        })
+        .RequireAuthorization(AuthPolicies.LoggedIn)
+        .WithName("Logout")
+        .WithSummary("登出（令牌版本自增,该用户所有已签发令牌立即失效）");
+
         // 管理员创建 / 重置用户。仅 admin。
         grp.MapPost("/users", async (
             CreateUserRequest req, HttpContext http, NpgsqlDataSource ds,
@@ -120,6 +138,39 @@ public static class AuthEndpoints
             var acc = new UserAccount { Username = req.Username, Role = req.Role };
             var hash = hasher.HashPassword(acc, req.Password);
 
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            // 本端点按 username upsert，会直接覆盖既有用户的 role——
+            // 若目标是现存 enabled admin 且要降为非 admin，必须保证还有别的 enabled admin，
+            // 否则唯一管理员一次"重置自己"就把系统锁死在无人可管的状态。
+            // FOR UPDATE 锁住全部 enabled admin 行，防两个并发降权请求互相看不见对方。
+            if (req.Role != AuthRoles.Admin)
+            {
+                var targetIsEnabledAdmin = false;
+                var otherEnabledAdmins = 0;
+                await using (var cmd = new NpgsqlCommand(@"
+                    SELECT username FROM users
+                    WHERE role = @admin AND enabled = true AND deleted_at IS NULL
+                    FOR UPDATE", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("admin", NpgsqlDbType.Varchar, AuthRoles.Admin);
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    while (await r.ReadAsync(ct))
+                    {
+                        if (string.Equals(r.GetString(0), req.Username, StringComparison.Ordinal))
+                            targetIsEnabledAdmin = true;
+                        else
+                            otherEnabledAdmins++;
+                    }
+                }
+                if (targetIsEnabledAdmin && otherEnabledAdmins == 0)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new { error = "不能把最后一名启用状态的管理员降权：系统将失去用户管理能力" });
+                }
+            }
+
             const string sql = @"
                 INSERT INTO users (username, full_name, email, password_hash, role, enabled)
                 VALUES (@u, @full, @em, @h, @r, true)
@@ -129,17 +180,22 @@ public static class AuthEndpoints
                         password_hash = EXCLUDED.password_hash,
                         role      = EXCLUDED.role,
                         enabled   = true,
+                        deleted_at = NULL,
                         failed_attempts = 0,
                         locked_until = NULL,
                         token_version = users.token_version + 1
                 RETURNING id";
-            await using var cmd = ds.CreateCommand(sql);
-            cmd.Parameters.AddWithValue("u", NpgsqlDbType.Varchar, req.Username);
-            cmd.Parameters.AddWithValue("full", NpgsqlDbType.Varchar, (object?)req.FullName ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("em", NpgsqlDbType.Varchar, (object?)req.Email ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("h", NpgsqlDbType.Varchar, hash);
-            cmd.Parameters.AddWithValue("r", NpgsqlDbType.Varchar, req.Role);
-            var id = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
+            long id;
+            await using (var cmd = new NpgsqlCommand(sql, conn, tx))
+            {
+                cmd.Parameters.AddWithValue("u", NpgsqlDbType.Varchar, req.Username);
+                cmd.Parameters.AddWithValue("full", NpgsqlDbType.Varchar, (object?)req.FullName ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("em", NpgsqlDbType.Varchar, (object?)req.Email ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("h", NpgsqlDbType.Varchar, hash);
+                cmd.Parameters.AddWithValue("r", NpgsqlDbType.Varchar, req.Role);
+                id = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
+            }
+            await tx.CommitAsync(ct);
 
             var actor = UserContext.Require(http);
             await WriteUserAuditAsync(ds, actor.UserId, "user_create", id,
@@ -149,7 +205,7 @@ public static class AuthEndpoints
         })
         .RequireAuthorization(AuthPolicies.AdminAccess)
         .WithName("CreateUser")
-        .WithSummary("创建 / 重置用户（admin）");
+        .WithSummary("创建 / 重置用户（admin；不可把最后一名管理员降权）");
 
         // 用户列表（admin）
         grp.MapGet("/users", async (NpgsqlDataSource ds, CancellationToken ct) =>
@@ -177,30 +233,120 @@ public static class AuthEndpoints
         .WithName("ListUsers")
         .WithSummary("用户列表（admin）");
 
-        // 启用 / 停用用户（admin,不能停用自己）
+        // 启用 / 停用用户（admin,不能停用自己,不能停用最后一名 enabled admin）
         grp.MapPost("/users/{id:long}/toggle", async (long id, HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
         {
             var actor = UserContext.Require(http);
             if (actor.UserId == id) return Results.BadRequest(new { error = "不能停用自己的账号" });
 
-            string username;
-            bool enabled;
-            await using (var cmd = ds.CreateCommand(@"
-                UPDATE users SET enabled = NOT enabled, token_version = token_version + 1 WHERE id=@id AND deleted_at IS NULL
-                RETURNING username, enabled"))
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            // 先锁目标行读当前态（reader 关闭后再回滚/返回，避免 404 变 500）
+            string? username = null;
+            string role = "";
+            var wasEnabled = false;
+            await using (var cmd = new NpgsqlCommand(@"
+                SELECT username, role, enabled FROM users
+                WHERE id = @id AND deleted_at IS NULL
+                FOR UPDATE", conn, tx))
             {
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
-                if (!await r.ReadAsync(ct)) return Results.NotFound(new { error = "用户不存在", id });
-                username = r.GetString(0);
-                enabled = r.GetBoolean(1);
+                if (await r.ReadAsync(ct))
+                {
+                    username = r.GetString(0);
+                    role = r.GetString(1);
+                    wasEnabled = r.GetBoolean(2);
+                }
             }
+            if (username is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "用户不存在", id });
+            }
+
+            // 即将停用一名 enabled admin：必须还有别的 enabled admin，否则系统失去用户管理能力
+            if (wasEnabled && role == AuthRoles.Admin)
+            {
+                await using var cnt = new NpgsqlCommand(@"
+                    SELECT count(*) FROM users
+                    WHERE role = @admin AND enabled = true AND deleted_at IS NULL AND id <> @id", conn, tx);
+                cnt.Parameters.AddWithValue("admin", NpgsqlDbType.Varchar, AuthRoles.Admin);
+                cnt.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
+                if ((long)(await cnt.ExecuteScalarAsync(ct))! == 0)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new { error = "不能停用最后一名启用状态的管理员" });
+                }
+            }
+
+            bool enabled;
+            await using (var cmd = new NpgsqlCommand(@"
+                UPDATE users SET enabled = NOT enabled, token_version = token_version + 1 WHERE id = @id
+                RETURNING enabled", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
+                enabled = (bool)(await cmd.ExecuteScalarAsync(ct))!;
+            }
+            await tx.CommitAsync(ct);
+
             await WriteUserAuditAsync(ds, actor.UserId, "user_toggle", id, $"{(enabled ? "启用" : "停用")}用户 {username}", ct);
             return Results.Ok(new { id, username, enabled });
         })
         .RequireAuthorization(AuthPolicies.AdminAccess)
         .WithName("ToggleUser")
-        .WithSummary("启用/停用用户（admin）");
+        .WithSummary("启用/停用用户（admin；保护最后一名管理员）");
+
+        // 自助改密：验证旧密码 → 写新 hash → token_version 自增（本人所有旧令牌失效,须重新登录）。
+        // 没有这个端点时用户只能找 admin 重置,现场用不起来。
+        grp.MapPost("/change-password", async (
+            ChangePasswordRequest req, HttpContext http, NpgsqlDataSource ds,
+            IPasswordHasher<UserAccount> hasher, CancellationToken ct) =>
+        {
+            var actor = UserContext.Require(http);
+            if (string.IsNullOrWhiteSpace(req.OldPassword) || string.IsNullOrWhiteSpace(req.NewPassword))
+                return Results.BadRequest(new { error = "旧密码与新密码必填" });
+            if (req.NewPassword.Length < 8)
+                return Results.BadRequest(new { error = "新密码至少 8 位" });
+            if (req.NewPassword == req.OldPassword)
+                return Results.BadRequest(new { error = "新密码不能与旧密码相同" });
+
+            string? hash = null, username = null, role = null;
+            await using (var cmd = ds.CreateCommand(
+                "SELECT password_hash, username, role FROM users WHERE id = @id AND enabled = true AND deleted_at IS NULL"))
+            {
+                cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, actor.UserId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (await r.ReadAsync(ct))
+                {
+                    hash = r.IsDBNull(0) ? null : r.GetString(0);
+                    username = r.GetString(1);
+                    role = r.GetString(2);
+                }
+            }
+            if (hash is null || username is null)
+                return Results.Unauthorized();
+
+            var account = new UserAccount { Id = actor.UserId, Username = username, Role = role ?? AuthRoles.Operator };
+            if (hasher.VerifyHashedPassword(account, hash, req.OldPassword) == PasswordVerificationResult.Failed)
+                return Results.BadRequest(new { error = "旧密码不正确" });
+
+            var newHash = hasher.HashPassword(account, req.NewPassword);
+            await using (var upd = ds.CreateCommand(@"
+                UPDATE users SET password_hash = @h, token_version = token_version + 1 WHERE id = @id"))
+            {
+                upd.Parameters.AddWithValue("h", NpgsqlDbType.Varchar, newHash);
+                upd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, actor.UserId);
+                await upd.ExecuteNonQueryAsync(ct);
+            }
+
+            await WriteUserAuditAsync(ds, actor.UserId, "user_change_password", actor.UserId, $"用户 {username} 自助修改密码", ct);
+            return Results.Ok(new { changed = true, note = "密码已修改,请用新密码重新登录" });
+        })
+        .RequireAuthorization(AuthPolicies.LoggedIn)
+        .WithName("ChangePassword")
+        .WithSummary("自助修改密码（验证旧密码;改后所有旧令牌失效须重新登录）");
 
         return app;
     }
@@ -247,3 +393,4 @@ public static class AuthEndpoints
 public sealed record LoginRequest(string Username, string Password);
 public sealed record LoginResponse(string AccessToken, long UserId, string Username, string Role);
 public sealed record CreateUserRequest(string Username, string Password, string Role, string? FullName = null, string? Email = null);
+public sealed record ChangePasswordRequest(string OldPassword, string NewPassword);

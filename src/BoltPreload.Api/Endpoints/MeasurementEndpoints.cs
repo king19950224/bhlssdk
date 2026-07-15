@@ -242,15 +242,16 @@ public static class MeasurementEndpoints
         {
             var n = Math.Clamp(limit ?? 50, 1, 500);
             var sql = @"
-                SELECT id, bolt_id, channel_id, ts, wave_blob_url, point_count,
-                       echo_start_ns, clock_int_ns, threshold,
-                       peak_positive, peak_negative, peak_to_peak,
-                       rms_value, noise_rms, snr_db
-                FROM wave_features
+                SELECT wf.id, wf.bolt_id, wf.channel_id, c.channel_no, wf.ts, wf.wave_blob_url, wf.point_count,
+                       wf.echo_start_ns, wf.clock_int_ns, wf.threshold,
+                       wf.peak_positive, wf.peak_negative, wf.peak_to_peak,
+                       wf.rms_value, wf.noise_rms, wf.snr_db
+                FROM wave_features wf
+                LEFT JOIN channels c ON c.id = wf.channel_id
                 WHERE 1=1"
-                + (channelId.HasValue ? " AND channel_id = @channel_id" : "")
-                + (boltId.HasValue ? " AND bolt_id = @bolt_id" : "")
-                + " ORDER BY ts DESC LIMIT @n";
+                + (channelId.HasValue ? " AND wf.channel_id = @channel_id" : "")
+                + (boltId.HasValue ? " AND wf.bolt_id = @bolt_id" : "")
+                + " ORDER BY wf.ts DESC LIMIT @n";
 
             await using var cmd = ds.CreateCommand(sql);
             if (channelId.HasValue) cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId.Value);
@@ -266,19 +267,20 @@ public static class MeasurementEndpoints
                     id = r.GetInt64(0),
                     boltId = r.IsDBNull(1) ? null : (long?)r.GetInt64(1),
                     channelId = r.GetInt64(2),
-                    ts = r.GetDateTime(3),
-                    waveBlobUrl = r.GetString(4),
-                    pointCount = r.GetInt32(5),
-                    echoStartNs = r.IsDBNull(6) ? null : (decimal?)r.GetDecimal(6),
-                    clockIntNs = r.IsDBNull(7) ? null : (int?)r.GetInt32(7),
-                    threshold = r.IsDBNull(8) ? null : (short?)r.GetInt16(8),
-                    peakPositive = r.IsDBNull(9) ? null : (int?)r.GetInt32(9),
-                    peakNegative = r.IsDBNull(10) ? null : (int?)r.GetInt32(10),
-                    peakToPeak = r.IsDBNull(11) ? null : (int?)r.GetInt32(11),
-                    rmsValue = r.IsDBNull(12) ? null : (decimal?)r.GetDecimal(12),
-                    noiseRms = r.IsDBNull(13) ? null : (decimal?)r.GetDecimal(13),
-                    snrDb = r.IsDBNull(14) ? null : (decimal?)r.GetDecimal(14),
-                    waveUrl = $"/api/waves/file?path={Uri.EscapeDataString(r.GetString(4))}"
+                    channelNo = r.IsDBNull(3) ? null : (int?)r.GetInt16(3),
+                    ts = r.GetDateTime(4),
+                    waveBlobUrl = r.GetString(5),
+                    pointCount = r.GetInt32(6),
+                    echoStartNs = r.IsDBNull(7) ? null : (decimal?)r.GetDecimal(7),
+                    clockIntNs = r.IsDBNull(8) ? null : (int?)r.GetInt32(8),
+                    threshold = r.IsDBNull(9) ? null : (short?)r.GetInt16(9),
+                    peakPositive = r.IsDBNull(10) ? null : (int?)r.GetInt32(10),
+                    peakNegative = r.IsDBNull(11) ? null : (int?)r.GetInt32(11),
+                    peakToPeak = r.IsDBNull(12) ? null : (int?)r.GetInt32(12),
+                    rmsValue = r.IsDBNull(13) ? null : (decimal?)r.GetDecimal(13),
+                    noiseRms = r.IsDBNull(14) ? null : (decimal?)r.GetDecimal(14),
+                    snrDb = r.IsDBNull(15) ? null : (decimal?)r.GetDecimal(15),
+                    waveUrl = $"/api/waves/file?path={Uri.EscapeDataString(r.GetString(5))}"
                 });
             }
 
@@ -295,20 +297,26 @@ public static class MeasurementEndpoints
             await using var tx = await conn.BeginTransactionAsync(ct);
             try
             {
-                long channelId;
-                long? boltId;
+                // reader 先读完关闭再回滚（开着 reader 回滚会抛异常，把 404 变 500）
+                long channelId = 0;
+                long? boltId = null;
+                var featureFound = false;
                 await using (var cmd = new NpgsqlCommand(
                     "SELECT channel_id, bolt_id FROM wave_features WHERE id=@id", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, featureId);
                     await using var r = await cmd.ExecuteReaderAsync(ct);
-                    if (!await r.ReadAsync(ct))
+                    if (await r.ReadAsync(ct))
                     {
-                        await tx.RollbackAsync(ct);
-                        return Results.NotFound(new { error = "wave feature not found", featureId });
+                        featureFound = true;
+                        channelId = r.GetInt64(0);
+                        boltId = r.IsDBNull(1) ? null : r.GetInt64(1);
                     }
-                    channelId = r.GetInt64(0);
-                    boltId = r.IsDBNull(1) ? null : r.GetInt64(1);
+                }
+                if (!featureFound)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.NotFound(new { error = "波形特征记录不存在", featureId });
                 }
 
                 await using (var cmd = new NpgsqlCommand(
@@ -489,9 +497,11 @@ public static class MeasurementEndpoints
             .WithTags("Channels")
             .RequireAuthorization(AuthPolicies.LoggedIn);
 
-        // 列出当前所有通道（含 auto_discovered 待人工确认的）
-        chGroup.MapGet("/", async (NpgsqlDataSource ds, string? state, CancellationToken ct) =>
+        // 列出当前所有通道（含 auto_discovered 待人工确认的）。
+        // deviceId 过滤下推到 SQL（此前前端拉全库再客户端过滤）；limit 护栏防自动发现流量撑大结果集。
+        chGroup.MapGet("/", async (NpgsqlDataSource ds, string? state, long? deviceId, int? limit, CancellationToken ct) =>
         {
+            var lim = Math.Clamp(limit ?? 2000, 1, 5000);
             var sql = @"
                 SELECT c.id, c.device_id, c.channel_no, c.state, c.first_seen_at, c.last_seen_at,
                        c.k_l, c.ref_time_ns, c.ref_temp_c,
@@ -500,10 +510,13 @@ public static class MeasurementEndpoints
                 LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE c.deleted_at IS NULL"
                 + (state is null ? "" : " AND c.state = @state")
-                + " ORDER BY c.device_id, c.channel_no";
+                + (deviceId is null ? "" : " AND c.device_id = @device_id")
+                + " ORDER BY c.device_id, c.channel_no LIMIT @lim";
 
             await using var cmd = ds.CreateCommand(sql);
             if (state is not null) cmd.Parameters.AddWithValue("state", NpgsqlDbType.Varchar, state);
+            if (deviceId is not null) cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId.Value);
+            cmd.Parameters.AddWithValue("lim", NpgsqlDbType.Integer, lim);
             await using var r = await cmd.ExecuteReaderAsync(ct);
 
             var items = new List<object>();
@@ -570,7 +583,9 @@ public static class MeasurementEndpoints
         .WithName("ListUnboundMeasurements")
         .WithSummary("未绑定 bolt 的测量数据（按时间倒序）");
 
-        // 未绑定测量计数（按 channel_id 汇总，运维一眼看出哪些通道在丢数据）
+        // 未绑定测量计数（按 channel_id 汇总，运维一眼看出哪些通道在丢数据）。
+        // 只报"真正在等绑定"的通道：软删通道（历史清理）与已绑螺栓的通道（遗留暂存）不算——
+        // 否则法兰页/设备页的未绑定提示会拿陈年数据报假警。遗留暂存仍可经 /unbound 原始列表查看。
         chGroup.MapGet("/unbound/summary", async (NpgsqlDataSource ds, CancellationToken ct) =>
         {
             const string sql = @"
@@ -579,7 +594,9 @@ public static class MeasurementEndpoints
                        MIN(um.ts) AS first_ts, MAX(um.ts) AS last_ts,
                        COUNT(um.echo_time_ns) AS valid_echo
                 FROM unbound_measurements um
-                JOIN channels c ON c.id = um.channel_id
+                JOIN channels c ON c.id = um.channel_id AND c.deleted_at IS NULL
+                LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE b.id IS NULL
                 GROUP BY um.device_id, um.channel_id, um.channel_no, c.state
                 ORDER BY cnt DESC";
             await using var cmd = ds.CreateCommand(sql);
@@ -759,10 +776,12 @@ public static class MeasurementEndpoints
             await using var conn = await ds.OpenConnectionAsync(ct);
             await using var tx = await conn.BeginTransactionAsync(ct);
 
-            long deviceId;
-            short channelNo;
+            // reader 先读完关闭再回滚（开着 reader 回滚会抛异常，把 404 变 500）
+            long deviceId = 0;
+            short channelNo = 0;
             long? boltId = null;
             string? beforeJson = null;
+            var channelFound = false;
 
             await using (var cmd = new NpgsqlCommand(@"
                 SELECT c.device_id, c.channel_no, b.id, to_jsonb(b)
@@ -773,36 +792,47 @@ public static class MeasurementEndpoints
             {
                 cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
-                if (!await r.ReadAsync(ct))
+                if (await r.ReadAsync(ct))
                 {
-                    await tx.RollbackAsync(ct);
-                    return Results.NotFound(new { error = "channel not found", channelId });
+                    channelFound = true;
+                    deviceId = r.GetInt64(0);
+                    channelNo = r.GetInt16(1);
+                    if (!r.IsDBNull(2))
+                    {
+                        boltId = r.GetInt64(2);
+                        beforeJson = r.GetString(3);
+                    }
                 }
-                deviceId = r.GetInt64(0);
-                channelNo = r.GetInt16(1);
-                if (!r.IsDBNull(2))
-                {
-                    boltId = r.GetInt64(2);
-                    beforeJson = r.GetString(3);
-                }
+            }
+            if (!channelFound)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "通道不存在", channelId });
             }
 
             if (boltId is null)
             {
                 await tx.RollbackAsync(ct);
-                return Results.BadRequest(new { error = "channel 未绑定 bolt", channelId });
+                return Results.BadRequest(new { error = "该通道未绑定螺栓", channelId });
             }
 
+            // channel_id 守卫：并发 move 可能已把该螺栓迁到别的通道（move 只锁目标通道与螺栓行，
+            // 不锁源通道）——按 id 盲删会把迁走的螺栓一并软删。0 行受影响 = 绑定已变，放弃本次解绑。
             await using (var cmd = new NpgsqlCommand(@"
                 UPDATE bolts
                    SET enabled = false,
                        state = 'disabled',
                        deleted_at = now(),
                        updated_at = now()
-                 WHERE id = @bolt_id", conn, tx))
+                 WHERE id = @bolt_id AND channel_id = @channel_id AND deleted_at IS NULL", conn, tx))
             {
                 cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId.Value);
-                await cmd.ExecuteNonQueryAsync(ct);
+                cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                if (await cmd.ExecuteNonQueryAsync(ct) == 0)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.Conflict(new { error = "绑定关系已变更（并发迁移/解绑？），请刷新后重试", channelId, boltId });
+                }
             }
 
             await using (var cmd = new NpgsqlCommand(@"
@@ -836,14 +866,30 @@ public static class MeasurementEndpoints
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 
+            // audit_log 同事务补录：binding_history 是绑定专用轨迹，审计日志页只查 audit_log，
+            // 缺这条会让"解绑"在统一审计视图里隐身
+            await using (var audit = new NpgsqlCommand(@"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+                VALUES (@uid, 'channel_unbind', 'bolt', @bid, @before::jsonb, NULL, @note, now())", conn, tx))
+            {
+                audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
+                audit.Parameters.AddWithValue("bid", NpgsqlDbType.Bigint, boltId.Value);
+                audit.Parameters.AddWithValue("before", NpgsqlDbType.Jsonb, (object?)beforeJson ?? DBNull.Value);
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                    $"解绑通道 CH{channelNo}（设备 {deviceId}）螺栓 #{boltId}，原因：{req?.Note ?? "（未填）"}");
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+
             await tx.CommitAsync(ct);
             resolver.Invalidate(deviceId, (ushort)channelNo);
 
             return Results.Ok(new { unbound = true, channelId, boltId });
         })
-        .RequireAuthorization(AuthPolicies.WriteAccess)
+        // 解绑=软删螺栓+清标定，破坏性操作与前端权限口径一致（UI 只给 reviewer 露按钮），
+        // 后端策略同步收紧为 reviewer+，堵住 operator 直调 API 的旁路
+        .RequireAuthorization(AuthPolicies.ReviewerAccess)
         .WithName("UnbindChannelBolt")
-        .WithSummary("解绑通道当前 bolt（事务 + 审计 + 缓存失效）");
+        .WithSummary("解绑通道当前 bolt（事务 + 审计 + 缓存失效；reviewer+）");
 
         return app;
     }
@@ -873,7 +919,9 @@ public static class MeasurementEndpoints
 
         try
         {
-            ChannelBindingSnapshot target;
+            // 以下三段均遵循「reader 先读完关闭，再回滚/返回」——开着 reader 回滚会抛异常，
+            // 把本应 404/409 的业务分支变成 500。
+            ChannelBindingSnapshot? target = null;
             await using (var cmd = new NpgsqlCommand(@"
                 SELECT id, device_id, channel_no, k_l, k_l_uncertainty, k_l_intercept_ns,
                        active_calibration_id, ref_time_ns, ref_temp_c, to_jsonb(c)
@@ -883,16 +931,16 @@ public static class MeasurementEndpoints
             {
                 cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, toChannelId);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
-                if (!await r.ReadAsync(ct))
-                {
-                    await tx.RollbackAsync(ct);
-                    return Results.NotFound(new { error = "target channel not found", toChannelId });
-                }
-
-                target = ReadChannelBindingSnapshot(r);
+                if (await r.ReadAsync(ct))
+                    target = ReadChannelBindingSnapshot(r);
+            }
+            if (target is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "目标通道不存在", toChannelId });
             }
 
-            BoltBindingSnapshot bolt;
+            BoltBindingSnapshot? bolt = null;
             await using (var cmd = new NpgsqlCommand(@"
                 SELECT b.id, b.channel_id, c.device_id, c.channel_no,
                        c.k_l, c.k_l_uncertainty, c.k_l_intercept_ns,
@@ -905,15 +953,17 @@ public static class MeasurementEndpoints
             {
                 cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
-                if (!await r.ReadAsync(ct))
-                {
-                    await tx.RollbackAsync(ct);
-                    return Results.NotFound(new { error = "bolt not found", boltId });
-                }
-
-                bolt = ReadBoltBindingSnapshot(r);
+                if (await r.ReadAsync(ct))
+                    bolt = ReadBoltBindingSnapshot(r);
+            }
+            if (bolt is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "螺栓不存在", boltId });
             }
 
+            long existingBoltId = 0;
+            string? existingBoltCode = null;
             await using (var cmd = new NpgsqlCommand(@"
                 SELECT id, code
                 FROM bolts
@@ -927,20 +977,39 @@ public static class MeasurementEndpoints
                 await using var r = await cmd.ExecuteReaderAsync(ct);
                 if (await r.ReadAsync(ct))
                 {
-                    await tx.RollbackAsync(ct);
-                    return Results.Conflict(new
-                    {
-                        error = "target channel already has active bolt",
-                        channelId = toChannelId,
-                        existingBoltId = r.GetInt64(0),
-                        existingBoltCode = r.GetString(1)
-                    });
+                    existingBoltId = r.GetInt64(0);
+                    existingBoltCode = r.GetString(1);
                 }
+            }
+            if (existingBoltCode is not null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.Conflict(new
+                {
+                    error = "目标通道已绑定其他螺栓",
+                    channelId = toChannelId,
+                    existingBoltId,
+                    existingBoltCode
+                });
+            }
+
+            // 安全：禁止跨设备绑定/迁移——通道与螺栓必须在同一物理设备，否则测量/标定上下文错乱
+            if (target.DeviceId != bolt.DeviceId)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.BadRequest(new
+                {
+                    error = "不允许跨设备绑定或迁移螺栓",
+                    boltDeviceId = bolt.DeviceId,
+                    targetDeviceId = target.DeviceId
+                });
             }
 
             var isMove = bolt.ChannelId != toChannelId;
             var action = isMove ? "move" : "bind";
-            await ApplyCalibrationPolicyAsync(conn, tx, target.ChannelId, bolt, normalizedAction, ct);
+            // 同通道"再绑一次"(!isMove) 不动标定：默认 invalidate 会把在产标定清掉（UI 双击 / 幂等重绑的坑）
+            if (isMove)
+                await ApplyCalibrationPolicyAsync(conn, tx, target.ChannelId, bolt, normalizedAction, ct);
 
             await using (var cmd = new NpgsqlCommand(@"
                 UPDATE bolts
@@ -957,9 +1026,14 @@ public static class MeasurementEndpoints
 
             if (isMove)
             {
+                // 源通道螺栓已迁走：镜像 unbind 清理标定,避免空通道仍显示 calibrated / 下次绑定误用旧 K_L
                 await using var fromCmd = new NpgsqlCommand(@"
                     UPDATE channels
                        SET business_state = 'unbound',
+                           k_l = NULL,
+                           k_l_uncertainty = NULL,
+                           k_l_intercept_ns = NULL,
+                           active_calibration_id = NULL,
                            updated_at = now()
                      WHERE id = @from_channel_id", conn, tx);
                 fromCmd.Parameters.AddWithValue("from_channel_id", NpgsqlDbType.Bigint, bolt.ChannelId);
@@ -1003,6 +1077,12 @@ public static class MeasurementEndpoints
                 wfCmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
                 wfCmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, toChannelId);
                 await wfCmd.ExecuteNonQueryAsync(ct);
+
+                // 回填后清理该通道的 unbound 暂存（已迁入 measurements 或与既有行重复）：避免 /unbound 报表持续报陈旧数据、避免重复回填
+                await using var delCmd = new NpgsqlCommand(
+                    "DELETE FROM unbound_measurements WHERE channel_id = @channel_id", conn, tx);
+                delCmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, toChannelId);
+                await delCmd.ExecuteNonQueryAsync(ct);
             }
 
             await using (var cmd = new NpgsqlCommand(@"
@@ -1024,6 +1104,24 @@ public static class MeasurementEndpoints
                 cmd.Parameters.AddWithValue("before", NpgsqlDbType.Jsonb, bolt.BoltJson);
                 cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, (object?)note ?? DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            // audit_log 同事务补录（统一审计视图只查 audit_log，见解绑处说明）
+            await using (var audit = new NpgsqlCommand(@"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+                SELECT @uid, @action, 'bolt', @bid, @before::jsonb, to_jsonb(b), @note
+                FROM bolts b WHERE b.id = @bid", conn, tx))
+            {
+                audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
+                audit.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, isMove ? "bolt_move_channel" : "channel_bind");
+                audit.Parameters.AddWithValue("bid", NpgsqlDbType.Bigint, boltId);
+                audit.Parameters.AddWithValue("before", NpgsqlDbType.Jsonb, bolt.BoltJson);
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                    (isMove
+                        ? $"迁移螺栓 #{boltId} 通道 {bolt.ChannelId} → {toChannelId}（标定策略 {normalizedAction}，回填 {backfilled} 条）"
+                        : $"绑定螺栓 #{boltId} 到通道 {toChannelId}（回填 {backfilled} 条）")
+                    + (string.IsNullOrWhiteSpace(note) ? "" : $"，备注：{note}"));
+                await audit.ExecuteNonQueryAsync(ct);
             }
 
             await tx.CommitAsync(ct);
@@ -1089,6 +1187,16 @@ public static class MeasurementEndpoints
             return;
         }
 
+        if (calibrationAction == "keep_uncomputed")
+        {
+            // 保留目标通道自身已有标定不动（no-op）。操作员显式选择"沿用目标通道现有标定"——
+            // 典型场景：把螺栓重新绑回它原来的通道，标定本就对应该螺栓，不该被清空或被源通道覆盖。
+            // 安全提示：若目标通道原是为别的螺栓标定的，沿用其 K_L 会给新螺栓算出错误预紧力；需要重标定时应选 invalidate。
+            // calibration_action 已写入 channel_binding_history，可审计追溯。
+            return;
+        }
+
+        // invalidate（默认）：清空目标通道标定，重标定通过前不出正式预紧力
         await using (var cmd = new NpgsqlCommand(@"
             UPDATE channels
                SET k_l = NULL,

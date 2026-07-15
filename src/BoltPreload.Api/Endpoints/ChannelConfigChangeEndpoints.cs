@@ -1,6 +1,8 @@
 using System.Text.Json;
 using BoltPreload.Api.Auth;
 using BoltPreload.Application.Devices;
+using BoltPreload.Application.Devices.ProbeScan;
+using BoltPreload.Application.Ingestion;
 using BoltPreload.Fx;
 using Npgsql;
 using NpgsqlTypes;
@@ -26,16 +28,21 @@ public static class ChannelConfigChangeEndpoints
             var lim = Math.Clamp(limit ?? 100, 1, 500);
             var (where, statusParam) = status switch
             {
-                "pending" => ("status IN ('requested','approved')", (string?)null),
+                "pending" => ("c.status IN ('requested','approved')", (string?)null),
                 null or "" => ("TRUE", null),
-                _ => ("status = @status", status)
+                _ => ("c.status = @status", status)
             };
+            // 联表取用户名：审批流展示"谁提交/谁审批/谁执行"必须是人名，不能让客户对着"用户1"猜
             await using var cmd = ds.CreateCommand($@"
-                SELECT id, device_id, channel_id, channel_no, status, requested_by, requested_at,
-                       approved_by, approved_at, executed_by, executed_at, verified_at, failure_reason, note, requested_jsonb
-                FROM channel_config_change_requests
+                SELECT c.id, c.device_id, c.channel_id, c.channel_no, c.status, c.requested_by, c.requested_at,
+                       c.approved_by, c.approved_at, c.executed_by, c.executed_at, c.verified_at, c.failure_reason, c.note, c.requested_jsonb,
+                       ru.username, au.username, eu.username
+                FROM channel_config_change_requests c
+                LEFT JOIN users ru ON ru.id = c.requested_by
+                LEFT JOIN users au ON au.id = c.approved_by
+                LEFT JOIN users eu ON eu.id = c.executed_by
                 WHERE {where}
-                ORDER BY requested_at DESC
+                ORDER BY c.requested_at DESC
                 LIMIT @lim");
             if (statusParam is not null) cmd.Parameters.AddWithValue("status", NpgsqlDbType.Varchar, statusParam);
             cmd.Parameters.AddWithValue("lim", NpgsqlDbType.Integer, lim);
@@ -50,9 +57,14 @@ public static class ChannelConfigChangeEndpoints
         app.MapGet("/api/config-changes/{id:long}", async (long id, NpgsqlDataSource ds, CancellationToken ct) =>
         {
             await using var cmd = ds.CreateCommand(@"
-                SELECT id, device_id, channel_id, channel_no, status, requested_by, requested_at,
-                       approved_by, approved_at, executed_by, executed_at, verified_at, failure_reason, note, requested_jsonb
-                FROM channel_config_change_requests WHERE id=@id");
+                SELECT c.id, c.device_id, c.channel_id, c.channel_no, c.status, c.requested_by, c.requested_at,
+                       c.approved_by, c.approved_at, c.executed_by, c.executed_at, c.verified_at, c.failure_reason, c.note, c.requested_jsonb,
+                       ru.username, au.username, eu.username
+                FROM channel_config_change_requests c
+                LEFT JOIN users ru ON ru.id = c.requested_by
+                LEFT JOIN users au ON au.id = c.approved_by
+                LEFT JOIN users eu ON eu.id = c.executed_by
+                WHERE c.id=@id");
             cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
             var items = await ReadListAsync(cmd, ct);
             return items.Count == 0 ? Results.NotFound(new { error = "请求不存在", id }) : Results.Ok(items[0]);
@@ -72,18 +84,27 @@ public static class ChannelConfigChangeEndpoints
             if (row.RequestedBy == reviewerId)
                 return Results.BadRequest(new { error = "审批人必须与提交人不同（两人复核底线）。", requestedBy = row.RequestedBy });
 
-            await using var cmd = ds.CreateCommand(@"
+            // 审批与审计同事务（责任链不可断）
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            await using (var cmd = new NpgsqlCommand(@"
                 UPDATE channel_config_change_requests
                 SET status='approved', approved_by=@rev, approved_at=now()
-                WHERE id=@id AND status='requested'");
-            cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, reviewerId);
-            cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
-            if (await cmd.ExecuteNonQueryAsync(ct) == 0)
-                return Results.Conflict(new { error = "状态已变更，审批未生效（并发？）", id });
+                WHERE id=@id AND status='requested'", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, reviewerId);
+                cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
+                if (await cmd.ExecuteNonQueryAsync(ct) == 0)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.Conflict(new { error = "状态已变更，审批未生效（并发？）", id });
+                }
+            }
 
-            await WriteAuditAsync(ds, reviewerId, "config_change_approve", row.ChannelId,
+            await WriteAuditAsync(conn, tx, reviewerId, "config_change_approve", row.ChannelId,
                 JsonSerializer.Serialize(new { requestId = id, requestedBy = row.RequestedBy }),
                 $"审批通过通道参数变更 #{id}", ct);
+            await tx.CommitAsync(ct);
             lf.CreateLogger("ConfigChange").LogWarning("参数变更已审批 #{Id} reviewer={Rev}", id, reviewerId);
             return Results.Ok(new { id, status = "approved", approvedBy = reviewerId });
         })
@@ -103,18 +124,27 @@ public static class ChannelConfigChangeEndpoints
                 return Results.Conflict(new { error = $"当前状态 {row.Status}，仅 requested 可驳回", id });
 
             var reason = string.IsNullOrWhiteSpace(body?.Reason) ? "（未填写驳回原因）" : body!.Reason!.Trim();
-            await using var cmd = ds.CreateCommand(@"
+            // 驳回与审计同事务
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            await using (var cmd = new NpgsqlCommand(@"
                 UPDATE channel_config_change_requests
                 SET status='rejected', approved_by=@rev, approved_at=now(), failure_reason=@reason
-                WHERE id=@id AND status='requested'");
-            cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, reviewerId);
-            cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, reason);
-            cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
-            if (await cmd.ExecuteNonQueryAsync(ct) == 0)
-                return Results.Conflict(new { error = "状态已变更，驳回未生效（并发？）", id });
+                WHERE id=@id AND status='requested'", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, reviewerId);
+                cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, reason);
+                cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
+                if (await cmd.ExecuteNonQueryAsync(ct) == 0)
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.Conflict(new { error = "状态已变更，驳回未生效（并发？）", id });
+                }
+            }
 
-            await WriteAuditAsync(ds, reviewerId, "config_change_reject", row.ChannelId,
+            await WriteAuditAsync(conn, tx, reviewerId, "config_change_reject", row.ChannelId,
                 JsonSerializer.Serialize(new { requestId = id, reason }), $"驳回通道参数变更 #{id}：{reason}", ct);
+            await tx.CommitAsync(ct);
             lf.CreateLogger("ConfigChange").LogWarning("参数变更被驳回 #{Id} reviewer={Rev} reason={Reason}", id, reviewerId, reason);
             return Results.Ok(new { id, status = "rejected", rejectedBy = reviewerId, reason });
         })
@@ -126,7 +156,8 @@ public static class ChannelConfigChangeEndpoints
         // ---- 执行（仅 approved；下发到对应设备）----
         app.MapPost("/api/config-changes/{id:long}/execute", async (
             long id, HttpContext http, IDeviceConnectorManager deviceManager,
-            NpgsqlDataSource ds, ILoggerFactory lf, CancellationToken ct) =>
+            NpgsqlDataSource ds, IChannelResolver resolver, ProbeScanState probeScanState,
+            ILoggerFactory lf, CancellationToken ct) =>
         {
             var logger = lf.CreateLogger("ConfigChange");
             var userId = UserContext.Require(http).UserId;
@@ -139,10 +170,17 @@ public static class ChannelConfigChangeEndpoints
             var runtime = deviceManager.Find(row.DeviceId);
             if (runtime is null)
                 return Results.NotFound(new { error = $"设备未加载到运行时：{row.DeviceId}", deviceId = row.DeviceId });
+            // 扫描互斥：扫描期间下发通道配置会与扫描器抢设备（set-mode/MCR/commission 同一约束）
+            if (probeScanState.IsRunning(row.DeviceId))
+                return Results.Conflict(new { error = "通道自动检测进行中，暂缓执行下发", deviceId = row.DeviceId, id });
 
             ChannelConfigUpdate? updates;
             try { updates = JsonSerializer.Deserialize<ChannelConfigUpdate>(row.RequestedJson); }
-            catch (Exception ex) { return Results.BadRequest(new { error = $"请求参数无法反序列化：{ex.Message}", id }); }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "参数变更请求体反序列化失败 #{Id}", id);
+                return Results.BadRequest(new { error = "请求参数格式不正确，无法解析", id });
+            }
             if (updates is null) return Results.BadRequest(new { error = "请求参数为空", id });
 
             try
@@ -160,6 +198,11 @@ public static class ChannelConfigChangeEndpoints
                         return Results.Conflict(new { error = "状态已变更，执行未记录（并发？）；设备可能已下发，请核对", id });
                 }
 
+                // 同步 channels 冗余配置 + 失效解析器缓存——否则热路径/前端长期按旧 DB 配置换算，
+                // 设备与库漂移（历史缺口：执行只改设备和审批单，不 sync 库）。
+                await SyncChannelRowAsync(ds, row.ChannelId, updates, ct);
+                resolver.Invalidate(row.DeviceId, (ushort)row.ChannelNo);
+
                 await WriteAuditAsync(ds, userId, "config_change_execute", row.ChannelId,
                     JsonSerializer.Serialize(new { requestId = id, deviceId = row.DeviceId, channelNo = row.ChannelNo, updates }),
                     $"执行下发通道参数变更 #{id}", ct);
@@ -172,7 +215,7 @@ public static class ChannelConfigChangeEndpoints
                 return Results.Ok(new
                 {
                     id, status = "executed", deviceId = row.DeviceId, channelNo = row.ChannelNo,
-                    note = "已下发设备。调用 /verify 触发读回比对确认实际生效。"
+                    note = "已下发设备并同步通道配置。请执行「验证」触发读回比对确认实际生效。"
                 });
             }
             catch (Exception ex)
@@ -248,7 +291,7 @@ public static class ChannelConfigChangeEndpoints
             return Results.Ok(new
             {
                 id, status = "executed", verified = false, comparisons,
-                note = "尚未全部匹配（设备读回未到位或不一致）。设备读回经 SDK 异步落库，可稍后重试 /verify。"
+                note = "尚未全部匹配（设备读回未到位或不一致），请稍后重试验证。"
             });
         })
         .RequireAuthorization(AuthPolicies.WriteAccess)
@@ -301,7 +344,10 @@ public static class ChannelConfigChangeEndpoints
                 verifiedAt = r.IsDBNull(11) ? (DateTime?)null : r.GetDateTime(11),
                 failureReason = r.IsDBNull(12) ? null : r.GetString(12),
                 note = r.IsDBNull(13) ? null : r.GetString(13),
-                requested = r.IsDBNull(14) ? null : r.GetString(14)
+                requested = r.IsDBNull(14) ? null : r.GetString(14),
+                requestedByName = r.FieldCount > 15 && !r.IsDBNull(15) ? r.GetString(15) : null,
+                approvedByName = r.FieldCount > 16 && !r.IsDBNull(16) ? r.GetString(16) : null,
+                executedByName = r.FieldCount > 17 && !r.IsDBNull(17) ? r.GetString(17) : null
             });
         }
         return items;
@@ -359,18 +405,72 @@ public static class ChannelConfigChangeEndpoints
         }
     }
 
+    /// <summary>
+    /// 执行下发成功后，把请求里的字段同步进 channels 冗余配置（只覆盖请求携带的字段）。
+    /// 与 DiagnosticEndpoints 的 sync-channel-config（device_readback）区分 config_source，便于追溯来源。
+    /// </summary>
+    private static async Task SyncChannelRowAsync(
+        NpgsqlDataSource ds, long channelId, ChannelConfigUpdate u, CancellationToken ct)
+    {
+        await using var cmd = ds.CreateCommand(@"
+            UPDATE channels SET
+                probe_freq_mhz   = COALESCE(@pf, probe_freq_mhz),
+                echo_win_ns      = COALESCE(@ew, echo_win_ns),
+                echo_width_us    = COALESCE(@ewd, echo_width_us),
+                gain             = COALESCE(@gain, gain),
+                threshold        = COALESCE(@thr, threshold),
+                meas_mode        = COALESCE(@mm, meas_mode),
+                tc_mode          = COALESCE(@tc, tc_mode),
+                temp_coefficient = COALESCE(@tcoef, temp_coefficient),
+                ref_time_ns      = COALESCE(@rt, ref_time_ns),
+                ref_temp_c       = COALESCE(@rtemp, ref_temp_c),
+                config_source    = 'config_change',
+                config_synced_at = now(),
+                updated_at       = now()
+            WHERE id = @id AND deleted_at IS NULL");
+        cmd.Parameters.AddWithValue("pf", NpgsqlDbType.Numeric, (object?)u.ProbeFreqMhz ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("ew", NpgsqlDbType.Numeric, (object?)u.EchoWinNs ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("ewd", NpgsqlDbType.Smallint, (object?)(short?)u.EchoWidthUs ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("gain", NpgsqlDbType.Real, (object?)(float?)u.Gain ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("thr", NpgsqlDbType.Smallint, (object?)u.Threshold ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("mm", NpgsqlDbType.Smallint, (object?)(short?)u.MeasMode ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("tc", NpgsqlDbType.Smallint, (object?)(short?)u.TcMode ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("tcoef", NpgsqlDbType.Numeric, (object?)u.TempCoefficient ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, (object?)u.RefTimeNs ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, (object?)u.RefTempC ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, channelId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     private static async Task WriteAuditAsync(
         NpgsqlDataSource ds, long userId, string action, long channelId, string afterJson, string note, CancellationToken ct)
     {
-        await using var cmd = ds.CreateCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@user_id, @action, 'channel', @target_id, NULL, @after::jsonb, @note, now())");
+        await using var cmd = ds.CreateCommand(AuditSql);
+        FillAuditParams(cmd, userId, action, channelId, afterJson, note);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>与状态更新共享事务的审计写入（approve/reject 用，责任链不可断）。</summary>
+    private static async Task WriteAuditAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx,
+        long userId, string action, long channelId, string afterJson, string note, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand(AuditSql, conn, tx);
+        FillAuditParams(cmd, userId, action, channelId, afterJson, note);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private const string AuditSql = @"
+        INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+        VALUES (@user_id, @action, 'channel', @target_id, NULL, @after::jsonb, @note, now())";
+
+    private static void FillAuditParams(NpgsqlCommand cmd, long userId, string action, long channelId, string afterJson, string note)
+    {
         cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, channelId);
         cmd.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, afterJson);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
-        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public sealed record RejectBody(string? Reason);

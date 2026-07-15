@@ -21,6 +21,8 @@ let liveTimer: number | undefined
 let ticking = false
 let disposed = false
 
+// activeChannelId 是 DB 主键（compare API 需要它）；展示要用物理通道号 channel_no
+const activeChannelNo = computed(() => features.value.find((f) => f.channelId === activeChannelId.value)?.channelNo ?? null)
 const cur = computed(() => cmp.value?.current ?? null)
 const refWave = computed(() => cmp.value?.reference ?? null)
 const metrics = computed(() => cmp.value?.metrics ?? null)
@@ -228,9 +230,9 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
     <div class="panel panel--glow">
       <div class="panel-hd">
         <span class="panel-title">
-          实时回波波形 A-Scan
+          <i class="hd-mark" />实时回波波形 A-Scan
           <span v-if="live" class="live-dot" />
-          <span v-if="cur" class="hd-sub">· CH{{ activeChannelId }} · {{ cur.pointCount }} 点</span>
+          <span v-if="cur" class="hd-sub">· CH{{ activeChannelNo ?? '?' }} · {{ cur.pointCount }} 点</span>
         </span>
         <div class="ascan-hd">
           <span v-if="cur" class="mono ascan-meta">SNR {{ cur.snrDb != null ? Number(cur.snrDb).toFixed(1) : '—' }}dB · 阈值 {{ cur.threshold ?? '—' }}</span>
@@ -244,7 +246,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
 
       <!-- 跟随暂停提示（手动切到某通道时） -->
       <div v-if="live && !follow" class="follow-bar">
-        <span><el-icon><View /></el-icon> 已暂停跟随，停在 CH{{ activeChannelId }}</span>
+        <span><el-icon><View /></el-icon> 已暂停跟随，停在 CH{{ activeChannelNo ?? '?' }}</span>
         <span class="follow-resume" @click="resumeFollow"><el-icon><VideoPlay /></el-icon> 跟随最新</span>
       </div>
 
@@ -279,7 +281,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
       <EChart v-if="cur" :option="ascanOption" height="300px" />
       <div v-else class="ascan-empty" v-loading="loadingCmp">
         <el-icon><TrendCharts /></el-icon>
-        <span>{{ loading ? '加载中…' : error ? '波形加载失败,请点上方「重试」。' : '暂无波形数据。模拟器或真机产生带波形的测量后,可在此实时回放并对比 A-Scan。' }}</span>
+        <span>{{ loading ? '加载中…' : error ? '波形加载失败,请点上方「重试」。' : '暂无波形数据。设备产生带波形的测量后,可在此实时回放并对比 A-Scan。' }}</span>
       </div>
 
       <div v-if="curStats" class="ascan-legend">
@@ -297,14 +299,14 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
     <!-- 波形特征（全局，点选切换通道） -->
     <div class="panel panel--glow">
       <div class="panel-hd">
-        <span class="panel-title">波形特征 · 信号质量 <span v-if="live" class="live-dot" /></span>
+        <span class="panel-title"><i class="hd-mark" />波形特征 · 信号质量 <span v-if="live" class="live-dot" /></span>
         <span class="hd-sub">点选某条切换到该通道做对比</span>
       </div>
       <div class="tbl">
         <div class="tr th"><span>时间</span><span>通道/螺栓</span><span>SNR dB</span><span>峰峰值</span><span>噪声 RMS</span><span>阈值</span><span>点数</span></div>
         <div v-for="(f, i) in features" :key="f.id" class="tr" :class="{ active: activeChannelId === f.channelId }" @click="selectChannel(f)">
           <span class="mono dim">{{ fmt(f.ts) }}<span v-if="i === 0" class="latest-tag">最新</span></span>
-          <span class="mono">CH{{ f.channelId }}{{ f.boltId ? ' · #' + f.boltId : '' }}</span>
+          <span class="mono">{{ f.channelNo != null ? 'CH' + f.channelNo : '—' }}{{ f.boltId ? ' · #' + f.boltId : '' }}</span>
           <span class="mono" :style="f.snrDb != null && Number(f.snrDb) < 12 ? 'color:var(--warn)' : ''">{{ f.snrDb != null ? Number(f.snrDb).toFixed(1) : '—' }}</span>
           <span class="mono">{{ f.peakToPeak ?? '—' }}</span>
           <span class="mono">{{ f.noiseRms != null ? Number(f.noiseRms).toFixed(1) : '—' }}</span>
@@ -326,7 +328,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
 .diag-error-msg { flex: 1; min-width: 0; }
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 6px; }
 .panel-title { display: inline-flex; align-items: center; }
-.hd-sub { font-size: 12px; color: var(--text-3); margin-left: 8px; }
+.panel-title .hd-sub { margin-left: 6px; }
 .ascan-hd { display: flex; align-items: center; gap: 12px; }
 .ascan-meta { font-size: 12px; color: var(--text-3); }
 .ascan-meta.dim { opacity: 0.7; }
@@ -360,10 +362,12 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
 .diag-note { font-size: 11px; color: var(--text-3); padding: 2px 20px 16px; line-height: 1.6; }
 .diag-note b { color: var(--text-2); }
 
-.tbl { padding: 4px 18px 16px; }
-.tr { display: grid; grid-template-columns: 200px 140px 90px 90px 100px 80px 70px; align-items: center; padding: 10px 6px; border-bottom: 1px solid var(--hairline); font-size: 12.5px; cursor: pointer; }
-.tr:not(.th):hover, .tr.active { background: rgba(56, 189, 248, 0.07); }
-.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; cursor: default; }
+.tbl { padding: 4px 12px 16px; overflow-x: auto; }
+.tr { display: grid; grid-template-columns: 200px 140px 90px 90px 100px 80px 70px; align-items: center; padding: 10px 8px; border-radius: 8px; font-size: 12.5px; cursor: pointer; min-width: 780px; }
+.tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
+.tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
+.tr:not(.th).active { background: rgba(56, 189, 248, 0.09); }
+.tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; cursor: default; }
 .tr.th:hover { background: none; }
 .dim { color: var(--text-3); }
 .latest-tag { display: inline-block; margin-left: 8px; font-size: 10px; color: #10b981; border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 8px; padding: 0 6px; }

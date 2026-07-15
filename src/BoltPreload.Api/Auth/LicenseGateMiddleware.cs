@@ -47,10 +47,11 @@ public sealed class LicenseGateMiddleware
             _logger.LogWarning("License 无效，拒绝写请求 {Method} {Path}：{Warning}",
                 ctx.Request.Method, ctx.Request.Path, status.Warning);
             ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+            // error 放人话（前端 ElMessage 直接展示），code 留机器可读标识
             await ctx.Response.WriteAsJsonAsync(new
             {
-                error = "license_invalid",
-                detail = status.Warning ?? "授权未通过校验",
+                error = status.Warning ?? "系统授权未通过校验，操作已被拒绝，请联系供应商更新授权",
+                code = "license_invalid",
                 machineCode = status.MachineCode
             });
             return;
@@ -64,8 +65,8 @@ public sealed class LicenseGateMiddleware
             ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
             await ctx.Response.WriteAsJsonAsync(new
             {
-                error = "license_capacity_exceeded",
-                detail = _enforcement.Violation ?? "超出授权容量上限",
+                error = _enforcement.Violation ?? "接入规模超出授权容量上限，操作已被拒绝，请联系供应商扩容授权",
+                code = "license_capacity_exceeded",
                 currentDevices = _enforcement.CurrentDevices,
                 currentChannels = _enforcement.CurrentChannels,
                 maxDevices = _enforcement.MaxDevices,

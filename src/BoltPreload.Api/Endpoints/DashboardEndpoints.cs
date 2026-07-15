@@ -34,7 +34,11 @@ public static class DashboardEndpoints
                 ORDER BY bs.preload_ratio ASC NULLS LAST
                 LIMIT 8;
 
-                SELECT severity, count(*) FROM alarms WHERE cleared_at IS NULL GROUP BY severity;
+                SELECT a.severity, count(*) FROM alarms a
+                JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
+                JOIN monitor_groups mg ON mg.id = b.group_id AND mg.deleted_at IS NULL
+                JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
+                WHERE a.cleared_at IS NULL GROUP BY a.severity;
 
                 WITH {AssetEndpoints.BoltStatusCte}
                 SELECT
@@ -43,14 +47,31 @@ public static class DashboardEndpoints
                     count(*) FILTER (WHERE preload_ratio >= 0.8 AND preload_ratio < 0.9) AS b80,
                     count(*) FILTER (WHERE preload_ratio >= 0.7 AND preload_ratio < 0.8) AS b70,
                     count(*) FILTER (WHERE preload_ratio < 0.7) AS b70d
-                FROM bolt_status WHERE status IN ('normal','warn','loose') AND preload_ratio IS NOT NULL;
+                FROM bolt_status WHERE status IN ('normal','warn','loose','high') AND preload_ratio IS NOT NULL;
 
-                WITH recent AS (
-                    SELECT bolt_id, regr_slope(preload_n, extract(epoch FROM ts)) AS slope,
-                           regr_r2(preload_n, extract(epoch FROM ts)) AS r2, count(*) n
-                    FROM measurements
-                    WHERE preload_n IS NOT NULL AND ts >= now() - interval '7 days'
-                    GROUP BY bolt_id HAVING count(*) >= 5
+                WITH cal AS (
+                    -- 只用「当前生效」的标定（未被 superseded、且已会签 approved / 自签 self_signed）来定沉降期起点；
+                    -- 否则被顶替 / 驳回 / 待复核的记录会把窗口起点错误前移，把有效回归历史饿死成 insufficient。
+                    SELECT bolt_id, max(created_at) AS calibrated_at
+                    FROM calibration_records
+                    WHERE superseded_by IS NULL AND review_state IN ('approved','self_signed')
+                    GROUP BY bolt_id
+                ), recent AS (
+                    SELECT m.bolt_id,
+                           regr_slope(m.preload_n, extract(epoch FROM m.ts)) AS slope,
+                           regr_r2(m.preload_n, extract(epoch FROM m.ts)) AS r2, count(*) n
+                    FROM measurements m
+                    LEFT JOIN cal ON cal.bolt_id = m.bolt_id
+                    -- 拟合窗口夹到「上次标定 + 2h 沉降期」之后：避免跨标定边界（基线/kL 变化造成的台阶）
+                    -- 与新标定后嵌入松弛瞬态污染斜率；刚标定不久（历史不足）自然被下面的门挡掉。
+                    WHERE m.preload_n IS NOT NULL
+                      AND m.ts >= GREATEST(now() - interval '7 days',
+                                           COALESCE(cal.calibrated_at + interval '2 hours', now() - interval '7 days'))
+                    GROUP BY m.bolt_id
+                    -- 质量门：≥30 样本、跨度≥24h（按天外推才有意义）、R²≥0.5（确为线性下降而非抖动），杜绝几分钟数据外推出的垃圾天数
+                    HAVING count(*) >= 30
+                       AND (max(m.ts) - min(m.ts)) >= interval '24 hours'
+                       AND regr_r2(m.preload_n, extract(epoch FROM m.ts)) >= 0.5
                 ), {AssetEndpoints.BoltStatusCte}
                 SELECT b.code, t.name, mg.name, bs.preload_n, b.min_preload_n, bs.preload_ratio, b.id,
                        (rc.slope)::double precision AS slope_sec,
@@ -140,6 +161,65 @@ public static class DashboardEndpoints
         .WithTags("Dashboard")
         .WithName("PreloadHealth")
         .WithSummary("总览：螺栓预紧力健康聚合");
+
+        // 时序趋势：驱动总览的 sparkline 与健康趋势主图。measurements 是 TimescaleDB hypertable，
+        // 用 time_bucket 聚合残余率(avg/min)、采集量、在测螺栓数；告警按 triggered_at 单独分桶后并入。
+        app.MapGet("/api/dashboard/trend", async (NpgsqlDataSource ds, int? hours, CancellationToken ct) =>
+        {
+            var h = Math.Clamp(hours ?? 24, 1, 168);
+            var bucketMin = h <= 24 ? 30 : h <= 72 ? 60 : 180;
+            // JOIN bolts 排除已软删螺栓的历史测点/告警：否则删螺栓后趋势线仍统计它，
+            // avg_ratio / active_bolts 与当前在测资产对不上（软删口径与 bolt_status CTE 一致）
+            var sql = $@"
+                SELECT time_bucket(make_interval(mins => {bucketMin}), m.ts) AS bucket,
+                       (avg(m.preload_ratio) FILTER (WHERE m.preload_ratio IS NOT NULL))::double precision AS avg_ratio,
+                       (min(m.preload_ratio) FILTER (WHERE m.preload_ratio IS NOT NULL))::double precision AS min_ratio,
+                       count(*) AS meas_count,
+                       count(DISTINCT m.bolt_id) FILTER (WHERE m.preload_ratio IS NOT NULL) AS active_bolts
+                FROM measurements m
+                JOIN bolts b ON b.id = m.bolt_id AND b.deleted_at IS NULL
+                WHERE m.ts > now() - make_interval(hours => {h})
+                GROUP BY bucket ORDER BY bucket;
+
+                SELECT time_bucket(make_interval(mins => {bucketMin}), a.triggered_at) AS bucket, count(*)
+                FROM alarms a
+                JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
+                WHERE a.triggered_at > now() - make_interval(hours => {h})
+                GROUP BY bucket ORDER BY bucket;";
+
+            await using var cmd = ds.CreateCommand(sql);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+
+            var rows = new List<(DateTime Ts, double? Avg, double? Min, long Count, long Bolts)>();
+            while (await r.ReadAsync(ct))
+                rows.Add((
+                    r.GetDateTime(0),
+                    r.IsDBNull(1) ? null : r.GetDouble(1),
+                    r.IsDBNull(2) ? null : r.GetDouble(2),
+                    r.GetInt64(3),
+                    r.GetInt64(4)));
+
+            var alarmMap = new Dictionary<DateTime, long>();
+            await r.NextResultAsync(ct);
+            while (await r.ReadAsync(ct))
+                alarmMap[r.GetDateTime(0)] = r.GetInt64(1);
+
+            var points = rows.Select(p => new
+            {
+                ts = p.Ts,
+                avgRatio = p.Avg,
+                minRatio = p.Min,
+                count = p.Count,
+                activeBolts = p.Bolts,
+                alarms = alarmMap.TryGetValue(p.Ts, out var a) ? a : 0L,
+            });
+
+            return Results.Ok(new { bucketMinutes = bucketMin, hours = h, points });
+        })
+        .RequireAuthorization(AuthPolicies.LoggedIn)
+        .WithTags("Dashboard")
+        .WithName("DashboardTrend")
+        .WithSummary("总览：残余率/采集/告警时序趋势");
 
         return app;
     }
