@@ -122,16 +122,20 @@ async function submitQuick() {
     kLUncertainty: quick.kLUncertainty, note: quick.note || undefined,
   }), '快速标定已生效（自签）')
 }
+// 采样窗口 180s：热插拔全通道轮询下单通道刷新率约 0.25Hz，默认 60s 窗口攒不够后端 minSamples=20
+const SAMPLE_WINDOW_SEC = 180
 function submitTorque() {
   if (torque.torqueNm == null) return ElMessage.warning('扭矩必填')
   run('torque', (cid) => calibrationApi.torqueCalibrate(cid, {
-    torqueNm: torque.torqueNm!, nutFactor: torque.nutFactor, nominalDiameterMm: torque.nominalDiameterMm, note: torque.note || undefined,
+    torqueNm: torque.torqueNm!, nutFactor: torque.nutFactor, nominalDiameterMm: torque.nominalDiameterMm,
+    sampleWindowSeconds: SAMPLE_WINDOW_SEC, note: torque.note || undefined,
   }), '扭矩法临时标定已生效（自签）')
 }
 function captureStepPoint() {
   if (step.torqueNm == null) return ElMessage.warning('扭矩必填')
   run('capture', (cid) => calibrationApi.captureTorquePoint(cid, {
     torqueNm: step.torqueNm!, nutFactor: step.nutFactor, nominalDiameterMm: step.nominalDiameterMm,
+    sampleWindowSeconds: SAMPLE_WINDOW_SEC,
   }), '已采集一个扭矩阶梯点')
 }
 function applyFit() {

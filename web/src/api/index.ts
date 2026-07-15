@@ -489,11 +489,13 @@ export const calibrationApi = {
   // quick / torque / apply-torque-fit 为自签临时标定（review_state=self_signed，立即生效）。
   quickCalibrate: (channelId: number, body: { kL: number; refTimeNs: number; refTempC: number; kLUncertainty?: number; note?: string; expiresDays?: number }) =>
     http.post<{ channelId: number; calibrationId: string }>(`/api/channels/${channelId}/quick-calibrate`, body),
-  torqueCalibrate: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; note?: string }) =>
+  // sampleWindowSeconds：声时取样窗口。热插拔全通道轮询下单通道刷新率被稀释（40 通道约 0.25Hz），
+  // 默认 60s 窗口攒不够 20 条样本，调用方应按实际采样时长传窗口（后端 clamp 5..600）。
+  torqueCalibrate: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; sampleWindowSeconds?: number; note?: string }) =>
     http.post<{ channelId: number; calibrationId: string; activeCalibration: { kL: number } }>(`/api/channels/${channelId}/torque-calibrate`, body),
   // 扭矩阶梯实验点：采集 / 列表 / 线性拟合摘要 / 应用拟合（含截距）为当前标定
   torquePoints: (channelId: number) => http.get<{ channelId: number; count: number; items: TorqueTestPoint[] }>(`/api/channels/${channelId}/torque-test-points`),
-  captureTorquePoint: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; note?: string }) =>
+  captureTorquePoint: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; sampleWindowSeconds?: number; note?: string }) =>
     http.post<{ id: number; channelId: number; estimatedPreloadN: number }>(`/api/channels/${channelId}/torque-test-points`, body),
   torquePointSummary: (channelId: number) => http.get<TorqueFitSummary>(`/api/channels/${channelId}/torque-test-points/summary`),
   applyTorqueFit: (channelId: number, body: { minPoints?: number; note?: string } = {}) =>

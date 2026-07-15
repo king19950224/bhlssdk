@@ -5,7 +5,7 @@
 // 2. 不可行的事情不提供(已拧紧且不能松的螺栓,物理上无法现场标出绝对值,只给趋势监测,不给假数字);
 // 3. 每一步实时显示声时稳定性,采样中给进度,完成页直接给"当前预紧力 XX kN(目标的 XX%)"。
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { boltApi, deviceApi, calibrationApi, type BoltListItem, type BoltChannelConfig } from '../api'
 
 const props = withDefaults(defineProps<{
@@ -45,6 +45,7 @@ const liveEcho = ref<number | null>(null)
 const liveTemp = ref<number | null>(null)
 const recentEchos = ref<number[]>([])
 let pollTimer: number | undefined
+let lastSampleTs = ''  // 按测量时间戳去重:轮询(1.2s)可能快于设备单通道刷新(全通道轮询下约 4s 一条)
 
 const echoSpreadNs = computed(() => {
   if (recentEchos.value.length < 4) return null
@@ -61,14 +62,20 @@ async function pollLive() {
     if (it?.echoNs != null) {
       liveEcho.value = Number(it.echoNs)
       liveTemp.value = it.tempC != null ? Number(it.tempC) : null
-      recentEchos.value.push(Number(it.echoNs))
-      if (recentEchos.value.length > 10) recentEchos.value.shift()
+      // 只有拿到【新测量】才计入稳定性样本:设备停报/数据陈旧时重复推同一值会把极差压成 0,
+      // 伪造出"稳定 ✓"误导现场在坏数据上设基线
+      if (it.lastTs && it.lastTs !== lastSampleTs) {
+        lastSampleTs = it.lastTs
+        recentEchos.value.push(Number(it.echoNs))
+        if (recentEchos.value.length > 10) recentEchos.value.shift()
+      }
     }
   } catch { /* 观测尽力 */ }
 }
 function startPoll() {
   stopPoll()
   recentEchos.value = []
+  lastSampleTs = ''
   pollTimer = window.setInterval(pollLive, 1200)
   void pollLive()
 }
@@ -105,6 +112,14 @@ function chooseScene(s: 'fresh' | 'inservice') {
 const baselineResult = ref<{ refNs: number; refTemp: number } | null>(null)
 async function setBaseline() {
   if (!chCfg.value) return
+  // 信号不稳时基线不可信(探头耦合差/干扰),要求现场明确确认而不是顺手点过
+  if (!echoStable.value) {
+    try {
+      await ElMessageBox.confirm(
+        `当前信号波动${echoSpreadNs.value != null ? ` ${echoSpreadNs.value.toFixed(1)} ns` : ''}偏大,基线可能不可靠。建议检查探头耦合后等待"稳定 ✓"再记录。仍要以当前读数设基线吗？`,
+        '信号未达稳定判据', { type: 'warning', confirmButtonText: '仍要记录', cancelButtonText: '再等等' })
+    } catch { return }
+  }
   busy.value = true
   errText.value = ''
   try {
@@ -135,24 +150,38 @@ function resumeAfterTighten() {
 // ---- 扭矩输入与标定(A 第 2 步) ----
 const torque = reactive({ torqueNm: null as number | null })
 const SAMPLE_TARGET = 20
+// 采样窗口 180s：热插拔全通道轮询下单通道刷新率被稀释(40 通道约 0.25Hz，60s 最多 15 条攒不够 20 条)，
+// 窗口放宽到 3 分钟；后端 torque-calibrate 按同一窗口取平均(clamp 5..600s)。螺栓静置，窗口放宽无物理代价。
+const SAMPLE_WINDOW_SEC = 180
+// 采样兜底超时：窗口期后仍不达标(设备离线/信号异常/上报过慢)，报错返回而不是永远转圈
+const SAMPLE_TIMEOUT_MS = 8 * 60_000
 const sampleCount = ref(0)
 let sampleTimer: number | undefined
+let samplingStartedAt = 0
 
 async function startCalibrate() {
   if (torque.torqueNm == null || torque.torqueNm <= 0) return ElMessage.warning('请输入拧紧时使用的扭矩(N·m)')
   step.value = 'calibrating'
   errText.value = ''
   sampleCount.value = 0
+  samplingStartedAt = Date.now()
   startPoll()
-  // 等窗口内攒够样本再提交(后端要求近 60s ≥20 条有效声时)
+  // 等窗口内攒够样本再提交(与后端 minSamples=20 同口径)
   sampleTimer = window.setInterval(async () => {
     try {
-      const ms = await boltApi.measurements(props.boltId!, 30)
-      const cutoff = Date.now() - 60_000
+      const ms = await boltApi.measurements(props.boltId!, 60)
+      const cutoff = Date.now() - SAMPLE_WINDOW_SEC * 1000
       sampleCount.value = ms.items.filter((m) => m.echoTimeNs != null && new Date(m.ts).getTime() > cutoff).length
       if (sampleCount.value >= SAMPLE_TARGET) {
         if (sampleTimer) { clearInterval(sampleTimer); sampleTimer = undefined }
         await submitTorque()
+        return
+      }
+      if (Date.now() - samplingStartedAt > SAMPLE_TIMEOUT_MS) {
+        if (sampleTimer) { clearInterval(sampleTimer); sampleTimer = undefined }
+        stopPoll()
+        errText.value = `采样超时:${Math.round(SAMPLE_TIMEOUT_MS / 60000)} 分钟内有效声时样本不足(${sampleCount.value}/${SAMPLE_TARGET})。请确认设备在线、探头耦合正常后重试。`
+        step.value = 'torque-input'
       }
     } catch { /* 下轮再试 */ }
   }, 2000)
@@ -164,6 +193,7 @@ async function submitTorque() {
   try {
     await calibrationApi.torqueCalibrate(props.channelId, {
       torqueNm: torque.torqueNm!,
+      sampleWindowSeconds: SAMPLE_WINDOW_SEC,
       note: `引导标定:安装扭矩 ${torque.torqueNm} N·m(向导流程:零载基线+扭矩反推)`,
     })
     bolt.value = await boltApi.get(props.boltId!)
@@ -173,6 +203,7 @@ async function submitTorque() {
   } catch (e) {
     errText.value = (e as Error)?.message || '标定计算失败'
     step.value = 'torque-input'
+    stopPoll()
   } finally {
     busy.value = false
   }
@@ -226,6 +257,9 @@ const doneKn = computed(() => {
       <p class="wz-lead" v-if="scene === 'fresh'">
         请确认螺栓处于<b>未拧紧</b>状态(刚穿入、螺母仅手拧贴合,不受力)。确认后点下方按钮,系统会把当前的超声读数记录为"零载基准"。
       </p>
+      <p class="wz-lead warn-lead" v-if="scene === 'fresh' && bolt?.state === 'calibrated'">
+        ⚠ 该螺栓已在监测中:松开它会触发"预紧力脱落"告警。请先到告警中心对它做<b>维护抑制</b>(填写检修原因),再松开重标,避免值班误响应。
+      </p>
       <p class="wz-lead" v-else>
         无需任何操作,系统将把<b>此刻</b>的超声读数记录为比较基准。之后页面上会显示这颗螺栓相对现在的松紧变化。
       </p>
@@ -276,7 +310,7 @@ const doneKn = computed(() => {
         <span class="torque-unit">N·m</span>
         <span v-if="bolt?.installTorqueNm" class="dim">(档案记录的安装扭矩:{{ Number(bolt.installTorqueNm).toFixed(0) }} N·m)</span>
       </div>
-      <p class="wz-hint">提交后系统会连续采集约 1 分钟的测量数据取平均,期间请勿再扳动螺栓。</p>
+      <p class="wz-hint">提交后系统会连续采集测量数据取平均(约 1~3 分钟,取决于设备轮询的通道数),期间请勿再扳动螺栓。</p>
       <div class="wz-actions">
         <el-button @click="step = 'scene'">返回</el-button>
         <el-button type="primary" :disabled="torque.torqueNm == null" @click="startCalibrate">开始标定</el-button>
@@ -330,6 +364,8 @@ const doneKn = computed(() => {
 <style scoped>
 .wz-lead { font-size: 13.5px; line-height: 1.8; color: var(--text-2); margin: 0 0 14px; }
 .wz-lead b { color: var(--text-1); }
+.warn-lead { color: var(--warn); border: 1px solid var(--warn); border-radius: 8px; padding: 8px 12px; font-size: 12.5px; }
+.warn-lead b { color: var(--warn); }
 .wz-stepline { font-size: 12px; color: var(--accent); letter-spacing: 0.08em; margin-bottom: 10px; font-weight: 600; }
 .wz-err { display: flex; align-items: center; gap: 8px; color: var(--crit); border: 1px solid var(--crit); border-radius: 8px; padding: 8px 12px; font-size: 12.5px; margin-bottom: 12px; }
 .wz-ok-note { display: flex; align-items: center; gap: 8px; color: var(--ok); font-size: 13px; margin-bottom: 10px; }
