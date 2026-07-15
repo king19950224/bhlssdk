@@ -140,7 +140,8 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
                 CommunicationParameters: spec.CommParams,
                 Address: spec.Address,
                 TransferMode: spec.TransferMode,
-                Model: spec.Model));
+                Model: spec.Model,
+                ChannelCount: spec.ChannelCount));
     }
 
     private static DeviceRuntimeContext BuildRealRuntimeFromConfig(
@@ -177,7 +178,8 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
                 CommunicationParameters: spec.CommParams,
                 Address: spec.Address,
                 TransferMode: spec.TransferMode,
-                Model: spec.Model));
+                Model: spec.Model,
+                ChannelCount: spec.ChannelCount));
     }
 
     private static List<DeviceRow> LoadEnabledDevices(NpgsqlDataSource dataSource, ILogger log)
@@ -268,7 +270,8 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
                     CommunicationParameters: "in-process",
                     Address: address,
                     TransferMode: 1,
-                    Model: 3)));
+                    Model: 3,
+                    ChannelCount: channelCount)));
         }
 
         if (count > 1)

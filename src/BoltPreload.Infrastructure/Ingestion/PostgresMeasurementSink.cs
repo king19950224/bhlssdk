@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using BoltPreload.Algorithms.Preload;
 using BoltPreload.Algorithms.Waveform;
 using BoltPreload.Application.Alarm;
+using BoltPreload.Application.Devices.ProbeScan;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Application.Realtime;
 using BoltPreload.Fx.Models;
@@ -25,6 +26,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     private readonly IAlarmSink? _alarmSink;
     private readonly IAlarmPublisher? _alarmPublisher;
     private readonly IPreloadCalculatorFactory _calculatorFactory;
+    private readonly ProbeScanState? _probeScan;
 
     private static readonly System.Text.Json.JsonSerializerOptions JsonOpts = new()
     {
@@ -64,7 +66,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         IAlarmEvaluator? alarmEvaluator = null,
         IAlarmSink? alarmSink = null,
         IAlarmPublisher? alarmPublisher = null,
-        IPreloadCalculatorFactory? calculatorFactory = null)
+        IPreloadCalculatorFactory? calculatorFactory = null,
+        ProbeScanState? probeScan = null)
     {
         _dataSource = dataSource;
         _resolver = resolver;
@@ -73,6 +76,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         _alarmEvaluator = alarmEvaluator;
         _alarmSink = alarmSink;
         _alarmPublisher = alarmPublisher;
+        _probeScan = probeScan;
         // 未注入工厂时（如单测直接 new）退化为默认工厂，保持原单波法行为
         _calculatorFactory = calculatorFactory ?? new PreloadCalculatorFactory(
             new SimplifiedCalculator(), new GbSingleWaveCalculator(), new GbBiWaveCalculator());
@@ -132,6 +136,13 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 break;
 
             case { BoltId: 0, ChannelId: > 0 } r:
+                // 全通道轮询（热插拔识别）下，空口会 7×24 持续上报无回波结果；unbound_measurements
+                // 没有保留期清理，照单全收会无限膨胀（40 通道每天可达数十万行垃圾）。
+                // 无回波的未绑定数据仅在通道扫描期间落库——probe-scan 依赖无回波样本区分
+                // active_no_echo / not_reporting；其余时间直接丢弃（在位判定走内存状态机，不依赖此表）。
+                // 有回波的未绑定数据（真实探头，等待绑定）照常落库。
+                if (cr.EchoTimeNs is null && !(_probeScan?.IsRunning(envelope.DeviceId) ?? false))
+                    break;
                 await WriteUnboundAsync(r.ChannelId, envelope, cr, ct);
                 break;
 

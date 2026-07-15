@@ -21,6 +21,7 @@ public sealed class IngestionService : BackgroundService
     private readonly IMeasurementSink _sink;
     private readonly IMeasurementPublisher _publisher;
     private readonly IMeasurementWal _wal;
+    private readonly ChannelPresenceTracker _presence;
     private readonly ILogger<IngestionService> _logger;
 
     public IngestionService(
@@ -28,12 +29,14 @@ public sealed class IngestionService : BackgroundService
         IMeasurementSink sink,
         IMeasurementPublisher publisher,
         IMeasurementWal wal,
+        ChannelPresenceTracker presence,
         ILogger<IngestionService> logger)
     {
         _deviceManager = deviceManager;
         _sink = sink;
         _publisher = publisher;
         _wal = wal;
+        _presence = presence;
         _logger = logger;
     }
 
@@ -115,6 +118,9 @@ public sealed class IngestionService : BackgroundService
                 runtimeStatus.MarkEnvelope(
                     envelope.ReceiveTime,
                     envelope.ResultType is FxResultType.ChannelResult or FxResultType.MultiChannelResult);
+
+                // 探头热插拔在位判定（纯内存计数，不做 IO；事件由 ChannelPresenceService 异步消费）
+                ObservePresence(envelope);
 
                 if (envelope.ResultType == FxResultType.DeviceParameter && envelope.DeviceParameter is not null)
                 {
@@ -204,6 +210,21 @@ public sealed class IngestionService : BackgroundService
         }
         _logger.LogWarning("等待 connector Connected 超时 device={DeviceId} state={State}",
             deviceId, connector.State);
+    }
+
+    private void ObservePresence(FxDecodedEnvelope envelope)
+    {
+        switch (envelope.ResultType)
+        {
+            case FxResultType.ChannelResult when envelope.ChannelResult is not null:
+                _presence.Observe(envelope.DeviceId, envelope.ChannelResult.Channel,
+                    envelope.ChannelResult.EchoTimeNs is not null, envelope.ReceiveTime);
+                break;
+            case FxResultType.MultiChannelResult when envelope.MultiChannelResult is not null:
+                foreach (var (chNo, cr) in envelope.MultiChannelResult.Channels)
+                    _presence.Observe(envelope.DeviceId, chNo, cr.EchoTimeNs is not null, envelope.ReceiveTime);
+                break;
+        }
     }
 
     private async Task SafePublishAsync(FxDecodedEnvelope envelope, CancellationToken ct)

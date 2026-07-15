@@ -160,6 +160,12 @@ builder.Services.Configure<HostOptions>(o =>
     o.ShutdownTimeout = TimeSpan.FromSeconds(30);
 });
 
+// 探头热插拔识别：全通道轮询 + 在位状态机 + 实时推送（Fx:HotPlug:Enabled=false 可关闭回旧行为）
+builder.Services.Configure<ChannelPresenceOptions>(builder.Configuration.GetSection("Fx:HotPlug"));
+builder.Services.AddSingleton<ChannelPresenceTracker>();
+builder.Services.AddSingleton<IChannelPresencePublisher, SignalRChannelPresencePublisher>();
+builder.Services.AddHostedService<BoltPreload.Api.Runtime.ChannelPresenceService>();
+
 // IngestionService 作为 BackgroundService 跑
 builder.Services.AddHostedService<IngestionService>();
 builder.Services.Configure<IngestionWatchdogOptions>(builder.Configuration.GetSection("Ingestion:Watchdog"));

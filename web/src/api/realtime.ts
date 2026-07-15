@@ -15,10 +15,16 @@ export interface OnAlarm {
 export interface OnDeviceParameter {
   deviceId: number; ts: string; address: number; channel: number | null; paramName: string; valueText: string | null
 }
+/** 探头热插拔在位变化（initial=true 是进程启动后的首次确认，前端只刷状态不弹提示） */
+export interface OnChannelPresence {
+  deviceId: number; channelNo: number; present: boolean; ts: string; initial: boolean
+  channelId: number | null; boltId: number | null; boltCode: string | null
+}
 interface EventMap {
   OnMeasurement: OnMeasurement
   OnAlarm: OnAlarm
   OnDeviceParameter: OnDeviceParameter
+  OnChannelPresence: OnChannelPresence
 }
 
 /** 连接状态，供 UI 显示「实时」指示灯。 */
@@ -32,6 +38,7 @@ const handlers: Record<string, Set<(p: unknown) => void>> = {
   OnMeasurement: new Set(),
   OnAlarm: new Set(),
   OnDeviceParameter: new Set(),
+  OnChannelPresence: new Set(),
 }
 
 function build(): signalR.HubConnection {

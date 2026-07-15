@@ -37,3 +37,24 @@ public sealed class NoopAlarmPublisher : IAlarmPublisher
     public Task PublishAsync(BoltPreload.Application.Alarm.AlarmEvent ev, CancellationToken ct = default)
         => Task.CompletedTask;
 }
+
+/// <summary>
+/// 通道在位（探头热插拔）事件推送。频率极低（现场插拔探头时才有），实现失败不抛。
+/// </summary>
+public interface IChannelPresencePublisher
+{
+    /// <param name="change">在位变化事件</param>
+    /// <param name="channelId">channels.id（若已登记）</param>
+    /// <param name="boltId">绑定螺栓 id（未绑定 = null）</param>
+    /// <param name="boltCode">绑定螺栓编号（未绑定 = null）</param>
+    Task PublishAsync(
+        Ingestion.ChannelPresenceChange change,
+        long? channelId, long? boltId, string? boltCode,
+        CancellationToken ct = default);
+}
+
+public sealed class NoopChannelPresencePublisher : IChannelPresencePublisher
+{
+    public Task PublishAsync(Ingestion.ChannelPresenceChange change, long? channelId, long? boltId, string? boltCode, CancellationToken ct = default)
+        => Task.CompletedTask;
+}

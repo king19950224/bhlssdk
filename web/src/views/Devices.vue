@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import {
   runtimeApi, deviceApi, channelApi, probeScanApi,
   type RuntimeDevice, type ChannelHealth, type ChannelRow, type UnboundSummaryRow, type ProbeScanView,
 } from '../api'
+import { onRealtime, startRealtime, type OnChannelPresence } from '../api/realtime'
 import { useAuth } from '../stores/auth'
 import EmptyState from '../components/EmptyState.vue'
 import BoltCreateDialog from '../components/BoltCreateDialog.vue'
@@ -84,13 +85,43 @@ async function loadBinding() {
   } catch { /* ignore */ }
 }
 
+// 探头热插拔：实时在位事件 → 通道灯即时翻转 + 新探头提示（识别与采集自动，绑定保持人工）
+let offPresence: (() => void) | undefined
+function onPresence(ev: OnChannelPresence) {
+  if (selected.value?.deviceId !== ev.deviceId) return
+  // 通道灯就地翻转（healthy/no_data 与后端落库词表一致），列表其余字段等下一轮轮询补齐
+  const row = channels.value.find((c) => c.channelNo === ev.channelNo)
+  if (row) row.hardwareState = ev.present ? 'healthy' : 'no_data'
+  else if (ev.present) loadHealth() // 新出现的通道（自动发现）：拉全量补行
+
+  if (ev.initial) return // 启动确认：只刷状态，不打扰
+  if (ev.present) {
+    loadBinding()
+    if (ev.boltCode) {
+      ElMessage.success(`通道 CH${ev.channelNo} 探头恢复（${ev.boltCode}），已继续采集`)
+    } else {
+      ElNotification({
+        title: `通道 CH${ev.channelNo} 检测到新探头`,
+        message: '已开始采集（未绑定螺栓）。数据进入未绑定列表，请到「通道与绑定」完成人工绑定。',
+        type: 'success', duration: 8000,
+        onClick: () => { tab.value = 'bind'; loadBinding() },
+      })
+    }
+  } else {
+    ElMessage.warning(`通道 CH${ev.channelNo} 探头断开${ev.boltCode ? `（${ev.boltCode}）` : ''}`)
+  }
+}
+
 onMounted(() => {
   loadDevices()
+  startRealtime()
+  offPresence = onRealtime('OnChannelPresence', onPresence)
   timer = window.setInterval(() => { if (selected.value && tab.value === 'health') loadHealth() }, 8000)
 })
 onUnmounted(() => {
   if (timer) clearInterval(timer)
   if (scanTimer) clearInterval(scanTimer)
+  offPresence?.()
 })
 
 const MODES: { mode: string; label: string; type: '' | 'primary' | 'warning' | 'danger' }[] = [

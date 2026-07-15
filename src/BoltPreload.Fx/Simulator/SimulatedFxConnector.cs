@@ -27,6 +27,10 @@ public sealed class SimulatedFxConnector : IFxConnector
     private Task? _samplingLoop;
     private long _dropped;  // H3：背压丢弃计数
 
+    // 探头热插拔模拟：不在字典 = 在位（默认全部插着）。拔出的通道仍随轮询上报，
+    // 但 EchoTime=null / StatusCode=-1（信号过小）——与真机"口上没探头"的表现一致。
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, bool> _probePresent = new();
+
     public long DeviceId => _options.DeviceId;
     public FxConnectorState State { get; private set; } = FxConnectorState.Idle;
     public ChannelReader<FxDecodedEnvelope> Results => _channel.Reader;
@@ -99,6 +103,16 @@ public sealed class SimulatedFxConnector : IFxConnector
         _logger.LogInformation("模拟器 Reconnect device={DeviceId}", _options.DeviceId);
         await DisconnectAsync(cancellationToken);
         await ConnectAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// 模拟现场插/拔某通道的探头（测试/演示用）。拔出后该通道上报无回波，插回恢复正常测量。
+    /// </summary>
+    public void SetProbePresent(ushort channel, bool present)
+    {
+        _probePresent[channel] = present;
+        _logger.LogInformation("模拟器 探头{Action} device={DeviceId} ch={Channel}",
+            present ? "插入" : "拔出", _options.DeviceId, channel);
     }
 
     public Task SetWorkModeAsync(FxWorkMode mode, ushort channel = 0, ushort address = 1, CancellationToken cancellationToken = default)
@@ -191,6 +205,22 @@ public sealed class SimulatedFxConnector : IFxConnector
                 if (ct.IsCancellationRequested) break;
 
                 var now = DateTimeOffset.UtcNow;
+
+                // 探头被"拔出"的通道：照常上报（设备仍轮询该口）但无回波，模拟空口/探头脱落
+                if (_probePresent.TryGetValue(ch, out var present) && !present)
+                {
+                    var noEcho = new FxChannelResultDto(
+                        Address: _options.Address, Channel: ch, StatusCode: -1,
+                        EchoTimeNs: null, EchoTime2Ns: null,
+                        SpTempC: (decimal)Math.Round(22.0 + (random.NextDouble() - 0.5), 2),
+                        DeltaTofNs: null, Gain: 10f, EchoWave: null,
+                        LowAi: null, HighAi: null, Angle: null, MidResults: null);
+                    BackpressureWriter.WriteWithBackpressure(_channel, new FxDecodedEnvelope(
+                        DeviceId: _options.DeviceId, ReceiveTime: now, IngestedAt: now,
+                        ResultType: FxResultType.ChannelResult, ChannelResult: noEcho), ref _dropped, OverflowSink);
+                    continue;
+                }
+
                 var baseTof = baseTofPerChannel[ch];
 
                 // 模拟温度小幅波动 22 ± 0.5°C

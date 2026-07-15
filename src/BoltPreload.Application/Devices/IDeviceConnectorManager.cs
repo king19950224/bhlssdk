@@ -28,9 +28,11 @@ public sealed record DeviceRuntimeContext(
     IIngestionRuntimeStatus RuntimeStatus,
     DeviceRuntimeOptions Options);
 
+/// <param name="ChannelCount">设备物理通道数（devices.channel_count / 模拟器 ChannelCount）；热插拔全通道轮询的目标范围 1..N</param>
 public sealed record DeviceRuntimeOptions(
     string Mode,
     string CommunicationParameters,
     ushort Address,
     ushort TransferMode,
-    ushort Model);
+    ushort Model,
+    ushort ChannelCount = 0);
