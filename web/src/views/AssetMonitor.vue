@@ -50,11 +50,13 @@ const boltView = ref<'radar' | 'grid' | 'trend'>('radar')
 const num = (v: number | null) => (v == null || !Number.isFinite(v) ? null : Number(v))
 // 让 stale/nodata 判定随时间刷新（否则设备离线后状态灯会一直停在最后一次加载时的判定）
 const now = useNow(30000)
-// 预计算每螺栓的"变化程度"指标（保持率/损失/安全裕度/松弛）
+// 预计算每螺栓的"变化程度"指标（保持率/损失/安全裕度/松弛）。
+// 标定判定必须与展示标签同源（服务端 b.status，基于通道有效标定）：原先传 bolts.state
+// （易漂移的冗余字段），会出现"标签已标定、tooltip 却按未标定算"的自相矛盾。
 const boltCells = computed(() =>
   bolts.value.map((b) => ({
     b,
-    h: computePreloadHealth({ state: b.boltState, lastTs: b.lastTs, current: b.preloadN, target: b.targetPreloadN, min: b.minPreloadN }, now.value),
+    h: computePreloadHealth({ calibrated: b.status !== 'uncalibrated', lastTs: b.lastTs, current: b.preloadN, target: b.targetPreloadN, min: b.minPreloadN }, now.value),
   })),
 )
 const marginStyle = (m: number | null) => (m == null ? '' : `color:${m < 0.1 ? '#f43f5e' : m < 0.3 ? '#f59e0b' : '#10b981'}`)
