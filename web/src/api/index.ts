@@ -185,7 +185,7 @@ export interface LooseBolt {
   status: string
   boltId: number
 }
-export interface ResidualDist { b100: number; b90: number; b80: number; b70: number; b70d: number }
+export interface ResidualDist { b100: number; b90: number; b80: number; b70: number; b70d: number; bhigh: number }
 export interface ApproachingBolt {
   boltCode: string; turbine: string; group: string
   preloadN: number | null; minPreloadN: number | null; preloadRatio: number | null

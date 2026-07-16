@@ -1454,8 +1454,10 @@ public static class CalibrationEndpoints
         .WithName("RejectCalibration")
         .WithSummary("驳回 pending 正式标定（reviewer）");
 
-        // 查通道标定历史
-        grp.MapGet("/calibrations", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
+        // 查通道标定历史。
+        // 只读档案对 LoggedIn 开放（不挂在 ReviewerAccess 组上）：operator 打开螺栓详情页也要看标定履历，
+        // 原先 403 会把详情页 init 整体打断（operator 看到"加载失败"）。写操作仍全部 reviewer+。
+        app.MapGet("/api/channels/{channelId:long}/calibrations", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
         {
             // 软删过滤 + 上限护栏（单通道档案通常几十条，200 足够展示；防长期运行后无界膨胀）
             const string sql = @"
@@ -1491,7 +1493,9 @@ public static class CalibrationEndpoints
                     createdAt = r.GetDateTime(9),
                     expiresAt = r.GetDateTime(10),
                     supersededBy = r.IsDBNull(11) ? null : (Guid?)r.GetGuid(11),
-                    isActive = r.IsDBNull(11),
+                    // "生效中" = 未被取代【且】已激活（自签或会签）。pending/rejected 未被取代但从未生效，
+                    // 原来只看 superseded_by 会给待会签记录错误打上"生效"徽标
+                    isActive = r.IsDBNull(11) && r.GetString(13) is "approved" or "self_signed",
                     notes = r.IsDBNull(12) ? null : r.GetString(12),
                     reviewState = r.GetString(13),
                     // 两人四眼：仅 approved 表示经【另一名】reviewer 会签；self_signed 为操作人自签的临时标定
@@ -1502,8 +1506,10 @@ public static class CalibrationEndpoints
             }
             return Results.Ok(new { channelId, count = items.Count, items });
         })
+        .RequireAuthorization(AuthPolicies.LoggedIn)
+        .WithTags("Calibration")
         .WithName("GetCalibrationHistory")
-        .WithSummary("通道标定历史（按时间倒序，含 superseded 关系）");
+        .WithSummary("通道标定历史（按时间倒序，含 superseded 关系；只读，登录即可）");
 
         return app;
     }

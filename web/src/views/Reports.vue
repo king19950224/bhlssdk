@@ -71,7 +71,15 @@ onMounted(load)
 async function download(r: ReportItem) {
   try {
     const res = await fetch(`/api/reports/${r.id}/download`, { headers: { Authorization: `Bearer ${getAuthToken()}` } })
-    if (!res.ok) throw new Error()
+    if (!res.ok) {
+      // 后端会带具体原因（404 文件缺失 / 400 完整性校验失败等），透传给用户而不是一律"可能未生成"
+      let msg = `下载失败（HTTP ${res.status}）`
+      try {
+        const body = await res.json() as { error?: string }
+        if (body?.error) msg = body.error
+      } catch { /* 非 JSON 响应 */ }
+      throw new Error(msg)
+    }
     const blob = await res.blob()
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -81,8 +89,8 @@ async function download(r: ReportItem) {
     a.download = `${r.title || 'report'}.${ext}`
     a.click()
     URL.revokeObjectURL(url)
-  } catch {
-    ElMessage.error('下载失败(报告文件可能未生成)')
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '下载失败(报告文件可能未生成)')
   }
 }
 function fmt(iso: string) {

@@ -86,7 +86,9 @@ async function loadUnbound() {
 const groupUnbound = computed<UnboundSummaryRow[]>(() => {
   if (!unboundRows.value.length) return []
   const devIds = new Set(bolts.value.map((b) => b.deviceId))
-  return devIds.size ? unboundRows.value.filter((u) => devIds.has(u.deviceId)) : unboundRows.value
+  // 组内无螺栓时无从判定该组归属设备——原先回退展示全站未绑定通道，多设备现场会把
+  // 其他风机设备的堆积误导到这个空组（照着提示「建档绑定」就绑错设备）。空组不展示。
+  return devIds.size ? unboundRows.value.filter((u) => devIds.has(u.deviceId)) : []
 })
 const unboundTotal = computed(() => groupUnbound.value.reduce((s, u) => s + u.count, 0))
 // 展示用：按通道号去重（历史自动发现可能给同一物理通道留多条记录）、堆积多的在前、最多列 8 路
@@ -94,6 +96,11 @@ const unboundChNos = computed(() => {
   const byNo = new Map<number, number>()
   for (const u of groupUnbound.value) byNo.set(u.channelNo, (byNo.get(u.channelNo) ?? 0) + u.count)
   return [...byNo.entries()].sort((a, b) => b[1] - a[1]).map(([no]) => no)
+})
+// 建档对话框预填：取堆积最多的通道（与提示文案排序一致），而不是 API 返回的原始顺序第一条
+const unboundTopChannelId = computed<number | null>(() => {
+  if (!groupUnbound.value.length) return null
+  return [...groupUnbound.value].sort((a, b) => b.count - a.count)[0].channelId
 })
 const unboundChLabel = computed(() => {
   const nos = unboundChNos.value
@@ -407,7 +414,7 @@ function onProjectChange() {
 
     <BoltCreateDialog
       v-model="createOpen"
-      :channel-id="groupUnbound[0]?.channelId ?? null"
+      :channel-id="unboundTopChannelId"
       :group-id="sel.group?.id ?? null"
       @done="refreshCurrent"
     />

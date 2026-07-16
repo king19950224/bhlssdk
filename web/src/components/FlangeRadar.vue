@@ -30,13 +30,19 @@ function pol(angDeg: number, r: number): [number, number] {
   return [C + r * Math.cos(a), C + r * Math.sin(a)]
 }
 
-// 现场位号：position_label 数字（"5号"→5）优先，其次 code 尾数，最后数组序。
+// 现场位号：position_label 优先，其次 code 尾数，最后数组序。
+// 解析规则："5号"/"第5号" 形式优先（避免 "M36-5号" 先吃到 36 落错孔位），
+// 否则取【最后一段】数字（"法兰12-3" → 3）；解析出 0 或非法值按未解析处理（圆盘只画 1..maxSeq，seq=0 会凭空消失）。
 function seqOf(b: GroupBolt, i: number): number {
-  const fromPos = b.positionLabel?.match(/(\d+)/)
-  if (fromPos) return Number(fromPos[1])
-  const fromCode = b.code.match(/(\d+)\s*$/)
-  if (fromCode) return Number(fromCode[1])
-  return i + 1
+  const pick = (m: RegExpMatchArray | null | undefined) => {
+    const n = m ? Number(m[1]) : NaN
+    return Number.isFinite(n) && n >= 1 ? n : null
+  }
+  const label = b.positionLabel ?? ''
+  return pick(label.match(/(\d+)\s*号/))
+    ?? pick(label.match(/(\d+)(?!.*\d)/))
+    ?? pick(b.code.match(/(\d+)\s*$/))
+    ?? i + 1
 }
 
 interface Hole {

@@ -34,19 +34,22 @@ public static class DashboardEndpoints
                 ORDER BY bs.preload_ratio ASC NULLS LAST
                 LIMIT 8;
 
+                -- 未闭合告警口径必须与告警中心 /api/alarms/summary 完全一致（仅按 bolts 软删过滤）。
+                -- 原先额外 JOIN monitor_groups/turbines 软删过滤：机组软删但螺栓未级联时，
+                -- 总览计数会吃掉这部分告警 → 「总览显示正常、告警中心却有未闭合 critical」的假安全。
                 SELECT a.severity, count(*) FROM alarms a
                 JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
-                JOIN monitor_groups mg ON mg.id = b.group_id AND mg.deleted_at IS NULL
-                JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
                 WHERE a.cleared_at IS NULL GROUP BY a.severity;
 
                 WITH {AssetEndpoints.BoltStatusCte}
                 SELECT
-                    count(*) FILTER (WHERE preload_ratio >= 1.0) AS b100,
+                    -- b100 上界封到 1.10：超张力(high, >110%)不能算进「达标」，否则与健康分布的「偏高」档自相矛盾
+                    count(*) FILTER (WHERE preload_ratio >= 1.0 AND preload_ratio <= 1.10) AS b100,
                     count(*) FILTER (WHERE preload_ratio >= 0.9 AND preload_ratio < 1.0) AS b90,
                     count(*) FILTER (WHERE preload_ratio >= 0.8 AND preload_ratio < 0.9) AS b80,
                     count(*) FILTER (WHERE preload_ratio >= 0.7 AND preload_ratio < 0.8) AS b70,
-                    count(*) FILTER (WHERE preload_ratio < 0.7) AS b70d
+                    count(*) FILTER (WHERE preload_ratio < 0.7) AS b70d,
+                    count(*) FILTER (WHERE preload_ratio > 1.10) AS bhigh
                 FROM bolt_status WHERE status IN ('normal','warn','loose','high') AND preload_ratio IS NOT NULL;
 
                 WITH cal AS (
@@ -125,7 +128,7 @@ public static class DashboardEndpoints
             }
 
             // 残余率分布（按 当前/目标 分桶，仅计已标定且有近期数据的螺栓）
-            object residualDist = new { b100 = 0L, b90 = 0L, b80 = 0L, b70 = 0L, b70d = 0L };
+            object residualDist = new { b100 = 0L, b90 = 0L, b80 = 0L, b70 = 0L, b70d = 0L, bhigh = 0L };
             await r.NextResultAsync(ct);
             if (await r.ReadAsync(ct))
                 residualDist = new
@@ -135,6 +138,7 @@ public static class DashboardEndpoints
                     b80 = r.GetInt64(2),
                     b70 = r.GetInt64(3),
                     b70d = r.GetInt64(4),
+                    bhigh = r.GetInt64(5),
                 };
 
             // 即将到限：近 7 天呈下降趋势、当前仍高于下限，按预计到限天数升序

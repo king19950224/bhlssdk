@@ -105,25 +105,44 @@ function setView(v: typeof view.value) {
   view.value = v
   load()
 }
+// OnAlarm 推送去抖：告警风暴（同周期多螺栓越限）时每条推送都全量刷新会打爆后端（3 个请求/条），
+// 合并 1s 内的推送为一次刷新
+let alarmDebounce: number | undefined
 onMounted(() => {
   load()
   timer = window.setInterval(() => { if (!document.hidden) load() }, 30000)
-  unsub = onRealtime('OnAlarm', () => load())
+  unsub = onRealtime('OnAlarm', () => {
+    if (alarmDebounce) return
+    alarmDebounce = window.setTimeout(() => { alarmDebounce = undefined; load() }, 1000)
+  })
 })
-onUnmounted(() => { if (timer) clearInterval(timer); unsub?.() })
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+  if (alarmDebounce) clearTimeout(alarmDebounce)
+  unsub?.()
+})
 
 // ---- 处置动作（均要求留痕） ----
+// 注意把「用户取消弹窗」和「API 调用失败」分开：原实现同一个 try/catch 全吞，
+// 网络错误/已被他人处置(404)会被当成"取消"静默忽略，操作者误以为已确认/已闭合。
 async function ack(a: AlarmItem) {
+  let note: string | undefined
   try {
     const { value } = await ElMessageBox.prompt('确认表示"已知悉、处置中"，告警保持开启。可填备注（记入档案）:', `确认告警 · ${a.boltCode}`, {
       confirmButtonText: '确认', cancelButtonText: '取消', inputType: 'textarea', inputValue: '',
     })
-    await alarmApi.ack(a.id, value || undefined)
+    note = value || undefined
+  } catch { return /* 用户取消 */ }
+  try {
+    await alarmApi.ack(a.id, note)
     ElMessage.success('已确认')
-    load()
-  } catch { /* 取消 */ }
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '确认失败（告警可能已被他人处置）')
+  }
+  load()
 }
 async function clear(a: AlarmItem) {
+  let reason: string
   try {
     const { value } = await ElMessageBox.prompt('闭合表示"已恢复/处置完成"。请填写闭合原因（记入审计）。若测点仍越限，闭合后会立即重新触发。', `闭合告警 · ${a.boltCode}`, {
       confirmButtonText: '闭合', cancelButtonText: '取消', inputType: 'textarea',
@@ -133,10 +152,15 @@ async function clear(a: AlarmItem) {
         return true
       },
     })
-    await alarmApi.clear(a.id, value)
+    reason = value
+  } catch { return /* 用户取消 */ }
+  try {
+    await alarmApi.clear(a.id, reason)
     ElMessage.success('已闭合')
-    load()
-  } catch { /* 取消 */ }
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '闭合失败（告警可能已被他人闭合）')
+  }
+  load()
 }
 const bulkAcking = ref(false)
 async function bulkAck() {
@@ -148,10 +172,13 @@ async function bulkAck() {
   } catch { return }
   bulkAcking.value = true
   try {
+    let ok = 0
     for (const a of targets) {
-      try { await alarmApi.ack(a.id, '批量确认') } catch { /* 单条失败不阻断 */ }
+      try { await alarmApi.ack(a.id, '批量确认'); ok++ } catch { /* 单条失败不阻断 */ }
     }
-    ElMessage.success(`已确认 ${targets.length} 条`)
+    // 如实报告成功/失败数，不把部分失败包装成全部成功
+    if (ok === targets.length) ElMessage.success(`已确认 ${ok} 条`)
+    else ElMessage.warning(`已确认 ${ok} 条，失败 ${targets.length - ok} 条（可能已被他人处置，列表已刷新）`)
     sel.value = {}
     load()
   } finally {

@@ -25,6 +25,10 @@ public static class AssetEndpoints
                      -- 与采集算预紧力所依据的完全一致；不再单看 bolts.state（该冗余字段由标定接口维护，
                      -- 历史上 API 标定路径漏写会漂移，导致已标定却显示未标定）。
                      WHEN c.k_l IS NULL OR c.active_calibration_id IS NULL THEN 'uncalibrated'
+                     -- 标定过期（UTC 日粒度，与采集热路径 CachedCalibration.IsExpiredAsOf 同口径）：
+                     -- 归 uncalibrated（前端文案'未标定/过期'）。不加这一档时，过期后到下一条测量间
+                     -- 会拿旧 preload 继续判 normal（假安全窗口）、之后又落进 nodata 误导排查方向。
+                     WHEN acr.expires_at IS NOT NULL AND (now() AT TIME ZONE 'UTC')::date > acr.expires_at THEN 'uncalibrated'
                      WHEN l.preload_n IS NULL OR l.ts < now() - interval '10 minutes' THEN 'nodata'
                      WHEN b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n THEN 'loose'
                      WHEN b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n * 1.1 THEN 'warn'
@@ -37,6 +41,7 @@ public static class AssetEndpoints
             JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
             JOIN monitor_groups mg ON mg.id = b.group_id AND mg.deleted_at IS NULL
             JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
+            LEFT JOIN calibration_records acr ON acr.id = c.active_calibration_id
             LEFT JOIN LATERAL (
                 SELECT preload_n, preload_ratio, ts FROM measurements m
                 WHERE m.bolt_id = b.id ORDER BY ts DESC LIMIT 1

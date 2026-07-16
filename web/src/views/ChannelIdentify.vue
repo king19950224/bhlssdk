@@ -10,8 +10,11 @@ const rows = ref<ChannelLive[]>([])
 const loading = ref(true)
 let timer: number | undefined
 
-// 每通道近期回波/峰峰值历史,用于检测"敲击"引起的跳动
-const hist = new Map<number, { echo: number[]; p2p: number[] }>()
+// 每通道近期回波/峰峰值历史,用于检测"敲击"引起的跳动。
+// lastTs 去重:全通道轮询下设备单通道约 4s 才出一条新测量,1s 轮询会把同一条测量重复
+// 推进历史窗,6 格窗被重复值占满后有效观测时间只剩 6s,敲击跳动常落在窗外漏检。
+// 只在测量时间戳变化时入窗,6 格 ≈ 24s 真实观测窗。
+const hist = new Map<number, { echo: number[]; p2p: number[]; lastTs: string }>()
 const moveScore = ref<Record<number, number>>({})
 const labelEdit = ref<Record<number, string>>({})
 const savingPos = ref<number | null>(null)
@@ -32,9 +35,13 @@ async function poll() {
     }
     const score: Record<number, number> = {}
     for (const it of d.items) {
-      const h = hist.get(it.channelNo) ?? { echo: [], p2p: [] }
-      if (it.echoNs != null) { h.echo.push(Number(it.echoNs)); if (h.echo.length > 6) h.echo.shift() }
-      if (it.peakToPeak != null) { h.p2p.push(it.peakToPeak); if (h.p2p.length > 6) h.p2p.shift() }
+      const h = hist.get(it.channelNo) ?? { echo: [], p2p: [], lastTs: '' }
+      const fresh = !!it.lastTs && it.lastTs !== h.lastTs
+      if (fresh) {
+        h.lastTs = it.lastTs!
+        if (it.echoNs != null) { h.echo.push(Number(it.echoNs)); if (h.echo.length > 6) h.echo.shift() }
+        if (it.peakToPeak != null) { h.p2p.push(it.peakToPeak); if (h.p2p.length > 6) h.p2p.shift() }
+      }
       hist.set(it.channelNo, h)
       // 跳动评分(仅对真探头通道有意义,噪声通道随机抖动不计):
       // 回波近期极差(ns)优先;无回波的探头用峰峰值相对变化折算

@@ -13,7 +13,7 @@ const runtime = useRuntime()
 const health = ref<PreloadHealth>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0, high: 0 })
 const byGroup = ref<{ turbine: string; group: string; health: PreloadHealth }[]>([])
 const topLoose = ref<LooseBolt[]>([])
-const residualDist = ref<ResidualDist>({ b100: 0, b90: 0, b80: 0, b70: 0, b70d: 0 })
+const residualDist = ref<ResidualDist>({ b100: 0, b90: 0, b80: 0, b70: 0, b70d: 0, bhigh: 0 })
 const approaching = ref<ApproachingBolt[]>([])
 const openAlarms = ref(0)
 const alarmsBySeverity = ref<{ severity: string; count: number }[]>([])
@@ -53,10 +53,22 @@ const overTension = computed(() => health.value.high)
 const measuredHealthPct = computed(() => (measured.value ? Math.round((health.value.normal / measured.value) * 100) : null))
 
 // 单一安全结论（首屏一句话说清安不安全 + 主色）
+// 告警按 severity 定级：仅 info 级未闭合不该把整屏拉成红色"严重"（与告警中心分级一致）
+const openBySev = computed(() => {
+  let crit = 0, warn = 0, info = 0
+  for (const s of alarmsBySeverity.value) {
+    if (s.severity === 'critical' || s.severity === 'crit') crit += s.count
+    else if (s.severity === 'warn' || s.severity === 'warning') warn += s.count
+    else info += s.count
+  }
+  return { crit, warn, info }
+})
 const verdict = computed<{ level: 'ok' | 'warn' | 'crit' | 'off'; text: string }>(() => {
   const h = health.value
   if (h.loose > 0) return { level: 'crit', text: `${h.loose} 颗预紧力松动，需立即停机巡检` }
-  if (openAlarms.value > 0) return { level: 'crit', text: `${openAlarms.value} 条未闭合告警待处置` }
+  if (openBySev.value.crit > 0) return { level: 'crit', text: `${openBySev.value.crit} 条严重告警未闭合，需立即处置` }
+  if (openBySev.value.warn > 0) return { level: 'warn', text: `${openBySev.value.warn} 条预警告警未闭合待处置` }
+  if (openBySev.value.info > 0) return { level: 'warn', text: `${openBySev.value.info} 条提示级告警未闭合` }
   if (h.warn > 0) return { level: 'warn', text: `${h.warn} 颗预警，预紧力接近下限` }
   if (h.high > 0) return { level: 'warn', text: `${h.high} 颗预紧力偏高（超目标 110%），关注超张力风险` }
   if (approaching.value.length > 0) return { level: 'warn', text: `${approaching.value.length} 颗预紧力持续下降，关注到限` }
@@ -202,9 +214,11 @@ const donutOption = computed(() => {
 
 const distBuckets = computed(() => {
   const r = residualDist.value
+  // 超张力(>110%)独立成档：不算进"达标"，与健康分布"偏高"档口径一致
   const items = [
-    { key: 'b100', label: '≥100% 达标及以上', count: r.b100, color: '#a78bfa' },
-    { key: 'b90', label: '90–100%', count: r.b90, color: '#10b981' },
+    { key: 'bhigh', label: '>110% 超张力', count: r.bhigh ?? 0, color: '#a78bfa' },
+    { key: 'b100', label: '100–110% 达标', count: r.b100, color: '#10b981' },
+    { key: 'b90', label: '90–100%', count: r.b90, color: '#34d399' },
     { key: 'b80', label: '80–90%', count: r.b80, color: '#f59e0b' },
     { key: 'b70', label: '70–80%', count: r.b70, color: '#fb923c' },
     { key: 'b70d', label: '<70%', count: r.b70d, color: '#f43f5e' },

@@ -36,7 +36,16 @@ public static class ReportEndpoints
             CancellationToken ct) =>
         {
             var currentUser = UserContext.Require(http);
-            var snapshot = await BuildTorqueStepSnapshotAsync(ds, channelId, ct);
+            TorqueStepReportSnapshot snapshot;
+            try
+            {
+                snapshot = await BuildTorqueStepSnapshotAsync(ds, channelId, ct);
+            }
+            catch (InvalidOperationException)
+            {
+                // 通道不存在/未绑定螺栓：给 404 而不是让异常冒泡成 500
+                return Results.NotFound(new { error = "通道不存在或未绑定螺栓，无法生成扭矩阶梯报告", channelId });
+            }
             if (snapshot.Points.Count == 0)
                 return Results.BadRequest(new { error = "没有扭矩实验点，无法生成报告", channelId });
 
@@ -403,9 +412,12 @@ public static class ReportEndpoints
                 }
             }
 
+            // 空部位不出报告：与扭矩阶梯"无实验点 400"对称（UI 有按钮门槛，但 API 直调也必须拦）
+            if (total == 0)
+                return Results.BadRequest(new { error = "该部位没有在册螺栓，无法生成验收报告", groupId });
+
             // 总体结论：有低于下限 → 不合格；有未标定/无数据 → 未完成；全部达标但含临时标定 → 有条件合格
-            var overall = total == 0 ? "无螺栓"
-                : failed > 0 ? "不合格"
+            var overall = failed > 0 ? "不合格"
                 : uncal + nodata > 0 ? "未完成（存在未标定或无数据螺栓）"
                 : tempPassed > 0 ? "有条件合格（含临时/工程估算标定）"
                 : "合格";

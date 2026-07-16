@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import EChart from '../components/EChart.vue'
@@ -16,7 +16,8 @@ import { useAuth } from '../stores/auth'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuth()
-const boltId = Number(route.params.boltId)
+// let 而非 const：Vue Router 在 /bolts/1 → /bolts/2 时复用组件实例，路由参数变化要重置全部状态并重新加载
+let boltId = Number(route.params.boltId)
 
 // 实时波形 + 松紧状态
 const live = ref(true)
@@ -28,7 +29,6 @@ const baselining = ref(false)
 
 // 实时预紧力滚动序列（拧松/拧紧肉眼可见升降）；livePreloadN/liveRatio 在 tightness 下方按 echo 连续计算
 const liveSeries = ref<{ t: number; v: number }[]>([])
-let lastLiveTs = ''
 // 实时最新测量时刻（SignalR/轮询驱动）：让头部 KPI 与陈旧度判定随实时数据更新,而非停在页面加载那一刻
 const liveTs = ref<string | null>(null)
 
@@ -175,19 +175,22 @@ async function loadWave() {
 }
 
 // 应用一条最新测量（声时/温度）→ 更新实时显示与滚动序列；SignalR 推送与轮询兜底共用。
+// 按毫秒时间戳做「只前进」去重：SignalR 队列(DropOldest)与 4s 轮询并存时可能乱序送达，
+// 或同一时刻的 ISO 字符串格式不同——字符串不等≠新数据，旧点回灌会让曲线出现时间回跳。
+let lastLiveMs = 0
 function applyLiveMeasurement(tsIso: string, echoNs: number | null, tempC: number | null) {
-  if (echoNs != null) {
+  if (!tsIso) return
+  const ms = new Date(tsIso).getTime()
+  if (!Number.isFinite(ms) || ms <= lastLiveMs) return
+  lastLiveMs = ms
+  if (echoNs != null && Number.isFinite(Number(echoNs))) {
     liveEchoNs.value = Number(echoNs)
     liveTempC.value = tempC != null ? Number(tempC) : liveTempC.value
   }
-  // 新测量到达 → 推入滚动序列（livePreloadN 已随 liveEchoNs 重算；按 ts 去重避免重复累计）
-  if (tsIso && tsIso !== lastLiveTs) {
-    lastLiveTs = tsIso
-    liveTs.value = tsIso
-    if (livePreloadN.value != null) {
-      liveSeries.value.push({ t: new Date(tsIso).getTime(), v: livePreloadN.value })
-      if (liveSeries.value.length > 90) liveSeries.value.shift()
-    }
+  liveTs.value = tsIso
+  if (livePreloadN.value != null) {
+    liveSeries.value.push({ t: ms, v: livePreloadN.value })
+    if (liveSeries.value.length > 90) liveSeries.value.shift()
   }
 }
 
@@ -284,8 +287,10 @@ async function setBaseline() {
   baselining.value = true
   try {
     const r = await deviceApi.recalibrate(c.deviceId, c.channelNo)
-    ElMessage.success(`基线已设为 ${Number(r.newRefTimeNs).toFixed(0)} ns`)
+    ElMessage.success(`基线已设为 ${Number(r.newRefTimeNs).toFixed(0)} ns。客户端实时预紧力将从新基线重新累计（旧 K_L + 新基线的换算在下一次标定前仅供参考）`)
     chCfg.value = await boltApi.channelConfig(boltId)
+    // 基线变了，旧基线算出的实时序列不再可比：清空重新累计，避免曲线出现悬崖式跳变误导现场
+    liveSeries.value = []
   } catch (e) {
     ElMessage.error((e as Error)?.message || '设基线失败(需复核员权限,或设备未测出稳定声时)')
   } finally {
@@ -306,8 +311,12 @@ async function countersign(c: CalibRecord) {
   try {
     await calibrationApi.countersign(bolt.value.channelId, c.id)
     ElMessage.success('已会签激活，标定生效')
+    // 会签是"首次进入已标定"的关键路径：bolt.calibrated/state 变了，不重载会让 KPI 仍显示
+    // "未标定"直到手动刷新；顺带重载预测与标定档案
     calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items
     chCfg.value = await boltApi.channelConfig(boltId)
+    bolt.value = await boltApi.get(boltId)
+    try { pred.value = await boltApi.prediction(boltId) } catch { /* 预测不可用 */ }
   } catch (e) {
     ElMessage.error((e as Error)?.message || '会签失败（需复核员权限，且不能与提交人相同）')
   } finally {
@@ -332,7 +341,9 @@ async function init() {
     try { pred.value = await boltApi.prediction(boltId) } catch { /* 预测不可用 */ }
     measurements.value = (await boltApi.measurements(boltId, 24)).items
     if (bolt.value) {
-      calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items
+      // 单独兜底：标定档案拉取失败（网络抖动等）不应打断波形/实时订阅等后续区块
+      try { calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items }
+      catch { calibrations.value = [] }
       const al = await alarmApi.list('?includeCleared=true&limit=200')
       // 审计履历是 reviewer+ 专属接口：operator 请求会 403。仅 reviewer 拉取，且单独 try 兜底，
       // 避免因审计 403 让 Promise.all 整体失败、后续波形/实时订阅不执行（operator 打开详情页残缺）。
@@ -383,6 +394,34 @@ onMounted(() => {
     loading.value = false
     return
   }
+  init()
+})
+
+// 路由参数变化（详情页跳详情页，如告警/榜单点击另一颗螺栓）：组件被复用不会重挂载，
+// 必须显式重置全部状态再 init，否则 KPI/趋势/实时订阅仍是上一颗螺栓的数据。
+watch(() => route.params.boltId, (nv, ov) => {
+  if (nv === ov || route.name !== 'boltDetail') return
+  const next = Number(nv)
+  if (!Number.isFinite(next)) return
+  boltId = next
+  stopLive()
+  unsubMeas?.()
+  unsubMeas = undefined
+  bolt.value = null
+  trend.value = []
+  measurements.value = []
+  calibrations.value = []
+  events.value = []
+  wave.value = null
+  waveFeat.value = null
+  chCfg.value = null
+  pred.value = null
+  liveSeries.value = []
+  lastLiveMs = 0
+  liveTs.value = null
+  liveEchoNs.value = null
+  liveTempC.value = null
+  loadErr.value = null
   init()
 })
 
@@ -914,6 +953,11 @@ async function exportTrendCsv() {
 
     <!-- 预紧力设置 -->
     <el-dialog v-model="settings.visible" title="编辑预紧力设置" width="520px">
+      <!-- 后端语义是"留空 = 不修改"（COALESCE），清空输入框不会清掉库里已有的值——必须明示，
+           否则用户"清空阈值→保存成功→旧值还在"会误以为已取消告警阈值 -->
+      <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+        留空的字段表示<b>保持原值不变</b>（不会清空）。如需取消某项阈值，请联系管理员在数据库层处理。
+      </el-alert>
       <el-form label-width="110px" label-position="left">
         <div class="form-sec">预紧力阈值（驱动状态判定与告警）</div>
         <el-form-item label="目标预紧力 N"><el-input-number v-model="form.targetPreloadN" :step="1000" :min="0" controls-position="right" style="width: 100%" /></el-form-item>

@@ -49,7 +49,15 @@ const torque = computed<TorqueStepSnapshot | null>(() => {
   return t
 })
 
-const RESULT: Record<string, string> = { 合格: '#10b981', 不合格: '#f43f5e', 未标定: '#61748f', 无数据: '#3b4659' }
+const RESULT: Record<string, string> = { 合格: '#10b981', '合格*': '#f59e0b', 不合格: '#f43f5e', 未标定: '#61748f', 无数据: '#3b4659' }
+// 总体结论分档配色：合格→绿、有条件合格/合格*→琥珀、未完成/无螺栓→灰、不合格→红。
+// 原实现 overall !== '合格' 一律红底,把"有条件合格（含临时标定）"画成验收失败,误导业主。
+function verdictClass(overall: string): string {
+  if (overall === '合格') return 'ok'
+  if (overall.startsWith('有条件合格') || overall === '合格*') return 'cond'
+  if (overall.startsWith('未完成') || overall === '无螺栓') return 'incomplete'
+  return 'no'
+}
 // 报告状态徽标（与列表页口径一致；archived 等不再一律显示"待签发"）
 const STATUS_LABEL: Record<string, string> = { signed: '已签发 · 已锁定', generated: '已生成 · 待签发', archived: '已归档' }
 const METHOD: Record<string, string> = {
@@ -197,7 +205,7 @@ async function download() {
         <div><span>报告编号</span><b>FR-{{ String(id).padStart(6, '0') }}</b></div>
       </div>
 
-      <div class="verdict" :class="flange.summary.overall === '合格' ? 'ok' : 'no'">
+      <div class="verdict" :class="verdictClass(flange.summary.overall)">
         <div class="v-main">
           <span class="v-label">验收结论</span>
           <span class="v-result">{{ flange.summary.overall }}</span>
@@ -345,11 +353,15 @@ async function download() {
 .verdict { display: flex; align-items: center; justify-content: space-between; padding: 18px 24px; border-radius: 10px; border: 1px solid; margin-bottom: 22px; }
 .verdict.ok { border-color: rgba(16, 185, 129, 0.4); background: rgba(16, 185, 129, 0.07); }
 .verdict.no { border-color: rgba(244, 63, 94, 0.4); background: rgba(244, 63, 94, 0.08); }
+.verdict.cond { border-color: rgba(245, 158, 11, 0.45); background: rgba(245, 158, 11, 0.07); }
+.verdict.incomplete { border-color: rgba(97, 116, 143, 0.45); background: rgba(97, 116, 143, 0.08); }
 .v-main { display: flex; flex-direction: column; gap: 4px; }
 .v-label { font-size: 12px; color: var(--text-3); letter-spacing: 0.1em; }
 .v-result { font-size: 34px; font-weight: 800; }
 .verdict.ok .v-result { color: var(--ok); }
 .verdict.no .v-result { color: var(--crit); }
+.verdict.cond .v-result { color: var(--warn); }
+.verdict.incomplete .v-result { color: var(--text-3); }
 .v-stats { display: flex; gap: 34px; }
 .v-stats > div { display: flex; flex-direction: column; align-items: center; gap: 3px; }
 .v-stats b { font-size: 24px; font-weight: 700; font-family: var(--font-mono); }

@@ -44,8 +44,11 @@ const healthPct = computed<Record<string, number>>(() => {
 })
 
 let disposed = false
+// inFlight 防重入：5s 轮询 + OnAlarm 推送可能并发触发 refresh，慢响应后到会覆盖新数据造成大屏"闪一下又回退"
+let inFlight = false
 async function refresh() {
-  if (document.hidden) return
+  if (document.hidden || inFlight) return
+  inFlight = true
   try {
     const d = await dashboardApi.preloadHealth()
     if (disposed) return
@@ -56,8 +59,10 @@ async function refresh() {
     openAlarms.value = d.openAlarms
     const alarms = (await alarmApi.list('?includeCleared=false&limit=10')).items
     if (!disposed) recentAlarms.value = alarms
-  } catch { /* 尽力刷新 */ }
+  } catch { /* 尽力刷新 */ } finally { inFlight = false }
 }
+// OnAlarm 去抖：告警风暴时合并 1s 内的推送为一次刷新（与总览页同思路）
+let alarmDebounce: number | undefined
 onMounted(() => {
   runtime.start()
   // 大屏是独立全屏路由,不经过 AppShell：需自行建立实时连接,告警才能秒级上屏
@@ -65,12 +70,16 @@ onMounted(() => {
   refresh()
   timer = window.setInterval(refresh, 5000)
   clock = window.setInterval(() => { now.value = new Date() }, 1000)
-  unsub = onRealtime('OnAlarm', () => refresh())
+  unsub = onRealtime('OnAlarm', () => {
+    if (alarmDebounce) return
+    alarmDebounce = window.setTimeout(() => { alarmDebounce = undefined; refresh() }, 1000)
+  })
 })
 onUnmounted(() => {
   disposed = true
   if (timer) clearInterval(timer)
   if (clock) clearInterval(clock)
+  if (alarmDebounce) clearTimeout(alarmDebounce)
   unsub?.()
   runtime.stop()
 })
