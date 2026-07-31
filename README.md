@@ -5,6 +5,8 @@
 ## 文档
 
 - 开发文档：`docs/development-guide.md`，新人先看这份。用什么做的、厂家资料、怎么通讯、接口有哪些、环境一步步怎么搭，都在里面
+- **现场部署手册：`docs/deployment-guide.md`**，到现场装机照这份做。必需配置清单、授权签发、装完自检都在里面
+- 交付检查计划：`docs/delivery-master-plan.md`，交付前逐页核对
 - 完整设计方案：`docs/plan.md`（从 `.cursor/plans/` 拷贝过来，含商用底线、算法、合规、附录 A~H）
 
 ## 开发环境要求
@@ -15,7 +17,10 @@
 - Node 20+（前端开发）
 - Git
 
-部署环境是 Windows 工控机，**不能用 Docker**，PG 用 Inno Setup 打的原生二进制（见方案附录 H）。开发机用 Docker 只是为了不污染原生 macOS。
+部署环境是 Windows 工控机，**不能用 Docker**，PG 走原生安装。开发机用 Docker 只是为了不污染原生 macOS。
+
+现场部署目前按 `docs/deployment-guide.md` 手工执行（建库跑迁移 → 注入配置 → 签发授权 → NSSM 注册服务 → 自检）。
+方案附录 H 规划的 Inno Setup 一键安装包尚未实现（`deploy/installer/` 为空），需在 Windows 上构建验证。
 
 ## 快速开始
 
@@ -34,7 +39,10 @@ cd src/BoltPreload.Api
 dotnet run
 ```
 
-默认端口 5000，UI 在 https://localhost:5000
+默认端口 5000，UI 在 http://localhost:5000（当前进程只提供 HTTP，TLS 由现场反向代理终结，见部署手册 §5）
+
+开发环境会自动创建 `admin` / `admin123`（仅 Development）。生产环境不会自动建账号，
+首装必须提供 `BoltPreload__BootstrapAdminPassword`，否则没人能登录 —— 详见部署手册 §5。
 
 ### 跑测试
 
@@ -66,11 +74,14 @@ BoltPreload/
 ├── web/                                Vue 3 前端
 ├── deploy/
 │   ├── docker-compose.yml              本地开发用
-│   ├── sql/                            数据库迁移脚本
-│   └── installer/                      Windows Inno Setup
+│   ├── sql/                            数据库迁移脚本（生产只跑 0*.sql，不含 dev/）
+│   ├── windows/                        工控机部署脚本（NSSM 服务注册、备份、诊断收集）
+│   └── installer/                      Windows Inno Setup（待实现）
 ├── tools/
-│   └── FxDeviceSimulator/              设备模拟器
-└── docs/                               架构 / 标定 SOP / 验收文档
+│   ├── FxDeviceSimulator/              设备模拟器
+│   ├── DeviceSmokeTest/                真机连通性烟测
+│   └── LicenseSigner/                  授权签发（供应商侧，不随交付包发出）
+└── docs/                               架构 / 部署手册 / 标定 SOP / 验收文档
 ```
 
 ## 业务约束

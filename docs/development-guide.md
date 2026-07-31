@@ -250,17 +250,19 @@ IngestionService（BackgroundService 常驻）
 - 入库兜底：数据库不可用时测量数据先写本地 WAL（`data/wal/`），数据库恢复后由 WalReplayService 自动重放补写；
 - 断线看门狗：默认 60 秒未收到数据自动重连，并重新下发工作模式。
 
-#### 4.3.1 探头热插拔识别（Fx:HotPlug）
+#### 4.3.1 探头热插拔与检测即螺栓（Fx:HotPlug）
 
-设备只测量 MCR 轮询集内的通道（probe-scan 设计事实 F1），因此热插拔识别的物理前提是**常态轮询全部物理通道**（1..`devices.channel_count`），由 `ChannelPresenceService` 在设备连接就绪后下发（会话 MCR 快照已是全通道则跳过；probe-scan 扫描期间让位，扫后由其恢复逻辑接管）。
+设备只测量 MCR 轮询集内的通道（probe-scan 设计事实 F1），因此热插拔识别的物理前提是**常态轮询全部物理通道**（1..`devices.channel_count`），由 `ChannelPresenceService` 在设备连接就绪后下发（会话 MCR 快照已是全通道则跳过；probe-scan / 验收会话期间让位，结束后收敛恢复）。
 
-- **插入识别**：探头插入空闲口 → 下个轮询周期起该通道有回波 → `ChannelPresenceTracker`（挂在采集热路径的纯内存状态机）连续 `PlugConsecutiveEchoes`（默认 3）条回波判定"插入"→ 更新 `channels.hardware_state=healthy`、SignalR 推 `OnChannelPresence` → 前端设备页通道灯即时翻转并弹"检测到新探头"提示。数据同时经既有自动发现链路（`IChannelResolver` 自动登记 + `unbound_measurements`）开始采集，**绑定螺栓保持人工**（探头无 ID，错绑比不绑危险）；
-- **拔出识别**：在位通道连续 `UnplugSilenceSeconds`（默认 20s）无回波 → 判定"拔出"（`hardware_state=no_data`，前端即时显示断开）。三类"假静默"会挂起判定、不误报：设备离线、probe-scan 扫描中、设备整机无上报（待机/链路抖动——设备级条件交给 Watchdog/SignalHealth）；通道被移出 MCR 轮询集（如运维手动下发部分通道集）时同样不判定该通道，重新入集后静默重新起算；
-- **数据卫生**：空口（无回波）的未绑定数据**不入库**（`unbound_measurements` 无保留期清理，40 通道 7×24 照单全收会无限膨胀）；仅 probe-scan 扫描期间放行（扫描依赖无回波样本区分 `active_no_echo`/`not_reporting`）。有回波的未绑定数据（真实探头）照常落库。在位判定走内存状态机，不依赖该表；
-- **收敛与边界**：全通道 MCR 仅对 model=3（多通道监测型）设备下发；每次 probe-scan 结束后重新校验收敛（防扫描恢复了旧的部分通道集）；手动经诊断接口下发的部分 MCR 会保留到下一次扫描结束或进程重启，期间集外通道的热插拔识别暂停；
-- **分层**：这里的在位/断开是 **UI 秒级显示**；安全告警 `signal_lost`（120s，`Alarm:SignalHealth`，有国标依据）由 SignalHealthService 独立判定，两者互不影响；
-- **代价与开关**：全通道轮询会稀释单通道刷新率（8→40 通道约 5 倍，每通道约几秒一条；预紧力为缓变量可接受）。`Fx:HotPlug:Enabled=false` 关闭后回到只轮询业务通道的旧行为；
-- **License 口径**：授权通道数按 SDK 会话已配置通道（`GetSessionChannelConfigs`）统计，全通道轮询与热插拔自动发现的未绑定通道**不改变**该口径。
+- **插入识别**：探头插入空闲口 → 下个轮询周期起该通道有回波 → `ChannelPresenceTracker`（采集热路径纯内存状态机）要求连续 `PlugConsecutiveEchoes`（默认 3）条**合理且稳定**的回波（声时 ≥ `MinPlausibleEchoNs`，序列抖动 ≤ `PlugStabilityBandNs`）才判"插入"→ 更新 `channels.hardware_state=healthy` / `last_present_at`、SignalR 推 `OnChannelPresence`；
+- **检测即螺栓（`Fx:HotPlug:AutoEnroll`，默认 true）**：在位且通道无活跃螺栓时，`BoltAutoEnroller` 自动建档（编号中文「通道X-Y号螺栓」——每 10 个物理口为一「通道」束、束内从 1 数到 10，第 13 口即「通道2-3号螺栓」，见 `ChannelNaming`；缺省规格 M20/8.8，目标预紧力空，待现场补全）。归属组：`devices.default_group_id` → 设备同项目唯一活跃组兜底 → 否则跳过并提示去设备页设置。设置默认组的 PATCH 会对当前在位未建档通道立即补建档；
+- **删除抑制（`channels.auto_enroll_hold`）**：人工解绑/删除且探头仍在位时置 hold，阻止立刻重建；真正离位（Present=false）后清 hold，再插入才重建。**进程重启不清 hold**（避免「删了重启又回来」）；
+- **拔出识别**：在位通道静默超自适应阈值（`max(UnplugSilenceSeconds, 通道数×PerChannelMeasureMs×UnplugSilenceCycles)`）→ `hardware_state=no_data`。假静默（离线 / 扫描中 / 整机无上报 / 通道不在 MCR 集）挂起判定；
+- **识别页统计口径**：通道数 → 在位 → 螺栓（在测 / 失联=曾在位现无信号 / 待接入=从未在位 / 待补规格=目标预紧力空）。孔位（`expected_bolt_count`）是结构配置，监测数是已建档探头，二者不自动同步；
+- **数据卫生**：空口或低于下限门的杂散未绑定数据不入库（probe-scan 期间放行）；有合理回波的未绑定数据落 `unbound_measurements`，建档后回填。保留期由 `UnboundRetention` 后台清理；
+- **分层**：在位/断开是 UI 秒级显示；安全告警 `signal_lost`（120s）由 SignalHealthService 独立判定；
+- **代价与开关**：全通道轮询稀释单通道刷新率（预紧力缓变量可接受）。`Fx:HotPlug:Enabled=false` 关热插拔；`AutoEnroll=false` 关自动建档（纯点位表流程）；
+- **License 口径**：授权通道数按 SDK 会话已配置通道统计，全通道轮询不改变该口径。
 
 ### 4.4 前后端通讯
 
@@ -278,7 +280,7 @@ SignalR 推送事件：
 | OnMeasurement | 单条测量结果（设备、通道、EchoTime、温度、预紧力等） |
 | OnAlarm | 报警的产生 / 确认 / 清除 |
 | OnDeviceParameter | 设备参数回读结果 |
-| OnChannelPresence | 探头热插拔在位变化（deviceId、channelNo、present、是否绑定螺栓；`initial=true` 为进程启动后的首次确认） |
+| OnChannelPresence | 探头热插拔在位变化（deviceId、channelNo、present、绑定螺栓编号；`initial=true` 为进程启动后的首次确认；自动建档成功时带新 boltId/code） |
 
 开发环境下前端 Vite 端口 5173，`/api` 与 `/hubs` 均代理至后端 5085 端口（`web/vite.config.ts`），无跨域问题。
 

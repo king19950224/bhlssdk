@@ -78,3 +78,37 @@ jobs:
         with:
           name: coverage
           path: '**/coverage.cobertura.xml'
+
+  # 前端此前完全不在 CI 里：9000+ 行、17 个页面的类型错误与依赖漏洞只能靠人工发现，
+  # 而 dotnet publish 会把 web/dist 打进 wwwroot —— 前端构建挂了等于交付包里没有界面。
+  web:
+    name: Web Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查 + 构建
+        # build 脚本本身就是 `vue-tsc -b && vite build`，类型错误会在这里失败
+        run: npm run build
+
+      - name: 校验构建产物存在
+        # 交付包靠 web/dist 生成 wwwroot；产物缺失时客户打开是空白页，必须在 CI 拦住
+        run: |
+          test -f dist/index.html || { echo "dist/index.html 缺失"; exit 1; }
+          test -d dist/assets || { echo "dist/assets 缺失"; exit 1; }
+
+      - name: 依赖漏洞审计
+        run: npm audit --audit-level=high

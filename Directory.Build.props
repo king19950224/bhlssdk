@@ -29,8 +29,10 @@
     <Company>BoltPreload</Company>
     <Product>BoltPreload — 螺栓预紧力在线监测系统</Product>
     <Copyright>(c) BoltPreload Team</Copyright>
-    <!-- 交付版本：与前端 package.json、界面 V1.0 标识保持一致 -->
-    <Version>1.0.0</Version>
+    <!-- 交付版本：与前端 package.json、界面版本标识保持一致。
+         1.1.0（不是重打 1.0.0）：v1.0.0 标签之后 main 上新增了"探头热插拔识别"特性，
+         按语义化版本应升次版本号；且 1.0.0 标签已发出，重打会让同名版本指向不同内容。 -->
+    <Version>1.1.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
@@ -39,7 +41,9 @@
 
   <!-- FxSDK→MathNet.Symbolics→FParsec 传递引入含高危 CVE 的 4.3.0 旧包，
        传递版本提升不沿 ProjectReference 传播，故在此对全部项目统一提升到修复版。
-       net8 下两者均为 facade 包（运行时用内置实现），无任何行为影响，仅消除安全审计告警。 -->
+       net8 下两者均为 facade 包（运行时用内置实现），无任何行为影响，仅消除安全审计告警。
+       注意：external/FxSDK/Directory.Build.props 会截断本文件的继承，那里另有一份同样的提升，
+       改版本号时两处要一起改。 -->
   <ItemGroup>
     <PackageReference Include="System.Net.Http" Version="4.3.4" />
     <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />
