@@ -3,12 +3,13 @@ namespace BoltPreload.Algorithms.Preload;
 /// <summary>
 /// GB/T 43232-2023 单波法（详见方案 §8.3）。
 /// <para>
-/// K_L 量纲约定（本实现与 plan 文档不一致，<b>需 owner 统一，勿擅自翻转</b>）：
-/// 本实现统一用 <c>K_L = Δt/F</c>（单位 ns/N），因此 <c>F = Δt / K_L</c>（见 <see cref="Calculate"/>，
+/// K_L 量纲约定（已裁定，见 docs/sdk-api-facts.md §12）：全系统统一
+/// <c>K_L = Δt/F</c>（单位 ns/N，量级 ~1e-4），因此 <c>F = Δt / K_L</c>（见 <see cref="Calculate"/>，
 /// 与 <c>torque-calibrate</c>/<c>quick-calibrate</c> 的 <c>kL = Δt/F</c> 自洽，整条标定→计算链闭合）。
-/// plan §8.3/§8.5/附录 C 与标定证书用的是 <c>K_L = Δt/(F·t₀)</c>（单位 1/N，量级 ~1e-11），
-/// 对应 <c>F = Δt·K_L/t₀</c>。两套约定相差因子 t₀(~3e4 ns)。
-/// <b>quick-calibrate 入参必须按本实现的 ns/N 约定（量级 ~1e-4）填写，切勿直接照证书的 1e-11 填。</b>
+/// 注意标定证书与 plan 早期章节（§8.3/§8.5/附录 C）用的是 <c>K_L = Δt/(F·t₀)</c>
+/// （单位 1/N，量级 ~1e-11），与本约定相差因子 t₀(~3e4 ns)。
+/// <b>quick-calibrate 入参必须按 ns/N 约定（量级 ~1e-4）填写，切勿直接照证书的 1e-11 填</b>
+/// （CalibrationEndpoints 的量级护栏会拦截）。
 /// </para>
 /// <para>精度约 ±5%（K_L 标定可靠时）。</para>
 /// </summary>
@@ -44,10 +45,9 @@ public sealed class GbSingleWaveCalculator : IPreloadCalculator
         var deltaTofNs = normalizedTofNs - input.RefTimeNs;
 
         // 2. 单波法预紧力：F = Δt / K_L
-        //    本实现统一约定 K_L = Δt/F（单位 ns/N），与标定链（torque/quick calibrate 存的 kL=Δt/F）自洽。
-        //    这与 plan §8.3/§8.5/附录 C 的 K_L=Δt/(F·t₀)（1/N, ~1e-11, F=Δt·K_L/t₀）相差因子 t₀，
-        //    两套约定需 owner 统一（勿在此处擅自翻转，会让已存 channels.k_l/calibration_records.k_l 全部失真）。
-        //    见类注释与 docs/plan.md §8.5。
+        //    全系统裁定约定 K_L = Δt/F（单位 ns/N，见 docs/sdk-api-facts.md §12），
+        //    与标定链（torque/quick calibrate 存的 kL=Δt/F）及 channels.k_l /
+        //    calibration_records.k_l 的存量数据自洽。勿翻转为 1/N 约定——那会让全部已存 k_l 失真。
         if (input.Calibration.KL <= 0m)
         {
             return new PreloadResult(null, null, deltaTofNs, false, ModelName, input.Calibration.CalibrationId);
