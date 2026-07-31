@@ -135,7 +135,7 @@ dotnet run --project tools/LicenseSigner -- verify \
 | `Jwt__SigningKey` | **是**，≥32 字节随机，建议 64 | 非 Development 下启动即失败并提示（已实测） |
 | `BoltPreload__BootstrapAdminPassword` | **首装必需** | 空库里没有任何用户，而建账号接口要求 admin 鉴权 → 401，**没人能登录，系统装完打不开**。首个管理员建好后即可移除该变量 |
 | `License__PublicKeyPem` | **是** | 授权判无效 → 全部写操作 403（见 §4） |
-| `Fx__Mode` | 建议显式设 `Real` | 未设时按 `Real` 兜底并告警（v1.1.0 起；旧版本会静默跑模拟器，现场看到的是假数据） |
+| `Fx__Mode` | 建议显式设 `Real` | 未设时按 `Real` 兜底并告警；若在 Production 环境显式配成 `Simulated`，服务直接拒绝启动（仿真数据不允许出现在现场，这是硬防线不是告警） |
 | `ASPNETCORE_URLS` | 建议 | 默认监听 5000。只给本机用则设 `http://127.0.0.1:5000`，给局域网用再放开并配防火墙 |
 | `Ingestion__WaveSampling__Enabled` | 视需要 | 默认 `false`。真机 MultiMeas 模式不随测量带波形，**不开启则波形诊断页和 A-Scan 没有数据源** |
 

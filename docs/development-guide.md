@@ -24,7 +24,7 @@
 系统采用 B/S 架构，核心设计要点：
 
 - 后端基于 .NET 8 构建，厂家 SDK 以源码方式编入工程，便于调试与维护；
-- 设备接入层与业务层解耦，通过统一接口（IFxConnector）屏蔽 SDK 细节，模拟器与真实设备可互换接入；
+- 设备接入层与业务层解耦，通过统一接口（IFxConnector）屏蔽 SDK 细节。进程内模拟器（`Fx:Mode=Simulated`）只服务于无真机的开发与自动化测试：Production 环境配 Simulated 会拒绝启动（见 Program.cs 开头的防线），独立模拟器工具 `tools/FxDeviceSimulator` 也不随交付包发布；
 - 测量数据采用时序数据库存储（PostgreSQL + TimescaleDB），支持高频写入与历史查询；
 - 前端通过 REST API 与 SignalR（WebSocket）获取数据，实现实时刷新。
 

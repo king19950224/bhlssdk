@@ -29,6 +29,18 @@ var builder = WebApplication.CreateBuilder(args);
 var isDevelopment = builder.Environment.IsDevelopment();
 
 // ============================================================================
+// 仿真模式生产防线（第一道检查，先于一切配置校验）
+// 商用底线：模拟器只用于开发/测试。生产环境跑仿真会把物理自洽、看起来完全正常的
+// 假预紧力当真实监测数据展示，属重大安全事故隐患，宁可拒绝启动也不能带病运行。
+// 缺省按 Real 判定（与 DeviceConnectorManager 同一口径）：配置丢失时绝不能静默进仿真。
+// ============================================================================
+var fxSimulated = string.Equals(builder.Configuration["Fx:Mode"] ?? "Real", "Simulated", StringComparison.OrdinalIgnoreCase);
+if (fxSimulated && builder.Environment.IsProduction())
+    throw new InvalidOperationException(
+        "Fx:Mode=Simulated 禁止在 Production 环境运行：模拟器产出的是仿真数据，不是现场真实测量。" +
+        "真机现场请设 Fx__Mode=Real；开发/演示环境请把 ASPNETCORE_ENVIRONMENT 设为 Development。");
+
+// ============================================================================
 // 日志：Serilog 写控制台 + 滚动文件
 // 路径用 AppContext.BaseDirectory，防御 Windows 服务 CWD=System32 把日志写错地方
 // ============================================================================
@@ -201,8 +213,8 @@ builder.Services.Configure<BoltPreload.Api.Runtime.WiringGuardOptions>(builder.C
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.WiringGuardService>();
 
 // 仿真模式：为模拟器驱动的螺栓通道写入真实标定，使采集链路算出真实预紧力（不再注入演示数据）。
-// 缺省按 Real 判定（与 DeviceConnectorManager 同一口径）：配置丢失时绝不能静默进仿真。
-if (string.Equals(builder.Configuration["Fx:Mode"] ?? "Real", "Simulated", StringComparison.OrdinalIgnoreCase))
+// 生产环境防线在文件开头（fxSimulated 判定处），此处只在合法环境下装配。
+if (fxSimulated)
     builder.Services.AddHostedService<BoltPreload.Api.Runtime.SimulatedCalibrationProvisioner>();
 
 // ============================================================================
