@@ -48,10 +48,20 @@ public sealed class LocalFileLicenseService : ILicenseService
     {
         _options = options.Value;
         _logger = logger;
-        MachineCode = ComputeMachineCode();
+
+        var macs = CollectCandidateMacs();
+        MachineCode = ComputeMachineCode(macs[0]);
+        _acceptedMachineCodes = macs.Select(ComputeMachineCode).ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
+    /// <summary>对外公布、供签发方签发用的机器码（候选集里最小 MAC 那一个）。</summary>
     public string MachineCode { get; }
+
+    /// <summary>
+    /// 验证时【接受】的机器码全集：本机每块物理网卡各算一个。
+    /// 只要 license 命中其中任意一个即视为同机，详见 <see cref="CollectCandidateMacs"/>。
+    /// </summary>
+    private readonly HashSet<string> _acceptedMachineCodes;
 
     public LicenseStatus GetStatus()
     {
@@ -86,7 +96,7 @@ public sealed class LocalFileLicenseService : ILicenseService
             if (doc is null)
                 return Invalid("license.json 格式错误", null);
 
-            var machineMismatch = !string.Equals(doc.MachineCode, MachineCode, StringComparison.OrdinalIgnoreCase);
+            var machineMismatch = !_acceptedMachineCodes.Contains(doc.MachineCode ?? "");
             var expired = DateOnly.FromDateTime(DateTime.UtcNow) > doc.ExpiresAt;
             var signatureValid = VerifySignature(doc, out var sigError);
 
@@ -96,7 +106,9 @@ public sealed class LocalFileLicenseService : ILicenseService
                 ? null
                 : string.Join("; ", new[]
                 {
-                    machineMismatch ? $"机器码不匹配：license={doc.MachineCode}, local={MachineCode}" : null,
+                    machineMismatch
+                        ? $"机器码不匹配：license={doc.MachineCode}，本机可接受={string.Join("/", _acceptedMachineCodes)}"
+                        : null,
                     expired ? $"授权已过期：{doc.ExpiresAt}" : null,
                     !signatureValid ? $"签名校验失败：{sigError}" : null
                 }.Where(x => x is not null));
@@ -192,16 +204,15 @@ public sealed class LocalFileLicenseService : ILicenseService
             Document: doc);
 
     /// <summary>
-    /// 机器码 = SHA-256(MachineName | 第一块物理网卡 MAC | OS | CPU 核数) 截前 16 hex。
-    /// 历史版本只用 MachineName/UserName/OSVersion.Platform/ProcessorCount — 改个用户名就变，
-    /// 克隆 VM 就完全一样。加入 MAC 之后强多了，但仍是供应商离线签发可控的范围。
+    /// 机器码 = SHA-256(MachineName | MAC | OS | CPU 核数) 截前 16 hex。
+    /// 字段顺序与历史版本一致，变的只是"用哪块网卡的 MAC"（见 <see cref="CollectCandidateMacs"/>）。
     /// </summary>
-    private static string ComputeMachineCode()
+    private static string ComputeMachineCode(string mac)
     {
         var input = string.Join("|", new[]
         {
             Environment.MachineName,
-            GetPrimaryMacAddress(),
+            mac,
             Environment.OSVersion.Platform.ToString(),
             Environment.ProcessorCount.ToString(System.Globalization.CultureInfo.InvariantCulture)
         });
@@ -209,25 +220,57 @@ public sealed class LocalFileLicenseService : ILicenseService
         return Convert.ToHexString(hash)[..16];
     }
 
-    private static string GetPrimaryMacAddress()
+    /// <summary>
+    /// 收集本机物理网卡 MAC，作为机器码的候选来源（升序，元素唯一，至少一项）。
+    /// <para>
+    /// <b>为什么不是"挑一块网卡"</b>：旧实现取「<c>OperationalStatus == Up</c> + 按网卡名排序的第一块」，
+    /// 这让机器码会自己漂移，实测同一台机器 30 分钟内就变了一次：
+    /// </para>
+    /// <list type="bullet">
+    /// <item>按<b>名字</b>排序会选中 <c>awdl0</c>（Apple 点对点临时接口）这类虚拟网卡，
+    ///       它自己上下线，且 MAC 每次会话随机；Windows 上对应 Hyper-V/WSL/VPN 虚拟适配器。</item>
+    /// <item>只认 <c>Up</c> 意味着<b>拔掉现场网线就换机器码</b> —— 授权随即失效，
+    ///       LicenseGate 拦掉全部写操作，值班人员在网络最不稳的时候连告警都确认不了。
+    ///       对安全监测系统，误锁远比放宽绑定危险。</item>
+    /// </list>
+    /// <para>
+    /// 现在的口径：<b>不看链路状态</b>（通断不是身份）；只取物理类型网卡；优先只用全局唯一
+    /// （universally administered）MAC —— 本地管理位为 1 的多是虚拟网卡与随机化地址，会话之间会变；
+    /// 按 MAC 升序，与网卡命名和枚举顺序无关。验证时接受任一候选算出的码（见 <see cref="_acceptedMachineCodes"/>），
+    /// 于是插拔网卡、虚拟适配器来去都不会让已签发的授权失效，换整机仍然匹配不上。
+    /// </para>
+    /// </summary>
+    private static List<string> CollectCandidateMacs()
     {
         try
         {
-            // 取第一块 Up + 非环回 + 物理（Ethernet / WiFi）网卡 MAC
-            var nic = NetworkInterface.GetAllNetworkInterfaces()
-                .Where(n => n.OperationalStatus == OperationalStatus.Up)
+            var all = NetworkInterface.GetAllNetworkInterfaces()
                 .Where(n => n.NetworkInterfaceType is NetworkInterfaceType.Ethernet
                                                   or NetworkInterfaceType.Wireless80211
                                                   or NetworkInterfaceType.GigabitEthernet)
-                .OrderBy(n => n.Name, StringComparer.Ordinal)
-                .FirstOrDefault();
-            if (nic is null) return "NO_MAC";
-            var bytes = nic.GetPhysicalAddress().GetAddressBytes();
-            return bytes.Length == 0 ? "NO_MAC" : Convert.ToHexString(bytes);
+                .Select(n => Convert.ToHexString(n.GetPhysicalAddress().GetAddressBytes()))
+                .Where(mac => mac.Length == 12 && mac != "000000000000")
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var universal = all.Where(IsUniversallyAdministered).ToList();
+            var chosen = universal.Count > 0 ? universal : all;
+            chosen.Sort(StringComparer.OrdinalIgnoreCase);
+
+            // 没有任何可用网卡（极简镜像/网卡全禁用）：退化成固定占位，机器码仍由机器名等决定，
+            // 保证行为确定 —— 绝不能返回空集让下标越界。
+            return chosen.Count > 0 ? chosen : ["NO_MAC"];
         }
         catch
         {
-            return "NO_MAC";
+            return ["NO_MAC"];
         }
     }
+
+    /// <summary>
+    /// MAC 首字节 bit1（0x02）为 0 表示全局唯一（厂商烧号）；为 1 是本地管理地址，
+    /// 常见于虚拟网卡、VPN、以及 macOS/iOS 的随机化 Wi-Fi 地址，不适合作为机器身份。
+    /// </summary>
+    private static bool IsUniversallyAdministered(string mac)
+        => (Convert.ToByte(mac[..2], 16) & 0x02) == 0;
 }
