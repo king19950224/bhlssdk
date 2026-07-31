@@ -738,19 +738,22 @@ public static class ReportEndpoints
     }
 }
 
-/// <summary>生成扭矩分步标定报告的请求：可选标题与备注。</summary>
+/// <summary>出一份扭矩分步标定报告。标题和备注可不填，不填就用默认的。</summary>
 public sealed record TorqueStepReportRequest(string? Title = null, string? Notes = null);
 
-/// <summary>生成法兰验收报告的请求：可选标题与备注。</summary>
+/// <summary>出一份法兰验收报告。标题和备注可不填。</summary>
 public sealed record FlangeReportRequest(string? Title = null, string? Notes = null);
 
-/// <summary>法兰验收报告中的一行螺栓结果（既用于 JSON 快照，也用于渲染归档 HTML）。</summary>
+/// <summary>法兰验收报告里的一行螺栓结果。存 JSON 快照和渲染归档 HTML 用的是同一份，省得两边对不上。</summary>
 public sealed record FlangeLine(
     string Code, string Spec, string? Position, short ChannelNo,
     decimal? TargetN, decimal? MinN, decimal? PreloadN, decimal? Ratio,
     DateTime? LastTs, string? CalibMethod, string Trust, decimal? RSquared, decimal? UncertaintyN, string Result);
 
-/// <summary>扭矩分步报告的数据快照（生成时 JSON 落库，之后数据变化不影响已出报告）。</summary>
+/// <summary>
+/// 扭矩分步报告的数据快照。生成那一刻把用到的数全部按 JSON 存下来，
+/// 之后螺栓参数、标定怎么改都动不了已经出过的报告——报告是要签字存档的，不能回头变样。
+/// </summary>
 public sealed record TorqueStepReportSnapshot(
     DateTimeOffset GeneratedAt,
     ChannelSnapshot Channel,
@@ -759,13 +762,13 @@ public sealed record TorqueStepReportSnapshot(
     TorqueFitSnapshot? Fit,
     string Conclusion);
 
-/// <summary>报告快照中的通道信息（含出报告时刻的 K_L 与生效标定）。</summary>
+/// <summary>快照里的通道信息，带上出报告那一刻用的 K_L 和当时生效的那条标定。</summary>
 public sealed record ChannelSnapshot(long ChannelId, long DeviceId, short ChannelNo, decimal? KL, decimal? KLInterceptNs, Guid? ActiveCalibrationId);
 
-/// <summary>报告快照中的螺栓信息。</summary>
+/// <summary>快照里的螺栓信息，记的是出报告当时的规格和目标值，后来改了也不影响这份报告。</summary>
 public sealed record BoltSnapshot(long BoltId, string Code, string NominalDiameter, decimal? TargetPreloadN, decimal? InstallTorqueNm);
 
-/// <summary>报告快照中的单个扭矩档位测量点（含剔除标记与原因）。</summary>
+/// <summary>快照里的一个扭矩档位测量点。被剔除的点也留着，连同剔除原因一起——拟合过程要能复核。</summary>
 public sealed record TorquePointSnapshot(
     long Id,
     decimal TorqueNm,
@@ -779,5 +782,5 @@ public sealed record TorquePointSnapshot(
     bool Excluded,
     string? ExcludeReason,
     string? Note);
-/// <summary>报告快照中的线性拟合结果（K_L 按 ns/N 约定）。</summary>
+/// <summary>快照里的线性拟合结果。K_L 按全系统的 ns/N 口径存。</summary>
 public sealed record TorqueFitSnapshot(long PointCount, double KL, double InterceptNs, double RSquared);

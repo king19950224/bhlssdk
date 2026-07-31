@@ -1097,13 +1097,13 @@ public static class DiagnosticEndpoints
 /// <param name="RefTimeNs">显式 RefTime (ns)</param>
 /// <param name="RefTempC">显式 RefTemp (°C)</param>
 public sealed record RecalibrateRequest(decimal? RefTimeNs = null, decimal? RefTempC = null);
-/// <summary>批量读取通道参数请求：不传 Channels/PropertyNames 时按默认通道集与默认参数集读。</summary>
+/// <summary>批量把通道参数从设备读回来。Channels / PropertyNames 不传就走默认通道集和默认参数集。</summary>
 public sealed record BatchReadChannelParamsRequest(
     ushort[]? Channels = null,
     string[]? PropertyNames = null,
     ushort? Address = null);
 
-/// <summary>下发 MCR 多通道轮询配置的请求：通道集与单轮/每日采集次数、起始秒。</summary>
+/// <summary>下发 MCR 多通道轮询配置：轮哪些通道、一轮采几次、一天采几轮、从第几秒起。</summary>
 public sealed record ConfigureMultiChannelPollingRequest(
     ushort[]? Channels = null,
     ushort? SingleCount = null,

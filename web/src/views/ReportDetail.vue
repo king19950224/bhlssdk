@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:报告详情——渲染归档报告快照(扭矩分步/法兰验收),支持复核签署与 HTML 下载。
+// 报告详情：把归档的报告快照渲染出来（扭矩分步/法兰验收），能签字复核，也能下载 HTML。
 import { onMounted, ref } from 'vue'
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'

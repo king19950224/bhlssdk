@@ -29,16 +29,16 @@ var builder = WebApplication.CreateBuilder(args);
 var isDevelopment = builder.Environment.IsDevelopment();
 
 // ============================================================================
-// 仿真模式生产防线（第一道检查，先于一切配置校验）
-// 商用底线：模拟器只用于开发/测试。生产环境跑仿真会把物理自洽、看起来完全正常的
-// 假预紧力当真实监测数据展示，属重大安全事故隐患，宁可拒绝启动也不能带病运行。
-// 缺省按 Real 判定（与 DeviceConnectorManager 同一口径）：配置丢失时绝不能静默进仿真。
+// 仿真模式的生产防线，放在最前面，比任何配置校验都早
+// 模拟器只给开发和测试用。它吐出来的假预紧力物理上自洽、在界面上跟真数据一模一样，
+// 真跑到现场就是拿仿真数据当监测结果看——螺栓松了照样显示正常。宁可起不来也不能这么跑。
+// 没配 Fx:Mode 时按 Real 算（跟 DeviceConnectorManager 一个口径），绝不能一声不吭滑进仿真。
 // ============================================================================
 var fxSimulated = string.Equals(builder.Configuration["Fx:Mode"] ?? "Real", "Simulated", StringComparison.OrdinalIgnoreCase);
 if (fxSimulated && builder.Environment.IsProduction())
     throw new InvalidOperationException(
-        "Fx:Mode=Simulated 禁止在 Production 环境运行：模拟器产出的是仿真数据，不是现场真实测量。" +
-        "真机现场请设 Fx__Mode=Real；开发/演示环境请把 ASPNETCORE_ENVIRONMENT 设为 Development。");
+        "Production 环境不许跑 Fx:Mode=Simulated：模拟器出的是仿真数据，不是现场真实测量。" +
+        "接真机就设 Fx__Mode=Real；要演示就把 ASPNETCORE_ENVIRONMENT 改成 Development。");
 
 // ============================================================================
 // 日志：Serilog 写控制台 + 滚动文件
@@ -212,8 +212,8 @@ builder.Services.AddHostedService<BoltPreload.Api.Runtime.UnboundRetentionServic
 builder.Services.Configure<BoltPreload.Api.Runtime.WiringGuardOptions>(builder.Configuration.GetSection("Alarm:WiringGuard"));
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.WiringGuardService>();
 
-// 仿真模式：为模拟器驱动的螺栓通道写入真实标定，使采集链路算出真实预紧力（不再注入演示数据）。
-// 生产环境防线在文件开头（fxSimulated 判定处），此处只在合法环境下装配。
+// 仿真模式下给模拟器驱动的通道写真标定，让采集链路照常算出预紧力，而不是往库里塞演示数据。
+// 生产环境早在文件开头就拦掉了，走到这里的一定是开发或测试环境。
 if (fxSimulated)
     builder.Services.AddHostedService<BoltPreload.Api.Runtime.SimulatedCalibrationProvisioner>();
 
@@ -520,5 +520,5 @@ finally
     Log.CloseAndFlush();
 }
 
-/// <summary>顶级语句宿主类的可见声明：集成测试用 WebApplicationFactory&lt;Program&gt; 挂载整个应用。</summary>
+/// <summary>顶级语句的宿主类。特意声明出来，是为了集成测试能用 WebApplicationFactory&lt;Program&gt; 把整个应用拉起来。</summary>
 public partial class Program { }

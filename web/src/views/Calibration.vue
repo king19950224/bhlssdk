@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:标定管理(复核员+)——标定记录与可信等级/有效期跟踪,正式载荷标定会签生效。
+// 标定管理（复核员以上）：所有标定记录都在这，盯的是可信等级和有效期。正式载荷标定要会签才生效。
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { calibrationApi, boltApi, type CalibMethod, type BoltListItem } from '../api'

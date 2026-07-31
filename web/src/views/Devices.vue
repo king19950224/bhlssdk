@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:设备管理——连接状态、通道在位矩阵与绑定情况、探头热插拔提示、默认监测组设置。
+// 采集设备：连没连上、哪些通道在位、绑没绑螺栓。探头插拔会在这弹提示，默认监测组也在这设。
 import { onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'

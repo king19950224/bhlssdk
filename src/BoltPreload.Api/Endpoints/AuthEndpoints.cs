@@ -394,14 +394,17 @@ public static class AuthEndpoints
     }
 }
 
-/// <summary>登录请求。</summary>
+/// <summary>登录。连续输错会锁账号，锁定判定按自增后的真实失败数来，防的是并发撞库。</summary>
 public sealed record LoginRequest(string Username, string Password);
 
-/// <summary>登录成功响应：JWT 与用户基本信息。</summary>
+/// <summary>登录成功返回：JWT 加用户基本信息，前端拿到就能渲染顶栏，不用再问一次。</summary>
 public sealed record LoginResponse(string AccessToken, long UserId, string Username, string Role);
 
-/// <summary>管理员创建用户请求。</summary>
+/// <summary>
+/// 管理员建号。注意是按 username upsert：同名会把密码和角色一起覆盖掉，
+/// 所以这个接口同时也是“重置用户”的入口，改别人角色走的也是它。
+/// </summary>
 public sealed record CreateUserRequest(string Username, string Password, string Role, string? FullName = null, string? Email = null);
 
-/// <summary>修改本人密码请求（须验证旧密码）。</summary>
+/// <summary>改自己的密码，得先验旧密码。改完 token_version 会跳，手上的旧令牌立刻作废。</summary>
 public sealed record ChangePasswordRequest(string OldPassword, string NewPassword);

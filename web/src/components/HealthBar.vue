@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 健康状态分布条:把一组螺栓的各状态数量画成分段占比条(正常/预警/松动/偏高/未标定/无数据)。
+// 健康状态分布条：一组螺栓各个状态各占多少，画成一根分段条（正常/预警/松动/偏高/未标定/无数据）。
 import { computed } from 'vue'
 import type { PreloadHealthCounts } from '../api'
 

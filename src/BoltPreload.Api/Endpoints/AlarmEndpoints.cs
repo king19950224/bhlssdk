@@ -398,11 +398,14 @@ public static class AlarmEndpoints
     }
 }
 
-/// <summary>确认告警请求：可选处理备注。</summary>
+/// <summary>确认告警——值班的人看见了。备注可不填。</summary>
 public sealed record AckRequest(string? Note = null);
 
-/// <summary>人工闭合告警请求：可选闭合原因。</summary>
+/// <summary>人工闭合告警。原因可不填，但闭合人和原因都会落库，事后要靠它追责。</summary>
 public sealed record ClearRequest(string? Reason = null);
 
-/// <summary>抑制（静默）告警请求：按螺栓/告警类型抑制指定小时数，原因必填。</summary>
+/// <summary>
+/// 把某颗螺栓的告警静音几小时（检修期间用）。BoltId 必须给：不给就成了全场静默，端点直接 400 拒掉。
+/// 原因也必填，trim 完不足 5 个字同样拒——不然事后没人说得清当时为什么把告警关了。
+/// </summary>
 public sealed record ShelveRequest(long? BoltId, string? AlarmType, int Hours, string Reason);

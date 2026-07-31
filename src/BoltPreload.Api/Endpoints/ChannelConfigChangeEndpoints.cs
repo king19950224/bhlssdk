@@ -473,6 +473,6 @@ public static class ChannelConfigChangeEndpoints
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
     }
 
-    /// <summary>驳回配置变更请求：可选驳回原因。</summary>
+    /// <summary>驳回配置变更。原因可不填，但填了申请人才知道该改什么再报。</summary>
     public sealed record RejectBody(string? Reason);
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:大屏态势看板(/board)——全屏无导航,健康分布/告警/松动 TOP 的 HMI 展示。
+// 大屏看板（/board）：给值班室墙上那块屏用的，全屏没有导航，只放健康分布、告警和松动 TOP。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'

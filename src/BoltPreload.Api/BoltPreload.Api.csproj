@@ -31,9 +31,10 @@
     <None Update="NLog.config">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <!-- 本地开发配置绝不进交付包：内含 dev 库口令、dev JWT 密钥，且
-         AllowMissingLicenseInDevelopment=true。文件一旦落到现场，把 ASPNETCORE_ENVIRONMENT
-         改成 Development 即可绕过授权校验并跑起仿真模式。本地调试仍照常加载。 -->
+    <!-- 本地开发配置不能跟着交付包出去：里面有开发库口令、开发 JWT 密钥，还有
+         AllowMissingLicenseInDevelopment=true。这文件一旦落到现场机器上，
+         把 ASPNETCORE_ENVIRONMENT 改成 Development 就能绕开授权、顺带把仿真模式也放行。
+         只在 publish 时排除，本地 dotnet run 照常加载。 -->
     <Content Update="appsettings.Development.json" CopyToPublishDirectory="Never" />
   </ItemGroup>
 

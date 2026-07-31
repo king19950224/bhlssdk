@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:报告列表——已归档的扭矩分步/法兰验收报告检索与详情入口。
+// 报告列表：归档过的扭矩分步和法兰验收报告都在这翻，点进去看详情。
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'

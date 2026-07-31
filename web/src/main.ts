@@ -1,4 +1,4 @@
-// 应用引导:装配 Pinia / 路由 / Element Plus(中文暗色),并挂 401 统一登出处理。
+// 应用启动：装 Pinia、路由、Element Plus（中文 + 暗色），再挂上 401 统一登出。
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import ElementPlus from 'element-plus'

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:资产监测——项目/风机/监测组层级浏览,法兰雷达图与组内螺栓网格卡。
+// 资产监测：按项目 → 风机 → 监测组一层层往下钻，法兰画成雷达图，组里的螺栓铺成网格卡。
 import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'

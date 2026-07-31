@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:登录——用户名密码换 JWT,成功后回跳来源页。
+// 登录：用户名密码换 JWT。进来之前想去哪，登完就跳回哪。
 import { ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'

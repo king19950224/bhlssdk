@@ -523,7 +523,7 @@ public static class BoltEndpoints
     };
 }
 
-/// <summary>修改螺栓参数请求：全字段可空，只更新给了值的字段（部分更新语义）。</summary>
+/// <summary>改螺栓参数。字段全可空——给了哪个改哪个，没给的不动。</summary>
 public sealed record BoltSettingsRequest(
     decimal? TargetPreloadN = null,
     decimal? MinPreloadN = null,

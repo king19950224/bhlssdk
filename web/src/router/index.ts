@@ -1,4 +1,5 @@
-// 路由表 + 全局守卫:未登录跳登录页,meta.roles 做角色守卫(后端另有 403 兜底,这里是纵深防御 + UX)。
+// 路由表 + 全局守卫：没登录就跳登录页，meta.roles 拦角色。
+// 真正说了算的是后端（越权一律 403），这里拦一道是省得让人点进去白跑一趟。
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuth } from '../stores/auth'

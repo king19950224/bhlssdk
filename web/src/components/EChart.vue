@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// ECharts 通用封装:传 option 即渲染,自动跟随容器尺寸 resize、卸载时销毁实例。
+// ECharts 通用封装：传 option 就渲染，容器尺寸变了自己 resize，卸载时销毁实例。
 import { onMounted, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import * as echarts from 'echarts'
 

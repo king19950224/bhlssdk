@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:螺栓详情——实时预紧力与趋势、A-Scan 波形、标定/告警/审计记录、预测窗口与参数设置。
+// 螺栓详情：一颗螺栓的全部家当——实时值和趋势、A-Scan 波形、标定/告警/审计记录、预测窗口、参数设置。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'

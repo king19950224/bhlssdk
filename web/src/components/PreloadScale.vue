@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 预紧力刻度条:当前值指针 + 目标/下限刻度,直观显示单栓预紧力位于安全区间的位置。
+// 预紧力刻度条：一把尺子标出目标值和下限，指针指当前值，一眼看出这颗还剩多少余量。
 import { computed } from 'vue'
 import { fmtN } from '../utils/preload'
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 页面:404——已登录时在外壳内提示路径不存在并导回首页。
+// 404：已登录的话就在外壳里提示这路径没有，给个回首页的按钮。
 import { useRouter } from 'vue-router'
 import { useAuth } from '../stores/auth'
 const router = useRouter()

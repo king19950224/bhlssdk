@@ -6,9 +6,9 @@ using Xunit;
 namespace BoltPreload.Tests.Integration;
 
 /// <summary>
-/// 仿真模式生产防线：Fx:Mode=Simulated 在 Production 环境必须拒绝启动——
-/// 模拟器产出物理自洽、看似正常的假预紧力，误配到现场等于把仿真数据当真实监测，
-/// 属重大安全隐患（商用底线）。防线是启动的第一道检查，先于连接串等一切校验，故本测试无需 Postgres。
+/// 锁住仿真模式的生产防线：Production 环境配了 Fx:Mode=Simulated 就必须起不来。
+/// 模拟器的假预紧力在界面上跟真的没区别，误配到现场就是拿仿真数据当监测结果看。
+/// 这道检查在启动最前面，连接串都还没校验，所以这个测试不需要 Postgres。
 /// </summary>
 public sealed class SimulatedModeGuardTests
 {
@@ -23,6 +23,6 @@ public sealed class SimulatedModeGuardTests
 
         var act = () => factory.CreateClient();
         act.Should().Throw<InvalidOperationException>()
-            .WithMessage("*Simulated 禁止在 Production 环境*");
+            .WithMessage("*Production 环境不许跑 Fx:Mode=Simulated*");
     }
 }
