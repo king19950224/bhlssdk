@@ -23,7 +23,7 @@
 - Windows 离线安装包。
 - License 授权。
 
-## 本轮已完成的商业化底座
+## 已经落地的商业化底座
 
 1. `DeviceConnectorManager`
    - 已把单例 connector 构造逻辑收口。

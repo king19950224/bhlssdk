@@ -1,11 +1,10 @@
-# 并发模型与跨切面不变量（Concurrency Model & Cross-cutting Invariants）
+# 并发模型与跨模块的硬约定
 
-本系统是 7×24 的安全监测服务，后台服务多、设备 I/O 与 DB 写入并发。本文把"设备会话串行、
-后台服务互不打架、软删一致"这些**隐式契约显式化**，作为改动这些区域时必须遵守的规范。
+这是个 7×24 跑着的监测服务，后台服务一堆，设备 I/O 和写库同时在跑。设备会话要串行、
+后台服务之间不能打架、软删的行不能混进统计——这些约定原来只存在于写代码的人脑子里，
+这里写下来。动到这几块之前先看一遍。
 
-对应代码修复见本轮：看门狗时序、连接器会话串行、扫描态跳过、软删聚合一致。
-
-## 1. 每设备会话级命令串行（Per-device session serialization）
+## 1. 同一台设备的会话命令必须串行
 
 **契约**：同一设备连接器上，所有"会话级"操作（连接/断开 + 下发命令）互斥串行执行。
 
@@ -45,7 +44,7 @@ flowchart LR
   Ingestion -.->|"Results.ReadAllAsync (consumer, independent)"| SDK
 ```
 
-## 2. 扫描期独占（ProbeScan exclusivity）
+## 2. 扫描期间这台设备归扫描独占
 
 **契约**：一台设备在跑通道扫描（`ProbeScanOrchestrator`）期间，独占其工作模式；
 其它按设备巡检的后台服务必须整机跳过该设备。
@@ -57,7 +56,7 @@ flowchart LR
   保证方法体一定执行、`finally` 一定 `_state.End(deviceId)`，即使在调度前一刻被 `TryAbort` 取消也不会永久卡 `IsRunning`。
   `mcr_single` 策略读取原始 MCR 快照失败时，在改动任何 MCR 之前直接失败（避免扫完只留最后一个通道）。
 
-## 3. 看门狗重连判定（Watchdog reconnect decision）
+## 3. 看门狗什么时候才该重连
 
 **契约**：连接断开、或"本次连接会话内"长时间无 `ChannelResult` 才重连；慢写库、扫描期不重连。
 
@@ -74,7 +73,7 @@ flowchart LR
 - Connect/Disconnect/Reconnect 用 `_connectLock` 串行；采样循环 `SingleWriter=true`，断开会先取消并 `await` 旧循环再启新循环，不会两条循环并发写。
 - 故仿真路径不需要 `_sessionLock`；换真机（`FxSdkConnector`）时由第 1 节的会话锁提供同等保证。
 
-## 5. 软删聚合一致（deleted_at cross-cutting invariant）
+## 5. 软删掉的行不能混进任何统计
 
 **契约**：所有健康/告警聚合都必须排除软删实体（`deleted_at IS NULL`）。
 
@@ -86,7 +85,7 @@ flowchart LR
 
 新增聚合请遵守：能软删的实体 + 未被上游过滤 → 加 `deleted_at IS NULL`；列表类若会"隐藏实体"，需显式决定是否改 LEFT JOIN 保留。
 
-## 6. 标定生命周期不变量（Calibration lifecycle）
+## 6. 标定从提交到失效的几条硬规矩
 
 **契约**：通道当前"生效标定" = 该 bolt 上 `superseded_by IS NULL AND review_state IN ('approved','self_signed')` 的记录；
 `pending` / `rejected` 一律不算生效。
@@ -109,7 +108,7 @@ flowchart LR
   （[DiagnosticEndpoints](../../src/BoltPreload.Api/Endpoints/DiagnosticEndpoints.cs)）；标定会签/驳回、同步通道配置等均在各自事务内连同审计一并提交或回滚。
 - 落盘副作用要能回滚：报告 HTML 落盘 + DB 记录，若 DB 失败要在 catch 内 `File.Delete` 清理孤儿文件（[ReportEndpoints](../../src/BoltPreload.Api/Endpoints/ReportEndpoints.cs)）。
 
-## 8. 前端时间派生 UI 的响应式刷新（Frontend staleness tick）
+## 8. 前端"几分钟前"这类显示要自己随时间走
 
 **契约**：任何"距今多久"派生的 UI（陈旧/离线判定、"N 分钟前"、状态灯 `nodata`）必须依赖一个随时间前进的响应式 `now`，
 不能用一次性的 `Date.now()`——否则无新数据时会永久卡在渲染时刻。

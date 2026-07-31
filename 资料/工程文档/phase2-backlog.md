@@ -1,9 +1,9 @@
-# Phase 2+ 受控待办（Roadmap Backlog）
+# Phase 2+ 待办清单
 
 代码里散落着一批 `Phase 2 / Phase 2+ / Phase 3` 标记——这些是**有意为之的分阶段规划**，不是隐藏债务。
 本文把它们汇总为一处受控清单，便于跟踪，避免"看似有、实则没接线"的误解。
 
-## 已接线 / 已闭环（本轮确认完成，非债务）
+## 已经接好线的（别再当待办看）
 - 告警维护抑制（shelve）：已接入评估派发（`PostgresMeasurementSink.EvaluateAndDispatchAlarmsAsync` → `IsAlarmShelvedAsync`），生效抑制吞掉触发并回滚状态机，过期后自动恢复。
 - 绑定/迁移标定动作 `keep_uncomputed`：已实现为"保留目标通道现有标定（no-op）"，与 `invalidate` 区分。
 - 前端 `TrendPoint` 重名：已拆为 `DashboardTrendPoint` 与 `TrendPoint`。
