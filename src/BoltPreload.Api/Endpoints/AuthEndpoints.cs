@@ -394,7 +394,14 @@ public static class AuthEndpoints
     }
 }
 
+/// <summary>登录请求。</summary>
 public sealed record LoginRequest(string Username, string Password);
+
+/// <summary>登录成功响应：JWT 与用户基本信息。</summary>
 public sealed record LoginResponse(string AccessToken, long UserId, string Username, string Role);
+
+/// <summary>管理员创建用户请求。</summary>
 public sealed record CreateUserRequest(string Username, string Password, string Role, string? FullName = null, string? Email = null);
+
+/// <summary>修改本人密码请求（须验证旧密码）。</summary>
 public sealed record ChangePasswordRequest(string OldPassword, string NewPassword);

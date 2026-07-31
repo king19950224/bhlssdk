@@ -508,5 +508,5 @@ finally
     Log.CloseAndFlush();
 }
 
-// Program 类不密封，方便集成测试用 WebApplicationFactory<Program>
+/// <summary>顶级语句宿主类的可见声明：集成测试用 WebApplicationFactory&lt;Program&gt; 挂载整个应用。</summary>
 public partial class Program { }

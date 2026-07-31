@@ -147,6 +147,7 @@ public static class ChannelEndpoints
     }
 }
 
+/// <summary>修改通道可读名称（物理位置标签）的请求。</summary>
 public sealed class ChannelNamePatchRequest
 {
     public string? Name { get; set; }

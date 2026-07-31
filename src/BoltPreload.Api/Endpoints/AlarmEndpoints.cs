@@ -398,6 +398,11 @@ public static class AlarmEndpoints
     }
 }
 
+/// <summary>确认告警请求：可选处理备注。</summary>
 public sealed record AckRequest(string? Note = null);
+
+/// <summary>人工闭合告警请求：可选闭合原因。</summary>
 public sealed record ClearRequest(string? Reason = null);
+
+/// <summary>抑制（静默）告警请求：按螺栓/告警类型抑制指定小时数，原因必填。</summary>
 public sealed record ShelveRequest(long? BoltId, string? AlarmType, int Hours, string Reason);

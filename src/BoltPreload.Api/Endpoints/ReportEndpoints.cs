@@ -738,7 +738,10 @@ public static class ReportEndpoints
     }
 }
 
+/// <summary>生成扭矩分步标定报告的请求：可选标题与备注。</summary>
 public sealed record TorqueStepReportRequest(string? Title = null, string? Notes = null);
+
+/// <summary>生成法兰验收报告的请求：可选标题与备注。</summary>
 public sealed record FlangeReportRequest(string? Title = null, string? Notes = null);
 
 /// <summary>法兰验收报告中的一行螺栓结果（既用于 JSON 快照，也用于渲染归档 HTML）。</summary>
@@ -747,6 +750,7 @@ public sealed record FlangeLine(
     decimal? TargetN, decimal? MinN, decimal? PreloadN, decimal? Ratio,
     DateTime? LastTs, string? CalibMethod, string Trust, decimal? RSquared, decimal? UncertaintyN, string Result);
 
+/// <summary>扭矩分步报告的数据快照（生成时 JSON 落库，之后数据变化不影响已出报告）。</summary>
 public sealed record TorqueStepReportSnapshot(
     DateTimeOffset GeneratedAt,
     ChannelSnapshot Channel,
@@ -755,8 +759,13 @@ public sealed record TorqueStepReportSnapshot(
     TorqueFitSnapshot? Fit,
     string Conclusion);
 
+/// <summary>报告快照中的通道信息（含出报告时刻的 K_L 与生效标定）。</summary>
 public sealed record ChannelSnapshot(long ChannelId, long DeviceId, short ChannelNo, decimal? KL, decimal? KLInterceptNs, Guid? ActiveCalibrationId);
+
+/// <summary>报告快照中的螺栓信息。</summary>
 public sealed record BoltSnapshot(long BoltId, string Code, string NominalDiameter, decimal? TargetPreloadN, decimal? InstallTorqueNm);
+
+/// <summary>报告快照中的单个扭矩档位测量点（含剔除标记与原因）。</summary>
 public sealed record TorquePointSnapshot(
     long Id,
     decimal TorqueNm,
@@ -770,4 +779,5 @@ public sealed record TorquePointSnapshot(
     bool Excluded,
     string? ExcludeReason,
     string? Note);
+/// <summary>报告快照中的线性拟合结果（K_L 按 ns/N 约定）。</summary>
 public sealed record TorqueFitSnapshot(long PointCount, double KL, double InterceptNs, double RSquared);

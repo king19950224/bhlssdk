@@ -8,6 +8,7 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Endpoints;
 
+/// <summary>设置参考波形请求：可选原因与备注（写审计）。</summary>
 public sealed record ReferenceWaveRequest(string? Reason = null, string? Note = null);
 
 /// <summary>
