@@ -12,7 +12,7 @@ using NpgsqlTypes;
 namespace BoltPreload.Api.Runtime;
 
 /// <summary>
-/// 探头热插拔宿主服务（设计见 docs/probe-hotplug-design 段落 / plan“探头热插拔识别设计”）。
+/// 探头热插拔宿主服务（设计见 资料/工程文档/plan.md 中“探头热插拔识别设计”段落）。
 /// <para>
 /// 职责一：让设备常态轮询【全部物理通道】（1..channel_count），这是热插拔识别的物理前提——
 /// 厂家设备只测 MCR 轮询集内的通道，探头插在轮询集外的口上一条数据都不会上来（probe-scan 设计 F1）。

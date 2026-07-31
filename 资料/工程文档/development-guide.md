@@ -468,9 +468,8 @@ bhlssdk/
 │   ├── sql/                         # 数据库迁移脚本，按序号执行
 │   └── windows/ installer/          # 工控机部署、Inno Setup
 ├── tools/FxDeviceSimulator/         # 独立 TCP 层设备模拟器
-├── docs/                            # 客户交付文档（部署 / 标定 SOP / 排障）
 └── 资料/
-    ├── 工程文档/                    # 内部工程文档（本文件所在目录，不随客户交付）
+    ├── 工程文档/                    # 全部工程/运维文档（本文件所在目录，不随客户交付）
     └── …                            # 厂家原始包、软著/会议材料等（不进 git）
 ```
 
@@ -492,4 +491,4 @@ bhlssdk/
 | 5432 端口冲突 | 本机已安装 PostgreSQL，停止本机实例或修改 compose 端口 |
 | 日志出现"无法解析通道，丢弃数据" | 种子数据未写入，执行 `bash setup.sh reset` 重建 |
 | 真机已连接但 EchoTime 全为 null | `Fx:Real:Channels` 未配置或配置错误，见 4.2.5 节 |
-| 其他问题 | 参见 `docs/troubleshooting.md` |
+| 其他问题 | 参见 `资料/工程文档/troubleshooting.md` |

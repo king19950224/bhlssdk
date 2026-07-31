@@ -4,17 +4,14 @@
 
 ## 文档
 
-**客户交付（`docs/`，随交付包发出）：**
-
-- **现场部署手册：`docs/deployment-guide.md`**，到现场装机照这份做。必需配置清单、授权签发、装完自检都在里面
-- 标定现场操作规程：`docs/calibration-field-guide.md`
-- 运维排障：`docs/troubleshooting.md`
-
-**内部工程文档（`资料/工程文档/`，不随客户交付包发出）：**
+全部在 `资料/工程文档/`（内部用，不随客户交付包发出）：
 
 - 开发文档：`资料/工程文档/development-guide.md`，新人先看这份
-- 交付检查计划：`资料/工程文档/delivery-master-plan.md`，交付前内部逐页核对
-- 完整设计方案：`资料/工程文档/plan.md`，含商用底线、算法、合规、附录 A~H
+- 现场部署手册：`资料/工程文档/deployment-guide.md`
+- 标定现场操作规程：`资料/工程文档/calibration-field-guide.md`
+- 运维排障：`资料/工程文档/troubleshooting.md`
+- 交付检查计划：`资料/工程文档/delivery-master-plan.md`
+- 完整设计方案：`资料/工程文档/plan.md`
 
 ## 开发环境要求
 
@@ -26,7 +23,7 @@
 
 部署环境是 Windows 工控机，**不能用 Docker**，PG 走原生安装。开发机用 Docker 只是为了不污染原生 macOS。
 
-现场部署目前按 `docs/deployment-guide.md` 手工执行（建库跑迁移 → 注入配置 → 签发授权 → NSSM 注册服务 → 自检）。
+现场部署目前按 `资料/工程文档/deployment-guide.md` 手工执行（建库跑迁移 → 注入配置 → 签发授权 → NSSM 注册服务 → 自检）。
 方案附录 H 规划的 Inno Setup 一键安装包尚未实现（`deploy/installer/` 为空），需在 Windows 上构建验证。
 
 ## 快速开始
@@ -88,7 +85,6 @@ BoltPreload/
 │   ├── FxDeviceSimulator/              设备模拟器
 │   ├── DeviceSmokeTest/                真机连通性烟测
 │   └── LicenseSigner/                  授权签发（供应商侧，不随交付包发出）
-├── docs/                               客户交付文档（部署手册 / 标定 SOP / 排障）
 └── 资料/工程文档/                       内部工程文档（不随客户交付包发出）
 ```
 

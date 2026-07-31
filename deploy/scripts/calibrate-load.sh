@@ -4,7 +4,7 @@
 # ----------------------------------------------------------------------------
 # 把现场逐点 (已知载荷 F[N], 温补后声时差 Δt[ns]) 喂进系统，跑通：
 #   登录 → (可选)重标定基线 → 提交载荷标定(load-calibrate) → 异人会签(countersign)
-# 详见 docs/calibration-field-guide.md。所有写操作要求 reviewer+ 账号。
+# 详见 资料/工程文档/calibration-field-guide.md。所有写操作要求 reviewer+ 账号。
 #
 # 依赖：curl, jq（均为常见预装；本仓库 macOS/CI 环境已具备）。
 #
@@ -114,7 +114,7 @@ case "$cmd" in
   load         --token --channel-id --reftime --reftemp --points "F:dt,F:dt,F:dt,F:dt" [--loading-device --cert --note]
   countersign  --token --channel-id --calib-id
 环境: BASE（默认 http://127.0.0.1:5080）
-详见 docs/calibration-field-guide.md
+详见 资料/工程文档/calibration-field-guide.md
 EOF
     exit 2
     ;;

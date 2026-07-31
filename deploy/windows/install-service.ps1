@@ -24,7 +24,7 @@
         -DeviceCommParams "192.168.1.50:23"
 
 .NOTES
-    完整现场步骤见 docs/deployment-guide.md。
+    完整现场步骤见 资料/工程文档/deployment-guide.md。
 #>
 param(
     [Parameter(Mandatory = $true)][string]$ConnectionString,
@@ -81,7 +81,7 @@ if ($JwtSigningKey.Length -lt 32) {
 
 $licensePath = Join-Path $InstallDir "license.json"
 if (!(Test-Path $licensePath)) {
-    Write-Warning "未发现 $licensePath —— 授权将判为无效：监测会照常运行，但建档/标定/告警确认等写操作一律被拒(403)。请按 docs/deployment-guide.md §4 签发后放入。"
+    Write-Warning "未发现 $licensePath —— 授权将判为无效：监测会照常运行，但建档/标定/告警确认等写操作一律被拒(403)。请按 资料/工程文档/deployment-guide.md §4 签发后放入。"
 }
 
 # ---------------------------------------------------------------- 站点配置文件
@@ -141,7 +141,7 @@ if ($BootstrapAdminPassword -ne "") {
 & $NssmPath set $ServiceName AppRestartDelay 10000 | Out-Null
 
 # 防火墙：默认不开。只有确实要从局域网访问时才显式 -OpenFirewall，
-# 且请注意当前服务只提供 HTTP，JWT 在网络上是明文（见 docs/deployment-guide.md §5）。
+# 且请注意当前服务只提供 HTTP，JWT 在网络上是明文（见 资料/工程文档/deployment-guide.md §5）。
 if ($OpenFirewall) {
     New-NetFirewallRule `
         -DisplayName "BoltPreload API $FirewallPort" `
@@ -177,7 +177,7 @@ if (-not $ready) {
 }
 
 Write-Host ""
-Write-Host "接下来请按 docs/deployment-guide.md §8 走一遍装完自检（尤其是：浏览器直接打开 /alarms 不应白屏、/api/license/status 应为 valid=true）。"
+Write-Host "接下来请按 资料/工程文档/deployment-guide.md §8 走一遍装完自检（尤其是：浏览器直接打开 /alarms 不应白屏、/api/license/status 应为 valid=true）。"
 if ($BootstrapAdminPassword -ne "") {
     Write-Host "提示：首个管理员已创建。建议登录确认后，重跑本脚本且不带 -BootstrapAdminPassword，把该密码从服务配置中移除。"
 }

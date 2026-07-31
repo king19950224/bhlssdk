@@ -124,4 +124,4 @@ Phase 1 第 2 周清单见 `docs/phase-1-week-2-checklist.md`（Phase 2 启动�
 
 ## 没跑通
 
-按 `docs/troubleshooting.md` 排查。如果都不解决，把这个清单和具体卡在第几条贴给我。
+按 `资料/工程文档/troubleshooting.md` 排查。如果都不解决，把这个清单和具体卡在第几条贴给我。

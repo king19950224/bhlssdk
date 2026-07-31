@@ -5,7 +5,7 @@ namespace BoltPreload.Application.Licensing;
 /// <para>
 /// 离线 license.json：机器码 + 通道数 + 设备数 + 到期时间 + RSA 签名。
 /// 验签实现见 <c>LocalFileLicenseService</c>；签发/密钥生成用 <c>tools/LicenseSigner</c>
-/// （流程见 docs/deployment-guide.md）。
+/// （流程见 资料/工程文档/deployment-guide.md）。
 /// </para>
 /// </summary>
 public interface ILicenseService
