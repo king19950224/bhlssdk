@@ -4,10 +4,17 @@
 
 ## 文档
 
-- 开发文档：`docs/development-guide.md`，新人先看这份。用什么做的、厂家资料、怎么通讯、接口有哪些、环境一步步怎么搭，都在里面
+**客户交付（`docs/`，随交付包发出）：**
+
 - **现场部署手册：`docs/deployment-guide.md`**，到现场装机照这份做。必需配置清单、授权签发、装完自检都在里面
-- 交付检查计划：`docs/delivery-master-plan.md`，交付前逐页核对
-- 完整设计方案：`docs/plan.md`，含商用底线、算法、合规、附录 A~H
+- 标定现场操作规程：`docs/calibration-field-guide.md`
+- 运维排障：`docs/troubleshooting.md`
+
+**内部工程文档（`资料/工程文档/`，不随客户交付包发出）：**
+
+- 开发文档：`资料/工程文档/development-guide.md`，新人先看这份
+- 交付检查计划：`资料/工程文档/delivery-master-plan.md`，交付前内部逐页核对
+- 完整设计方案：`资料/工程文档/plan.md`，含商用底线、算法、合规、附录 A~H
 
 ## 开发环境要求
 
@@ -81,7 +88,8 @@ BoltPreload/
 │   ├── FxDeviceSimulator/              设备模拟器
 │   ├── DeviceSmokeTest/                真机连通性烟测
 │   └── LicenseSigner/                  授权签发（供应商侧，不随交付包发出）
-└── docs/                               架构 / 部署手册 / 标定 SOP / 验收文档
+├── docs/                               客户交付文档（部署手册 / 标定 SOP / 排障）
+└── 资料/工程文档/                       内部工程文档（不随客户交付包发出）
 ```
 
 ## 业务约束

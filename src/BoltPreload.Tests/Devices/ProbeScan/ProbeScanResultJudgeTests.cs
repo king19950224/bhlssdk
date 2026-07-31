@@ -5,7 +5,7 @@ using Xunit;
 namespace BoltPreload.Tests.Devices.ProbeScan;
 
 /// <summary>
-/// 验证 ProbeScanResultJudge 规则。规则在 docs/probe-scan-design.md §4，
+/// 验证 ProbeScanResultJudge 规则。规则在 资料/工程文档/probe-scan-design.md §4，
 /// 阈值默认值（minSamples=20、snr=20dB、echoStd=5ns、pp=600）写死在测试里，
 /// 避免阈值漂移时单测被"动态"绑架而无声变绿。
 /// </summary>

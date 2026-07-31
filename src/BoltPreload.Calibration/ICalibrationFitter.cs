@@ -9,7 +9,7 @@ namespace BoltPreload.Calibration;
 public readonly record struct CalibrationPoint(double ForceN, double DeltaTofNs, double SigmaF = 0.0);
 
 /// <summary>
-/// 线性标定拟合结果。模型 <c>Δt = K_L · F + b</c>（本系统 K_L 约定 = Δt/F，单位 ns/N，见 docs/sdk-api-facts.md §12）。
+/// 线性标定拟合结果。模型 <c>Δt = K_L · F + b</c>（本系统 K_L 约定 = Δt/F，单位 ns/N，见 资料/工程文档/sdk-api-facts.md §12）。
 /// </summary>
 /// <param name="KL">斜率 = 载荷因子 K_L（ns/N）。用法：F = (Δt − b) / K_L</param>
 /// <param name="InterceptNs">截距 b（ns）</param>

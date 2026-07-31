@@ -5,7 +5,7 @@ namespace BoltPreload.Calibration;
 /// <summary>
 /// 线性最小二乘标定拟合器（plan §8.5）。
 /// <para>
-/// 模型 <c>Δt = K_L·F + b</c>，K_L 为斜率（ns/N，见 docs/sdk-api-facts.md §12）。
+/// 模型 <c>Δt = K_L·F + b</c>，K_L 为斜率（ns/N，见 资料/工程文档/sdk-api-facts.md §12）。
 /// 支持普通/加权最小二乘 + R² + 斜率标准误；Grubbs 异常点剔除**仅在 n≥20 时生效**
 /// （GB/T 4883-2008，小样本套 Grubbs 属误用，见 plan §8.5.1）。
 /// </para>

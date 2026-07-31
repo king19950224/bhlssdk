@@ -114,7 +114,7 @@ flowchart TD
 | `active_weak` | `echoRate ≥ 0.5` 且 (`snrAvgDb < snrGoodDb` 或 `echoStdNs > echoStdGoodNs` 或 `peakToPeakAvg < peakToPeakMin`) |
 | `active_good` | `echoRate ≥ 0.95` 且 `snrAvgDb ≥ 20 dB` 且 `echoStdNs ≤ 5 ns` 且 `peakToPeakAvg ≥ 600` |
 
-> 阈值 20 dB / 5 ns / 600 来自 `docs/lab-torque-step-report-2026-05-22.md` 实验室验证的“健康通道”基线，不是拍脑袋。
+> 阈值 20 dB / 5 ns / 600 来自 `资料/工程文档/lab-torque-step-report-2026-05-22.md` 实验室验证的“健康通道”基线，不是拍脑袋。
 
 `hardware_state` 同步映射规则：
 

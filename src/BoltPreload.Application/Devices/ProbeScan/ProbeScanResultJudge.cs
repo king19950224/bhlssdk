@@ -52,7 +52,7 @@ public static class ProbeScanVerdictNames
 }
 
 /// <summary>
-/// 纯函数判定器。规则见 docs/probe-scan-design.md §4。
+/// 纯函数判定器。规则见 资料/工程文档/probe-scan-design.md §4。
 /// </summary>
 public static class ProbeScanResultJudge
 {

@@ -42,26 +42,26 @@ G2_EXEMPT = {
 # G3:参与检查的"活文档"(会随代码演进而维护的文档)
 G3_LIVING_DOCS = [
     "README.md",
-    "docs/getting-started.md",
-    "docs/development-guide.md",
+    "资料/工程文档/getting-started.md",
+    "资料/工程文档/development-guide.md",
     "docs/deployment-guide.md",
-    "docs/concurrency-model.md",
-    "docs/sdk-api-facts.md",
+    "资料/工程文档/concurrency-model.md",
+    "资料/工程文档/sdk-api-facts.md",
     "docs/calibration-field-guide.md",
-    "docs/delivery-master-plan.md",
+    "资料/工程文档/delivery-master-plan.md",
     "docs/troubleshooting.md",
-    "docs/probe-scan-design.md",
-    "docs/torque-step-test-protocol.md",
-    "docs/commercialization-roadmap.md",
-    "docs/phase2-backlog.md",
+    "资料/工程文档/probe-scan-design.md",
+    "资料/工程文档/torque-step-test-protocol.md",
+    "资料/工程文档/commercialization-roadmap.md",
+    "资料/工程文档/phase2-backlog.md",
 ]
 # 豁免的历史记录文档(带日期/阶段快照,保留当时原貌,不随重构改写):
-#   docs/plan.md                               原始方案快照(K_L 口径等以 sdk-api-facts.md §12 为准)
-#   docs/phase-1-week-1-acceptance.md          阶段验收记录
-#   docs/phase-1-week-2-acceptance.md          阶段验收记录
-#   docs/lab-torque-step-report-2026-05-22.md  实验记录
-#   docs/site-debug-2026-05-21.md              现场排障记录
-#   docs/sdk-changelog.md                      SDK 变更流水(按时间追加)
+#   资料/工程文档/plan.md                               原始方案快照(K_L 口径等以 sdk-api-facts.md §12 为准)
+#   资料/工程文档/phase-1-week-1-acceptance.md          阶段验收记录
+#   资料/工程文档/phase-1-week-2-acceptance.md          阶段验收记录
+#   资料/工程文档/lab-torque-step-report-2026-05-22.md  实验记录
+#   资料/工程文档/site-debug-2026-05-21.md              现场排障记录
+#   资料/工程文档/sdk-changelog.md                      SDK 变更流水(按时间追加)
 
 # G3:反引号引用只检查源码类扩展名(不查 license.json 等运行期生成文件)
 G3_REF_EXTS = (".cs", ".ts", ".vue", ".sql", ".ps1", ".md")
@@ -70,8 +70,9 @@ G3_REF_EXTS = (".cs", ".ts", ".vue", ".sql", ".ps1", ".md")
 G4_CSHARP = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b")
 G4_WEB = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b|@ts-ignore|@ts-nocheck|eslint-disable|\bdebugger\b|console\.log")
 
-# 仓库文件索引要跳过的目录
-INDEX_SKIP = {".git", "node_modules", "bin", "obj", "dist", "logs", "data", "资料", ".vs", ".idea"}
+# 仓库文件索引要跳过的目录。资料/ 不全跳——只扫 资料/工程文档/（内部工程文档仍进 git）
+INDEX_SKIP = {".git", "node_modules", "bin", "obj", "dist", "logs", "data", ".vs", ".idea"}
+INDEX_资料_ONLY = "工程文档"
 
 
 def iter_files(base: Path, suffixes: tuple[str, ...]) -> list[Path]:
@@ -79,8 +80,12 @@ def iter_files(base: Path, suffixes: tuple[str, ...]) -> list[Path]:
     import os
 
     out = []
+    materials = (ROOT / "资料").resolve()
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = [d for d in dirnames if d not in INDEX_SKIP]
+        # 资料/ 下只进入工程文档，其余（软著/会议/现场照片）不扫
+        if Path(dirpath).resolve() == materials:
+            dirnames[:] = [d for d in dirnames if d == INDEX_资料_ONLY]
         for name in filenames:
             p = Path(dirpath) / name
             if p.suffix in suffixes:

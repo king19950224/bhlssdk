@@ -1,7 +1,7 @@
 namespace BoltPreload.Application.Devices.ProbeScan;
 
 /// <summary>
-/// 通道自动检测的默认参数。具体值依据见 docs/probe-scan-design.md §3 §4。
+/// 通道自动检测的默认参数。具体值依据见 资料/工程文档/probe-scan-design.md §3 §4。
 /// 阈值可被 API 请求覆盖；这里只是 fallback。
 /// </summary>
 public sealed class ProbeScanOptions

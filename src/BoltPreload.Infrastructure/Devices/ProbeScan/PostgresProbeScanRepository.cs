@@ -7,7 +7,7 @@ namespace BoltPreload.Infrastructure.Devices.ProbeScan;
 
 /// <summary>
 /// Postgres 实现。所有 SQL 显式列出列名，避免 SELECT * 在 schema 演进时静默错位。
-/// 设计文档：docs/probe-scan-design.md §5。
+/// 设计文档：资料/工程文档/probe-scan-design.md §5。
 /// </summary>
 public sealed class PostgresProbeScanRepository : IProbeScanRepository
 {

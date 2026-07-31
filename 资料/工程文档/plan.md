@@ -217,7 +217,7 @@ P = Δt / (t₀ / K_L)
 - `t₀` — 未拧紧时纵波传播时间（零应力基线）
 - `K_L` — 载荷因子（单位轴力引起的声时相对变化），需要标定
 
-> **K_L 量纲约定（最终裁定，以 `docs/sdk-api-facts.md §12` 为准）**：
+> **K_L 量纲约定（最终裁定，以 `资料/工程文档/sdk-api-facts.md §12` 为准）**：
 > 本节及 §8.5/附录 C 用的是国标对照写法 `K_L = Δt/(F·t₀)`（单位 1/N）。
 > **实现与存量数据统一用 `K_L = Δt/F`（单位 ns/N，量级 ~1e-4），`F = Δt/K_L`。**
 > 另外，本行上方公式 `P = Δt/(t₀/K_L)`（= `Δt·K_L/t₀`）在 1/N 约定下是**错误反解**，正确应为 `F = Δt/(K_L·t₀)`。两套约定换算：`K_L(ns/N) = K_L(1/N)·t₀`。
@@ -598,7 +598,7 @@ DEFAULT_FREQUENCY = 2_000_000 Hz (2 MHz)
 FILTER_ORDER = 21
 ```
 
-**ChannelResult 状态码（按 C# SDK 1.4 源码定义；Java 1.0 略有差异，详见 `docs/sdk-api-facts.md`）**
+**ChannelResult 状态码（按 C# SDK 1.4 源码定义；Java 1.0 略有差异，详见 `资料/工程文档/sdk-api-facts.md`）**
 
 ```
  0  正常

@@ -1,7 +1,7 @@
 -- ============================================================================
 -- 0013_channel_probe_scan.sql
 -- 通道自动检测（Probe Scan）：扫描运行记录 + 每通道判定结果
--- 设计文档：docs/probe-scan-design.md
+-- 设计文档：资料/工程文档/probe-scan-design.md
 -- ----------------------------------------------------------------------------
 -- 设计意图：
 -- 1. 扫描期间逐通道 SetWorkMode SingleMeas，复用 measurements/unbound_measurements/

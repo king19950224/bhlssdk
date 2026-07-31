@@ -7,7 +7,7 @@ using System.Security.Claims;
 namespace BoltPreload.Api.Endpoints;
 
 /// <summary>
-/// 通道自动检测 API。详见 docs/probe-scan-design.md §6。
+/// 通道自动检测 API。详见 资料/工程文档/probe-scan-design.md §6。
 /// 所有写入路径要求 WriteAccess（扫描会中断业务监测）。
 /// </summary>
 public static class ProbeScanEndpoints

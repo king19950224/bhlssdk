@@ -10,7 +10,7 @@
 
 ## 1. ChannelResult 字段
 
-文件：[external/FxSDK/Models/MeasResult.cs](../external/FxSDK/Models/MeasResult.cs)
+文件：[external/FxSDK/Models/MeasResult.cs](../../external/FxSDK/Models/MeasResult.cs)
 
 | 字段 | C# 类型 | 必/可空 | 说明 |
 |---|---|---|---|
@@ -67,7 +67,7 @@ if (!rawData && channelConfig is { ProbeFreq: > 0 } && chResult.EchoWave is { Wa
 
 ## 2. StatusCode 状态码
 
-文件：[external/FxSDK/Models/MeasResult.cs:27-36](../external/FxSDK/Models/MeasResult.cs)
+文件：[external/FxSDK/Models/MeasResult.cs:27-36](../../external/FxSDK/Models/MeasResult.cs)
 
 | 值 | C# SDK 1.4 含义 | Java SDK 1.0 含义 | 处理建议 |
 |---|---|---|---|
@@ -83,7 +83,7 @@ if (!rawData && channelConfig is { ProbeFreq: > 0 } && chResult.EchoWave is { Wa
 
 ## 3. EchoWave 字段
 
-文件：[external/FxSDK/Models/MeasResult.cs:82-104](../external/FxSDK/Models/MeasResult.cs)
+文件：[external/FxSDK/Models/MeasResult.cs:82-104](../../external/FxSDK/Models/MeasResult.cs)
 
 | 字段 | C# 类型 | 默认值 | 说明 |
 |---|---|---|---|
@@ -95,7 +95,7 @@ if (!rawData && channelConfig is { ProbeFreq: > 0 } && chResult.EchoWave is { Wa
 
 ## 4. SignalProcessor 常量
 
-文件：[external/FxSDK/Utility/SignalProcessor.cs:14-32](../external/FxSDK/Utility/SignalProcessor.cs)
+文件：[external/FxSDK/Utility/SignalProcessor.cs:14-32](../../external/FxSDK/Utility/SignalProcessor.cs)
 
 | 常量 | 值 | 说明 |
 |---|---|---|
@@ -107,7 +107,7 @@ if (!rawData && channelConfig is { ProbeFreq: > 0 } && chResult.EchoWave is { Wa
 
 ## 5. CalculateExtensions 常量
 
-文件：[external/FxSDK/Utility/CalculateExtensions.cs](../external/FxSDK/Utility/CalculateExtensions.cs)
+文件：[external/FxSDK/Utility/CalculateExtensions.cs](../../external/FxSDK/Utility/CalculateExtensions.cs)
 
 | 常量 | 值 | 说明 |
 |---|---|---|
@@ -117,7 +117,7 @@ if (!rawData && channelConfig is { ProbeFreq: > 0 } && chResult.EchoWave is { Wa
 
 ## 6. MultiChIotProtocolHandler 常量（model=3 多通道监测版）
 
-文件：[external/FxSDK/Codec/MultiChIotProtocolHandler.cs](../external/FxSDK/Codec/MultiChIotProtocolHandler.cs)
+文件：[external/FxSDK/Codec/MultiChIotProtocolHandler.cs](../../external/FxSDK/Codec/MultiChIotProtocolHandler.cs)
 
 | 常量 | 值 | 说明 |
 |---|---|---|
@@ -154,7 +154,7 @@ if (!rawData && channelConfig is { ProbeFreq: > 0 } && chResult.EchoWave is { Wa
 
 ## 7. IotR24ProtocolHandler 常量（model=2 实时 24 通道版）
 
-文件：[external/FxSDK/Codec/IotR24ProtocolHandler.cs](../external/FxSDK/Codec/IotR24ProtocolHandler.cs)
+文件：[external/FxSDK/Codec/IotR24ProtocolHandler.cs](../../external/FxSDK/Codec/IotR24ProtocolHandler.cs)
 
 | 常量 | 值 | 说明 |
 |---|---|---|
@@ -181,7 +181,7 @@ if (!rawData && channelConfig is { ProbeFreq: > 0 } && chResult.EchoWave is { Wa
 
 ## 8. WorkMode 枚举（关键，方法签名用）
 
-文件：[external/FxSDK/Models/Config/DeviceConfig.cs:258-269](../external/FxSDK/Models/Config/DeviceConfig.cs)
+文件：[external/FxSDK/Models/Config/DeviceConfig.cs:258-269](../../external/FxSDK/Models/Config/DeviceConfig.cs)
 
 ```csharp
 public enum WorkMode
@@ -202,7 +202,7 @@ public enum WorkMode
 
 ## 9. DeviceConfig 关键字段
 
-文件：[external/FxSDK/Models/Config/DeviceConfig.cs](../external/FxSDK/Models/Config/DeviceConfig.cs)
+文件：[external/FxSDK/Models/Config/DeviceConfig.cs](../../external/FxSDK/Models/Config/DeviceConfig.cs)
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -217,7 +217,7 @@ public enum WorkMode
 
 ## 10. FxClient 关键事件
 
-文件：[external/FxSDK/FxClient.cs](../external/FxSDK/FxClient.cs)
+文件：[external/FxSDK/FxClient.cs](../../external/FxSDK/FxClient.cs)
 
 | 事件 | 签名 |
 |---|---|

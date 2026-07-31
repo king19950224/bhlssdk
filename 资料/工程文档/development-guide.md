@@ -105,7 +105,7 @@
 - `.cs` 源码文件保持原样，未做任何修改；
 - 仅调整 `FxSDK.csproj` 三处（TargetFramework 由 net6.0 改为 net8.0 等），明细见 `external/FxSDK/README.md`；
 - 未采用 NuGet 引用（厂家未发布包）；以源码方式编入便于断点调试；
-- 升级 SDK 版本时须同步更新 `docs/sdk-api-facts.md`，否则不允许合并。
+- 升级 SDK 版本时须同步更新 `资料/工程文档/sdk-api-facts.md`，否则不允许合并。
 
 ### 3.4 设备型号
 
@@ -468,14 +468,16 @@ bhlssdk/
 │   ├── sql/                         # 数据库迁移脚本，按序号执行
 │   └── windows/ installer/          # 工控机部署、Inno Setup
 ├── tools/FxDeviceSimulator/         # 独立 TCP 层设备模拟器
-├── docs/                            # 项目文档
-└── 资料/FxSDK C#+Java源码+使用示例/  # 厂家原始交付物（含官方使用说明）
+├── docs/                            # 客户交付文档（部署 / 标定 SOP / 排障）
+└── 资料/
+    ├── 工程文档/                    # 内部工程文档（本文件所在目录，不随客户交付）
+    └── …                            # 厂家原始包、软著/会议材料等（不进 git）
 ```
 
 ## 8. 开发注意事项
 
 1. 算法、阈值、报警规则的修改必须可追溯至国家标准、SDK 源码或现场标定数据，不接受无依据的经验值；
-2. SDK 字段、状态码、常量问题以 `docs/sdk-api-facts.md` 为准，不以 Java 1.0 文档为依据；
+2. SDK 字段、状态码、常量问题以 `资料/工程文档/sdk-api-facts.md` 为准，不以 Java 1.0 文档为依据；
 3. 禁止修改 `external/FxSDK/` 下的 `.cs` 文件；需要扩展行为时在 `BoltPreload.Fx` 适配层实现；
 4. K_L 量纲约定：全系统 `K_L = Δt/F`，单位 ns/N，量级约 1e-4。标定证书上 1/N 量纲（约 1e-11）的数值不可直接录入，接口已设量级护栏，详见 sdk-api-facts.md §12；
 5. 工程开启编译警告即错误（TreatWarningsAsErrors），提交前须保证 `dotnet build` 无警告、`dotnet test` 全部通过；
@@ -490,4 +492,4 @@ bhlssdk/
 | 5432 端口冲突 | 本机已安装 PostgreSQL，停止本机实例或修改 compose 端口 |
 | 日志出现"无法解析通道，丢弃数据" | 种子数据未写入，执行 `bash setup.sh reset` 重建 |
 | 真机已连接但 EchoTime 全为 null | `Fx:Real:Channels` 未配置或配置错误，见 4.2.5 节 |
-| 其他问题 | 参见 troubleshooting.md |
+| 其他问题 | 参见 `docs/troubleshooting.md` |

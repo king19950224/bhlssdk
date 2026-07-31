@@ -6,7 +6,7 @@ namespace BoltPreload.Tests.Calibration;
 
 /// <summary>
 /// LeastSquaresFitter 标定拟合回归测试（plan §8.5）。
-/// 约定：模型 Δt = K_L·F + b，K_L 单位 ns/N（docs/sdk-api-facts.md §12）。
+/// 约定：模型 Δt = K_L·F + b，K_L 单位 ns/N（资料/工程文档/sdk-api-facts.md §12）。
 /// </summary>
 public class LeastSquaresFitterTests
 {

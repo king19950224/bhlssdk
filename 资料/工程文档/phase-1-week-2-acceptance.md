@@ -45,7 +45,7 @@
 - SDK 协议约束：一次写整组 `MeasMode + Threshold + RefTime + RefTemp + LEchoWave`（不能拆，见 `MultiChIotProtocolHandler.cs:269`）
 - 已限制 `ConfigureChannelAsync` 只能写 SDK 协议层真实支持的 5 个属性（`ProbeFreq`/`EchoWin`/`EchoWidth`/`PulseConfig`/`Gain`），其他属性引导调用方走 `/recalibrate`
 
-### 1.4 现场诊断报告 `docs/site-debug-2026-05-21.md`
+### 1.4 现场诊断报告 `资料/工程文档/site-debug-2026-05-21.md`
 
 业主/厂家可读的诊断报告，定位当前 `EchoTime` 接受率仅 4% 的根因（温度偏离 RefTemp 6.7°C），并给出三条解决路径（在线重标定 / 找厂家调阈值 / 重做出厂标定）。
 

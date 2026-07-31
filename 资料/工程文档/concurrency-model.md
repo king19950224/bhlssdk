@@ -9,7 +9,7 @@
 
 **契约**：同一设备连接器上，所有"会话级"操作（连接/断开 + 下发命令）互斥串行执行。
 
-- 实现：[src/BoltPreload.Fx/FxSdkConnector.cs](../src/BoltPreload.Fx/FxSdkConnector.cs) 用单把 `_sessionLock`（`SemaphoreSlim(1,1)`）
+- 实现：[src/BoltPreload.Fx/FxSdkConnector.cs](../../src/BoltPreload.Fx/FxSdkConnector.cs) 用单把 `_sessionLock`（`SemaphoreSlim(1,1)`）
   串行化 `ConnectAsync` / `DisconnectAsync`、**连接建立后的会话 provisioning**（`OnSdkConnectedAsync`）以及所有下发命令：
   `SetWorkModeAsync` / `ReadDeviceParamAsync` / `ReadChannelParamAsync` / `ConfigureMultiChannelPollingAsync` /
   `ConfigureChannelAsync` / `RecalibrateChannelAsync`。
@@ -50,7 +50,7 @@ flowchart LR
 **契约**：一台设备在跑通道扫描（`ProbeScanOrchestrator`）期间，独占其工作模式；
 其它按设备巡检的后台服务必须整机跳过该设备。
 
-- 单一守卫：[src/BoltPreload.Application/Devices/ProbeScan/ProbeScanState.cs](../src/BoltPreload.Application/Devices/ProbeScan/ProbeScanState.cs) 的 `IsRunning(deviceId)`。
+- 单一守卫：[src/BoltPreload.Application/Devices/ProbeScan/ProbeScanState.cs](../../src/BoltPreload.Application/Devices/ProbeScan/ProbeScanState.cs) 的 `IsRunning(deviceId)`。
 - 三处调用方一致跳过：`IngestionWatchdogService`、`WaveSamplingService`、`SignalHealthService`
   （均在遍历设备/螺栓时 `if (probeScan.IsRunning(deviceId)) continue;`）。新增按设备的后台巡检必须沿用此守卫。
 - 扫描生命周期不变量：`ProbeScanOrchestrator` 的主体用 `Task.Run(..., CancellationToken.None)` 调度，
@@ -69,7 +69,7 @@ flowchart LR
 
 ## 4. 仿真连接器（SimulatedFxConnector）为何天然安全
 
-[src/BoltPreload.Fx/Simulator/SimulatedFxConnector.cs](../src/BoltPreload.Fx/Simulator/SimulatedFxConnector.cs)：
+[src/BoltPreload.Fx/Simulator/SimulatedFxConnector.cs](../../src/BoltPreload.Fx/Simulator/SimulatedFxConnector.cs)：
 - 无 `_sessionId` 等共享会话状态；命令方法（SetWorkMode/ReadChannelParam/Configure*/Recalibrate）都是**无状态的日志 no-op**，天然线程安全。
 - Connect/Disconnect/Reconnect 用 `_connectLock` 串行；采样循环 `SingleWriter=true`，断开会先取消并 `await` 旧循环再启新循环，不会两条循环并发写。
 - 故仿真路径不需要 `_sessionLock`；换真机（`FxSdkConnector`）时由第 1 节的会话锁提供同等保证。
@@ -78,7 +78,7 @@ flowchart LR
 
 **契约**：所有健康/告警聚合都必须排除软删实体（`deleted_at IS NULL`）。
 
-- 健康聚合的单一事实源：[src/BoltPreload.Api/Endpoints/AssetEndpoints.cs](../src/BoltPreload.Api/Endpoints/AssetEndpoints.cs) 的 `BoltStatusCte`
+- 健康聚合的单一事实源：[src/BoltPreload.Api/Endpoints/AssetEndpoints.cs](../../src/BoltPreload.Api/Endpoints/AssetEndpoints.cs) 的 `BoltStatusCte`
   （对 channels / monitor_groups / turbines / bolts 均加 `deleted_at IS NULL`）。
 - 跨切面 `open_alarms` 子查询（/projects、/turbines、/groups）与 `DashboardEndpoints` 的按 severity 计数
   也统一按 `bolts.deleted_at IS NULL` 过滤，与告警列表口径一致。
@@ -92,12 +92,12 @@ flowchart LR
 `pending` / `rejected` 一律不算生效。
 
 - **生效口径统一**：标定中心 `active_count`、预测窗口"最近一次生效标定 `max(created_at)`"过滤均按此定义
-  （[CalibrationEndpoints](../src/BoltPreload.Api/Endpoints/CalibrationEndpoints.cs) / [BoltEndpoints](../src/BoltPreload.Api/Endpoints/BoltEndpoints.cs) / [DashboardEndpoints](../src/BoltPreload.Api/Endpoints/DashboardEndpoints.cs)）。
+  （[CalibrationEndpoints](../../src/BoltPreload.Api/Endpoints/CalibrationEndpoints.cs) / [BoltEndpoints](../../src/BoltPreload.Api/Endpoints/BoltEndpoints.cs) / [DashboardEndpoints](../../src/BoltPreload.Api/Endpoints/DashboardEndpoints.cs)）。
   `pending` 不得进入生效集，否则整定窗口/计数会被未会签的草稿污染。
 - **有效期从【激活】起算**：正式载荷标定 `expires_at` 在会签（countersign）时按 `CURRENT_DATE + (expires_at - created_at::date)` 重锚，
   审核期不消耗有效期（久审后的标定不会一激活就临近过期）。
 - **通道标定缓存随绑定关系清理**：unbind 与 move 的【源通道】都要清空 `k_l / k_l_uncertainty / k_l_intercept_ns / active_calibration_id`
-  （[BoltBindingEndpoints](../src/BoltPreload.Api/Endpoints/BoltBindingEndpoints.cs)），避免空通道仍显示 calibrated 或下次绑定误用旧 K_L。
+  （[BoltBindingEndpoints](../../src/BoltPreload.Api/Endpoints/BoltBindingEndpoints.cs)），避免空通道仍显示 calibrated 或下次绑定误用旧 K_L。
 - **状态机闭环**：`pending` 有两条出口——countersign（异人激活，写通道 + supersede 旧标定）或 reject（置 `rejected`，不激活、不动通道）；
   两条出口都写审计。四眼底线：countersign 会签人必须 ≠ 提交人。
 
@@ -106,15 +106,15 @@ flowchart LR
 **契约**：任何"安全攸关的状态变更"与其审计留痕必须在**同一数据库事务**内提交，不允许"改了但没留痕"或"留痕了但没改"的半提交。
 
 - 例：`configure-channel` 的变更请求写入 + 管理员免审批的 `config_change_approve` 审计条目现在同一 `conn/tx` 提交
-  （[DiagnosticEndpoints](../src/BoltPreload.Api/Endpoints/DiagnosticEndpoints.cs)）；标定会签/驳回、同步通道配置等均在各自事务内连同审计一并提交或回滚。
-- 落盘副作用要能回滚：报告 HTML 落盘 + DB 记录，若 DB 失败要在 catch 内 `File.Delete` 清理孤儿文件（[ReportEndpoints](../src/BoltPreload.Api/Endpoints/ReportEndpoints.cs)）。
+  （[DiagnosticEndpoints](../../src/BoltPreload.Api/Endpoints/DiagnosticEndpoints.cs)）；标定会签/驳回、同步通道配置等均在各自事务内连同审计一并提交或回滚。
+- 落盘副作用要能回滚：报告 HTML 落盘 + DB 记录，若 DB 失败要在 catch 内 `File.Delete` 清理孤儿文件（[ReportEndpoints](../../src/BoltPreload.Api/Endpoints/ReportEndpoints.cs)）。
 
 ## 8. 前端时间派生 UI 的响应式刷新（Frontend staleness tick）
 
 **契约**：任何"距今多久"派生的 UI（陈旧/离线判定、"N 分钟前"、状态灯 `nodata`）必须依赖一个随时间前进的响应式 `now`，
 不能用一次性的 `Date.now()`——否则无新数据时会永久卡在渲染时刻。
 
-- 单一实现：[web/src/utils/useNow.ts](../web/src/utils/useNow.ts) 的 `useNow(intervalMs)` 返回按间隔自增的 `now` ref。
+- 单一实现：[web/src/utils/useNow.ts](../../web/src/utils/useNow.ts) 的 `useNow(intervalMs)` 返回按间隔自增的 `now` ref。
 - `computePreloadHealth(inp, nowMs)` / `fmtAgo(iso, nowMs)` 接受时间入参；`BoltDetail` / `AssetMonitor` / `Alarms` / `LivePreload`
   传入 `useNow()` 的值，使状态灯与相对时间随时间刷新。
 - `LivePreload` 通道表只按"当前仍已标定"的 API 结果重建（剔除失标定/解绑通道，保留滚动序列），主图 cutoff 依赖 `now` 平滑左移。

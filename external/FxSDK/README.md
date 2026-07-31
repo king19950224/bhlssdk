@@ -35,7 +35,7 @@
 3. 重新应用上表中的改动（TargetFramework / GeneratePackageOnBuild / 依赖版本 / Directory.Build.props）
 4. `dotnet build` 验证编译
 5. 跑回归测试集（包括算法回归数据、协议解码用例）
-6. 记录版本变更到 `docs/sdk-changelog.md`
+6. 记录版本变更到 `资料/工程文档/sdk-changelog.md`
 
 ## 商用合规提醒
 
@@ -43,4 +43,4 @@
 
 - 合同必须要求厂家提供完整协议文档
 - 合同必须要求 SDK 源码 escrow（厂家失联时我们能拿到源码自维护）
-- 关键协议常量已经在 `docs/plan.md §8.1` 记录留底（即使没 SDK 也能重写编解码）
+- 关键协议常量已经在 `资料/工程文档/plan.md §8.1` 记录留底（即使没 SDK 也能重写编解码）

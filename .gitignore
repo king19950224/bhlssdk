@@ -70,4 +70,7 @@ src/BoltPreload.Api/data/
 
 # 非交付范围的资料（厂家原始 SDK 资料、软著申请、会议/申报材料等）— 不进 git
 # 厂家 C# 1.4 源码已净化拷到 external/FxSDK/（见 external/FxSDK/README.md）
+# 例外：资料/工程文档/ 是内部工程文档（开发指南、设计、验收记录），继续进 git，不随客户交付包发出。
 资料/
+!资料/工程文档/
+!资料/工程文档/**

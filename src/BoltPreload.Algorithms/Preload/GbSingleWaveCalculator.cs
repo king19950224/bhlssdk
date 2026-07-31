@@ -3,7 +3,7 @@ namespace BoltPreload.Algorithms.Preload;
 /// <summary>
 /// GB/T 43232-2023 单波法（详见方案 §8.3）。
 /// <para>
-/// K_L 量纲约定（已裁定，见 docs/sdk-api-facts.md §12）：全系统统一
+/// K_L 量纲约定（已裁定，见 资料/工程文档/sdk-api-facts.md §12）：全系统统一
 /// <c>K_L = Δt/F</c>（单位 ns/N，量级 ~1e-4），因此 <c>F = Δt / K_L</c>（见 <see cref="Calculate"/>，
 /// 与 <c>torque-calibrate</c>/<c>quick-calibrate</c> 的 <c>kL = Δt/F</c> 自洽，整条标定→计算链闭合）。
 /// 注意标定证书与 plan 早期章节（§8.3/§8.5/附录 C）用的是 <c>K_L = Δt/(F·t₀)</c>
@@ -45,7 +45,7 @@ public sealed class GbSingleWaveCalculator : IPreloadCalculator
         var deltaTofNs = normalizedTofNs - input.RefTimeNs;
 
         // 2. 单波法预紧力：F = Δt / K_L
-        //    全系统裁定约定 K_L = Δt/F（单位 ns/N，见 docs/sdk-api-facts.md §12），
+        //    全系统裁定约定 K_L = Δt/F（单位 ns/N，见 资料/工程文档/sdk-api-facts.md §12），
         //    与标定链（torque/quick calibrate 存的 kL=Δt/F）及 channels.k_l /
         //    calibration_records.k_l 的存量数据自洽。勿翻转为 1/N 约定——那会让全部已存 k_l 失真。
         if (input.Calibration.KL <= 0m)
