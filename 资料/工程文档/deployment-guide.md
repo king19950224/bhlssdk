@@ -45,6 +45,10 @@ dotnet publish src/BoltPreload.Api/BoltPreload.Api.csproj -c Release -r win-x64 
 交付包内容自检：`out/BoltPreload.Api.exe`、`out/wwwroot/index.html`、`out/wwwroot/assets/`、`out/NLog.config` 都应存在。
 **`wwwroot/index.html` 缺失就是前端没打进去**，装上去打开是空白页。
 
+反向自检同样重要：`out/appsettings.Development.json` **必须不存在**（csproj 已设 `CopyToPublishDirectory=Never`）。
+该文件含开发库口令、开发 JWT 密钥，且 `AllowMissingLicenseInDevelopment=true`——一旦随包发出，现场把
+`ASPNETCORE_ENVIRONMENT` 改成 `Development` 就能绕过授权校验并跑起仿真模式。发现它出现在 `out/` 就别发货。
+
 另需一并带到现场：`deploy/sql/0*.sql`（全部迁移）、`deploy/windows/*.ps1`、签好的 `license.json`。
 
 ---
