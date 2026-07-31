@@ -32,7 +32,10 @@ dotnet run
 
 浏览器开 <http://localhost:5000/swagger> 看 API 文档。
 
-`SimulatedFxConnector` 启动后自动开始模拟产生数据，5Hz × 3 通道。
+要用模拟器产数据（无真机时），需在 `appsettings.Development.json` 里显式设 `Fx:Mode=Simulated` ——
+主配置 `appsettings.json` 的默认值是 `Real`，且缺该键时也按 `Real` 兜底（避免现场配置丢失时静默跑仿真、
+让值班人员盯着假数据）。设为 Simulated 后 `SimulatedFxConnector` 启动即产数据，5Hz × 12 通道
+（通道数见 `Fx:Simulator:ChannelCount`）。
 
 ## 验证 Phase 1 里程碑
 

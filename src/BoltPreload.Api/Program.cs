@@ -201,7 +201,8 @@ builder.Services.Configure<BoltPreload.Api.Runtime.WiringGuardOptions>(builder.C
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.WiringGuardService>();
 
 // 仿真模式：为模拟器驱动的螺栓通道写入真实标定，使采集链路算出真实预紧力（不再注入演示数据）。
-if (string.Equals(builder.Configuration["Fx:Mode"] ?? "Simulated", "Simulated", StringComparison.OrdinalIgnoreCase))
+// 缺省按 Real 判定（与 DeviceConnectorManager 同一口径）：配置丢失时绝不能静默进仿真。
+if (string.Equals(builder.Configuration["Fx:Mode"] ?? "Real", "Simulated", StringComparison.OrdinalIgnoreCase))
     builder.Services.AddHostedService<BoltPreload.Api.Runtime.SimulatedCalibrationProvisioner>();
 
 // ============================================================================
@@ -388,6 +389,24 @@ app.MapBoltEndpoints();
 app.MapAlarmEndpoints();
 app.MapReportEndpoints();
 app.MapLicenseEndpoints();
+
+// ============================================================================
+// SPA 深链回退
+// 前端用 createWebHistory()（无 # 的干净 URL）。直接访问 /alarms、刷新 /bolts/123、
+// 或把大屏 /board 设成工控机浏览器主页时，请求先到静态文件中间件——wwwroot 下没有这些路径的文件，
+// 于是返回 404 空响应（浏览器上就是一张白页），前端路由和它自己的 404 页面根本没机会执行。
+// 回退到 index.html 后由前端路由接管，未知路径也才能落到 NotFound.vue。
+// 顺序：必须在所有业务 endpoint 之后注册。
+// ============================================================================
+
+// 未知的 /api、/hubs 路径回 404 JSON，不能落到下面的 SPA 回退：
+// 否则接口名拼错会拿到一份 index.html（HTTP 200），前端 fetch 按 JSON 解析后报出与真实原因无关的错。
+app.MapFallback("/api/{**path}", () => Results.NotFound(new { error = "接口不存在", code = "endpoint_not_found" }))
+   .AllowAnonymous();
+app.MapFallback("/hubs/{**path}", () => Results.NotFound()).AllowAnonymous();
+
+// 其余非文件路径（{*path:nonfile} 不匹配带扩展名的请求，缺失的静态资源仍返回 404）交给前端路由
+app.MapFallbackToFile("index.html").AllowAnonymous();
 
 // 从 DB 重建告警评估器的内存状态机（防止重启后 on-delay 计数清零、已开启告警重复触发）。
 // 关键：必须在 app.RunAsync() 之前【同步 await】完成 —— HostedService（IngestionService）的 StartAsync

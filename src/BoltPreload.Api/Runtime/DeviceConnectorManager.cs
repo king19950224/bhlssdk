@@ -33,9 +33,18 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         NpgsqlDataSource dataSource,
         ILoggerFactory loggerFactory)
     {
-        var fxMode = configuration["Fx:Mode"] ?? "Simulated";
         var log = loggerFactory.CreateLogger<DeviceConnectorManager>();
         _log = log;
+
+        // 缺 Fx:Mode 时按 Real 兜底，不是 Simulated：模拟器会产出物理上自洽、看起来完全正常的预紧力，
+        // 现场若因配置丢失而静默跑成仿真，值班人员盯着的是假数据 —— 对安全监测系统这是最坏的失效方向。
+        // 退到 Real 时若没有可用设备配置，表现为"连不上/无数据"，是能被看见的失败。
+        var fxMode = configuration["Fx:Mode"];
+        if (string.IsNullOrWhiteSpace(fxMode))
+        {
+            fxMode = "Real";
+            log.LogWarning("未配置 Fx:Mode，按 Real（真机）兜底。若本机是开发/演示环境需显式设置 Fx:Mode=Simulated。");
+        }
 
         var runtimes = string.Equals(fxMode, "Real", StringComparison.OrdinalIgnoreCase)
             ? BuildRealRuntimes(configuration, dataSource, loggerFactory, log)
