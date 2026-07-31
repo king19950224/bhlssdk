@@ -117,7 +117,7 @@ onMounted(async () => {
     if (p.present) void poll()
     // 验收会话中的插拔事件是现场确认的关键反馈，弹提示；平时只翻状态灯不打扰
     if (!p.initial && session.value?.active) {
-      if (p.present) ElMessage.success(`CH${p.channelNo} 信号出现——与当前接的电缆核对无误后，点该通道「确认验收」`)
+      if (p.present) ElMessage.success(`CH${p.channelNo} 信号出现——与当前接的电缆核对无误后，点该通道“确认验收”`)
       else ElMessage.warning(`CH${p.channelNo} 信号静默——刚断开的电缆对应 CH${p.channelNo}`)
     }
   }))
@@ -162,7 +162,7 @@ function isLost(it: ChannelLive) {
 function isPending(it: ChannelLive) {
   return it.boltId != null && !hasSignal(it) && it.lastPresentAt == null
 }
-/** 待补规格：已建档但无目标预紧力（自动建档缺省态，与「未标定」分开） */
+/** 待补规格：已建档但无目标预紧力（自动建档缺省态，与“未标定”分开） */
 function needsSpec(it: ChannelLive) {
   return it.boltId != null && it.targetPreloadN == null
 }
@@ -420,13 +420,13 @@ async function savePosition(it: ChannelLive) {
   const label = (labelEdit.value[it.channelNo] ?? '').trim()
   if (!label && it.positionLabel) {
     try {
-      await ElMessageBox.confirm(`输入为空，将清空 CH${it.channelNo} 的现有位号「${it.positionLabel}」，确认？`, '清空位号', { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' })
+      await ElMessageBox.confirm(`输入为空，将清空 CH${it.channelNo} 的现有位号“${it.positionLabel}”，确认？`, '清空位号', { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' })
     } catch { return }
   }
   savingPos.value = it.channelNo
   try {
     await boltApi.updateSettings(it.boltId, { positionLabel: label })
-    ElMessage.success(`通道 ${it.channelNo} 位置已标为「${label || '(清空)'}」`)
+    ElMessage.success(`通道 ${it.channelNo} 位置已标为“${label || '(清空)'}”`)
     await poll()
   } catch (e) {
     ElMessage.error((e as Error)?.message || '保存失败')
@@ -497,7 +497,7 @@ async function unbind(it: ChannelLive) {
       <span class="nogroup-badge">自动建档未生效</span>
       <span class="nogroup-text">
         检测到 {{ unboundSignalCount }} 路在位探头，但设备未设置默认监测组——新螺栓无处归属。
-        请到「采集设备」页设置默认监测组，设置后当前在位通道会立即补建档。
+        请到“采集设备”页设置默认监测组，设置后当前在位通道会立即补建档。
       </span>
       <el-button size="small" type="warning" @click="router.push({ name: 'devices', query: deviceId != null ? { deviceId } : undefined })">去设置 →</el-button>
     </div>
@@ -512,7 +512,7 @@ async function unbind(it: ChannelLive) {
         <el-button size="small" :loading="sessionBusy" @click="endSession">结束会话并恢复轮询</el-button>
       </div>
       <p class="session-hint">
-        <b>顺序接入（新装）</b>：按点位表逐根接线，接头插入后对应通道秒级点亮并弹提示，核对电缆标签后点「确认验收」。
+        <b>顺序接入（新装）</b>：按点位表逐根接线，接头插入后对应通道秒级点亮并弹提示，核对电缆标签后点“确认验收”。
         <b>拔插确认（存量）</b>：在设备端断开某根电缆接头，静默的通道即对应该电缆，回插信号恢复后确认。
         结束/超时后自动恢复全通道轮询。
       </p>
@@ -550,7 +550,7 @@ async function unbind(it: ChannelLive) {
         </div>
 
         <div class="ch-accept">
-          <span v-if="it.acceptedAt" class="acc-ok">✓ 已验收 {{ fmtDay(it.acceptedAt) }}</span>
+          <span v-if="it.acceptedAt" class="acc-ok">已验收 {{ fmtDay(it.acceptedAt) }}</span>
           <span v-else class="acc-no">未验收</span>
           <el-button size="small" :type="it.acceptedAt ? 'default' : 'success'" :plain="!!it.acceptedAt" text bg @click="openAccept(it)">
             {{ it.acceptedAt ? '重新验收' : '确认验收' }}
@@ -591,8 +591,8 @@ async function unbind(it: ChannelLive) {
       </div>
       <div v-if="!loading && !rows.length" class="empty">
         {{ deviceId == null
-          ? '未找到采集设备运行时,请先到「采集设备」页确认设备已接入'
-          : '该设备通道目录为空——请到「采集设备」页用「通道数」设置实际通道数（如 48）重建目录' }}
+          ? '未找到采集设备运行时,请先到“采集设备”页确认设备已接入'
+          : '该设备通道目录为空——请到“采集设备”页用“通道数”设置实际通道数（如 48）重建目录' }}
       </div>
     </div>
 
@@ -600,7 +600,7 @@ async function unbind(it: ChannelLive) {
     <el-dialog v-model="acceptOpen" :title="`确认验收：CH${acceptTarget?.channelNo ?? ''}`" width="480px" destroy-on-close>
       <el-alert type="info" :closable="false" show-icon style="margin-bottom: 14px">
         验收会把当前声时存为该通道的<b>接线指纹</b>并落验收记录（含操作人，可出报告）。
-        信号验证方式要求验收时刻有回波；无信号的备用通道请用「人工登记」。
+        信号验证方式要求验收时刻有回波；无信号的备用通道请用“人工登记”。
       </el-alert>
       <el-form label-width="90px" label-position="left">
         <el-form-item label="验收方式">
@@ -613,7 +613,7 @@ async function unbind(it: ChannelLive) {
           <el-input v-model="acceptForm.cableLabel" placeholder="现场线缆吊牌号，如 W-A12（强烈建议填）" maxlength="64" />
         </el-form-item>
         <el-form-item label="物理位置">
-          <el-input v-model="acceptForm.positionLabel" placeholder="如「1号机舱后法兰 5号孔」，写入通道位置" maxlength="64" />
+          <el-input v-model="acceptForm.positionLabel" placeholder="如“1号机舱后法兰 5号孔”，写入通道位置" maxlength="64" />
         </el-form-item>
         <el-form-item label="备注">
           <el-input v-model="acceptForm.note" type="textarea" :rows="2" placeholder="选填（记入验收记录与审计）" />
@@ -629,7 +629,7 @@ async function unbind(it: ChannelLive) {
     <el-dialog v-model="importOpen" title="导入点位表（接线表）" width="640px" destroy-on-close>
       <el-alert type="info" :closable="false" show-icon style="margin-bottom: 14px">
         CSV 表头：<code>channel_no,position_label,bolt_code,nominal_diam,grade,target_preload_n,min_preload_n</code>
-        （仅前两列必填；「导出点位表」可拿到当前模板）。导入为<b>全或无</b>：任一行无效整批不生效。
+        （仅前两列必填；“导出点位表”可拿到当前模板）。导入为<b>全或无</b>：任一行无效整批不生效。
         已绑定螺栓的通道只更新位置、不重复建档，可放心重导。
       </el-alert>
       <div class="imp-file">

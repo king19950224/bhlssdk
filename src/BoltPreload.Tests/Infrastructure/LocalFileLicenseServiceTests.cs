@@ -63,7 +63,7 @@ public class LocalFileLicenseServiceTests
     }
 
     /// <summary>
-    /// 机器码必须在同一台机器上稳定。旧实现取「OperationalStatus==Up + 按网卡名排序的第一块」，
+    /// 机器码必须在同一台机器上稳定。旧实现取“OperationalStatus==Up + 按网卡名排序的第一块”，
     /// 会被 awdl0 / VPN / Hyper-V 这类虚拟网卡的上下线改掉，实测同机 30 分钟内变过一次 ——
     /// 后果是已签发的授权自己失效、现场写操作全被 403 拦掉。
     /// </summary>

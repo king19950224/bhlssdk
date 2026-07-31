@@ -36,14 +36,14 @@ public static class DashboardEndpoints
 
                 -- 未闭合告警口径必须与告警中心 /api/alarms/summary 完全一致（仅按 bolts 软删过滤）。
                 -- 原先额外 JOIN monitor_groups/turbines 软删过滤：机组软删但螺栓未级联时，
-                -- 总览计数会吃掉这部分告警 → 「总览显示正常、告警中心却有未闭合 critical」的假安全。
+                -- 总览计数会吃掉这部分告警 → “总览显示正常、告警中心却有未闭合 critical”的假安全。
                 SELECT a.severity, count(*) FROM alarms a
                 JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
                 WHERE a.cleared_at IS NULL GROUP BY a.severity;
 
                 WITH {AssetEndpoints.BoltStatusCte}
                 SELECT
-                    -- b100 上界封到 1.10：超张力(high, >110%)不能算进「达标」，否则与健康分布的「偏高」档自相矛盾
+                    -- b100 上界封到 1.10：超张力(high, >110%)不能算进“达标”，否则与健康分布的“偏高”档自相矛盾
                     count(*) FILTER (WHERE preload_ratio >= 1.0 AND preload_ratio <= 1.10) AS b100,
                     count(*) FILTER (WHERE preload_ratio >= 0.9 AND preload_ratio < 1.0) AS b90,
                     count(*) FILTER (WHERE preload_ratio >= 0.8 AND preload_ratio < 0.9) AS b80,
@@ -53,7 +53,7 @@ public static class DashboardEndpoints
                 FROM bolt_status WHERE status IN ('normal','warn','loose','high') AND preload_ratio IS NOT NULL;
 
                 WITH cal AS (
-                    -- 只用「当前生效」的标定（未被 superseded、且已会签 approved / 自签 self_signed）来定沉降期起点；
+                    -- 只用“当前生效”的标定（未被 superseded、且已会签 approved / 自签 self_signed）来定沉降期起点；
                     -- 否则被顶替 / 驳回 / 待复核的记录会把窗口起点错误前移，把有效回归历史饿死成 insufficient。
                     SELECT bolt_id, max(created_at) AS calibrated_at
                     FROM calibration_records
@@ -65,7 +65,7 @@ public static class DashboardEndpoints
                            regr_r2(m.preload_n, extract(epoch FROM m.ts)) AS r2, count(*) n
                     FROM measurements m
                     LEFT JOIN cal ON cal.bolt_id = m.bolt_id
-                    -- 拟合窗口夹到「上次标定 + 2h 沉降期」之后：避免跨标定边界（基线/kL 变化造成的台阶）
+                    -- 拟合窗口夹到“上次标定 + 2h 沉降期”之后：避免跨标定边界（基线/kL 变化造成的台阶）
                     -- 与新标定后嵌入松弛瞬态污染斜率；刚标定不久（历史不足）自然被下面的门挡掉。
                     WHERE m.preload_n IS NOT NULL
                       AND m.ts >= GREATEST(now() - interval '7 days',

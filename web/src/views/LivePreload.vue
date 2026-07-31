@@ -5,8 +5,8 @@ import { boltApi, deviceApi, runtimeApi } from '../api'
 import { onRealtime, realtimeState } from '../api/realtime'
 
 // 实时预紧力波形：紧了上升、松了下降。
-// 数据口径与 BoltDetail 的「实时预紧力」一致——客户端按 (echo − RefTime) / K_L 连续换算，
-// 不走服务端 GB 30~90% 范围过滤，所以能「看着拧松一路掉到底、拧紧一路涨上去」。
+// 数据口径与 BoltDetail 的“实时预紧力”一致——客户端按 (echo − RefTime) / K_L 连续换算，
+// 不走服务端 GB 30~90% 范围过滤，所以能“看着拧松一路掉到底、拧紧一路涨上去”。
 // 驱动：channelsLive 轮询（每通道最新回波，一次拿全部）为主 + SignalR OnMeasurement 即时加速。
 
 interface LiveChan {
@@ -43,7 +43,7 @@ const loading = ref(true)
 const error = ref<string | null>(null)
 const rev = ref(0) // 递增触发图表重算
 const lastUpdate = ref<number>(0)
-const now = ref(Date.now()) // 每秒心跳：Date.now() 非响应式，用它驱动「陈旧度」随时间走动
+const now = ref(Date.now()) // 每秒心跳：Date.now() 非响应式，用它驱动“陈旧度”随时间走动
 
 const MED_WIN = 5 // 中位数窗口：免疫单点声时量化尖刺
 const MEAN_WIN = 11 // 均值窗口：压住低 SNR 通道数秒周期的回波识别波动（≈10s @ 多通道轮询）
@@ -57,7 +57,7 @@ function median(vals: number[]): number {
 
 // 两级尾部滤波：先 MED_WIN 中位数压住声时量化尖刺，再 MEAN_WIN 均值压低 SNR 通道
 // 数秒周期的回波识别随机波动（弱信号通道 ±5~7kN 锯齿的主因）。只用历史点，无未来滞后；
-// 代价是拧动响应慢几秒，要即时跟手可切「原始」。
+// 代价是拧动响应慢几秒，要即时跟手可切“原始”。
 function smoothSeries(pts: { t: number; v: number }[]): { t: number; v: number }[] {
   if (!smooth.value || pts.length < 2) return pts
   const med: { t: number; v: number }[] = []
@@ -291,7 +291,7 @@ function chipStatus(c: LiveChan): { color: string; label: string } {
   const cur = curOf(c)
   if (cur == null) return { color: '#3b4659', label: '无数据' }
   // 标定基线不匹配时客户端连续换算会得出物理不可能的量级（如 -9000kN）：
-  // 标为「数据异常」提示查标定，不能当有效读数打"低于下限"标签
+  // 标为“数据异常”提示查标定，不能当有效读数打"低于下限"标签
   if (c.target != null && c.target > 0 && (cur < -c.target || cur > c.target * 5))
     return { color: '#f43f5e', label: '数据异常·查标定' }
   if (c.min != null && cur < c.min) return { color: '#f43f5e', label: '低于下限' }

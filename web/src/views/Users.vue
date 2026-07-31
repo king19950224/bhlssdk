@@ -60,7 +60,7 @@ async function submit() {
 }
 async function toggle(u: UserRow) {
   try {
-    await ElMessageBox.confirm(`确认${u.enabled ? '停用' : '启用'}用户「${u.username}」?`, u.enabled ? '停用' : '启用', {
+    await ElMessageBox.confirm(`确认${u.enabled ? '停用' : '启用'}用户“${u.username}”?`, u.enabled ? '停用' : '启用', {
       type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消',
     })
     await userApi.toggle(u.id)
@@ -127,7 +127,7 @@ function fmt(iso: string | null) {
           <el-input v-model="form.password" type="password" show-password placeholder="至少 8 位" />
         </el-form-item>
         <div v-if="dialog.mode === 'reset'" class="reset-hint">
-          重置后该账户将解除锁定并处于启用状态；若此前已停用，如仍需停用请重置后再次点「停用」。
+          重置后该账户将解除锁定并处于启用状态；若此前已停用，如仍需停用请重置后再次点“停用”。
         </div>
       </el-form>
       <template #footer>

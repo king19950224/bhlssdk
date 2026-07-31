@@ -140,7 +140,7 @@ async function exportPdf() {
     const html = fileUrl.value ? await fetchArchivedHtml() : null
     if (html) {
       const w = window.open('', '_blank')
-      if (!w) { ElMessage.warning('浏览器拦截了新窗口，请允许弹窗后重试，或使用「下载」'); return }
+      if (!w) { ElMessage.warning('浏览器拦截了新窗口，请允许弹窗后重试，或使用“下载”'); return }
       w.document.open()
       w.document.write(html)
       w.document.close()

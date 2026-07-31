@@ -961,7 +961,7 @@ public static class DiagnosticEndpoints
                     acceptedAt = r.IsDBNull(13) ? (DateTime?)null : r.GetDateTime(13),
                     // 曾在位标记：识别页据此区分"失联"（曾在位，红色警示）与"待接入"（从未在位，中性）
                     lastPresentAt = r.IsDBNull(14) ? (DateTime?)null : r.GetDateTime(14),
-                    // 自动建档缺省无目标值 → 识别页「待补规格」引导
+                    // 自动建档缺省无目标值 → 识别页“待补规格”引导
                     targetPreloadN = r.IsDBNull(15) ? (decimal?)null : r.GetDecimal(15),
                 });
             return Results.Ok(new { deviceId, count = items.Count, items });

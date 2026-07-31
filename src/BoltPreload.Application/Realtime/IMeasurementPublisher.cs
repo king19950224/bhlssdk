@@ -13,7 +13,7 @@ namespace BoltPreload.Application.Realtime;
 public interface IMeasurementPublisher
 {
     /// <summary>
-    /// 推送一条解码后的测量。实现应做到「失败不抛」，避免阻塞主入库流水。
+    /// 推送一条解码后的测量。实现应做到“失败不抛”，避免阻塞主入库流水。
     /// </summary>
     Task PublishAsync(FxDecodedEnvelope envelope, CancellationToken ct = default);
 }

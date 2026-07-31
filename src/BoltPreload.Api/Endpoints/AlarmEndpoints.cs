@@ -379,7 +379,7 @@ public static class AlarmEndpoints
 
     /// <summary>
     /// 把告警确认/闭合/抑制动作写入 audit_log（append-only 轨迹），与状态更新共享同一事务。
-    /// alarms 行本身的 acknowledged_by/cleared_by 是当前态；audit_log 是不可篡改的历史，满足「可追责」。
+    /// alarms 行本身的 acknowledged_by/cleared_by 是当前态；audit_log 是不可篡改的历史，满足“可追责”。
     /// </summary>
     private static async Task WriteAlarmAuditAsync(
         NpgsqlConnection conn, NpgsqlTransaction tx,

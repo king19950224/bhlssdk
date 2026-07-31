@@ -284,7 +284,7 @@ async function downloadReport(id: number) {
           <el-form-item label="系统相对不确定度"><el-input-number v-model="load.systematicRelativeUncertainty" :step="0.001" :min="0" :precision="4" controls-position="right" style="width:100%" /></el-form-item>
           <el-form-item label="备注"><el-input v-model="load.note" type="textarea" :rows="2" /></el-form-item>
           <el-button type="primary" :loading="busy === 'load'" @click="submitLoad">提交正式标定（待会签）</el-button>
-          <p class="hint">≥4 点最小二乘，强制 R²≥0.98 + JJF 不确定度评定；提交后须另一名复核员到「标定档案」会签激活。</p>
+          <p class="hint">≥4 点最小二乘，强制 R²≥0.98 + JJF 不确定度评定；提交后须另一名复核员到“标定档案”会签激活。</p>
         </el-form>
       </el-tab-pane>
 

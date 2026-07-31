@@ -6,7 +6,7 @@ import {
   type ChannelRow, type UnboundSummaryRow,
 } from '../api'
 
-// 「建档并绑定」对话框：现场接了新探头/新螺栓时的一键闭环。
+// “建档并绑定”对话框：现场接了新探头/新螺栓时的一键闭环。
 // 选未绑定通道 + 监测组 → 填位号与规格（预设可改）→ 提交后：
 // 建 bolts 档案、通道置 bound、暂存数据回填成正式测量，一个事务完成。
 const props = withDefaults(defineProps<{
@@ -19,7 +19,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   'update:modelValue': [boolean]
-  // 带出新档案标识,父页面可无缝接标定向导(接入闭环:建档→绑定→标定)
+  // 带出新档案标识,父页面拿到后可直接弹标定向导(建档→绑定→标定一口气走完)
   done: [payload?: { boltId: number; channelId: number; code: string }]
 }>()
 
@@ -170,7 +170,7 @@ async function submit() {
         </el-select>
       </el-form-item>
       <el-form-item label="现场位号">
-        <el-input v-model="form.positionLabel" placeholder="如「5号」——俯视图按位号落孔位，强烈建议填" maxlength="64" />
+        <el-input v-model="form.positionLabel" placeholder="如“5号”——俯视图按位号落孔位，强烈建议填" maxlength="64" />
       </el-form-item>
       <el-form-item label="编号">
         <el-input v-model="form.code" placeholder="留空自动生成（组编号-CH通道号）" maxlength="64" />

@@ -89,11 +89,11 @@ API 端 `device_parameter_history` 表也正确记录了
 
 | 假设 | 验证方法 | 结论 |
 |---|---|---|
-| 探头脱落 | 看 `LEchoWave` 波形 | ❌ 回波清晰，物理 OK |
-| AFE 损坏 | 看噪声基底和信号幅度 | ❌ SNR 高，AFE OK |
-| 软件没把 EchoTime 解码出来 | 看协议 NLog 原始帧 + DTO 字段 | ❌ 协议里就是 null |
-| 网络丢包 | 测量条数对得上心跳节奏 | ❌ 无丢包 |
-| 温度传感器坏 | `SpTemp` 稳定在 23.4 °C，符合室温 | ❌ 传感器 OK |
+| 探头脱落 | 看 `LEchoWave` 波形 | 排除：回波清晰，物理 OK |
+| AFE 损坏 | 看噪声基底和信号幅度 | 排除：SNR 高，AFE OK |
+| 软件没把 EchoTime 解码出来 | 看协议 NLog 原始帧 + DTO 字段 | 排除：协议里就是 null |
+| 网络丢包 | 测量条数对得上心跳节奏 | 排除：无丢包 |
+| 温度传感器坏 | `SpTemp` 稳定在 23.4 °C，符合室温 | 排除：传感器 OK |
 
 ## 四、解决路径（按风险/收益排序）
 
@@ -139,14 +139,14 @@ SDK 协议层会一次性把 `MeasMode + Threshold + RefTime + RefTemp + LEchoWa
 
 | # | 事项 | 状态 | 文件 |
 |---|---|---|---|
-| 1 | `device_parameter_history` 表，永久保留设备参数读取流水 | ✅ | `deploy/sql/0002_device_parameter_history.sql` |
-| 2 | `PostgresMeasurementSink` 自动落 `DeviceParameter`（含 LEchoWave JSON） | ✅ | `src/BoltPreload.Infrastructure/Ingestion/PostgresMeasurementSink.cs` |
-| 3 | API：参数历史查询、通道当前快照 | ✅ | `src/BoltPreload.Api/Endpoints/MeasurementEndpoints.cs` |
-| 4 | API：远程读设备/通道参数（运维不去现场） | ✅ | `src/BoltPreload.Api/Endpoints/DiagnosticEndpoints.cs` |
-| 5 | API：远程改通道参数（`Gain`/`ProbeFreq`/`EchoWin` 等） | ✅ | 同上 |
-| 6 | API：通道重标定（自动或手动指定基线） | ✅ | 同上 |
-| 7 | `IFxConnector` 抽象，真机/模拟器同接口 | ✅ | `src/BoltPreload.Fx/IFxConnector.cs` |
-| 8 | `MultiChannelResult` 拆分入库 | ✅ | 同 `PostgresMeasurementSink` |
+| 1 | `device_parameter_history` 表，永久保留设备参数读取流水 | 已完成 | `deploy/sql/0002_device_parameter_history.sql` |
+| 2 | `PostgresMeasurementSink` 自动落 `DeviceParameter`（含 LEchoWave JSON） | 已完成 | `src/BoltPreload.Infrastructure/Ingestion/PostgresMeasurementSink.cs` |
+| 3 | API：参数历史查询、通道当前快照 | 已完成 | `src/BoltPreload.Api/Endpoints/MeasurementEndpoints.cs` |
+| 4 | API：远程读设备/通道参数（运维不去现场） | 已完成 | `src/BoltPreload.Api/Endpoints/DiagnosticEndpoints.cs` |
+| 5 | API：远程改通道参数（`Gain`/`ProbeFreq`/`EchoWin` 等） | 已完成 | 同上 |
+| 6 | API：通道重标定（自动或手动指定基线） | 已完成 | 同上 |
+| 7 | `IFxConnector` 抽象，真机/模拟器同接口 | 已完成 | `src/BoltPreload.Fx/IFxConnector.cs` |
+| 8 | `MultiChannelResult` 拆分入库 | 已完成 | 同 `PostgresMeasurementSink` |
 
 ## 六、给业主/厂家的话
 

@@ -82,7 +82,7 @@ export function pctParts(counts: number[], total?: number): number[] {
   return out
 }
 
-/** 把时间戳格式化为「N 秒/分钟/小时/天前」，用于「最后已知数据」的陈旧度提示。 */
+/** 把时间戳格式化为“N 秒/分钟/小时/天前”，用于“最后已知数据”的陈旧度提示。 */
 export function fmtAgo(iso: string | null | undefined, nowMs: number = Date.now()): string {
   if (!iso) return '—'
   const ms = nowMs - new Date(iso).getTime()

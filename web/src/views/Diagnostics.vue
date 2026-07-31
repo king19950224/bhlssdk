@@ -220,7 +220,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
 
 <template>
   <div class="diag rise">
-    <!-- 加载失败横幅：把「请求失败」与「暂无波形」明确区分，并提供重试 -->
+    <!-- 加载失败横幅：把“请求失败”与“暂无波形”明确区分，并提供重试 -->
     <div v-if="error" class="diag-error">
       <el-icon><WarningFilled /></el-icon>
       <span class="diag-error-msg">加载失败：{{ error }}</span>
@@ -276,13 +276,13 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
       </div>
       <div v-else-if="cur && !hasRef" class="metrics-empty">
         <el-icon><InfoFilled /></el-icon>
-        该通道尚未设置参考波形。波形稳定（已拧到目标、耦合良好）时点「设为参考」，之后即可实时对比相似度 / 衰减 / 健康度，预警探头老化与耦合劣化。
+        该通道尚未设置参考波形。波形稳定（已拧到目标、耦合良好）时点“设为参考”，之后即可实时对比相似度 / 衰减 / 健康度，预警探头老化与耦合劣化。
       </div>
 
       <EChart v-if="cur" :option="ascanOption" height="300px" />
       <div v-else class="ascan-empty" v-loading="loadingCmp">
         <el-icon><TrendCharts /></el-icon>
-        <span>{{ loading ? '加载中…' : error ? '波形加载失败,请点上方「重试」。' : '暂无波形数据。设备产生带波形的测量后,可在此实时回放并对比 A-Scan。' }}</span>
+        <span>{{ loading ? '加载中…' : error ? '波形加载失败,请点上方“重试”。' : '暂无波形数据。设备产生带波形的测量后,可在此实时回放并对比 A-Scan。' }}</span>
       </div>
 
       <div v-if="curStats" class="ascan-legend">

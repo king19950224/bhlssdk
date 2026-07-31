@@ -7,7 +7,7 @@
 - 开发文档：`docs/development-guide.md`，新人先看这份。用什么做的、厂家资料、怎么通讯、接口有哪些、环境一步步怎么搭，都在里面
 - **现场部署手册：`docs/deployment-guide.md`**，到现场装机照这份做。必需配置清单、授权签发、装完自检都在里面
 - 交付检查计划：`docs/delivery-master-plan.md`，交付前逐页核对
-- 完整设计方案：`docs/plan.md`（从 `.cursor/plans/` 拷贝过来，含商用底线、算法、合规、附录 A~H）
+- 完整设计方案：`docs/plan.md`，含商用底线、算法、合规、附录 A~H
 
 ## 开发环境要求
 

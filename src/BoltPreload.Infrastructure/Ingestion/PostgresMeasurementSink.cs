@@ -431,7 +431,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         // 故重放路径改走无状态 critical 安全网（C1）补判一次。数据照常补写入库。
         if (evaluateAlarms)
         {
-            // 仅在真正写入新行时才推进「有状态」告警状态机：ON CONFLICT DO NOTHING 命中（rowsAffected==0）
+            // 仅在真正写入新行时才推进“有状态”告警状态机：ON CONFLICT DO NOTHING 命中（rowsAffected==0）
             // 说明该 (channel_id, ts) 是重复投递、已在首次入库时评估过；再评估会重复累加 on/off-delay 连续计数，
             // 导致提前触发或提前恢复。重复样本直接跳过评估。
             if (rowsAffected > 0)

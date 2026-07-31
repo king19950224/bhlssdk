@@ -4,7 +4,7 @@ namespace BoltPreload.Api.Auth;
 /// License 容量限额（MaxDevices / MaxChannels）的运行时强制状态。
 /// <para>
 /// 启动时按【实际加载的设备 / 通道数】评估一次，<see cref="LicenseGateMiddleware"/> 据此与签名有效性
-/// 一起决定写操作是否放行。设计原则与「无效 license 仍继续监测、只拦写操作」一致：
+/// 一起决定写操作是否放行。设计原则与“无效 license 仍继续监测、只拦写操作”一致：
 /// 超授权容量【不停采集】（绝不因授权问题让安全监测静默失效），只拦截写操作并显著告警，
 /// 逼业主补足正确授权后才能继续配置/标定/下发。
 /// </para>

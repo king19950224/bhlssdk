@@ -142,7 +142,7 @@ public static class BoltBindingEndpoints
             }
 
             // 探头仍在位时置 auto_enroll_hold：阻止立刻自动重建；真正离位后由
-            // ChannelPresenceService 清 hold。重启不清——避免「删了重启又回来」。
+            // ChannelPresenceService 清 hold。重启不清——避免“删了重启又回来”。
             await using (var cmd = new NpgsqlCommand(@"
                 UPDATE channels
                    SET business_state = 'unbound',
@@ -230,7 +230,7 @@ public static class BoltBindingEndpoints
 
         try
         {
-            // 以下三段均遵循「reader 先读完关闭，再回滚/返回」——开着 reader 回滚会抛异常，
+            // 以下三段均遵循“reader 先读完关闭，再回滚/返回”——开着 reader 回滚会抛异常，
             // 把本应 404/409 的业务分支变成 500。
             ChannelBindingSnapshot? target = null;
             await using (var cmd = new NpgsqlCommand(@"

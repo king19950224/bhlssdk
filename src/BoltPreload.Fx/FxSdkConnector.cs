@@ -323,7 +323,7 @@ public sealed class FxSdkConnector : IFxConnector
 
             // SDK 协议层（MultiChIotProtocolHandler.EncodeChannel）只支持 5 个 propertyName：
             //     ProbeFreq / EchoWin / EchoWidth / PulseConfig / Gain
-            //   以及 RefTime —— 但它实际是「整组标定基线」：一条命令把
+            //   以及 RefTime —— 但它实际是“整组标定基线”：一条命令把
             //   MeasMode + Threshold + RefTime + RefTemp + LEchoWave 一起写。
             //   所以单写 RefTemp / Threshold / MeasMode / TcMode / TempCoefficient 都会被 SDK 拒绝。
             //   这里只接受 SDK 真实支持的属性；RefTime 走专门的"重标定"流程（需先读到 LEchoWave）。

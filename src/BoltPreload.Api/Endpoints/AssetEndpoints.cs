@@ -317,7 +317,7 @@ public static class AssetEndpoints
                 });
             }
 
-            // code 缺省自动生成中文「通道X-Y号螺栓」（与自动建档同一套 ChannelNaming）；
+            // code 缺省自动生成中文“通道X-Y号螺栓”（与自动建档同一套 ChannelNaming）；
             // 与既有（含软删）冲突时追加 -2/-3…
             // （UNIQUE(group_id, code) 不排除软删行，解绑后重建同通道螺栓是常见场景）
             string code;

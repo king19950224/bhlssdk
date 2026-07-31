@@ -123,7 +123,7 @@ onUnmounted(() => {
 })
 
 // ---- 处置动作（均要求留痕） ----
-// 注意把「用户取消弹窗」和「API 调用失败」分开：原实现同一个 try/catch 全吞，
+// 注意把“用户取消弹窗”和“API 调用失败”分开：原实现同一个 try/catch 全吞，
 // 网络错误/已被他人处置(404)会被当成"取消"静默忽略，操作者误以为已确认/已闭合。
 async function ack(a: AlarmItem) {
   let note: string | undefined

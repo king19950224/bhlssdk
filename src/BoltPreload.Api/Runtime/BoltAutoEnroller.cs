@@ -11,7 +11,7 @@ namespace BoltPreload.Api.Runtime;
 /// 检测即螺栓：通道确认在位且无绑定螺栓时自动建档（现场零点击）。
 /// <para>
 /// 语义（用户拍板）：探头插上、回波过下限门+稳定性门确认在位 → 螺栓档案自动出现并显示；
-/// 编号自动（中文「通道X-Y号螺栓」，见 <see cref="ChannelNaming"/>）、缺省规格
+/// 编号自动（中文“通道X-Y号螺栓”，见 <see cref="ChannelNaming"/>）、缺省规格
 /// （42CrMo/M20/8.8，可后补位置/规格/目标值）。
 /// 建档事务与点位表导入（WiringTableEndpoints）同构：INSERT bolts → 通道 business_state →
 /// 暂存测量回填 → 波形特征归属 → 绑定历史 + 审计（操作者 system:auto-enroll，user_id 为空）。
@@ -22,7 +22,7 @@ namespace BoltPreload.Api.Runtime;
 /// </para>
 /// <para>
 /// 不自动复活：人工删除且探头仍在位时 channels.auto_enroll_hold=true，本服务跳过建档；
-/// 真正离位（Present=false）后清 hold，再插入才重建。进程重启不清 hold——避免「删了重启又回来」。
+/// 真正离位（Present=false）后清 hold，再插入才重建。进程重启不清 hold——避免“删了重启又回来”。
 /// </para>
 /// </summary>
 public sealed class BoltAutoEnroller
@@ -165,7 +165,7 @@ public sealed class BoltAutoEnroller
             positionLabel = r.IsDBNull(1) ? null : r.GetString(1);
         }
 
-        // ---------- 编号：中文「通道X-Y号螺栓」，与既有（含软删）冲突时追加 -2/-3… ----------
+        // ---------- 编号：中文“通道X-Y号螺栓”，与既有（含软删）冲突时追加 -2/-3… ----------
         var baseCode = ChannelNaming.DefaultBoltCode(channelNo);
         var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         await using (var cmd = new NpgsqlCommand(

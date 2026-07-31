@@ -41,7 +41,7 @@ public sealed class FxChannelInit
 }
 
 /// <summary>
-/// 在 <c>BoltPreload.Fx</c> 内集中构造厂家 SDK 配置对象与连接器，把「FxSDK 组合」从 Api 收回到适配层，
+/// 在 <c>BoltPreload.Fx</c> 内集中构造厂家 SDK 配置对象与连接器，把“FxSDK 组合”从 Api 收回到适配层，
 /// 使上层不再 <c>using FxSDK.*</c>
 /// <para>初始通道会话由上层从 DB/配置加载为 plain 的 <see cref="FxChannelInit"/> 后传入，DB/配置访问不进适配层。</para>
 /// </summary>

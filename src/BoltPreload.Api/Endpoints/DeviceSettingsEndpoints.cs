@@ -10,7 +10,7 @@ namespace BoltPreload.Api.Endpoints;
 /// <summary>
 /// 设备设置：默认监测组（探头在位自动建档的归属组）。
 /// <para>
-/// 「检测即螺栓」的前提是系统知道新螺栓归到哪个组（bolts.group_id NOT NULL）：
+/// “检测即螺栓”的前提是系统知道新螺栓归到哪个组（bolts.group_id NOT NULL）：
 /// 本端点提供设置入口；设置成功后立即对该设备当前【在位且未建档】的通道补建档——
 /// 用户不必重新插拔探头，设置完列表秒级出现螺栓。
 /// </para>

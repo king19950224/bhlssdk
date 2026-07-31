@@ -137,7 +137,7 @@ function fmt(iso: string) {
     </div>
 
     <el-dialog v-model="genVisible" title="生成扭矩阶梯报告" width="460px">
-      <p class="dlg-sub">选择已采集扭矩阶梯实验点的通道，生成可追溯的 HTML 报告（法兰验收报告在「资产监测」按部位生成）。</p>
+      <p class="dlg-sub">选择已采集扭矩阶梯实验点的通道，生成可追溯的 HTML 报告（法兰验收报告在“资产监测”按部位生成）。</p>
       <el-select v-model="genChannelId" placeholder="选择通道" filterable style="width: 100%">
         <el-option v-for="c in channels" :key="c.id" :label="`CH${c.channelNo} · ${c.boltCode}（设备${c.deviceId}）`" :value="c.id" />
       </el-select>

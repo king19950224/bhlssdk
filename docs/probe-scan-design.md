@@ -1,7 +1,7 @@
 # 通道自动检测（Probe Scan）设计
 
 > 状态：**已实现并真机验证**（2026-05-27）。代码见 `src/BoltPreload.Application/Devices/ProbeScan/`、`src/BoltPreload.Infrastructure/Devices/ProbeScan/`、`src/BoltPreload.Api/Endpoints/ProbeScanEndpoints.cs`、`src/BoltPreload.Api/wwwroot/probe-scan.html`。  
-> 目的：在现场不知道探头插在哪几个物理通道的情况下，由系统自动识别「哪些通道接了探头、信号质量如何」，输出供运维人工绑定的清单。**不自动绑定 bolt**。
+> 目的：在现场不知道探头插在哪几个物理通道的情况下，由系统自动识别“哪些通道接了探头、信号质量如何”，输出供运维人工绑定的清单。**不自动绑定 bolt**。
 
 ---
 
@@ -9,7 +9,7 @@
 
 | # | 事实 | 来源 | 设计含义 |
 |---|---|---|---|
-| F1 | 厂家设备只测「当前被选中的通道」；软件选 2，则物理插在 1 的探头不会有数据 | 现场实测 + 用户口述（2026-05-26 11:31） | 不能一次性 `EnabledChannels=[1..40]` 当作自动检测依据，必须**逐通道选通** |
+| F1 | 厂家设备只测“当前被选中的通道”；软件选 2，则物理插在 1 的探头不会有数据 | 现场实测 + 用户口述（2026-05-26 11:31） | 不能一次性 `EnabledChannels=[1..40]` 当作自动检测依据，必须**逐通道选通** |
 | F2 | ~~SDK 支持 `FxWorkMode.SingleMeas`，接受 `channel` 参数~~ **修正**：model=3 多通道设备的 `SingleMeas` 是**单次测量**，命令下发后只回 1 条结果就停，不循环上报 | `src/BoltPreload.Fx/IFxConnector.cs` L37、真机实测 2026-05-27 | 不能用 `SingleMeas` 做持续采样窗口。改用 `MCRConfig.EnabledChannels=[ch]` 单元素 + `MultiMeas` 模拟单通道连续上报，即 `mcr_single` 策略 |
 | F3 | Watchdog 默认 60s 无 `ChannelResult` 自动重连并 `SetWorkMode(MultiMeas)` | `src/BoltPreload.Application/Ingestion/IngestionWatchdogService.cs` L97–119 | 扫描期间**必须暂停 Watchdog**，否则单通道无信号超过 60s 会被强制拉回 MultiMeas，扫描被打断 |
 | F4 | `IngestionService.RunRuntimeAsync` 启动时强制 `SetWorkMode(MultiMeas)` | `src/BoltPreload.Application/Ingestion/IngestionService.cs` L59 | 扫描必须在 Ingestion 启动**之后**触发；扫描结束必须恢复 MultiMeas，否则业务停摆 |
@@ -70,7 +70,7 @@ flowchart TD
 **关键不变量**：
 
 1. `E` 与 `N` 必须成对出现，包在 try/finally 里。`N` 失败不能让 ProbeScanState 永久占位、不能让设备停在错误 MCR / WorkMode。
-2. **finally 的恢复用 `CancellationToken.None`**：用户 abort 不能把恢复操作也取消掉，否则 mcr_single 策略会把设备停在「只跑最后扫描通道」的脏状态。
+2. **finally 的恢复用 `CancellationToken.None`**：用户 abort 不能把恢复操作也取消掉，否则 mcr_single 策略会把设备停在“只跑最后扫描通道”的脏状态。
 3. 扫描期 `Watchdog.CheckRuntimeAsync` 先检查 `ProbeScanState.IsRunning(deviceId)`，是就 `return`，不重连不切模式 —— 否则 60s 单通道无信号会触发强制 `MultiMeas` 重连，扫描被打断。
 4. 扫描期 `IngestionService` 的 `await foreach (var envelope in connector.Results)` 继续消费 MCR 单通道上来的数据，这是好事——波形和测量值正常入库（落到 `unbound_measurements + wave_features`），扫描器**不直接订阅 connector.Results**，只查这两张表的窗口聚合。这样不会和入库主路径抢消费。
 5. 写结果用 `CancellationToken.None`：用户在最后一刻 abort 也要把已扫到的部分落库。
@@ -89,7 +89,7 @@ flowchart TD
 | 扫 1–40 总耗时 | ~7.5 min | 40 × 11 s |
 | 扫 1–10 总耗时 | ~110 s | 适合现场快速验证 |
 
-> 总耗时是「业务监测中断时长」，必须在 API 文档和 UI 提示里写明。
+> 总耗时是“业务监测中断时长”，必须在 API 文档和 UI 提示里写明。
 
 ---
 
@@ -114,7 +114,7 @@ flowchart TD
 | `active_weak` | `echoRate ≥ 0.5` 且 (`snrAvgDb < snrGoodDb` 或 `echoStdNs > echoStdGoodNs` 或 `peakToPeakAvg < peakToPeakMin`) |
 | `active_good` | `echoRate ≥ 0.95` 且 `snrAvgDb ≥ 20 dB` 且 `echoStdNs ≤ 5 ns` 且 `peakToPeakAvg ≥ 600` |
 
-> 阈值 20 dB / 5 ns / 600 来自 `docs/lab-torque-step-report-2026-05-22.md` 实验室验证的「健康通道」基线，不是拍脑袋。
+> 阈值 20 dB / 5 ns / 600 来自 `docs/lab-torque-step-report-2026-05-22.md` 实验室验证的“健康通道”基线，不是拍脑袋。
 
 `hardware_state` 同步映射规则：
 
@@ -510,7 +510,7 @@ stateDiagram-v2
     completed --> [*]
 ```
 
-`finally` 是唯一的恢复入口，三个终态共用：「**重发原始 MCR 通道集 + SetWorkMode(MultiMeas)**」（均用 `CancellationToken.None`）。
+`finally` 是唯一的恢复入口，三个终态共用：“**重发原始 MCR 通道集 + SetWorkMode(MultiMeas)**”（均用 `CancellationToken.None`）。
 
 ---
 
@@ -531,19 +531,19 @@ stateDiagram-v2
 
 ## 10. 验收
 
-1. **单元测试** `ProbeScanResultJudge`：5 种 verdict + 边界条件 + `ToHardwareState` 映射 → **10 条** ✅
-2. **进程内并发** `ProbeScanState`：占位/重入/释放/abort → **7 条** ✅
+1. **单元测试** `ProbeScanResultJudge`：5 种 verdict + 边界条件 + `ToHardwareState` 映射，**10 条**
+2. **进程内并发** `ProbeScanState`：占位/重入/释放/abort，**7 条**
 3. **Orchestrator 不变量**（用 FakeConnector + FakeRepository）：
-   - 正常完成：每通道收到 mode 调用，最后必为 MultiMeas → ✅
-   - abort 中途也必须恢复 MultiMeas → ✅
-   - `mcr_single` 策略：最后一次 MCR 必为原始通道集 → ✅
-   - 已有 open run 时抛 `ProbeScanConflictException` → ✅
+   - 正常完成：每通道收到 mode 调用，最后必为 MultiMeas
+   - abort 中途也必须恢复 MultiMeas
+   - `mcr_single` 策略：最后一次 MCR 必为原始通道集
+   - 已有 open run 时抛 `ProbeScanConflictException`
 4. **真机现场实测**（2026-05-27）：
    - 扫 1-10，mcr_single 策略 → 5/6/7/8 出现 `active_good`/`active_weak`/`active_no_echo` 区分清晰
    - 扫描完成 15s 内业务监测恢复（1-40 通道再次正常上报）
    - 在扫描期间发 `POST /set-mode` → 409 拒绝
-5. **并发拒绝**：连续两次 `POST /probe-scan`，第二次 409 ✅
-6. **改名 LEFT JOIN**：8 号改名后立刻在已完成扫描的 `results[8].name` 出现 ✅
+5. **并发拒绝**：连续两次 `POST /probe-scan`，第二次 409
+6. **改名 LEFT JOIN**：8 号改名后立刻在已完成扫描的 `results[8].name` 出现
 
 测试合计 38/38 全绿（2026-05-27 13:14 UTC）。
 
@@ -551,7 +551,7 @@ stateDiagram-v2
 
 ## 11. 不做的事（明确划界）
 
-- **不做自动绑定 bolt**。即使某通道 `active_good` 且 `boundBoltCode` 为空，系统也只在报告里显示「未绑定」，不直接写 `bolts.channel_id`。
+- **不做自动绑定 bolt**。即使某通道 `active_good` 且 `boundBoltCode` 为空，系统也只在报告里显示“未绑定”，不直接写 `bolts.channel_id`。
 - **不做多设备并发扫描**。Phase 1 假设一台设备；多设备时排队 / 排序由调用方负责。
 - **不持久化原始波形到扫描结果表**。波形已经被 `LocalFileWaveStore` 在常规链路写过了，扫描器只统计 `wave_features` 的聚合。
 - **不动 `measurements` / `unbound_measurements` 写库逻辑**。扫描期间数据通过 IngestionService 正常入库；扫描器只读统计这两张表。

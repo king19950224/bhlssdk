@@ -24,7 +24,7 @@
 系统采用 B/S 架构，核心设计要点：
 
 - 后端基于 .NET 8 构建，厂家 SDK 以源码方式编入工程，便于调试与维护；
-- 设备接入层与业务层解耦，通过统一接口（IFxConnector）屏蔽 SDK 细节，支持模拟器与真实设备无缝切换；
+- 设备接入层与业务层解耦，通过统一接口（IFxConnector）屏蔽 SDK 细节，模拟器与真实设备可互换接入；
 - 测量数据采用时序数据库存储（PostgreSQL + TimescaleDB），支持高频写入与历史查询；
 - 前端通过 REST API 与 SignalR（WebSocket）获取数据，实现实时刷新。
 
@@ -185,7 +185,7 @@ ASP.NET Core 8 后端（BoltPreload.Api 及下属各层）
 
 #### 4.2.4 事件模型
 
-SDK 采用异步非阻塞通信、事件驱动回调。核心流程为「连接设备 → 配置参数 → 设置工作模式 → 接收数据」：
+SDK 采用异步非阻塞通信、事件驱动回调。核心流程为“连接设备 → 配置参数 → 设置工作模式 → 接收数据”：
 
 ```csharp
 var client = new FxClient();
@@ -255,8 +255,8 @@ IngestionService（BackgroundService 常驻）
 设备只测量 MCR 轮询集内的通道（probe-scan 设计事实 F1），因此热插拔识别的物理前提是**常态轮询全部物理通道**（1..`devices.channel_count`），由 `ChannelPresenceService` 在设备连接就绪后下发（会话 MCR 快照已是全通道则跳过；probe-scan / 验收会话期间让位，结束后收敛恢复）。
 
 - **插入识别**：探头插入空闲口 → 下个轮询周期起该通道有回波 → `ChannelPresenceTracker`（采集热路径纯内存状态机）要求连续 `PlugConsecutiveEchoes`（默认 3）条**合理且稳定**的回波（声时 ≥ `MinPlausibleEchoNs`，序列抖动 ≤ `PlugStabilityBandNs`）才判"插入"→ 更新 `channels.hardware_state=healthy` / `last_present_at`、SignalR 推 `OnChannelPresence`；
-- **检测即螺栓（`Fx:HotPlug:AutoEnroll`，默认 true）**：在位且通道无活跃螺栓时，`BoltAutoEnroller` 自动建档（编号中文「通道X-Y号螺栓」——每 10 个物理口为一「通道」束、束内从 1 数到 10，第 13 口即「通道2-3号螺栓」，见 `ChannelNaming`；缺省规格 M20/8.8，目标预紧力空，待现场补全）。归属组：`devices.default_group_id` → 设备同项目唯一活跃组兜底 → 否则跳过并提示去设备页设置。设置默认组的 PATCH 会对当前在位未建档通道立即补建档；
-- **删除抑制（`channels.auto_enroll_hold`）**：人工解绑/删除且探头仍在位时置 hold，阻止立刻重建；真正离位（Present=false）后清 hold，再插入才重建。**进程重启不清 hold**（避免「删了重启又回来」）；
+- **检测即螺栓（`Fx:HotPlug:AutoEnroll`，默认 true）**：在位且通道无活跃螺栓时，`BoltAutoEnroller` 自动建档（编号中文“通道X-Y号螺栓”——每 10 个物理口为一“通道”束、束内从 1 数到 10，第 13 口即“通道2-3号螺栓”，见 `ChannelNaming`；缺省规格 M20/8.8，目标预紧力空，待现场补全）。归属组：`devices.default_group_id` → 设备同项目唯一活跃组兜底 → 否则跳过并提示去设备页设置。设置默认组的 PATCH 会对当前在位未建档通道立即补建档；
+- **删除抑制（`channels.auto_enroll_hold`）**：人工解绑/删除且探头仍在位时置 hold，阻止立刻重建；真正离位（Present=false）后清 hold，再插入才重建。**进程重启不清 hold**（避免“删了重启又回来”）；
 - **拔出识别**：在位通道静默超自适应阈值（`max(UnplugSilenceSeconds, 通道数×PerChannelMeasureMs×UnplugSilenceCycles)`）→ `hardware_state=no_data`。假静默（离线 / 扫描中 / 整机无上报 / 通道不在 MCR 集）挂起判定；
 - **识别页统计口径**：通道数 → 在位 → 螺栓（在测 / 失联=曾在位现无信号 / 待接入=从未在位 / 待补规格=目标预紧力空）。孔位（`expected_bolt_count`）是结构配置，监测数是已建档探头，二者不自动同步；
 - **数据卫生**：空口或低于下限门的杂散未绑定数据不入库（probe-scan 期间放行）；有合理回波的未绑定数据落 `unbound_measurements`，建档后回填。保留期由 `UnboundRetention` 后台清理；
@@ -317,7 +317,7 @@ SignalR 推送事件：
 > - `quick-calibrate` / `torque-calibrate` / `apply-torque-fit`：现场自签的临时/工程估算标定，立即生效但 `review_state='self_signed'`（单人，非会签），有效期短，**不得作为安全验收结论**（trust 等级 temporary/engineering_estimate，见 `/api/calibration-center/summary`）；
 > - `recalibrate`（写设备 RefTime/RefTemp 基线）：需 reviewer+ 权限，全程写审计。
 >
-> 故 `review_state='approved'` 严格等价于「已通过两人会签」，报告与审计可直接信任该字段。
+> 故 `review_state='approved'` 严格等价于“已通过两人会签”，报告与审计可直接信任该字段。
 
 ### 5.2 设备适配层接口（IFxConnector）
 
@@ -480,7 +480,7 @@ bhlssdk/
 4. K_L 量纲约定：全系统 `K_L = Δt/F`，单位 ns/N，量级约 1e-4。标定证书上 1/N 量纲（约 1e-11）的数值不可直接录入，接口已设量级护栏，详见 sdk-api-facts.md §12；
 5. 工程开启编译警告即错误（TreatWarningsAsErrors），提交前须保证 `dotnet build` 无警告、`dotnet test` 全部通过；
 6. 连接串、JWT 密钥、license 公钥等敏感配置不得提交仓库。开发环境置于 `appsettings.Development.json`（已 gitignore），生产环境通过环境变量（如 `ConnectionStrings__Postgres`）或 user-secrets 注入；
-7. 提交/接手前跑 `python3 tools/code-audit.py`（零依赖）复核代码卫生：后端 public 类型注释覆盖、前端文件头注释、活文档引用有效性、TODO/调试残留等五类门禁须全部归零。豁免清单与理由内联在脚本头部，新增豁免必须写明原因。
+7. 提交/接手前跑 `python3 tools/code-audit.py`（零依赖）复核代码卫生：后端 public 类型注释覆盖、前端文件头注释、活文档引用有效性、TODO/调试残留、文风统一（状态用文字不用表情符号、引号用中文弯引号）等六类门禁须全部归零。豁免清单与理由内联在脚本头部，新增豁免必须写明原因。
 
 ## 9. 常见问题
 

@@ -63,7 +63,7 @@ async function pollLive() {
       liveEcho.value = Number(it.echoNs)
       liveTemp.value = it.tempC != null ? Number(it.tempC) : null
       // 只有拿到【新测量】才计入稳定性样本:设备停报/数据陈旧时重复推同一值会把极差压成 0,
-      // 伪造出"稳定 ✓"误导现场在坏数据上设基线
+      // 伪造出"稳定"误导现场在坏数据上设基线
       if (it.lastTs && it.lastTs !== lastSampleTs) {
         lastSampleTs = it.lastTs
         recentEchos.value.push(Number(it.echoNs))
@@ -116,7 +116,7 @@ async function setBaseline() {
   if (!echoStable.value) {
     try {
       await ElMessageBox.confirm(
-        `当前信号波动${echoSpreadNs.value != null ? ` ${echoSpreadNs.value.toFixed(1)} ns` : ''}偏大,基线可能不可靠。建议检查探头耦合后等待"稳定 ✓"再记录。仍要以当前读数设基线吗？`,
+        `当前信号波动${echoSpreadNs.value != null ? ` ${echoSpreadNs.value.toFixed(1)} ns` : ''}偏大,基线可能不可靠。建议检查探头耦合后等待显示"稳定"再记录。仍要以当前读数设基线吗？`,
         '信号未达稳定判据', { type: 'warning', confirmButtonText: '仍要记录', cancelButtonText: '再等等' })
     } catch { return }
   }
@@ -258,7 +258,7 @@ const doneKn = computed(() => {
         请确认螺栓处于<b>未拧紧</b>状态(刚穿入、螺母仅手拧贴合,不受力)。确认后点下方按钮,系统会把当前的超声读数记录为"零载基准"。
       </p>
       <p class="wz-lead warn-lead" v-if="scene === 'fresh' && bolt?.state === 'calibrated'">
-        ⚠ 该螺栓已在监测中:松开它会触发"预紧力脱落"告警。请先到告警中心对它做<b>维护抑制</b>(填写检修原因),再松开重标,避免值班误响应。
+        注意:该螺栓已在监测中,松开它会触发"预紧力脱落"告警。请先到告警中心对它做<b>维护抑制</b>(填写检修原因),再松开重标,避免值班误响应。
       </p>
       <p class="wz-lead" v-else>
         无需任何操作,系统将把<b>此刻</b>的超声读数记录为比较基准。之后页面上会显示这颗螺栓相对现在的松紧变化。
@@ -275,7 +275,7 @@ const doneKn = computed(() => {
         <div class="lb-row">
           <span class="lb-k">信号稳定性</span>
           <b v-if="echoSpreadNs == null" class="dim">评估中…</b>
-          <b v-else-if="echoStable" style="color: var(--ok)">稳定(波动 {{ echoSpreadNs.toFixed(1) }} ns)✓</b>
+          <b v-else-if="echoStable" style="color: var(--ok)">稳定(波动 {{ echoSpreadNs.toFixed(1) }} ns)</b>
           <b v-else style="color: var(--warn)">波动较大({{ echoSpreadNs.toFixed(1) }} ns),请检查探头耦合后再试</b>
         </div>
       </div>
@@ -293,7 +293,7 @@ const doneKn = computed(() => {
       <div class="wz-ok-note"><el-icon><CircleCheckFilled /></el-icon> 基准已记录({{ baselineResult ? baselineResult.refNs.toFixed(0) + ' ns' : '' }})</div>
       <p class="wz-lead">
         现在请按安装工艺,用力矩扳手把螺栓<b>拧紧到规定扭矩</b>。<br />
-        拧紧期间可以关闭本窗口——回来后在向导首页点「已做过第一步基准,直接输入扭矩」继续。
+        拧紧期间可以关闭本窗口——回来后在向导首页点“已做过第一步基准,直接输入扭矩”继续。
       </p>
       <div class="wz-actions">
         <el-button @click="close">先去拧紧,稍后继续</el-button>

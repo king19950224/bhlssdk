@@ -86,14 +86,14 @@ async function loadUnbound() {
     unboundRows.value = (await channelApi.unboundSummary()).items
   } catch { /* 引导信息，尽力加载 */ }
 }
-// 只对「在位状态机确认过探头」的通道弹引导：暂存行可能含 probe-scan 无回波样本或偶发杂散，
+// 只对“在位状态机确认过探头”的通道弹引导：暂存行可能含 probe-scan 无回波样本或偶发杂散，
 // 行数多 ≠ 有信号——与点位与验收页同一口径（hardware_state 是唯一事实源）
 const PRESENT_STATES = new Set(['healthy', 'noisy', 'suspect'])
 const groupUnbound = computed<UnboundSummaryRow[]>(() => {
   if (!unboundRows.value.length) return []
   const devIds = new Set(bolts.value.map((b) => b.deviceId))
   // 组内无螺栓时无从判定该组归属设备——原先回退展示全站未绑定通道，多设备现场会把
-  // 其他风机设备的堆积误导到这个空组（照着提示「建档绑定」就绑错设备）。空组不展示。
+  // 其他风机设备的堆积误导到这个空组（照着提示“建档绑定”就绑错设备）。空组不展示。
   if (!devIds.size) return []
   return unboundRows.value.filter((u) => devIds.has(u.deviceId) && PRESENT_STATES.has(u.hardwareState))
 })
@@ -325,7 +325,7 @@ function onProjectChange() {
         <el-icon class="ub-ic"><WarningFilled /></el-icon>
         <div class="ub-text">
           检测到 <b class="mono">{{ unboundChLabel }}</b> 有信号但未建档
-          <span class="ub-sub">共 {{ unboundTotal.toLocaleString() }} 条数据已暂存。请到「采集设备」设置默认监测组以自动建档，或到「点位与验收」手工处理</span>
+          <span class="ub-sub">共 {{ unboundTotal.toLocaleString() }} 条数据已暂存。请到“采集设备”设置默认监测组以自动建档，或到“点位与验收”手工处理</span>
         </div>
         <div class="ub-actions">
           <el-button size="small" @click="router.push({ name: 'devices' })">设置默认组</el-button>

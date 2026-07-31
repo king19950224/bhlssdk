@@ -141,7 +141,7 @@ export interface ConfigVerifyResult {
   comparisons: { param: string; requested: number; actual: number | null; match: boolean }[]
 }
 export const configChangeApi = {
-  // 「全部」= 不传 status（后端把未知值当精确匹配,传 all 会永远查空）
+  // “全部”= 不传 status（后端把未知值当精确匹配,传 all 会永远查空）
   list: (status = 'pending') =>
     http.get<{ count: number; items: ConfigChange[] }>(
       `/api/config-changes${status && status !== 'all' ? `?status=${status}` : ''}`),
@@ -420,7 +420,7 @@ export interface ChannelLive {
   acceptedAt: string | null
   /** 曾在位标记（仅在位事件写入）：失联=建档且曾在位但当前无信号；待接入=建档但从未在位 */
   lastPresentAt: string | null
-  /** 目标预紧力；自动建档缺省为空 →「待补规格」 */
+  /** 目标预紧力；自动建档缺省为空 →“待补规格” */
   targetPreloadN: number | null
 }
 

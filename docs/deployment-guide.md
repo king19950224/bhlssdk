@@ -2,7 +2,7 @@
 
 > 适用版本：v1.1.0。目标环境：风场/桥梁现场 Windows 工控机，**不使用 Docker**，PostgreSQL 走原生安装。
 > 本手册中的每一步都在 macOS + Linux 容器上做过等价演练（空库首装、Production 冷启动、授权签发、鉴权与深链验证）；
-> Windows 特有部分（NSSM 服务注册、防火墙、PG 原生安装）标注了「需在 Windows 上验证」。
+> Windows 特有部分（NSSM 服务注册、防火墙、PG 原生安装）标注了“需在 Windows 上验证”。
 
 ---
 

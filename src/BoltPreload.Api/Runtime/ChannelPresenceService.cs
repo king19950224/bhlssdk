@@ -12,7 +12,7 @@ using NpgsqlTypes;
 namespace BoltPreload.Api.Runtime;
 
 /// <summary>
-/// 探头热插拔宿主服务（设计见 docs/probe-hotplug-design 段落 / plan「探头热插拔识别设计」）。
+/// 探头热插拔宿主服务（设计见 docs/probe-hotplug-design 段落 / plan“探头热插拔识别设计”）。
 /// <para>
 /// 职责一：让设备常态轮询【全部物理通道】（1..channel_count），这是热插拔识别的物理前提——
 /// 厂家设备只测 MCR 轮询集内的通道，探头插在轮询集外的口上一条数据都不会上来（probe-scan 设计 F1）。
@@ -272,7 +272,7 @@ public sealed class ChannelPresenceService : BackgroundService
     /// <summary>
     /// 更新 channels.hardware_state / last_seen_at / last_present_at 并带回绑定信息。
     /// 插入 → healthy；拔出 → no_data（与 probe-scan verdict→hardware_state 映射同一词表）。
-    /// last_present_at 是「曾在位」的专用标记（识别页据此区分"失联"与"待接入"）——
+    /// last_present_at 是“曾在位”的专用标记（识别页据此区分"失联"与"待接入"）——
     /// 只在 Present=true 时写，别的写入方没有（last_seen_at 会被任意上报刷新，语义不同）。
     /// Present=false 时清 auto_enroll_hold（人工删除抑制：真正离位后才允许再自动建档）。
     /// 通道行可能尚未由自动发现创建（首条测量入库前）——0 行受影响时不报错，绑定信息返回空。

@@ -1,5 +1,5 @@
 -- ============================================================================
--- 资产层级补「风机 / 机组」层
+-- 资产层级补“风机 / 机组”层
 -- ----------------------------------------------------------------------------
 -- 原资产层级 项目 → 监测组(部位) → 螺栓 缺少风机层；一个风场几十上百台风机时，
 -- 操作员需先选风机再看其各部位。补 turbines 表，置于 项目 与 监测组 之间：
@@ -29,9 +29,9 @@ ALTER TABLE monitor_groups
     ADD COLUMN IF NOT EXISTS turbine_id bigint REFERENCES turbines(id);
 CREATE INDEX IF NOT EXISTS idx_monitor_groups_turbine
     ON monitor_groups(turbine_id) WHERE deleted_at IS NULL;
-COMMENT ON COLUMN monitor_groups.turbine_id IS '所属风机；存量数据回填到「默认机组」';
+COMMENT ON COLUMN monitor_groups.turbine_id IS '所属风机；存量数据回填到“默认机组”';
 
--- 回填：为存在「无机组归属」部位的项目各建一台默认机组并挂接，保证资产树不断链。
+-- 回填：为存在“无机组归属”部位的项目各建一台默认机组并挂接，保证资产树不断链。
 -- 幂等：默认机组 code='DEFAULT'；仅处理 turbine_id 仍为空的部位。
 DO $$
 DECLARE p RECORD; t_id bigint;

@@ -28,7 +28,7 @@ interface EventMap {
   OnChannelPresence: OnChannelPresence
 }
 
-/** 连接状态，供 UI 显示「实时」指示灯。 */
+/** 连接状态，供 UI 显示“实时”指示灯。 */
 export const realtimeState = ref<'disconnected' | 'connecting' | 'connected'>('disconnected')
 
 let connection: signalR.HubConnection | null = null

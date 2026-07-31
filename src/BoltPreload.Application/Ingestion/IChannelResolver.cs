@@ -5,7 +5,7 @@ namespace BoltPreload.Application.Ingestion;
 /// <para>
 /// 抽出来的原因：
 /// 1. hot path（每条 ChannelResult 都要解析），必须能加缓存；
-/// 2. 同时支持「自动发现」语义，未来可能换实现（如多设备路由表 / 网关）。
+/// 2. 同时支持“自动发现”语义，未来可能换实现（如多设备路由表 / 网关）。
 /// </para>
 /// <para>
 /// 实现规则：

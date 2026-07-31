@@ -1,103 +1,3 @@
----
-name: 螺栓预紧力在线监测系统方案
-overview: 基于厂家 FxSDK（C# 1.4 / Java 1.0-Beta）做一套面向桥梁、风电、关键法兰螺栓的长期在线监测系统。后端 .NET 8 常驻，Web 前端做监控大屏和管理后台，时序库存测量数据。
-todos:
-  - id: scaffold
-    content: 解决方案脚手架（.NET 8、Mac 下 brew 装 PG+Timescale 跑通本地、Serilog、基础 DI）
-    status: pending
-  - id: device_simulator
-    content: 写一个 FxSDK 设备模拟器，按协议回放假数据，开发和压测都用得上
-    status: pending
-  - id: fx_wrap
-    content: 包一层 IFxConnector，把 SDK 的事件回调转成 Channel<DecodedResult>
-    status: pending
-  - id: connector_service
-    content: 把厂家给的重连逻辑落到 ConnectorService，加上设备 CRUD 和三层 Watchdog
-    status: pending
-  - id: ingestion
-    content: 数据落地链路：本地 WAL 文件 → Timescale 批量写 → IMemoryCache 最新值 → SignalR 推送
-    status: pending
-  - id: domain_preload
-    content: 领域模型 + 预紧力换算三档：模型 A 简化版（兜底，Phase 1 就能跑）→ GB/T 43232 单波法 → 双波法（Phase 2+）
-    status: pending
-  - id: algo_tof
-    content: TOF 算法封装层 - 直接调 C# SDK 1.4 已有的 6 种 TOF 算法 + DenoiseSignal 小波降噪 + 配置化选择，按通道存默认算法
-    status: pending
-  - id: algo_signal_quality
-    content: 信号质量评估（SNR / 波形相似度 / 主频偏移），识别耦合不良
-    status: pending
-  - id: calibration
-    content: 标定向导（分级拧紧法）+ 最小二乘拟合 K_L + R²校验 + Grubbs 剔除异常点 + JJF 1059.1 不确定度评定 + 标定档案永久留痕
-    status: pending
-  - id: agc
-    content: AGC 封装（手动一键 + 定期巡检），跑 AGC 时给报警引擎"维护中"信号
-    status: pending
-  - id: algo_test_dataset
-    content: 算法回归测试集（多温度多预紧力的标定数据 + 加噪鲁棒性 + 长期稳定性），CI 自动跑
-    status: pending
-  - id: alarm_engine
-    content: 报警引擎：算法（迟滞 + 时间过滤 + 变化率 + 滑动中值 + 卡尔曼趋势）+ 工程（ISA-18.2 分级/抑制/泛滥保护）
-    status: pending
-  - id: frontend
-    content: Vue 前端，HMI 配色按 ISA-101，关键页面：大屏、组详情、螺栓详情、设备、报警、报表
-    status: pending
-  - id: rbac_audit
-    content: JWT + RBAC + 多租户 + 审计日志（append-only），关键操作走双人复核
-    status: pending
-  - id: security
-    content: 工业信息安全：TLS、依赖扫描、密码策略、最小端口、设备入网准入，对标 IEC 62443
-    status: pending
-  - id: time_sync
-    content: Windows W32Time 同步 NTP，连上设备立刻校时，区分事件时间和入库时间
-    status: pending
-  - id: northbound
-    content: 北向接口看客户需要：OPC UA / MQTT / Webhook，至少留接口
-    status: pending
-  - id: windows_packaging
-    content: Inno Setup 安装包：打 PG+Timescale 二进制 + .NET 服务 + 注册 Windows Service + 防火墙规则
-    status: pending
-  - id: ha_dr
-    content: 单机高可用：UPS + 服务自启 + WAL 不丢数据 + 备份脚本 + 季度恢复演练
-    status: pending
-  - id: observability
-    content: prometheus-net 指标 + UI 健康页 + 跑一轮压测找瓶颈
-    status: pending
-  - id: localization_xc
-    content: 信创适配（按项目要不要做），达梦/麒麟/ARM64/国密
-    status: pending
-  - id: report_compliance
-    content: 报告 PDF 数字签名、校准证书管理、验收文档按 GB/T 8567 + GB/T 25000.51 整理
-    status: pending
-  - id: vendor_risk
-    content: SDK 供应商风险防范（§9.16）- 协议文档审计、源码 escrow 合同条款、设备模拟器独立可用、关键协议常量留档
-    status: pending
-  - id: license_compliance
-    content: 开源许可合规（§9.17）- 依赖清单 + 许可证审查 + NOTICE 文件，上线前 1 个月启动
-    status: pending
-  - id: data_compliance
-    content: 数据合规（§9.18）- 数据分类分级、PIPL/数据安全法、关键基础设施安全审查支持业主合规部
-    status: pending
-  - id: training_kt
-    content: 培训与知识转移（§9.19）- 5 类对象培训材料 + 考核 + 培训证书 + 完整源码/文档交付
-    status: pending
-  - id: bcm
-    content: 业务连续性管理（§9.20）- 人员/技术/厂家/业务四维度 BCM 计划，每年演练
-    status: pending
-  - id: explainable
-    content: 算法可解释性（§9.21）- 每个报警必带规则/原始数据/历史趋势/算法版本/标定版本，30秒可判
-    status: pending
-  - id: tco
-    content: 10 年 TCO 测算表（§9.22）- 部署/运营/隐性成本分项，合同谈判前完成
-    status: pending
-  - id: bite
-    content: 系统自检 BITE（§9.23）- 开机自检 + 运行时自检 + 故障定位工具
-    status: pending
-  - id: hmi_detail
-    content: HMI 大屏与报警声音具体规范（§9.24）- 字号/对比度/声音频率/颜色按 GB 2893 + WCAG AAA
-    status: pending
-isProject: false
----
-
 # 螺栓预紧力在线监测系统 — 总体方案
 
 ## 零、商用底线原则（任何阶段都不能违背）
@@ -317,7 +217,7 @@ P = Δt / (t₀ / K_L)
 - `t₀` — 未拧紧时纵波传播时间（零应力基线）
 - `K_L` — 载荷因子（单位轴力引起的声时相对变化），需要标定
 
-> ⚠️ **K_L 量纲约定（最终裁定，以 `docs/sdk-api-facts.md §12` 为准）**：
+> **K_L 量纲约定（最终裁定，以 `docs/sdk-api-facts.md §12` 为准）**：
 > 本节及 §8.5/附录 C 用的是国标对照写法 `K_L = Δt/(F·t₀)`（单位 1/N）。
 > **实现与存量数据统一用 `K_L = Δt/F`（单位 ns/N，量级 ~1e-4），`F = Δt/K_L`。**
 > 另外，本行上方公式 `P = Δt/(t₀/K_L)`（= `Δt·K_L/t₀`）在 1/N 约定下是**错误反解**，正确应为 `F = Δt/(K_L·t₀)`。两套约定换算：`K_L(ns/N) = K_L(1/N)·t₀`。
@@ -4054,7 +3954,7 @@ UI 实现按 ISA-101 HPHMI + §9.24 大屏规范。下面是关键页面的布�
 │ │ 预紧力 100.2 ± 2.1 kN (k=2)    比例 100.2%    健康度 95             │   │
 │ │ 温度 22.3 °C   声时 27395 ns   声时差 195 ns   SNR 28 dB           │   │
 │ │ 状态: 正常 ●   算法: ThrSignal v1.0   标定: 2026-05-20 (1 天前)    │   │
-│ │ 国标范围: ✓ 满足 (当前应力 320 MPa, 范围 30%~90% Rp02)              │   │
+│ │ 国标范围: 满足 (当前应力 320 MPa, 范围 30%~90% Rp02)                │   │
 │ └─────────────────────────────────────────────────────────────────────┘   │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ 历史趋势  [1h] [24h] [7d] [30d] [自定义]                                 │

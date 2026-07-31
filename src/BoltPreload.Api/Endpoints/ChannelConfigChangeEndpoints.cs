@@ -215,7 +215,7 @@ public static class ChannelConfigChangeEndpoints
                 return Results.Ok(new
                 {
                     id, status = "executed", deviceId = row.DeviceId, channelNo = row.ChannelNo,
-                    note = "已下发设备并同步通道配置。请执行「验证」触发读回比对确认实际生效。"
+                    note = "已下发设备并同步通道配置。请执行“验证”触发读回比对确认实际生效。"
                 });
             }
             catch (Exception ex)

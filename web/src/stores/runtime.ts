@@ -4,7 +4,7 @@ import { onRealtime } from '../api/realtime'
 
 /**
  * 运行时设备状态的单一来源：集中 /api/runtime/devices 轮询，供 AppShell 顶栏与
- * Dashboard「系统状态」共用，避免两个组件各自定时拉取造成的重复请求。
+ * Dashboard“系统状态”共用，避免两个组件各自定时拉取造成的重复请求。
  *
  * - start()/stop() 引用计数：只要还有使用方存活就持续刷新，全部卸载才停。
  * - 标签页隐藏（document.hidden）时跳过轮询，可见时立即补刷。

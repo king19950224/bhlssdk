@@ -85,8 +85,8 @@ const METHOD_LABEL: Record<string, string> = {
   load_calibrated: '正式载荷标定', gb_single_wave: 'GB 单波法', gb_bi_wave: 'GB 双波法',
   torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定', sim_baseline: '初始基线',
 }
-// 通道标定生命周期状态：仅在「过期/停用」时覆盖标签（避免把仍有 K_L、在出数的临时标定误标为未标定），
-// 其余回退到 calibrated 布尔。让「标定过期」不再笼统显示为「已标定」，与总览「未标定/过期」桶口径一致。
+// 通道标定生命周期状态：仅在“过期/停用”时覆盖标签（避免把仍有 K_L、在出数的临时标定误标为未标定），
+// 其余回退到 calibrated 布尔。让“标定过期”不再笼统显示为“已标定”，与总览“未标定/过期”桶口径一致。
 const STATE_LABEL: Record<string, string> = { expired: '标定过期', disabled: '已停用' }
 // 告警类型中文映射（与告警中心一致；履历时间线用）
 const ALARM_TYPE_LABEL: Record<string, string> = {
@@ -105,7 +105,7 @@ const num = (v: number | string | null | undefined) => {
   return Number.isFinite(n) ? n : null
 }
 
-// 让 stale/nodata 判定与「N 分钟前」随时间刷新（离线后不再卡在最后一次加载的判定）
+// 让 stale/nodata 判定与“N 分钟前”随时间刷新（离线后不再卡在最后一次加载的判定）
 const now = useNow(30000)
 // 展示值：实时链路有新读数时用实时值,否则用加载时的最后已知值——
 // 修掉"头部 KPI 停在加载瞬间、下方实时区块却在跳"的同页两套数值问题。
@@ -125,7 +125,7 @@ const health = computed(() =>
   }, now.value),
 )
 const status = computed(() => health.value.status)
-// 数据陈旧（nodata = 无有效预紧力或超过 10 分钟无新测量）时：头部数值标注为「最后已知」，并抑制趋势预测（陈旧/稀疏样本外推不可信）
+// 数据陈旧（nodata = 无有效预紧力或超过 10 分钟无新测量）时：头部数值标注为“最后已知”，并抑制趋势预测（陈旧/稀疏样本外推不可信）
 const isStale = computed(() => status.value === 'nodata')
 const liveLabel = computed(() => (isStale.value ? '最后已知' : '当前'))
 // 区分两类 nodata：设备失联（>10min 无测量）vs 信号丢失（有测量但无有效预紧力读数），文案分别表述
@@ -176,7 +176,7 @@ async function loadWave() {
 }
 
 // 应用一条最新测量（声时/温度）→ 更新实时显示与滚动序列；SignalR 推送与轮询兜底共用。
-// 按毫秒时间戳做「只前进」去重：SignalR 队列(DropOldest)与 4s 轮询并存时可能乱序送达，
+// 按毫秒时间戳做“只前进”去重：SignalR 队列(DropOldest)与 4s 轮询并存时可能乱序送达，
 // 或同一时刻的 ISO 字符串格式不同——字符串不等≠新数据，旧点回灌会让曲线出现时间回跳。
 let lastLiveMs = 0
 function applyLiveMeasurement(tsIso: string, echoNs: number | null, tempC: number | null) {
@@ -727,7 +727,7 @@ async function exportTrendCsv() {
       </div>
     </div>
 
-    <!-- 失联 / 数据陈旧横幅：明确标出数值为「最后已知」、趋势预测暂不可信，避免误读为实时 -->
+    <!-- 失联 / 数据陈旧横幅：明确标出数值为“最后已知”、趋势预测暂不可信，避免误读为实时 -->
     <div v-if="bolt && isStale" class="stale-banner">
       <el-icon><WarningFilled /></el-icon>
       <span v-if="offlineStale">该通道已 <b>{{ fmtAgo(effLastTs, now) }}</b> 无新测量（设备离线 / 失联）。下列数值为<b>最后已知值</b>，趋势预测已暂停。</span>
@@ -850,7 +850,7 @@ async function exportTrendCsv() {
         <span class="tight-dt">相对基线 ΔTOF <b class="mono" :style="`color:${tightness.color}`">{{ (tightness.dt >= 0 ? '+' : '') + tightness.dt.toFixed(1) }} ns</b><template v-if="tightness.dF != null"> · ≈ <b class="mono" :style="`color:${tightness.color}`">{{ signedN(tightness.dF) }} N</b></template></span>
         <span class="tight-hint">{{ tightness.band === 'loose' ? '回波偏早 → 预紧力下降 / 松动方向' : tightness.band === 'tight' ? '回波偏晚 → 预紧力高于基线' : '回波在基线附近 · 稳定' }}</span>
       </div>
-      <div v-else-if="wave" class="tight-bar tight-nobase">未设基线 — 拧到目标状态后点「设当前为基线」,之后即可看松紧</div>
+      <div v-else-if="wave" class="tight-bar tight-nobase">未设基线 — 拧到目标状态后点“设当前为基线”,之后即可看松紧</div>
 
       <EChart v-if="wave" :option="ascanOption" height="240px" />
       <div v-if="waveStats" class="ascan-legend">

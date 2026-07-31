@@ -38,7 +38,7 @@ const METHOD_LABEL: Record<string, string> = {
 }
 // 单点标定（无回归）方法：R² 无意义，避免界面把占位的 0.000 当成"拟合极差"
 const SINGLE_POINT = new Set(['quick', 'torque_estimate'])
-// 初始基线非载荷标定，单列「参考」可信级（后端 trustLevel 落 unknown，这里前端归一）
+// 初始基线非载荷标定，单列“参考”可信级（后端 trustLevel 落 unknown，这里前端归一）
 function trustView(m: CalibMethod) {
   if (m.method === 'sim_baseline') return { label: '参考', color: '#8b5cf6' }
   return TRUST[m.trustLevel] ?? { label: m.trustLevel || '未分级', color: '#61748f' }

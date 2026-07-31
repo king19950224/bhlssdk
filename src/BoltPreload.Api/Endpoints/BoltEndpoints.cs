@@ -325,13 +325,13 @@ public static class BoltEndpoints
             var win = Math.Clamp(windowDays ?? 7, 1, 90);
             await using var cmd = ds.CreateCommand(@"
                 WITH cal AS (
-                    -- 只用「当前生效」的标定（未被 superseded、且 approved/self_signed 生效）定沉降期起点，
+                    -- 只用“当前生效”的标定（未被 superseded、且 approved/self_signed 生效）定沉降期起点，
                     -- 排除被顶替 / 驳回 / 待复核记录把窗口错误前移。
                     SELECT max(created_at) AS calibrated_at FROM calibration_records
                     WHERE bolt_id = @id AND superseded_by IS NULL AND review_state IN ('approved','self_signed')
                 ),
                 w AS (
-                    -- 拟合窗口夹到「上次标定 + 2h 沉降期」之后：不跨标定边界、不含嵌入松弛瞬态
+                    -- 拟合窗口夹到“上次标定 + 2h 沉降期”之后：不跨标定边界、不含嵌入松弛瞬态
                     SELECT preload_n, ts FROM measurements
                     WHERE bolt_id = @id AND preload_n IS NOT NULL
                       AND ts >= GREATEST(now() - make_interval(days => @win),
@@ -365,7 +365,7 @@ public static class BoltEndpoints
             double? ratePerDay = slope.HasValue ? slope.Value * 86400.0 : null;
             // 平稳带：日变化幅度 < 目标的 0.1% 视为平稳（避免噪声被当趋势）
             double stableBand = (double)(target ?? cur ?? 100000m) * 0.001;
-            // 可信度门（与总览「即将到限」同口径）：样本≥30、跨度≥24h、R²≥0.5，任一不足即 insufficient，
+            // 可信度门（与总览“即将到限”同口径）：样本≥30、跨度≥24h、R²≥0.5，任一不足即 insufficient，
             // 不外推。否则几分钟/几十分钟的标定抖动会算出 -19万 N/天、0 天到限这类垃圾值。
             const long minSamples = 30;
             const double minSpanSec = 24 * 3600;
@@ -455,7 +455,7 @@ public static class BoltEndpoints
                     effective_length_mm= COALESCE(@len, effective_length_mm),
                     cross_section_mm2  = COALESCE(@area, cross_section_mm2),
                     install_torque_nm  = COALESCE(@torque, install_torque_nm),
-                    -- 位置标签：null=不改；空串=清空(置 null)；有值=设置。便于「通道识别」纠正/清空标签。
+                    -- 位置标签：null=不改；空串=清空(置 null)；有值=设置。便于“通道识别”纠正/清空标签。
                     position_label     = CASE WHEN @pos IS NULL THEN position_label ELSE NULLIF(@pos, '') END,
                     nominal_diam       = COALESCE(@nd, nominal_diam),
                     grade              = COALESCE(@grade, grade),

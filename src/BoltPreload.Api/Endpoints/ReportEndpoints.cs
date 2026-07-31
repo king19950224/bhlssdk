@@ -727,7 +727,7 @@ public static class ReportEndpoints
             <thead><tr><th>#</th><th>螺栓</th><th>规格</th><th>位置</th><th>目标 (N)</th><th>下限 (N)</th><th>当前 (N)</th><th>保持率</th><th>标定方法</th><th>可信等级</th><th>R²</th><th>结论</th></tr></thead>
             <tbody>{{rows}}</tbody>
           </table>
-          <p class="muted">本报告由系统自动生成，数据快照已归档可追溯。「合格*」表示该螺栓预紧力达标但其标定为临时/工程估算等级，不作为正式安全验收依据；正式验收须以载荷标定（正式等级）为准。</p>
+          <p class="muted">本报告由系统自动生成，数据快照已归档可追溯。“合格*”表示该螺栓预紧力达标但其标定为临时/工程估算等级，不作为正式安全验收依据；正式验收须以载荷标定（正式等级）为准。</p>
           <table style="margin-top:36px">
             <tr><th style="width:20%">编制（签字）</th><td style="width:30%"></td><th style="width:20%">审核（签字）</th><td style="width:30%"></td></tr>
             <tr><th>日期</th><td></td><th>日期</th><td></td></tr>

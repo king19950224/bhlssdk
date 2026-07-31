@@ -224,7 +224,7 @@ public sealed class LocalFileLicenseService : ILicenseService
     /// <summary>
     /// 收集本机物理网卡 MAC，作为机器码的候选来源（升序，元素唯一，至少一项）。
     /// <para>
-    /// <b>为什么不是"挑一块网卡"</b>：旧实现取「<c>OperationalStatus == Up</c> + 按网卡名排序的第一块」，
+    /// <b>为什么不是"挑一块网卡"</b>：旧实现取“<c>OperationalStatus == Up</c> + 按网卡名排序的第一块”，
     /// 这让机器码会自己漂移，实测同一台机器 30 分钟内就变了一次：
     /// </para>
     /// <list type="bullet">

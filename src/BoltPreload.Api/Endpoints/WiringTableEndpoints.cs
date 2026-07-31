@@ -208,7 +208,7 @@ public static class WiringTableEndpoints
                 var grade = string.IsNullOrWhiteSpace(row.Grade) ? "8.8" : row.Grade.Trim();
                 var rp02 = BoltSpecPresets.GradeRp02Mpa.TryGetValue(grade, out var rp) ? rp : 640m;
 
-                // 编号：显式优先；缺省中文「通道X-Y号螺栓」（与自动建档同一套 ChannelNaming），
+                // 编号：显式优先；缺省中文“通道X-Y号螺栓”（与自动建档同一套 ChannelNaming），
                 // 与既有（含软删）冲突时追加 -2/-3…
                 string code;
                 if (!string.IsNullOrWhiteSpace(row.BoltCode))

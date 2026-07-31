@@ -146,7 +146,7 @@ function onPresence(ev: OnChannelPresence) {
     } else {
       ElNotification({
         title: `通道 CH${ev.channelNo} 检测到新探头`,
-        message: '已开始采集（未建档）。设置设备默认监测组后新探头会自动建档，也可到「通道与绑定」人工建档。',
+        message: '已开始采集（未建档）。设置设备默认监测组后新探头会自动建档，也可到“通道与绑定”人工建档。',
         type: 'success', duration: 8000,
         onClick: () => { tab.value = 'bind'; loadBinding() },
       })
@@ -176,7 +176,7 @@ const MODES: { mode: string; label: string; type: '' | 'primary' | 'warning' | '
 async function setMode(mode: string, label: string) {
   if (!selected.value) return
   try {
-    await ElMessageBox.confirm(`确认对【${selected.value.name}】下发工作模式「${label}」？`, '工作模式', { type: 'warning' })
+    await ElMessageBox.confirm(`确认对【${selected.value.name}】下发工作模式“${label}”？`, '工作模式', { type: 'warning' })
   } catch { return }
   busyMode.value = mode
   try {
@@ -287,7 +287,7 @@ function openCreate(channelId: number | null) {
   createOpen.value = true
 }
 
-// 建档完成 → 无缝接标定向导(接入闭环最后一步),复核员权限才弹
+// 建档完成 → 紧接着弹标定向导(接入流程最后一步),复核员权限才弹
 const wizardOpen = ref(false)
 const wizardSel = ref<{ boltId: number; channelId: number; code: string } | null>(null)
 async function onBoltCreated(payload?: { boltId: number; channelId: number; code: string }) {
@@ -418,7 +418,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
               <span class="dim">{{ rrow.reason || '—' }}</span>
             </div>
           </div>
-          <EmptyState v-else :empty="!scanning" :loading="scanning" empty-text="尚无扫描结果，点「发起自动检测」逐通道判定有无探头" />
+          <EmptyState v-else :empty="!scanning" :loading="scanning" empty-text="尚无扫描结果，点“发起自动检测”逐通道判定有无探头" />
         </el-tab-pane>
 
         <!-- 通道与绑定 -->
@@ -450,7 +450,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
 
     <el-dialog v-model="groupDlgOpen" title="默认监测组（自动建档）" width="460px">
       <p class="dlg-note">
-        探头插入确认在位后，系统自动把螺栓建档到此组：编号「通道X-Y号螺栓」（每 10 口一束、束内 1~10）、缺省规格 M20/8.8（可在螺栓详情后补位置、规格与目标值）。
+        探头插入确认在位后，系统自动把螺栓建档到此组：编号“通道X-Y号螺栓”（每 10 口一束、束内 1~10）、缺省规格 M20/8.8（可在螺栓详情后补位置、规格与目标值）。
         保存后对当前已在位但未建档的通道立即补建档，无需重新插拔。
       </p>
       <el-select v-model="groupDlgSel" clearable placeholder="选择监测组（清空 = 暂停自动建档）" style="width: 100%">

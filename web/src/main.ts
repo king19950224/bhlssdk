@@ -15,7 +15,7 @@ import { useAuth } from './stores/auth'
 
 const app = createApp(App)
 const pinia = createPinia()
-// 关键：显式设中文 locale，否则 Element Plus 内置文案（日期选择器/分页/「No Data」空态/下拉「No data」/
+// 关键：显式设中文 locale，否则 Element Plus 内置文案（日期选择器/分页/“No Data”空态/下拉“No data”/
 // 弹窗默认按钮等）全是英文——这是界面大面积英文的根因。
 app.use(pinia).use(router).use(ElementPlus, { locale: zhCn })
 
