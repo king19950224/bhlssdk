@@ -44,8 +44,10 @@ public sealed class ChannelPresenceService : BackgroundService
     private readonly ChannelPresenceOptions _opt;
     private readonly ILogger<ChannelPresenceService> _logger;
 
-    // 已确认下发过全通道 MCR 的设备（本进程内幂等；设备端 MCR 是持久配置，重启进程会话快照为空时会再下发一次收敛）
-    private readonly HashSet<long> _mcrConfigured = [];
+    // 已确认下发过全通道 MCR 的设备 → 当时的目标通道数（本进程内幂等；设备端 MCR 是持久配置，
+    // 重启进程会话快照为空时会再下发一次收敛）。记录通道数是为了在通道目录扩容
+    //（TryUpdateChannelCount，如 40→48）后检测到目标变化并重新收敛，而不是永久跳过。
+    private readonly Dictionary<long, ushort> _mcrConfigured = [];
 
     public ChannelPresenceService(
         IDeviceConnectorManager deviceManager,
@@ -110,22 +112,24 @@ public sealed class ChannelPresenceService : BackgroundService
                 _mcrConfigured.Remove(rt.DeviceId);
                 continue;
             }
-            if (_mcrConfigured.Contains(rt.DeviceId)) continue;
+            var channelCount = rt.Options.ChannelCount;
+            // 已确认且目标通道数没变才跳过；通道目录扩容（40→48）会改变目标，需重新收敛
+            if (_mcrConfigured.TryGetValue(rt.DeviceId, out var configuredCount) && configuredCount == channelCount)
+                continue;
             if (rt.Connector.State != FxConnectorState.Connected) continue;
 
             if (rt.Options.Model != 3)
             {
                 // MCR 多通道轮询仅 model=3（多通道监测型）支持，其它型号不下发
-                _mcrConfigured.Add(rt.DeviceId);
+                _mcrConfigured[rt.DeviceId] = channelCount;
                 _logger.LogInformation("设备 {DeviceId} model={Model} 非多通道监测型，热插拔识别仅覆盖现有轮询集", rt.DeviceId, rt.Options.Model);
                 continue;
             }
 
-            var channelCount = rt.Options.ChannelCount;
             if (channelCount == 0)
             {
                 // 无通道数信息（老配置路径）：不猜，跳过并只提示一次
-                _mcrConfigured.Add(rt.DeviceId);
+                _mcrConfigured[rt.DeviceId] = channelCount;
                 _logger.LogWarning("设备 {DeviceId} 无 channel_count 信息，跳过全通道轮询下发（热插拔识别仅覆盖现有轮询集）", rt.DeviceId);
                 continue;
             }
@@ -134,7 +138,7 @@ public sealed class ChannelPresenceService : BackgroundService
             var session = rt.Connector.GetSessionMcrChannels();
             if (session.Count == target.Length && !target.Except(session).Any())
             {
-                _mcrConfigured.Add(rt.DeviceId);
+                _mcrConfigured[rt.DeviceId] = channelCount;
                 continue;
             }
 
@@ -143,7 +147,7 @@ public sealed class ChannelPresenceService : BackgroundService
                 // SingleCount=1：每通道单次采样后轮转，让全通道遍历周期最短（与 probe-scan 恢复用参数一致）
                 await rt.Connector.ConfigureMultiChannelPollingAsync(target, singleCount: 1, dailyCount: 0, cancellationToken: ct);
                 await rt.Connector.SetWorkModeAsync(FxWorkMode.MultiMeas, channel: 0, address: rt.Options.Address, ct);
-                _mcrConfigured.Add(rt.DeviceId);
+                _mcrConfigured[rt.DeviceId] = channelCount;
                 _logger.LogInformation("已下发全通道轮询（热插拔识别）device={DeviceId} channels=1..{Count}", rt.DeviceId, channelCount);
             }
             catch (OperationCanceledException) { throw; }

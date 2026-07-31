@@ -72,17 +72,18 @@ public static class FxConnectorFactory
             Address = spec.Address,
             TransferMode = spec.TransferMode,
             UsChannelCount = (ushort)Math.Clamp((int)spec.ChannelCount, 1, 48),
-            MCRConfig = new MCRConfig
-            {
-                EnabledChannels = channelConfigs.Select(c => c.Channel).Distinct().OrderBy(c => c).ToList()
-            }
+            // 【不要】在这里预填 MCRConfig.EnabledChannels：GetSessionMcrChannels 的语义是
+            // "本会话实际写到设备的轮询集"，预填会让 ChannelPresenceService 误以为设备已是
+            // 全通道轮询而跳过下发——设备断电重置/厂家工具改动后系统就静坐干等，一条数据不来。
+            // 保持空快照，连上后由 ChannelPresenceService 在首轮 sweep 内下发收敛（设计即如此）。
         };
         return new FxSdkConnector(spec.DeviceId, deviceConfig, logger, channelConfigs);
     }
 
     // 只映射加载器会设置的 12 个字段，其余（PulseConfig / MeasWin / TempProbe / IsDeltaToFMode ...）
     // 保留 SDK ChannelConfig 默认值——与历史 FxInitialChannelConfigLoader 的构造完全一致。
-    private static ChannelConfig ToChannelConfig(FxChannelInit c) => new()
+    // internal：FxSdkConnector 在线补配会话通道（ProvisionSessionChannelsAsync）复用同一映射，保证行为一致。
+    internal static ChannelConfig ToChannelConfig(FxChannelInit c) => new()
     {
         Address = c.Address,
         Channel = c.Channel,

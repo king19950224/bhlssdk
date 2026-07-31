@@ -1,4 +1,5 @@
 using BoltPreload.Api.Auth;
+using BoltPreload.Application.Devices;
 using BoltPreload.Application.Devices.ProbeScan;
 using Microsoft.Extensions.Options;
 using System.Security.Claims;
@@ -21,15 +22,19 @@ public static class ProbeScanEndpoints
             ProbeScanRequestBody? body,
             IProbeScanOrchestrator orchestrator,
             IOptions<ProbeScanOptions> options,
+            IDeviceConnectorManager deviceManager,
             ClaimsPrincipal user,
             CancellationToken ct) =>
         {
             var opt = options.Value;
 
-            // channels 缺省 = 1..40（与设备 channel_count 对齐由 0012 迁移保证）
+            // channels 缺省 = 1..channel_count（取设备运行时的物理通道数，48 通道设备扫全 48；
+            // 运行时缺通道数信息时回退 1..40 的历史行为）
+            var defaultCount = deviceManager.Find(deviceId)?.Options.ChannelCount ?? 0;
+            if (defaultCount == 0) defaultCount = 40;
             ushort[] channels = body?.Channels is { Length: > 0 }
                 ? body.Channels.Where(c => c > 0).Distinct().OrderBy(c => c).ToArray()
-                : Enumerable.Range(1, 40).Select(x => (ushort)x).ToArray();
+                : Enumerable.Range(1, defaultCount).Select(x => (ushort)x).ToArray();
 
             if (channels.Length == 0)
                 return Results.BadRequest(new { error = "channels 不能为空" });

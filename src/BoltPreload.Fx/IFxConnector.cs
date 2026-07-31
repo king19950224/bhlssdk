@@ -100,6 +100,18 @@ public interface IFxConnector : IAsyncDisposable
     IReadOnlyList<FxSessionChannelConfigSnapshot> GetSessionChannelConfigs();
 
     /// <summary>
+    /// 在线补配通道的 SDK 本地会话配置（sendCommand=false，只写 SessionContext，不写设备参数）。
+    /// <para>
+    /// 用途：通道目录扩容（如 40→48）后，SDK 只对 SessionContext 里有 ChannelConfig 且 ProbeFreq&gt;0
+    /// 的通道计算 EchoTime——不补配的话新通道插上探头也识别不出回波，只能等进程重启重新装载。
+    /// 语义为"只补缺"：同一 (address, channel) 已有会话配置时跳过，不覆盖真实读回/重标定后的会话状态。
+    /// </para>
+    /// 默认空实现（模拟器/测试桩没有 SDK 会话概念）。
+    /// </summary>
+    Task ProvisionSessionChannelsAsync(IReadOnlyCollection<FxChannelInit> channels, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    /// <summary>
     /// 当前设备端 MCR 轮询启用的通道集（实时会话状态）。ProbeScan 扫描前据此快照，扫描后恢复业务通道集——
     /// 比读 DB 的 sampling_enabled 标志更可靠（后者可能与设备实际 MCR 不同步）。
     /// 默认返回空（无 MCR 概念的实现，如模拟器 / 测试桩）。

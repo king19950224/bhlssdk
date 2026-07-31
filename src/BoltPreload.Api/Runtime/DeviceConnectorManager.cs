@@ -21,7 +21,11 @@ namespace BoltPreload.Api.Runtime;
 /// </summary>
 public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisposable
 {
+    // TryUpdateChannelCount 会整体替换字典里的 record（Options 是不可变 record），
+    // 与后台服务的 Runtimes/Find 读取并发，用 _gate 串行化字典读写。
+    private readonly object _gate = new();
     private readonly Dictionary<long, DeviceRuntimeContext> _runtimes;
+    private readonly long _primaryId;
     private readonly ILogger<DeviceConnectorManager> _log;
 
     public DeviceConnectorManager(
@@ -45,7 +49,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             runtimes[0] = runtimes[0] with { IsPrimary = true };
 
         _runtimes = runtimes.ToDictionary(r => r.DeviceId);
-        Primary = runtimes.First(r => r.IsPrimary);
+        _primaryId = runtimes.First(r => r.IsPrimary).DeviceId;
 
         log.LogInformation("DeviceConnectorManager 载入 {Count} 个设备运行时：{List}",
             runtimes.Count,
@@ -53,12 +57,33 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
                 $"{r.DeviceId}/{r.Name}/{r.Options.Mode}{(r.IsPrimary ? "(primary)" : "")}")));
     }
 
-    public IReadOnlyCollection<DeviceRuntimeContext> Runtimes => _runtimes.Values.ToArray();
+    public IReadOnlyCollection<DeviceRuntimeContext> Runtimes
+    {
+        get { lock (_gate) return _runtimes.Values.ToArray(); }
+    }
 
-    public DeviceRuntimeContext Primary { get; }
+    public DeviceRuntimeContext Primary
+    {
+        get { lock (_gate) return _runtimes[_primaryId]; }
+    }
 
     public DeviceRuntimeContext? Find(long deviceId)
-        => _runtimes.TryGetValue(deviceId, out var runtime) ? runtime : null;
+    {
+        lock (_gate) return _runtimes.TryGetValue(deviceId, out var runtime) ? runtime : null;
+    }
+
+    public bool TryUpdateChannelCount(long deviceId, ushort channelCount)
+    {
+        var clamped = (ushort)Math.Clamp((int)channelCount, 1, 48);
+        lock (_gate)
+        {
+            if (!_runtimes.TryGetValue(deviceId, out var rt)) return false;
+            if (rt.Options.ChannelCount == clamped) return true;
+            _runtimes[deviceId] = rt with { Options = rt.Options with { ChannelCount = clamped } };
+        }
+        _log.LogInformation("运行时通道数已更新 device={DeviceId} channelCount={Count}", deviceId, clamped);
+        return true;
+    }
 
     /// <summary>
     /// 停机时释放所有设备连接器（DI 容器对单例 IAsyncDisposable 自动调用）。
@@ -67,7 +92,9 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        foreach (var rt in _runtimes.Values)
+        DeviceRuntimeContext[] snapshot;
+        lock (_gate) snapshot = _runtimes.Values.ToArray();
+        foreach (var rt in snapshot)
         {
             try
             {

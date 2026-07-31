@@ -21,7 +21,9 @@ public sealed class FxSdkConnector : IFxConnector
 {
     private readonly FxClient _client;
     private readonly DeviceConfig _config;
-    private readonly IReadOnlyList<ChannelConfig> _initialChannelConfigs;
+    // 会话通道配置装载清单：构造时来自 channels 表快照，之后可经 ProvisionSessionChannelsAsync 在线补充
+    //（通道目录扩容不重启进程）。所有读写都在 _sessionLock 内（连接 provisioning 与在线补配互斥）。
+    private readonly List<ChannelConfig> _initialChannelConfigs;
     private readonly long _deviceId;
     private readonly ILogger<FxSdkConnector> _logger;
     private readonly Channel<FxDecodedEnvelope> _channel;
@@ -68,7 +70,7 @@ public sealed class FxSdkConnector : IFxConnector
     {
         _deviceId = deviceId;
         _config = config;
-        _initialChannelConfigs = (initialChannelConfigs ?? Array.Empty<ChannelConfig>()).ToArray();
+        _initialChannelConfigs = (initialChannelConfigs ?? Array.Empty<ChannelConfig>()).ToList();
         _logger = logger;
         _client = new FxClient();
         // FullMode=Wait：让 TryWrite 满时返回 false，从而能精确统计背压丢弃并在丢弃前落 WAL 兜底（H3）。
@@ -257,6 +259,53 @@ public sealed class FxSdkConnector : IFxConnector
     // ProbeScan 扫描前快照它作为"业务轮询集"，扫描后恢复，避免 mcr_single 逐通道改写后只剩最后一个通道。
     public IReadOnlyList<ushort> GetSessionMcrChannels()
         => _config.MCRConfig?.EnabledChannels is { Count: > 0 } ch ? ch.ToArray() : Array.Empty<ushort>();
+
+    /// <summary>
+    /// 在线补配会话通道配置（见 <see cref="IFxConnector.ProvisionSessionChannelsAsync"/>）。
+    /// 只补缺不覆盖；已连接时立即写 SessionContext（sendCommand=false），
+    /// 同时并入 <see cref="_initialChannelConfigs"/> 保证后续重连 provisioning 不丢。
+    /// </summary>
+    public async Task ProvisionSessionChannelsAsync(
+        IReadOnlyCollection<FxChannelInit> channels,
+        CancellationToken cancellationToken = default)
+    {
+        if (channels.Count == 0) return;
+
+        await _sessionLock.WaitAsync(cancellationToken);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            var added = new List<ushort>();
+            foreach (var init in channels)
+            {
+                if (init.Channel == 0 || init.ProbeFreq <= 0m) continue;
+                if (_initialChannelConfigs.Any(c => c.Channel == init.Channel && c.Address == init.Address))
+                    continue;
+
+                var cfg = FxConnectorFactory.ToChannelConfig(init);
+                _initialChannelConfigs.Add(cfg);
+                added.Add(cfg.Channel);
+
+                // 已连接：立即写会话，SDK 即刻能对该通道波形算 EchoTime；
+                // 未连接：只并入装载清单，下次连接的 provisioning 统一写入。
+                if (_sessionId is { } session && State == FxConnectorState.Connected)
+                {
+                    await _client.ConfigureChannelAsync(session, cfg, propertyName: null, sendCommand: false);
+                    _latestChannelConfig[cfg.Channel] = cfg;
+                }
+            }
+
+            if (added.Count > 0)
+                _logger.LogInformation(
+                    "在线补配会话通道配置 device={DeviceId} channels={Channels}（state={State}，不写设备参数）",
+                    _deviceId, string.Join(",", added), State);
+        }
+        finally
+        {
+            _sessionLock.Release();
+        }
+    }
 
     public Task ConfigureChannelAsync(
         ushort channel,

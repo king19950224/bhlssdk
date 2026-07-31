@@ -23,6 +23,8 @@ export interface RuntimeDevice {
   name: string
   isPrimary: boolean
   state: string
+  // 运行时选项（含物理通道数 channelCount，热插拔全通道轮询范围 1..N）
+  options: { mode: string; communicationParameters: string; address: number; transferMode: number; model: number; channelCount: number }
   lastEnvelopeAt: string | null
   lastChannelResultAt: string | null
   envelopeCount: number
@@ -348,6 +350,12 @@ export const deviceApi = {
     return http.post<{ triggered: boolean; deviceId: number; mode: string }>(
       `/api/devices/${deviceId}/diagnostic/set-mode/${mode}${q ? `?${q}` : ''}`)
   },
+  // 通道目录现状（channel_count / 活跃通道 / 目录缺失通道号）
+  channelCatalog: (deviceId: number) =>
+    http.get<ChannelCatalog>(`/api/devices/${deviceId}/channel-catalog/`),
+  // 重建通道目录（reviewer+）：更新 channel_count、复活被删通道、补插缺失行，运行时即时生效
+  rebuildChannelCatalog: (deviceId: number, channelCount: number, note?: string) =>
+    http.post<ChannelCatalogRebuildResult>(`/api/devices/${deviceId}/channel-catalog/`, { channelCount, note }),
   // 设备设置：默认监测组（探头在位自动建档的归属组）+ 同项目可选组列表
   getSettings: (deviceId: number) =>
     http.get<DeviceSettings>(`/api/devices/${deviceId}/settings/`),
@@ -363,6 +371,16 @@ export interface DeviceSettings {
 export interface DeviceSettingsPatchResult {
   deviceId: number; defaultGroupId: number | null; defaultGroupCode: string | null
   enrolledBolts: { channelNo: number; boltId: number; code: string }[]
+}
+export interface ChannelCatalog {
+  deviceId: number; channelCount: number; activeChannels: number
+  missingChannels: number[]; extraActiveChannels: number; maxChannelCount: number
+}
+export interface ChannelCatalogRebuildResult {
+  deviceId: number; channelCount: number; previousChannelCount: number
+  resurrectedChannels: number[]; createdChannels: number[]; extraActiveChannels: number
+  runtimeUpdated: boolean; sessionProvisioned: boolean; mcrReconfigured: boolean
+  warning: string | null
 }
 
 // ---- 通道清单 / 绑定 ----

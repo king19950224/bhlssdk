@@ -354,6 +354,7 @@ app.MapAssetEndpoints();
 app.MapDashboardEndpoints();
 app.MapProbeScanEndpoints();
 app.MapChannelEndpoints();
+app.MapChannelCatalogEndpoints();
 app.MapDeviceSettingsEndpoints();
 app.MapAcceptanceEndpoints();
 app.MapWiringTableEndpoints();

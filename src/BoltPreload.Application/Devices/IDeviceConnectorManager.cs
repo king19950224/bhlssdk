@@ -18,6 +18,13 @@ public interface IDeviceConnectorManager
     DeviceRuntimeContext Primary { get; }
 
     DeviceRuntimeContext? Find(long deviceId);
+
+    /// <summary>
+    /// 运行时更新设备物理通道数（devices.channel_count 变更后同步内存运行时，免重启）。
+    /// 热插拔全通道轮询（ChannelPresenceService）与探头扫描默认通道集都以此为准。
+    /// 返回 false 表示设备不在运行时中。
+    /// </summary>
+    bool TryUpdateChannelCount(long deviceId, ushort channelCount);
 }
 
 public sealed record DeviceRuntimeContext(

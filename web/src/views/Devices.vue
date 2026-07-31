@@ -244,6 +244,40 @@ async function unbind(c: ChannelRow) {
   } catch { /* 取消 */ }
 }
 
+// 通道目录重建（reviewer+）：设置设备实际物理通道数（如 48），复活被删通道、补插缺失行，
+// 全通道轮询/探头扫描范围随之扩大——解决"只显示 8 个通道/新口永远识别不到"的死角
+const rebuildingCatalog = ref(false)
+async function editChannelCatalog() {
+  if (!selected.value) return
+  const current = selected.value.options?.channelCount || 40
+  let input: string
+  try {
+    const r = await ElMessageBox.prompt(
+      `设置【${selected.value.name}】的物理通道数（1..48）。确认后：目录中缺失/被删除的通道会补齐恢复，` +
+      '设备将轮询全部通道（热插拔识别范围 1..N），新插探头即可被发现。已绑定的螺栓不受影响。',
+      '通道目录', {
+        confirmButtonText: '重建目录', cancelButtonText: '取消',
+        inputValue: String(current),
+        inputPattern: /^([1-9]|[1-3][0-9]|4[0-8])$/, inputErrorMessage: '通道数须为 1..48 的整数',
+      })
+    input = r.value
+  } catch { return }
+  rebuildingCatalog.value = true
+  try {
+    const r = await deviceApi.rebuildChannelCatalog(selected.value.deviceId, Number(input))
+    const parts = [`通道数 ${r.previousChannelCount}→${r.channelCount}`]
+    if (r.resurrectedChannels.length) parts.push(`恢复 ${r.resurrectedChannels.length} 个被删通道`)
+    if (r.createdChannels.length) parts.push(`新建 ${r.createdChannels.length} 个通道`)
+    ElMessage.success(`通道目录已重建：${parts.join('，')}`)
+    if (r.warning) ElMessage.warning(r.warning)
+    await Promise.all([loadDevices(), loadHealth(), loadBinding()])
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '通道目录重建失败（需复核员权限）')
+  } finally {
+    rebuildingCatalog.value = false
+  }
+}
+
 // 建档并绑定（新接入螺栓的闭环）：预选该行通道打开对话框
 const createOpen = ref(false)
 const createChannelId = ref<number | null>(null)
@@ -314,12 +348,17 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />{{ selected.name }} · 设备控制台</span>
         <span class="hd-tools">
+          <el-tooltip content="设备物理通道数（全通道轮询/识别范围 1..N）。点击重建通道目录" placement="bottom">
+            <el-button size="small" text type="primary" :loading="rebuildingCatalog" :disabled="!auth.isReviewer" @click="editChannelCatalog">
+              通道数 {{ selected.options?.channelCount || '—' }}
+            </el-button>
+          </el-tooltip>
           <el-tooltip content="探头在位自动建档的归属监测组。未设置时新探头只采集不建档" placement="bottom">
             <el-button size="small" text :type="settings?.defaultGroupId ? 'primary' : 'warning'" :disabled="!auth.isReviewer" @click="openGroupDlg">
               默认组 {{ settings?.defaultGroupCode || '未设置' }}
             </el-button>
           </el-tooltip>
-          <router-link :to="{ name: 'identify', query: { deviceId: selected.deviceId } }" class="hd-link">敲击识别 →</router-link>
+          <router-link :to="{ name: 'identify', query: { deviceId: selected.deviceId } }" class="hd-link">点位与验收 →</router-link>
         </span>
       </div>
       <div v-if="selected.state !== 'Connected'" class="offline-note">
