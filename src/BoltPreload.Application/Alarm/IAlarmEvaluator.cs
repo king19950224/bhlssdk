@@ -8,7 +8,8 @@ namespace BoltPreload.Application.Alarm;
 /// - <b>Deadband</b>：触发阈值和恢复阈值不重合，避免在临界值附近抖动；
 /// - <b>On-delay</b>：连续 N 条都越限才触发，防止单条噪声触发；
 /// - <b>Off-delay</b>：连续 M 条都恢复才闭合；
-/// - <b>状态机持久化</b>：Phase 1 走内存（重启后从 DB 当前开启告警重建）；Phase 2 改 Redis。
+/// - <b>状态机存储</b>：内存态（进程启动时从 DB 当前开启告警重建，见 Program 启动流程）；
+///   单站部署下无需外部存储，多实例部署时才需要考虑共享存储。
 /// </para>
 /// </summary>
 public interface IAlarmEvaluator

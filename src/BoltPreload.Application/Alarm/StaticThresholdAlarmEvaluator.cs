@@ -41,8 +41,9 @@ public sealed class StaticThresholdAlarmOptions
 /// </code>
 /// </para>
 /// <para>
-/// 每个 bolt 一个状态机。线程安全：用 lock 保证状态机原子性。
-/// Phase 2+ 加 CUSUM/EWMA 看趋势，加抑制（suppress）/搁置（shelve）支持。
+    /// 每个 bolt 一个状态机。线程安全：用 lock 保证状态机原子性。
+    /// 告警抑制/搁置由告警中心接口（AlarmEndpoints）在管理层实现，本评估器保持纯阈值判定；
+    /// 趋势类判据（CUSUM/EWMA）为后续增强方向。
 /// </para>
 /// </summary>
 public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator

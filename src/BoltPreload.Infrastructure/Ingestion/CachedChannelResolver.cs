@@ -107,7 +107,7 @@ public sealed class CachedChannelResolver : IChannelResolver
     }
 
     /// <summary>
-    /// 只失效本 resolver 写入过的 key。Phase 1 早期实现是 mc.Compact(1.0) 整个进程缓存清空，
+    /// 只失效本 resolver 写入过的 key。早期实现是 mc.Compact(1.0) 整个进程缓存清空，
     /// 多个 caller 共享 IMemoryCache 时会误伤 — 改成显式遍历 _knownKeys。
     /// </summary>
     public void InvalidateAll()

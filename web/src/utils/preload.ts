@@ -16,9 +16,6 @@ export const STATUS_META: Record<PreloadStatus, { label: string; color: string; 
   nodata: { label: '无数据', color: '#3b4659', cls: 'led--off' },
 }
 
-// 展示顺序（健康条 / 图例统一用）
-export const STATUS_ORDER: PreloadStatus[] = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata']
-
 export interface PreloadInput {
   calibrated?: boolean
   state?: string | null

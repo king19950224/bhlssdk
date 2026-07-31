@@ -3,8 +3,9 @@ namespace BoltPreload.Application.Licensing;
 /// <summary>
 /// 商业授权服务。
 /// <para>
-/// Phase 1 先做离线 license.json：机器码 + 通道数 + 设备数 + 到期时间 + 签名字段。
-/// Phase 2 再接正式签名校验（RSA/ECDSA）和授权生成工具。
+/// 离线 license.json：机器码 + 通道数 + 设备数 + 到期时间 + RSA 签名。
+/// 验签实现见 <c>LocalFileLicenseService</c>；签发/密钥生成用 <c>tools/LicenseSigner</c>
+/// （流程见 docs/deployment-guide.md）。
 /// </para>
 /// </summary>
 public interface ILicenseService

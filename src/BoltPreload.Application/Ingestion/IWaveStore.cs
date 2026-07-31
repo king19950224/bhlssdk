@@ -5,7 +5,7 @@ namespace BoltPreload.Application.Ingestion;
 /// <summary>
 /// 波形存储抽象。
 /// <para>
-/// Phase 1 用 <c>LocalFileWaveStore</c>（本地文件）。Phase 3 可换 S3 / MinIO / 阿里云 OSS 实现。
+/// 当前实现为 <c>LocalFileWaveStore</c>（本地文件）；如需对象存储（S3 / MinIO / OSS）可另行实现。
 /// 不直接走数据库 LOB —— PostgreSQL bytea 写大文件会显著拖慢热路径。
 /// </para>
 /// </summary>

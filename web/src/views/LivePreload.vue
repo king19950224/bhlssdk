@@ -45,9 +45,6 @@ const rev = ref(0) // 递增触发图表重算
 const lastUpdate = ref<number>(0)
 const now = ref(Date.now()) // 每秒心跳：Date.now() 非响应式，用它驱动「陈旧度」随时间走动
 
-// 平滑窗口：开启 = 中位数去尖刺 + 较大均值压中频波动；关闭 = 原始
-const SMOOTH_WIN = 7
-const smoothWin = computed(() => (smooth.value ? SMOOTH_WIN : 1))
 const MED_WIN = 5 // 中位数窗口：免疫单点声时量化尖刺
 const MEAN_WIN = 11 // 均值窗口：压住低 SNR 通道数秒周期的回波识别波动（≈10s @ 多通道轮询）
 
@@ -61,7 +58,7 @@ function median(vals: number[]): number {
 // 两级尾部滤波：先 MED_WIN 中位数压住声时量化尖刺，再 MEAN_WIN 均值压低 SNR 通道
 // 数秒周期的回波识别随机波动（弱信号通道 ±5~7kN 锯齿的主因）。只用历史点，无未来滞后；
 // 代价是拧动响应慢几秒，要即时跟手可切「原始」。
-function smoothSeries(pts: { t: number; v: number }[], _win?: number): { t: number; v: number }[] {
+function smoothSeries(pts: { t: number; v: number }[]): { t: number; v: number }[] {
   if (!smooth.value || pts.length < 2) return pts
   const med: { t: number; v: number }[] = []
   for (let i = 0; i < pts.length; i++) {
@@ -322,7 +319,7 @@ const option = computed<Record<string, unknown>>(() => {
   const series: Record<string, unknown>[] = list.map((c) => {
     const color = PALETTE[channels.value.indexOf(c) % PALETTE.length]
     const raw = c.series.filter((p) => p.t >= cutoff)
-    const data = smoothSeries(raw, smoothWin.value).map((p) => [p.t, toDisplay(p.v, c.target)])
+    const data = smoothSeries(raw).map((p) => [p.t, toDisplay(p.v, c.target)])
     return {
       name: c.code || `CH${c.channelNo}`,
       type: 'line',

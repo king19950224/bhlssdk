@@ -5,12 +5,11 @@ using Microsoft.Extensions.Logging;
 namespace BoltPreload.Fx.Simulator;
 
 /// <summary>
-/// 进程内设备模拟器（Phase 1 用，不依赖真机）。
+/// 进程内设备模拟器（开发/演示用，不依赖真机；Fx:Mode=Simulated 时启用）。
 /// 按配置的采样率、通道数生成假 <see cref="FxChannelResultDto"/>。
 /// </summary>
 /// <remarks>
-/// <para>Phase 1 第一周的关键里程碑就靠这个：模拟器 → IFxConnector → 入库 → API 查询。</para>
-/// <para>Phase 2 接真机时，业务层换实现就行，不用动其他代码。</para>
+/// <para>与真机连接器（<c>FxSdkConnector</c>）共用 <see cref="IFxConnector"/> 接口，业务层无感切换。</para>
 /// <para>注意：本模拟器**独立于 SDK 实现**，按方案 §9.16 SDK 供应商风险，
 /// 万一 SDK 失联，我们至少能用模拟器跑回归测试，保证基本可用性。</para>
 /// </remarks>
@@ -162,7 +161,7 @@ public sealed class SimulatedFxConnector : IFxConnector
 
     public Task ConfigureChannelAsync(ushort channel, ChannelConfigUpdate updates, ushort address = 1, CancellationToken cancellationToken = default)
     {
-        // 模拟器不存配置，只打日志（Phase 3 可以让模拟器按配置改基线值）
+        // 模拟器不存配置，只打日志（如需模拟"按配置改基线值"的行为可在此扩展）
         _logger.LogDebug("模拟器 ConfigureChannel ch={Channel} updates={Updates}", channel, updates);
         return Task.CompletedTask;
     }

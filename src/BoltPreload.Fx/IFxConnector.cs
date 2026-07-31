@@ -63,7 +63,7 @@ public interface IFxConnector : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 写通道级参数（Phase 2 用于重标定 / 改阈值 / 改增益等）。
+    /// 写通道级参数（重标定 / 改阈值 / 改增益等）。
     /// <para>典型用法：把当前 TOF/Temp 写成新 RefTime/RefTemp，等价于在线重标定。</para>
     /// </summary>
     /// <param name="channel">通道号</param>

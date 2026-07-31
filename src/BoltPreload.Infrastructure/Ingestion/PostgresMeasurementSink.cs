@@ -14,7 +14,7 @@ namespace BoltPreload.Infrastructure.Ingestion;
 
 /// <summary>
 /// 时序数据写入器（直接走 Npgsql，绕开 EF Core 的 change tracking）。
-/// <para>Phase 1 的简化实现：单条 INSERT。Phase 2+ 改批量 COPY 提性能（详见方案 §5.3）。</para>
+/// <para>当前为单条 INSERT（现有采样节拍下足够）；若吞吐成为瓶颈，可改批量 COPY（方案 §5.3）。</para>
 /// </summary>
 public sealed class PostgresMeasurementSink : IMeasurementSink
 {

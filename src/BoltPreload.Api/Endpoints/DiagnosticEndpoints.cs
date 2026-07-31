@@ -9,7 +9,8 @@ using NpgsqlTypes;
 namespace BoltPreload.Api.Endpoints;
 
 /// <summary>
-/// 设备调试用 endpoint，Phase 2 真机调试期间用。
+/// 设备诊断与调试端点：SDK 会话/参数读回、工作模式下发、通道健康总览、
+/// 点位与验收页实时数据源（channels/live）、重标定等。
 /// 触发读设备参数后，响应通过 SDK 异步事件回来，要看 IngestionService 日志。
 /// </summary>
 public static class DiagnosticEndpoints
@@ -1080,7 +1081,7 @@ public static class DiagnosticEndpoints
 - 把 MeasMode+Threshold+RefTime+RefTemp+LEchoWave 一次性写到设备（SDK 协议约束）。
 
 操作后建议：
-- 在 calibration_records 表里登记本次重标定（Phase 3 自动）；
+- 在 calibration_records 表里登记本次重标定（当前需人工，标定接口会自动登记）；
 - 等 10s 后调 ReadChannelParam(RefTime) 验证设备实际生效；
 - 持续观察 EchoTime 在新 RefTemp 下的接受率是否提升。");
 

@@ -6,9 +6,9 @@ namespace BoltPreload.Algorithms.Preload;
 /// <remarks>
 /// 三档实现，按螺栓标定状态自动降级：
 /// <list type="number">
-/// <item>双波法（最准，±3%）— Phase 2+ 实现</item>
-/// <item>GB/T 43232-2023 单波法（±5%）— Phase 2 实现</item>
-/// <item>简化模型 A（±15%~25%，仅需 v/E/S/L₀，不需标定）— Phase 1 实现兜底</item>
+/// <item>双波法（最准，±3%）— 未实现（待横波 TOF 数据源，见 <see cref="GbBiWaveCalculator"/>）</item>
+/// <item>GB/T 43232-2023 单波法（±5%）— 已实现，当前生产路径</item>
+/// <item>简化模型 A（±15%~25%，仅需 v/E/S/L₀，不需标定）— 已实现，无标定时兜底</item>
 /// </list>
 /// 调用方按 <see cref="IPreloadCalculatorFactory"/> 拿到合适的实例。
 /// </remarks>

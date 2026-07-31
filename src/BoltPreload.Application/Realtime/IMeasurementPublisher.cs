@@ -5,8 +5,9 @@ namespace BoltPreload.Application.Realtime;
 /// <summary>
 /// 实时测量推送抽象。
 /// <para>
-/// Phase 1 用 SignalR 实现；Phase 2 可换 MQTT、Kafka、WebSocket bridge 等。
-/// IngestionService 不直接依赖 SignalR，便于在没有 web 层的部署（纯采集网关）里关掉推送。
+/// 当前用 SignalR 实现（<c>SignalRMeasurementPublisher</c>）；抽象成接口是为了
+/// IngestionService 不直接依赖 SignalR，便于替换传输（MQTT / Kafka 等）或在
+/// 没有 web 层的部署（纯采集网关）里关掉推送。
 /// </para>
 /// </summary>
 public interface IMeasurementPublisher
@@ -15,13 +16,6 @@ public interface IMeasurementPublisher
     /// 推送一条解码后的测量。实现应做到「失败不抛」，避免阻塞主入库流水。
     /// </summary>
     Task PublishAsync(FxDecodedEnvelope envelope, CancellationToken ct = default);
-}
-
-/// <summary>空实现：当未启用实时推送时使用，零开销。</summary>
-public sealed class NoopMeasurementPublisher : IMeasurementPublisher
-{
-    public Task PublishAsync(FxDecodedEnvelope envelope, CancellationToken ct = default)
-        => Task.CompletedTask;
 }
 
 /// <summary>
@@ -51,10 +45,4 @@ public interface IChannelPresencePublisher
         Ingestion.ChannelPresenceChange change,
         long? channelId, long? boltId, string? boltCode,
         CancellationToken ct = default);
-}
-
-public sealed class NoopChannelPresencePublisher : IChannelPresencePublisher
-{
-    public Task PublishAsync(Ingestion.ChannelPresenceChange change, long? channelId, long? boltId, string? boltCode, CancellationToken ct = default)
-        => Task.CompletedTask;
 }

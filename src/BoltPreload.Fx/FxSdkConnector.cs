@@ -8,9 +8,8 @@ using WorkMode = FxSDK.Models.WorkMode;
 namespace BoltPreload.Fx;
 
 /// <summary>
-/// 
-/// 把 SDK 的 <see cref="FxClient.OnResultReceived"/> 事件转成内部 <see cref="System.Threading.Channels.Channel{T}"/>。
-/// Phase 1 第二周开始接入实验室真机 192.168.0.7:23。
+/// 真机连接器：把厂家 SDK 的 <see cref="FxClient.OnResultReceived"/> 事件流
+/// 转成内部 <see cref="System.Threading.Channels.Channel{T}"/> 供 IngestionService 消费。
 /// </summary>
 /// <remarks>
 /// <para>本类只做"事件 → 通道"的桥接，不做业务计算。业务计算在 Application 层。</para>
@@ -739,7 +738,7 @@ public sealed class FxSdkConnector : IFxConnector
             EchoTime2Ns: cr.EchoTime2,
             SpTempC: cr.SpTemp,
             DeltaTofNs: cr.DeltaTof,
-            Gain: 0f,  // SDK 1.4 的 ChannelResult 没有 Gain 字段（在 ChannelConfig），Phase 2 从配置带过来
+            Gain: 0f,  // SDK 1.4 的 ChannelResult 没有 Gain 字段（在 ChannelConfig）；如需真实增益须从通道配置带过来，当前固定 0
             EchoWave: cr.EchoWave is null ? null : ToDto(cr.EchoWave),
             LowAi: cr.LowAi,
             HighAi: cr.HighAi,

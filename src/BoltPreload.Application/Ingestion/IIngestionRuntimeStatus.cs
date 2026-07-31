@@ -14,7 +14,8 @@ public interface IIngestionRuntimeStatus
     long EnvelopeCount { get; }
     long ChannelResultCount { get; }
 
-    /// <summary>入库写失败累计次数。Phase 1 无 WAL，写失败即丢数；本计数让丢数可观测（经 /api/runtime/devices 暴露）。</summary>
+    /// <summary>入库写失败累计次数（经 /api/runtime/devices 暴露）。测量类信封写失败会落 WAL 兜底重放
+    /// （WAL 未启用或非测量信封则真丢失），本计数用于观测 DB 写入健康度。</summary>
     long WriteFailureCount { get; }
 
     void MarkEnvelope(DateTimeOffset at, bool isChannelResult);

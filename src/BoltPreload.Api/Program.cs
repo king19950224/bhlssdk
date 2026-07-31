@@ -111,13 +111,13 @@ else
     builder.Services.AddSingleton<IMeasurementWal>(NoopMeasurementWal.Instance);
 }
 
-// 波形存储：Phase 1 走本地文件。Phase 3 可换 S3/MinIO 实现 IWaveStore
+// 波形存储：本地文件实现；如需对象存储（S3/MinIO 等）另实现 IWaveStore 即可
 builder.Services.Configure<LocalFileWaveStoreOptions>(builder.Configuration.GetSection("WaveStore"));
 builder.Services.AddSingleton<IWaveStore, LocalFileWaveStore>();
 // 波形保留清理：周期删早于 RetentionDays 的历史波形 + 清扫残留 .tmp，防止 data/waves 无限增长
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.WaveRetentionService>();
 
-// 开发期间：SDK 协议帧打日志（Phase 2 真机调试用，Phase 3 上线前关掉）。
+// SDK 协议帧日志开关（真机联调排障用，生产保持 false 以免刷盘）。
 // 经 BoltPreload.Fx 适配层封装，Api 不直接依赖 FxSDK.Utility。
 FxConnectorFactory.DeveloperMode = builder.Configuration.GetValue<bool>("Fx:DeveloperMode", false);
 

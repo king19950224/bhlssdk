@@ -14,8 +14,7 @@ public sealed record MoveBoltChannelRequest(long ToChannelId, string Calibration
 public sealed record UnbindChannelRequest(string? Note = null);
 
 /// <summary>
-/// Phase 1 最小测量查询接口。
-/// Phase 2 改成 MediatR 走 Application 层 Query Handler。
+/// 测量数据查询（最新值 / 按螺栓历史 / 未绑定暂存）与通道-螺栓绑定管理端点。
 /// </summary>
 public static class MeasurementEndpoints
 {
@@ -25,7 +24,7 @@ public static class MeasurementEndpoints
             .WithTags("Measurements")
             .RequireAuthorization(AuthPolicies.LoggedIn);
 
-        // 最近 N 条（不限通道）— 用于 Phase 1 第一周里程碑验证
+        // 最近 N 条（不限通道）— 全局最新测量速览
         group.MapGet("/latest", async (NpgsqlDataSource dataSource, int? limit, CancellationToken ct) =>
         {
             var n = Math.Clamp(limit ?? 20, 1, 500);

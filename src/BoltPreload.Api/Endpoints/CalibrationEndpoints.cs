@@ -7,11 +7,13 @@ using NpgsqlTypes;
 namespace BoltPreload.Api.Endpoints;
 
 /// <summary>
-/// 标定相关接口。
+/// 标定相关接口。三条标定路径：
 /// <para>
-/// Phase 1 提供「快速标定」（quick-calibrate）：
-/// 运维直接传入 k_l / RefTime / RefTemp，等价于"我知道这颗螺栓在已知预紧力下的 TOF"。
-/// 严格的多点最小二乘标定（含 R²、不确定度、双签）放在 Phase 2/3 的标定工作站做。
+/// 1. 「快速标定」（quick-calibrate）：运维直接传入 k_l / RefTime / RefTemp，
+///    等价于"我知道这颗螺栓在已知预紧力下的 TOF"，用于恢复/迁移已知参数；
+/// 2. 「扭矩法临时标定」（torque-calibrate）：由扭矩+摩擦系数估算载荷，临时性质，正式验收需替换；
+/// 3. 「正式多点载荷标定」：GB/T 43232 路径 B/C，真实载荷点最小二乘拟合，
+///    强制 R²≥0.98 + JJF 1059.1 不确定度评定 + 两人会签（见本文件后半部分）。
 /// </para>
 /// <para>
 /// 调用流程：

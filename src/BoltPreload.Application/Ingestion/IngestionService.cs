@@ -12,8 +12,8 @@ namespace BoltPreload.Application.Ingestion;
 /// 一个 IFxConnector 对应一个设备，对应一个 IngestionService 任务。
 /// </summary>
 /// <remarks>
-/// Phase 1 简化版：单连接、同步消费、单条入库。
-/// Phase 2+ 改：批量 + WAL + 多连接管理（按方案 §5.2 ConnectorService）。
+/// 每个设备运行时一条独立消费循环并发运行（单设备异常退避重启，不拖垮其它设备）；
+/// 入库失败与背压溢出走 WAL 兜底，由 <c>WalReplayService</c> 重放补写。
 /// </remarks>
 public sealed class IngestionService : BackgroundService
 {
