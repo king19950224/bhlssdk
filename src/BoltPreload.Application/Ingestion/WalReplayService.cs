@@ -1,3 +1,4 @@
+using BoltPreload.Application.Diagnostics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -15,17 +16,20 @@ public sealed class WalReplayService : BackgroundService
 {
     private readonly IMeasurementWal _wal;
     private readonly IMeasurementSink _sink;
+    private readonly BackgroundServiceHealth _health;
     private readonly ILogger<WalReplayService> _logger;
     private readonly TimeSpan _interval;
 
     public WalReplayService(
         IMeasurementWal wal,
         IMeasurementSink sink,
+        BackgroundServiceHealth health,
         IOptions<MeasurementWalOptions> options,
         ILogger<WalReplayService> logger)
     {
         _wal = wal;
         _sink = sink;
+        _health = health;
         _logger = logger;
         _interval = TimeSpan.FromSeconds(Math.Max(1, options.Value.ReplayIntervalSeconds));
     }
@@ -44,6 +48,8 @@ public sealed class WalReplayService : BackgroundService
         using var timer = new PeriodicTimer(_interval);
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
+            // 心跳：本服务停摆则 DB 恢复后不再补写积压测量，数据会永久缺一段
+            _health.Beat("wal-replay", _interval);
             try
             {
                 if (_wal.PendingCount == 0)

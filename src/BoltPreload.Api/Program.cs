@@ -4,6 +4,7 @@ using BoltPreload.Api.Endpoints;
 using BoltPreload.Api.Hubs;
 using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Alarm;
+using BoltPreload.Application.Diagnostics;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Devices.Acceptance;
 using BoltPreload.Application.Devices.ProbeScan;
@@ -82,6 +83,11 @@ builder.Services.AddMemoryCache(options =>
 
 // 通道解析（带缓存）
 builder.Services.AddSingleton<IChannelResolver, CachedChannelResolver>();
+
+// 后台服务存活登记：各周期性服务打心跳，/api/health/ready 据此判断"监测是否真的还在跑"。
+// 配了 BackgroundServiceExceptionBehavior.Ignore（见下）之后，服务死了进程还活着，
+// 没有这层登记就只能靠人去翻日志才发现监测已经停了。
+builder.Services.AddSingleton<BackgroundServiceHealth>();
 
 // 预紧力计算器 + 工厂（按螺栓规格 / 标定状态选最高精度可用算法；采集热路径用）。
 // 之前 PostgresMeasurementSink 直接 new GbSingleWaveCalculator()，工厂从未接线 → 现改为经工厂注入。
@@ -186,6 +192,10 @@ builder.Services.AddHostedService<BoltPreload.Api.Runtime.SignalHealthService>()
 builder.Services.Configure<BoltPreload.Api.Runtime.WaveSamplingOptions>(builder.Configuration.GetSection("Ingestion:WaveSampling"));
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.WaveSamplingService>();
 
+// 未绑定测量保留清理：unbound_measurements 此前无任何清理任务，插着探头不建档会无限膨胀
+builder.Services.Configure<BoltPreload.Api.Runtime.UnboundRetentionOptions>(builder.Configuration.GetSection("Ingestion:UnboundRetention"));
+builder.Services.AddHostedService<BoltPreload.Api.Runtime.UnboundRetentionService>();
+
 // 接线指纹守卫：已验收通道声时偏离验收指纹 → wiring_suspect 告警（检修换接电缆的最后防线，只告警不停发）
 builder.Services.Configure<BoltPreload.Api.Runtime.WiringGuardOptions>(builder.Configuration.GetSection("Alarm:WiringGuard"));
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.WiringGuardService>();
@@ -233,7 +243,7 @@ app.MapGet("/api/health", () => new
 // 就绪检查（readiness）：实际探测关键依赖（DB 连通性）。
 // 区别于上面的 liveness（仅表示进程还在）——运维/负载均衡探针用 /ready 判断"能否真正服务请求"，
 // DB 不通时返回 503，避免"进程在、但后端依赖已断"的静默失效被当成健康。
-app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorManager manager, CancellationToken ct) =>
+app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorManager manager, BackgroundServiceHealth svcHealth, CancellationToken ct) =>
 {
     // 1) DB 连通性（硬性：down → 503，运维/负载均衡据此摘流）
     try
@@ -274,15 +284,30 @@ app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorMana
     }
     catch { /* 探测尽力 */ }
 
-    return Results.Ok(new
+    // 4) 后台服务存活：宿主配了 BackgroundServiceExceptionBehavior.Ignore（一个服务崩不拖停整机），
+    //    代价是服务死了进程还活着。此前本接口只看 DB，采集看门狗 / 信号健康停摆时依旧返回 ready ——
+    //    最坏情况是 SignalHealthService 死了、探头脱落不再产生 signal_lost，而探针一路绿灯。
+    //    失联（超过正常间隔 3 倍未心跳）即 503，让运维探针能发现"进程在、监测已停"。
+    var services = svcHealth.Snapshot();
+    var deadServices = services.Where(s => s.Stale).Select(s => s.Name).ToArray();
+    var payload = new
     {
-        status = "ready",
+        status = deadServices.Length > 0 ? "degraded" : "ready",
         db = "up",
         devices = new { total = deviceTotal, connected = deviceConnected },
         maxIdleSeconds = maxIdle,
         freeDiskGb,
+        backgroundServices = services,
+        deadServices,
         timestamp = now
-    });
+    };
+
+    if (deadServices.Length > 0)
+    {
+        app.Logger.LogError("/api/health/ready 后台服务失联：{Dead}", string.Join(", ", deadServices));
+        return Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    return Results.Ok(payload);
 })
 .AllowAnonymous()
 .WithTags("Health");

@@ -1,6 +1,7 @@
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Devices.Acceptance;
 using BoltPreload.Application.Devices.ProbeScan;
+using BoltPreload.Application.Diagnostics;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Application.Realtime;
 using BoltPreload.Fx;
@@ -42,6 +43,7 @@ public sealed class ChannelPresenceService : BackgroundService
     private readonly NpgsqlDataSource _ds;
     private readonly BoltAutoEnroller _enroller;
     private readonly ChannelPresenceOptions _opt;
+    private readonly BackgroundServiceHealth _health;
     private readonly ILogger<ChannelPresenceService> _logger;
 
     // 已确认下发过全通道 MCR 的设备 → 当时的目标通道数（本进程内幂等；设备端 MCR 是持久配置，
@@ -57,6 +59,7 @@ public sealed class ChannelPresenceService : BackgroundService
         AcceptanceSessionState acceptance,
         NpgsqlDataSource ds,
         BoltAutoEnroller enroller,
+        BackgroundServiceHealth health,
         IOptions<ChannelPresenceOptions> opt,
         ILogger<ChannelPresenceService> logger)
     {
@@ -67,6 +70,7 @@ public sealed class ChannelPresenceService : BackgroundService
         _acceptance = acceptance;
         _ds = ds;
         _enroller = enroller;
+        _health = health;
         _opt = opt.Value;
         _logger = logger;
     }
@@ -168,6 +172,9 @@ public sealed class ChannelPresenceService : BackgroundService
         {
             try { if (!await timer.WaitForNextTickAsync(ct)) return; }
             catch (OperationCanceledException) { return; }
+
+            // 心跳：本服务停摆则探头插拔不再被识别，UI 在位状态会一直停在最后一次的样子
+            _health.Beat("channel-presence", TimeSpan.FromSeconds(Math.Max(1, _opt.SweepIntervalSeconds)));
 
             try
             {

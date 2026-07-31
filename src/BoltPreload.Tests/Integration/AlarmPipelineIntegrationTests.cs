@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Alarm;
 using BoltPreload.Application.Devices.ProbeScan;
+using BoltPreload.Application.Diagnostics;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Application.Realtime;
 using BoltPreload.Domain.Entities;
@@ -139,6 +140,7 @@ public sealed class AlarmPipelineIntegrationTests
             new PostgresAlarmSink(_fx.DataSource, NullLogger<PostgresAlarmSink>.Instance),
             new NoopAlarmPublisher(),
             new ProbeScanState(),
+            new BackgroundServiceHealth(),
             Options.Create(new SignalHealthOptions()),   // 默认 120s 无回波判丢失，10 分钟静默必命中
             NullLogger<SignalHealthService>.Instance);
         await svc.CheckAsync(default);

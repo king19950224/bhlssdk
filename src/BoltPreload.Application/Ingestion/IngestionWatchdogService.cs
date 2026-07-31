@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Devices.ProbeScan;
+using BoltPreload.Application.Diagnostics;
 using BoltPreload.Fx;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -39,15 +40,19 @@ public sealed class IngestionWatchdogService : BackgroundService
     // 避免看门狗对着 in-flight 连接再发 ReconnectAsync 打断它、形成重连风暴。
     private readonly ConcurrentDictionary<long, DateTimeOffset> _inFlightSince = new();
 
+    private readonly BackgroundServiceHealth _health;
+
     public IngestionWatchdogService(
         IDeviceConnectorManager deviceManager,
         IOptions<IngestionWatchdogOptions> options,
         ProbeScanState probeScanState,
+        BackgroundServiceHealth health,
         ILogger<IngestionWatchdogService> logger)
     {
         _deviceManager = deviceManager;
         _options = options.Value;
         _probeScanState = probeScanState;
+        _health = health;
         _logger = logger;
     }
 
@@ -82,6 +87,9 @@ public sealed class IngestionWatchdogService : BackgroundService
                 if (!await timer.WaitForNextTickAsync(stoppingToken)) return;
             }
             catch (OperationCanceledException) { return; }
+
+            // 心跳：看门狗停摆则设备断线后不再自动重连，系统失去自愈能力
+            _health.Beat("ingestion-watchdog", TimeSpan.FromSeconds(_options.CheckIntervalSeconds));
 
             foreach (var runtime in _deviceManager.Runtimes)
             {

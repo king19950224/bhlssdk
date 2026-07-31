@@ -1,5 +1,6 @@
 using BoltPreload.Application.Alarm;
 using BoltPreload.Application.Devices.ProbeScan;
+using BoltPreload.Application.Diagnostics;
 using BoltPreload.Application.Realtime;
 using Microsoft.Extensions.Options;
 using Npgsql;
@@ -33,17 +34,19 @@ public sealed class SignalHealthService : BackgroundService
     private readonly IAlarmPublisher _publisher;
     private readonly ProbeScanState _probeScan;
     private readonly SignalHealthOptions _opt;
+    private readonly BackgroundServiceHealth _health;
     private readonly ILogger<SignalHealthService> _logger;
 
     public SignalHealthService(
         NpgsqlDataSource ds, IAlarmSink sink, IAlarmPublisher publisher,
-        ProbeScanState probeScan,
+        ProbeScanState probeScan, BackgroundServiceHealth health,
         IOptions<SignalHealthOptions> opt, ILogger<SignalHealthService> logger)
     {
         _ds = ds;
         _sink = sink;
         _publisher = publisher;
         _probeScan = probeScan;
+        _health = health;
         _opt = opt.Value;
         _logger = logger;
     }
@@ -61,6 +64,9 @@ public sealed class SignalHealthService : BackgroundService
         {
             try { if (!await timer.WaitForNextTickAsync(stoppingToken)) return; }
             catch (OperationCanceledException) { return; }
+            // 心跳：本服务停摆意味着探头脱落不再产生 signal_lost 告警，属安全相关静默失效，
+            // 必须能在 /api/health/ready 看出来
+            _health.Beat("signal-health", TimeSpan.FromSeconds(_opt.CheckIntervalSeconds));
             try { await CheckAsync(stoppingToken); }
             catch (OperationCanceledException) { return; }
             catch (Exception ex) { _logger.LogError(ex, "SignalHealth 检查异常"); }
