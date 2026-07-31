@@ -42,7 +42,10 @@ public class Channel
     /// <summary>参考温度（°C），标定时确定</summary>
     public decimal? RefTempC { get; set; }
 
-    /// <summary>当前生效的载荷因子 K_L（1/N），冗余自 calibration_records</summary>
+    /// <summary>
+    /// 当前生效的载荷因子 K_L，冗余自 calibration_records。
+    /// 单位是 <b>ns/N</b>（量级 ~1e-4），全系统统一按 K_L = Δt/F 存，别照标定证书上 1/N 的 1e-11 填。
+    /// </summary>
     public decimal? KL { get; set; }
 
     /// <summary>当前 K_L 的扩展不确定度（k=2）</summary>

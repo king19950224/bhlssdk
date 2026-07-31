@@ -50,7 +50,7 @@ public sealed record ChannelRoute(
 
 /// <summary>缓存的标定参数（从 channels 冗余字段读，避免 JOIN）</summary>
 /// <param name="CalibrationId">calibration_records.id</param>
-/// <param name="KL">载荷因子（1/N）</param>
+/// <param name="KL">载荷因子 K_L，单位 ns/N（量级 ~1e-4），不是证书上那个 1/N 的 1e-11</param>
 /// <param name="KLUncertainty">扩展不确定度（k=2）</param>
 /// <param name="RefTimeNs">参考声时</param>
 /// <param name="RefTempC">参考温度</param>
