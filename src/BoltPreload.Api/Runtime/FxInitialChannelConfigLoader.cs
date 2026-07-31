@@ -3,7 +3,7 @@ using BoltPreload.Fx;
 using Npgsql;
 using NpgsqlTypes;
 
-namespace BoltPreload.Api;
+namespace BoltPreload.Api.Runtime;
 
 /// <summary>
 /// 启动时加载 SDK 本地 SessionContext 所需的通道配置（返回 plain 的 <see cref="FxChannelInit"/>，

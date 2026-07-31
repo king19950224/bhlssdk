@@ -168,7 +168,8 @@ export const userApi = {
 }
 
 // ---- 总览(预紧力健康) ----
-export interface PreloadHealth {
+/** 各健康状态的螺栓数量汇总(区别于 utils/preload.ts 中单颗螺栓的 PreloadHealth 评估结果)。 */
+export interface PreloadHealthCounts {
   total: number
   normal: number
   warn: number
@@ -204,8 +205,8 @@ export interface DashboardTrendPoint {
 export const dashboardApi = {
   preloadHealth: () =>
     http.get<{
-      global: PreloadHealth
-      byGroup: { turbine: string; group: string; health: PreloadHealth }[]
+      global: PreloadHealthCounts
+      byGroup: { turbine: string; group: string; health: PreloadHealthCounts }[]
       topLoose: LooseBolt[]
       openAlarms: number
       alarmsBySeverity: { severity: string; count: number }[]
@@ -219,15 +220,15 @@ export const dashboardApi = {
 // ---- 资产层级 ----
 export interface ProjectNode {
   id: number; code: string; name: string; industry: string; location: string | null
-  turbines: number; health: PreloadHealth; openAlarms: number
+  turbines: number; health: PreloadHealthCounts; openAlarms: number
 }
 export interface TurbineNode {
   id: number; code: string; name: string; model: string | null; capacityKw: number | null
-  location: string | null; state: string; groups: number; health: PreloadHealth; openAlarms: number
+  location: string | null; state: string; groups: number; health: PreloadHealthCounts; openAlarms: number
 }
 export interface GroupNode {
   id: number; code: string; name: string; structureType: string | null
-  expectedBoltCount: number | null; targetPreloadN: number | null; health: PreloadHealth; openAlarms: number
+  expectedBoltCount: number | null; targetPreloadN: number | null; health: PreloadHealthCounts; openAlarms: number
 }
 export interface GroupBolt {
   id: number; code: string; nominalDiam: string; grade: string; positionLabel: string | null

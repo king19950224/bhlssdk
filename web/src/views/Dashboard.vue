@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'
-import { dashboardApi, type PreloadHealth, type LooseBolt, type ResidualDist, type ApproachingBolt, type DashboardTrendPoint } from '../api'
+import { dashboardApi, type PreloadHealthCounts, type LooseBolt, type ResidualDist, type ApproachingBolt, type DashboardTrendPoint } from '../api'
 import { useRuntime } from '../stores/runtime'
 import { onRealtime } from '../api/realtime'
 import { pctParts } from '../utils/preload'
@@ -10,8 +10,8 @@ import { pctParts } from '../utils/preload'
 const router = useRouter()
 const runtime = useRuntime()
 
-const health = ref<PreloadHealth>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0, high: 0 })
-const byGroup = ref<{ turbine: string; group: string; health: PreloadHealth }[]>([])
+const health = ref<PreloadHealthCounts>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0, high: 0 })
+const byGroup = ref<{ turbine: string; group: string; health: PreloadHealthCounts }[]>([])
 const topLoose = ref<LooseBolt[]>([])
 const residualDist = ref<ResidualDist>({ b100: 0, b90: 0, b80: 0, b70: 0, b70d: 0, bhigh: 0 })
 const approaching = ref<ApproachingBolt[]>([])

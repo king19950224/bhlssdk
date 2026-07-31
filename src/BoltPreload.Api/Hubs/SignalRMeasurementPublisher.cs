@@ -1,88 +1,8 @@
-using BoltPreload.Application.Alarm;
 using BoltPreload.Application.Realtime;
 using BoltPreload.Fx.Models;
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.Extensions.Logging;
 
 namespace BoltPreload.Api.Hubs;
-
-/// <summary>SignalR 告警推送。</summary>
-public sealed class SignalRAlarmPublisher : IAlarmPublisher
-{
-    private readonly IHubContext<MeasurementsHub> _hub;
-    private readonly ILogger<SignalRAlarmPublisher> _logger;
-
-    public SignalRAlarmPublisher(IHubContext<MeasurementsHub> hub, ILogger<SignalRAlarmPublisher> logger)
-    {
-        _hub = hub;
-        _logger = logger;
-    }
-
-    public async Task PublishAsync(AlarmEvent ev, CancellationToken ct = default)
-    {
-        try
-        {
-            await _hub.Clients.All.SendAsync("OnAlarm", new
-            {
-                action = ev.Action.ToString().ToLowerInvariant(),
-                boltId = ev.BoltId,
-                channelId = ev.ChannelId,
-                type = ev.Type,
-                severity = ev.Severity,
-                ts = ev.Ts,
-                preloadN = ev.PreloadN,
-                preloadRatio = ev.PreloadRatio,
-                targetPreloadN = ev.TargetPreloadN,
-                thresholdLow = ev.ThresholdLowRatio,
-                thresholdHigh = ev.ThresholdHighRatio,
-                consecutive = ev.ConsecutiveCount,
-                message = ev.Message
-            }, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "SignalR 告警推送失败 bolt={Bolt}", ev.BoltId);
-        }
-    }
-}
-
-/// <summary>SignalR 通道在位（探头热插拔）推送。频率极低，直接 SendAsync 不需要队列。</summary>
-public sealed class SignalRChannelPresencePublisher : IChannelPresencePublisher
-{
-    private readonly IHubContext<MeasurementsHub> _hub;
-    private readonly ILogger<SignalRChannelPresencePublisher> _logger;
-
-    public SignalRChannelPresencePublisher(IHubContext<MeasurementsHub> hub, ILogger<SignalRChannelPresencePublisher> logger)
-    {
-        _hub = hub;
-        _logger = logger;
-    }
-
-    public async Task PublishAsync(
-        BoltPreload.Application.Ingestion.ChannelPresenceChange change,
-        long? channelId, long? boltId, string? boltCode,
-        CancellationToken ct = default)
-    {
-        try
-        {
-            await _hub.Clients.All.SendAsync("OnChannelPresence", new
-            {
-                deviceId = change.DeviceId,
-                channelNo = (int)change.ChannelNo,
-                present = change.Present,
-                ts = change.At,
-                initial = change.Initial,
-                channelId,
-                boltId,
-                boltCode
-            }, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "SignalR 在位推送失败 device={Device} ch={Ch}", change.DeviceId, change.ChannelNo);
-        }
-    }
-}
 
 /// <summary>
 /// 基于 SignalR 的实时测量发布者。

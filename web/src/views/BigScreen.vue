@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'
-import { dashboardApi, alarmApi, type PreloadHealth, type LooseBolt, type ApproachingBolt, type AlarmItem } from '../api'
+import { dashboardApi, alarmApi, type PreloadHealthCounts, type LooseBolt, type ApproachingBolt, type AlarmItem } from '../api'
 import { useRuntime } from '../stores/runtime'
 import { onRealtime, startRealtime, realtimeState } from '../api/realtime'
 import { pctParts } from '../utils/preload'
@@ -10,8 +10,8 @@ import { pctParts } from '../utils/preload'
 const router = useRouter()
 const runtime = useRuntime()
 
-const health = ref<PreloadHealth>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0, high: 0 })
-const byGroup = ref<{ turbine: string; group: string; health: PreloadHealth }[]>([])
+const health = ref<PreloadHealthCounts>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0, high: 0 })
+const byGroup = ref<{ turbine: string; group: string; health: PreloadHealthCounts }[]>([])
 const topLoose = ref<LooseBolt[]>([])
 const approaching = ref<ApproachingBolt[]>([])
 const openAlarms = ref(0)

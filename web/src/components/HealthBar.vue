@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { PreloadHealth } from '../api'
+import type { PreloadHealthCounts } from '../api'
 
-const props = defineProps<{ health: PreloadHealth }>()
+const props = defineProps<{ health: PreloadHealthCounts }>()
 
 // 与 utils/preload STATUS_META 顺序/配色一致；high(偏高/超张力)=紫
 const ORDER = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata'] as const
