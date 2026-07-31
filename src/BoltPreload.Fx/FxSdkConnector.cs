@@ -572,10 +572,14 @@ public sealed class FxSdkConnector : IFxConnector
                 "或在请求体里提供 explicitRefTimeNs/explicitRefTempC 强制写入。");
         }
 
-        // 2. 拿 LEchoWave：如果缓存没有，触发 ReadChannelParam 并 TCS 等待（事件驱动，不再 100ms busy-poll）
+        // 2. 拿 LEchoWave：如果缓存没有，触发设备读回并 TCS 等待（事件驱动，不再 100ms busy-poll）。
+        //    注意读的是 "RefTime" 而不是 "LEchoWave"：MultiChIot 协议没有单读 LEchoWave 的命令——
+        //    EncodeReadChannelParameter 遇到 "LEchoWave" 返回空列表，等于什么都不发，这里会白等 5s 后超时。
+        //    "RefTime" 走存储读(0x42)，回包是整组基线 MeasMode+Threshold+RefTime+RefTemp+LEchoWave，
+        //    其中 LEchoWave 经 CacheLatest 落入 _latestEchoWave 并唤醒下面的等待器。
         if (!_latestEchoWave.TryGetValue(channel, out var latestWave))
         {
-            _logger.LogInformation("通道 {Ch} 缺 LEchoWave 缓存，触发上行读取", channel);
+            _logger.LogInformation("通道 {Ch} 缺 LEchoWave 缓存，触发 RefTime 存储读（整组基线，含参考波形）", channel);
 
             // 先注册等待器，再发请求 — 避免"请求-响应"之间的 race
             var tcs = new TaskCompletionSource<EchoWave>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -583,7 +587,7 @@ public sealed class FxSdkConnector : IFxConnector
 
             try
             {
-                await _client.ReadChannelParamAsync(session, "LEchoWave", channel, address);
+                await _client.ReadChannelParamAsync(session, "RefTime", channel, address);
 
                 // 二次检查：发请求过程中如果数据已到，直接用
                 if (_latestEchoWave.TryGetValue(channel, out latestWave))

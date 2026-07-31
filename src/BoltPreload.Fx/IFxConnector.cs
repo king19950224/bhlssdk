@@ -80,7 +80,7 @@ public interface IFxConnector : IAsyncDisposable
     /// <para>
     /// 内部流程：
     /// 1. 取出本地缓存的最近一次 ChannelResult（EchoTime + SpTemp）；
-    /// 2. 触发 ReadChannelParam(LEchoWave) 拿当前波形（SDK 上行）；
+    /// 2. 若缺波形缓存，触发 ReadChannelParam(RefTime) 存储读，整组带回设备基线（含参考波形 LEchoWave）；
     /// 3. 等 LEchoWave 回来后，调 SDK ConfigureChannelAsync(propertyName="RefTime") 把
     ///    MeasMode + Threshold + RefTime + RefTemp + LEchoWave 一次性整组写到设备。
     /// </para>

@@ -33,9 +33,13 @@ public abstract class IoSession
     public string SessionId { get; protected set; }
 
     /// <summary>
-    /// 心跳间隔（秒）
+    /// 心跳间隔（秒）。
+    /// 厂家原值 20s。实测 DEV_LAB_001 的 TCP 链路（192.168.0.7:23 串口服务器）约 5s 无流量即被对端断开：
+    /// 设备不上行数据时（未在测量），20s 心跳保不住连接，导致 MultiMeas 启动/轮询配置命令
+    /// 只能在原厂软件扫波"喂活"链路时才有机会生效。缩短到 2s 使空闲连接常驻。
+    /// 心跳内容是单字节 0x00 填充，协议解码按帧头(DE DE DE DE)同步，会自动忽略。
     /// </summary>
-    protected static readonly double HeartbeatSeconds = 20;
+    protected static readonly double HeartbeatSeconds = 2;
 
     #region 触发事件
     protected void FireSessionConnected()

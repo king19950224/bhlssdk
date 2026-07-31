@@ -14,10 +14,14 @@ namespace BoltPreload.Api.Endpoints;
 /// </summary>
 public static class DiagnosticEndpoints
 {
+    // 仅列协议真能编码成读命令的参数（见 MultiChIotProtocolHandler.EncodeReadChannelParameter）：
+    // 前 5 个是寄存器读(0x22)；RefTime 是存储读(0x42)，回包为整组基线
+    // MeasMode+Threshold+RefTime+RefTemp+LEchoWave，一并落 device_parameter_history。
+    // 此前列表里的 MeasMode/Threshold/RefTemp 没有对应读命令分支——编码返回空列表、什么都不发，
+    // 属静默 no-op；它们的值实际一直是随 RefTime 组读回来的。
     private static readonly string[] DefaultChannelParamNames =
     [
-        "ProbeFreq", "Gain", "MeasMode", "Threshold",
-        "RefTime", "RefTemp", "EchoWin", "EchoWidth"
+        "ProbeFreq", "Gain", "EchoWin", "EchoWidth", "PulseConfig", "RefTime"
     ];
 
     public static IEndpointRouteBuilder MapDiagnosticEndpoints(this IEndpointRouteBuilder app)
@@ -1072,7 +1076,7 @@ public static class DiagnosticEndpoints
 
 流程：
 - 取本通道最近一次有效的 EchoTime / SpTemp 作为新 RefTime / RefTemp；
-- 如果本地缓存没有 LEchoWave，自动触发 ReadChannelParam(LEchoWave) 拿最新波形；
+- 如果本地缓存没有 LEchoWave，自动触发 ReadChannelParam(RefTime) 存储读，整组带回设备基线（含参考波形）；
 - 把 MeasMode+Threshold+RefTime+RefTemp+LEchoWave 一次性写到设备（SDK 协议约束）。
 
 操作后建议：
