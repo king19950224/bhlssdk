@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import {
   runtimeApi, deviceApi, channelApi, probeScanApi,
   type RuntimeDevice, type ChannelHealth, type ChannelRow, type UnboundSummaryRow, type ProbeScanView,
+  type DeviceSettings,
 } from '../api'
 import { onRealtime, startRealtime, type OnChannelPresence } from '../api/realtime'
 import { useAuth } from '../stores/auth'
@@ -48,7 +49,7 @@ async function loadDevices() {
 }
 async function selectDevice(d: RuntimeDevice) {
   selected.value = d
-  await Promise.all([loadHealth(), loadScan(), loadBinding()])
+  await Promise.all([loadHealth(), loadScan(), loadBinding(), loadSettings()])
 }
 async function loadHealth() {
   const did = selected.value?.deviceId
@@ -85,7 +86,48 @@ async function loadBinding() {
   } catch { /* ignore */ }
 }
 
-// 探头热插拔：实时在位事件 → 通道灯即时翻转 + 新探头提示（识别与采集自动，绑定保持人工）
+// 默认监测组（检测即螺栓：探头在位自动建档的归属组）
+const settings = ref<DeviceSettings | null>(null)
+const groupDlgOpen = ref(false)
+const groupDlgSel = ref<number | null>(null)
+const savingGroup = ref(false)
+async function loadSettings() {
+  const did = selected.value?.deviceId
+  if (did == null) return
+  try {
+    const s = await deviceApi.getSettings(did)
+    if (selected.value?.deviceId === did) settings.value = s
+  } catch { /* ignore */ }
+}
+function openGroupDlg() {
+  groupDlgSel.value = settings.value?.defaultGroupId ?? null
+  groupDlgOpen.value = true
+}
+async function saveDefaultGroup() {
+  if (!selected.value) return
+  savingGroup.value = true
+  try {
+    const r = await deviceApi.patchSettings(selected.value.deviceId, groupDlgSel.value)
+    if (settings.value) settings.value = { ...settings.value, defaultGroupId: r.defaultGroupId, defaultGroupCode: r.defaultGroupCode }
+    if (r.enrolledBolts.length) {
+      ElNotification({
+        title: `已自动建档 ${r.enrolledBolts.length} 颗在位螺栓`,
+        message: r.enrolledBolts.map((b) => `CH${b.channelNo} → ${b.code}`).join('、'),
+        type: 'success', duration: 8000,
+      })
+      await Promise.all([loadHealth(), loadBinding()])
+    } else {
+      ElMessage.success(r.defaultGroupId ? `默认监测组已设为 ${r.defaultGroupCode}` : '已清除默认监测组（自动建档暂停）')
+    }
+    groupDlgOpen.value = false
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '设置失败（需复核员权限）')
+  } finally {
+    savingGroup.value = false
+  }
+}
+
+// 探头热插拔：实时在位事件 → 通道灯即时翻转 + 新探头提示（识别、采集、建档全自动）
 let offPresence: (() => void) | undefined
 function onPresence(ev: OnChannelPresence) {
   if (selected.value?.deviceId !== ev.deviceId) return
@@ -98,11 +140,12 @@ function onPresence(ev: OnChannelPresence) {
   if (ev.present) {
     loadBinding()
     if (ev.boltCode) {
-      ElMessage.success(`通道 CH${ev.channelNo} 探头恢复（${ev.boltCode}），已继续采集`)
+      // 在位事件带螺栓编号：老螺栓恢复或刚自动建档的新螺栓，都已在采集
+      ElMessage.success(`通道 CH${ev.channelNo} 探头在位（${ev.boltCode}），采集中`)
     } else {
       ElNotification({
         title: `通道 CH${ev.channelNo} 检测到新探头`,
-        message: '已开始采集（未绑定螺栓）。数据进入未绑定列表，请到「通道与绑定」完成人工绑定。',
+        message: '已开始采集（未建档）。设置设备默认监测组后新探头会自动建档，也可到「通道与绑定」人工建档。',
         type: 'success', duration: 8000,
         onClick: () => { tab.value = 'bind'; loadBinding() },
       })
@@ -270,7 +313,14 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
     <div class="panel panel--glow" v-if="selected">
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />{{ selected.name }} · 设备控制台</span>
-        <router-link :to="{ name: 'identify', query: { deviceId: selected.deviceId } }" class="hd-link">敲击识别 →</router-link>
+        <span class="hd-tools">
+          <el-tooltip content="探头在位自动建档的归属监测组。未设置时新探头只采集不建档" placement="bottom">
+            <el-button size="small" text :type="settings?.defaultGroupId ? 'primary' : 'warning'" :disabled="!auth.isReviewer" @click="openGroupDlg">
+              默认组 {{ settings?.defaultGroupCode || '未设置' }}
+            </el-button>
+          </el-tooltip>
+          <router-link :to="{ name: 'identify', query: { deviceId: selected.deviceId } }" class="hd-link">敲击识别 →</router-link>
+        </span>
       </div>
       <div v-if="selected.state !== 'Connected'" class="offline-note">
         <el-icon><WarningFilled /></el-icon>
@@ -358,6 +408,20 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
       </el-tabs>
     </div>
 
+    <el-dialog v-model="groupDlgOpen" title="默认监测组（自动建档）" width="460px">
+      <p class="dlg-note">
+        探头插入确认在位后，系统自动把螺栓建档到此组：编号「通道X-Y号螺栓」（每 10 口一束、束内 1~10）、缺省规格 M20/8.8（可在螺栓详情后补位置、规格与目标值）。
+        保存后对当前已在位但未建档的通道立即补建档，无需重新插拔。
+      </p>
+      <el-select v-model="groupDlgSel" clearable placeholder="选择监测组（清空 = 暂停自动建档）" style="width: 100%">
+        <el-option v-for="g in settings?.availableGroups || []" :key="g.id" :value="g.id" :label="`${g.code} · ${g.name}`" />
+      </el-select>
+      <template #footer>
+        <el-button @click="groupDlgOpen = false">取消</el-button>
+        <el-button type="primary" :loading="savingGroup" @click="saveDefaultGroup">保存</el-button>
+      </template>
+    </el-dialog>
+
     <BoltCreateDialog v-model="createOpen" :channel-id="createChannelId" @done="onBoltCreated" />
     <CalibrationWizard
       v-model="wizardOpen"
@@ -385,6 +449,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
 .dc-metrics span { font-size: 11px; color: var(--text-3); }
 
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; }
+.hd-tools { display: flex; align-items: center; gap: 14px; }
 .offline-note { display: flex; align-items: center; gap: 8px; margin: 10px 20px 0; padding: 8px 12px; border: 1px solid var(--warn); border-radius: 8px; color: var(--warn); font-size: 12.5px; }
 .hd-link { font-size: 12px; }
 .dev-tabs { padding: 0 18px 12px; }
@@ -396,6 +461,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
 .scan-st .st-run { color: var(--accent); }
 .unbound-note { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--warn); padding: 4px 0 12px; flex-wrap: wrap; }
 .unbound-note .un-text { flex: 1; min-width: 200px; }
+.dlg-note { font-size: 12.5px; color: var(--text-2); line-height: 1.7; margin: 0 0 14px; }
 
 .tbl { padding: 4px 4px 8px; overflow-x: auto; }
 .tr { display: grid; grid-template-columns: 50px 110px 130px 110px 100px 80px 70px 70px 90px; align-items: center; padding: 10px 10px; border-radius: 8px; font-size: 12.5px; min-width: 820px; }

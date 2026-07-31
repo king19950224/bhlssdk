@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import EChart from '../components/EChart.vue'
 import { boltApi, deviceApi, runtimeApi } from '../api'
 import { onRealtime, realtimeState } from '../api/realtime'
@@ -194,8 +194,8 @@ async function init() {
       /* 无设备运行时也允许只看历史播种点 */
     }
     await loadCalibration(true)
-    // 默认只显示一颗（首个已标定通道），其余由用户点选加入，避免多线拥挤
-    if (!selected.value.size && channels.value.length) selected.value = new Set([channels.value[0].channelNo])
+    // 默认只显示一颗（首个有数据的通道），其余由用户点选加入，避免多线拥挤
+    if (!selected.value.size && visible.value.length) selected.value = new Set([visible.value[0].channelNo])
     error.value = null
   } catch (e) {
     error.value = e instanceof Error ? e.message : '初始化失败'
@@ -232,7 +232,7 @@ function toggleSelect(channelNo: number) {
   selected.value = s
 }
 function selectAll() {
-  selected.value = new Set(channels.value.map((c) => c.channelNo))
+  selected.value = new Set(visible.value.map((c) => c.channelNo))
 }
 function clearSel() {
   selected.value = new Set()
@@ -257,16 +257,14 @@ function isStale(c: LiveChan): boolean {
   const t = lastDataMs(c)
   return t == null || now.value - t > STALE_MS
 }
-function staleAgo(c: LiveChan): string {
-  const t = lastDataMs(c)
-  if (t == null) return '从未上报'
-  const s = Math.floor((now.value - t) / 1000)
-  if (s < 60) return '刚刚'
-  if (s < 3600) return `${Math.floor(s / 60)} 分前`
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`
-  return `${(s / 86400).toFixed(1)} 天前`
-}
-const onlineCount = computed(() => channels.value.filter((c) => !isStale(c)).length)
+// 无数据不上屏：断数据的通道整体从芯片与曲线中隐藏（选中状态保留），恢复上报自动回来
+const visible = computed(() => channels.value.filter((c) => !isStale(c)))
+const onlineCount = computed(() => visible.value.length)
+
+// 默认选中第一个有数据的通道；页面打开时全无数据的话，等首个通道上线自动选中
+watch(visible, (list) => {
+  if (!selected.value.size && list.length) selected.value = new Set([list[0].channelNo])
+})
 
 // 展示用值：kN 或 保持率%（相对自身目标）
 function toDisplay(valN: number | null, target: number | null): number | null {
@@ -311,7 +309,7 @@ function fmtVal(valN: number | null, target: number | null): string {
   return unit.value === 'kN' ? d.toFixed(1) : d.toFixed(0)
 }
 
-const shown = computed(() => channels.value.filter((c) => selected.value.has(c.channelNo)))
+const shown = computed(() => visible.value.filter((c) => selected.value.has(c.channelNo)))
 const calibratedCount = computed(() => channels.value.length)
 const staleSec = computed(() => (lastUpdate.value ? Math.round((now.value - lastUpdate.value) / 1000) : null))
 
@@ -437,10 +435,10 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
       <el-button size="small" text @click="retry">重试</el-button>
     </div>
 
-    <!-- 当前值卡片：点选要显示的螺栓（默认一颗，可多选） -->
-    <div class="chips-wrap" v-if="channels.length">
+    <!-- 当前值卡片：点选要显示的螺栓（默认一颗，可多选）。无数据的通道自动隐藏，恢复上报自动回来 -->
+    <div class="chips-wrap" v-if="visible.length">
       <div class="chips-bar">
-        <span class="chips-hint">点选要显示的螺栓 · 已选 {{ shown.length }}/{{ channels.length }}</span>
+        <span class="chips-hint">点选要显示的螺栓 · 已选 {{ shown.length }}/{{ visible.length }} · 无数据的通道自动隐藏</span>
         <div class="chips-acts">
           <span class="mini" role="button" tabindex="0" @click="selectAll" @keydown.enter="selectAll">全选</span>
           <span class="mini" role="button" tabindex="0" @click="clearSel" @keydown.enter="clearSel">清空</span>
@@ -448,10 +446,10 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
       </div>
       <div class="chips">
         <div
-          v-for="c in channels"
+          v-for="c in visible"
           :key="c.channelNo"
           class="chip"
-          :class="{ active: selected.has(c.channelNo), dim: !selected.has(c.channelNo), stale: isStale(c) }"
+          :class="{ active: selected.has(c.channelNo), dim: !selected.has(c.channelNo) }"
           role="button"
           tabindex="0"
           @click="toggleSelect(c.channelNo)"
@@ -462,17 +460,16 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
             <span class="chip-code">{{ c.code || 'CH' + c.channelNo }}</span>
             <span class="chip-ch mono">CH{{ c.channelNo }}</span>
           </div>
-          <div class="chip-val" :class="{ 'chip-val--stale': isStale(c) }">
+          <div class="chip-val">
             <b>{{ fmtVal(curOf(c), c.target) }}</b><i>{{ unitLabel }}</i>
             <span
-              v-if="!isStale(c) && chipDelta(c) != null && Math.abs(chipDelta(c) as number) >= 200"
+              v-if="chipDelta(c) != null && Math.abs(chipDelta(c) as number) >= 200"
               class="chip-arrow"
               :class="(chipDelta(c) as number) > 0 ? 'up' : 'down'"
             >{{ (chipDelta(c) as number) > 0 ? '▲' : '▼' }}</span>
           </div>
-          <div class="chip-sub" :class="{ 'chip-sub--stale': isStale(c) }">
-            <template v-if="isStale(c)">无信号 · 最后数据 {{ staleAgo(c) }}</template>
-            <template v-else>{{ chipStatus(c).label }} · 目标 {{ c.target != null ? (c.target / 1000).toFixed(1) + 'kN' : '—' }}</template>
+          <div class="chip-sub">
+            {{ chipStatus(c).label }} · 目标 {{ c.target != null ? (c.target / 1000).toFixed(1) + 'kN' : '—' }}
           </div>
         </div>
       </div>
@@ -489,6 +486,7 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
       <EChart v-if="hasData" :option="option" height="440px" />
       <div v-else-if="!loading" class="cw-empty">
         <template v-if="!channels.length">暂无已标定通道——请先在标定中心 / 螺栓详情完成标定</template>
+        <template v-else-if="!visible.length">当前无在测数据——插上探头、通道有数据后会自动出现</template>
         <template v-else-if="!shown.length">点上方卡片选择要显示的螺栓</template>
         <template v-else>正在采集…拧松 / 拧紧螺栓即可看到曲线实时升降</template>
       </div>
@@ -542,10 +540,6 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
 .chip-arrow.up { color: #10b981; }
 .chip-arrow.down { color: #f43f5e; }
 .chip-sub { font-size: 11px; color: var(--text-3); }
-/* 无信号通道：旧值置灰弱化（仅供参考），状态行给警示色 */
-.chip.stale .chip-code { color: var(--text-3); }
-.chip-val--stale b { color: var(--text-3); opacity: 0.55; text-decoration: line-through; text-decoration-thickness: 1px; }
-.chip-sub--stale { color: #f59e0b; }
 
 .chart-wrap { padding: 14px 18px 16px; }
 .cw-hd { display: flex; align-items: center; justify-content: space-between; padding: 0 2px 10px; }

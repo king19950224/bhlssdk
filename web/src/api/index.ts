@@ -348,6 +348,21 @@ export const deviceApi = {
     return http.post<{ triggered: boolean; deviceId: number; mode: string }>(
       `/api/devices/${deviceId}/diagnostic/set-mode/${mode}${q ? `?${q}` : ''}`)
   },
+  // 设备设置：默认监测组（探头在位自动建档的归属组）+ 同项目可选组列表
+  getSettings: (deviceId: number) =>
+    http.get<DeviceSettings>(`/api/devices/${deviceId}/settings/`),
+  // 设置默认监测组（reviewer+）；设置成功后后端会对当前在位未建档的通道立即补建档
+  patchSettings: (deviceId: number, defaultGroupId: number | null) =>
+    http.patch<DeviceSettingsPatchResult>(`/api/devices/${deviceId}/settings/`, { defaultGroupId }),
+}
+export interface DeviceSettings {
+  deviceId: number; projectId: number
+  defaultGroupId: number | null; defaultGroupCode: string | null
+  availableGroups: { id: number; code: string; name: string }[]
+}
+export interface DeviceSettingsPatchResult {
+  deviceId: number; defaultGroupId: number | null; defaultGroupCode: string | null
+  enrolledBolts: { channelNo: number; boltId: number; code: string }[]
 }
 
 // ---- 通道清单 / 绑定 ----
@@ -360,6 +375,8 @@ export interface ChannelRow {
 export interface UnboundSummaryRow {
   deviceId: number; channelId: number; channelNo: number; channelState: string
   count: number; firstTs: string; lastTs: string; validEchoCount: number
+  /** 在位状态机维护的硬件状态——"检测到探头"引导只认 healthy/noisy/suspect，暂存行数≠有信号 */
+  hardwareState: string
 }
 export const channelApi = {
   list: (opts: { state?: string; deviceId?: number } = {}) => {

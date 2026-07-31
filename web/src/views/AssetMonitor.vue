@@ -85,12 +85,16 @@ async function loadUnbound() {
     unboundRows.value = (await channelApi.unboundSummary()).items
   } catch { /* 引导信息，尽力加载 */ }
 }
+// 只对「在位状态机确认过探头」的通道弹引导：暂存行可能含 probe-scan 无回波样本或偶发杂散，
+// 行数多 ≠ 有信号——与点位与验收页同一口径（hardware_state 是唯一事实源）
+const PRESENT_STATES = new Set(['healthy', 'noisy', 'suspect'])
 const groupUnbound = computed<UnboundSummaryRow[]>(() => {
   if (!unboundRows.value.length) return []
   const devIds = new Set(bolts.value.map((b) => b.deviceId))
   // 组内无螺栓时无从判定该组归属设备——原先回退展示全站未绑定通道，多设备现场会把
   // 其他风机设备的堆积误导到这个空组（照着提示「建档绑定」就绑错设备）。空组不展示。
-  return devIds.size ? unboundRows.value.filter((u) => devIds.has(u.deviceId)) : []
+  if (!devIds.size) return []
+  return unboundRows.value.filter((u) => devIds.has(u.deviceId) && PRESENT_STATES.has(u.hardwareState))
 })
 const unboundTotal = computed(() => groupUnbound.value.reduce((s, u) => s + u.count, 0))
 // 展示用：按通道号去重（历史自动发现可能给同一物理通道留多条记录）、堆积多的在前、最多列 8 路
@@ -315,24 +319,27 @@ function onProjectChange() {
 
     <!-- 螺栓层：法兰圈 / 网格 -->
     <template v-else>
-      <!-- 未绑定通道引导条：现场接了探头但系统没建档，主动提示而不是"装看不见" -->
+      <!-- 在位未建档：通常因未设默认监测组；检测即螺栓开启后应很少出现 -->
       <div v-if="groupUnbound.length" class="unbound-banner panel">
         <el-icon class="ub-ic"><WarningFilled /></el-icon>
         <div class="ub-text">
-          检测到 <b class="mono">{{ unboundChLabel }}</b> 有信号但未绑定螺栓
-          <span class="ub-sub">共 {{ unboundTotal.toLocaleString() }} 条数据已暂存，建档绑定后自动回填，一条不丢</span>
+          检测到 <b class="mono">{{ unboundChLabel }}</b> 有信号但未建档
+          <span class="ub-sub">共 {{ unboundTotal.toLocaleString() }} 条数据已暂存。请到「采集设备」设置默认监测组以自动建档，或到「点位与验收」手工处理</span>
         </div>
         <div class="ub-actions">
-          <el-button size="small" @click="router.push({ name: 'identify' })">敲击识别</el-button>
+          <el-button size="small" @click="router.push({ name: 'devices' })">设置默认组</el-button>
+          <el-button size="small" @click="router.push({ name: 'identify' })">点位与验收</el-button>
           <el-button size="small" type="primary" @click="createOpen = true">建档绑定</el-button>
         </div>
       </div>
 
-      <!-- 部位工程摘要：目标/下限基准 + 状态分布计数（密集、可对比，先统计后单根） -->
+      <!-- 部位工程摘要：孔位=结构配置，监测=已建档探头（不自动同步） -->
       <div class="grp-summary panel" v-if="bolts.length">
         <div class="gs-refs">
-          <div class="gs-ref"><span class="gs-k">监测</span><b class="mono">{{ boltSummary.total }}</b><span class="gs-u">颗</span></div>
-          <div class="gs-ref gs-holes" title="修改法兰配置孔位数（多接/扩容后在此修正）" @click="editHoles">
+          <div class="gs-ref" title="已建档探头数（检测即螺栓：在位自动生成）">
+            <span class="gs-k">监测</span><b class="mono">{{ boltSummary.total }}</b><span class="gs-u">颗</span>
+          </div>
+          <div class="gs-ref gs-holes" title="法兰物理孔位配置（工程结构，不与检测数自动同步）" @click="editHoles">
             <span class="gs-k">配置孔位</span><b class="mono">{{ sel.group?.expectedBoltCount ?? '—' }}</b>
             <el-icon class="gs-edit"><Edit /></el-icon>
           </div>
@@ -366,7 +373,7 @@ function onProjectChange() {
       <div v-if="boltView === 'radar'" class="panel panel--glow ring-panel">
         <div class="panel-hd">
           <span class="panel-title"><i class="hd-mark" />法兰螺栓布置（俯视）</span>
-          <span class="hd-sub mono">{{ sel.group?.name }} · 监测 {{ bolts.length }} 颗</span>
+          <span class="hd-sub mono">{{ sel.group?.name }} · 监测 {{ bolts.length }} 颗（孔位 {{ sel.group?.expectedBoltCount ?? '—' }}）</span>
         </div>
         <div class="ring-body">
           <FlangeRadar

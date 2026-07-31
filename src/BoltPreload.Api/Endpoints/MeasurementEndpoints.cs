@@ -586,18 +586,21 @@ public static class MeasurementEndpoints
         // 未绑定测量计数（按 channel_id 汇总，运维一眼看出哪些通道在丢数据）。
         // 只报"真正在等绑定"的通道：软删通道（历史清理）与已绑螺栓的通道（遗留暂存）不算——
         // 否则法兰页/设备页的未绑定提示会拿陈年数据报假警。遗留暂存仍可经 /unbound 原始列表查看。
+        // 带回 hardware_state：前端"检测到探头未建档"引导只对在位状态机确认过的通道弹
+        //（暂存行可能含 probe-scan 期间落的无回波样本/偶发杂散，行数≠有信号）。
         chGroup.MapGet("/unbound/summary", async (NpgsqlDataSource ds, CancellationToken ct) =>
         {
             const string sql = @"
                 SELECT um.device_id, um.channel_id, um.channel_no,
                        c.state, COUNT(*) AS cnt,
                        MIN(um.ts) AS first_ts, MAX(um.ts) AS last_ts,
-                       COUNT(um.echo_time_ns) AS valid_echo
+                       COUNT(um.echo_time_ns) AS valid_echo,
+                       c.hardware_state
                 FROM unbound_measurements um
                 JOIN channels c ON c.id = um.channel_id AND c.deleted_at IS NULL
                 LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE b.id IS NULL
-                GROUP BY um.device_id, um.channel_id, um.channel_no, c.state
+                GROUP BY um.device_id, um.channel_id, um.channel_no, c.state, c.hardware_state
                 ORDER BY cnt DESC";
             await using var cmd = ds.CreateCommand(sql);
             var items = new List<object>();
@@ -613,7 +616,8 @@ public static class MeasurementEndpoints
                     count = r.GetInt64(4),
                     firstTs = r.GetDateTime(5),
                     lastTs = r.GetDateTime(6),
-                    validEchoCount = r.GetInt64(7)
+                    validEchoCount = r.GetInt64(7),
+                    hardwareState = r.GetString(8)
                 });
             }
             return Results.Ok(new { items });
@@ -835,6 +839,8 @@ public static class MeasurementEndpoints
                 }
             }
 
+            // 探头仍在位时置 auto_enroll_hold：阻止立刻自动重建；真正离位后由
+            // ChannelPresenceService 清 hold。重启不清——避免「删了重启又回来」。
             await using (var cmd = new NpgsqlCommand(@"
                 UPDATE channels
                    SET business_state = 'unbound',
@@ -842,6 +848,9 @@ public static class MeasurementEndpoints
                        k_l_uncertainty = NULL,
                        k_l_intercept_ns = NULL,
                        active_calibration_id = NULL,
+                       auto_enroll_hold = CASE
+                           WHEN hardware_state IN ('healthy', 'noisy', 'suspect') THEN true
+                           ELSE auto_enroll_hold END,
                        updated_at = now()
                  WHERE id = @channel_id", conn, tx))
             {

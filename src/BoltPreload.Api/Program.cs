@@ -164,6 +164,8 @@ builder.Services.Configure<HostOptions>(o =>
 builder.Services.Configure<ChannelPresenceOptions>(builder.Configuration.GetSection("Fx:HotPlug"));
 builder.Services.AddSingleton<ChannelPresenceTracker>();
 builder.Services.AddSingleton<IChannelPresencePublisher, SignalRChannelPresencePublisher>();
+// 检测即螺栓：在位确认且未绑定 → 自动建档（Fx:HotPlug:AutoEnroll=false 可关，走纯点位表流程）
+builder.Services.AddSingleton<BoltPreload.Api.Runtime.BoltAutoEnroller>();
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.ChannelPresenceService>();
 
 // IngestionService 作为 BackgroundService 跑
@@ -344,6 +346,7 @@ app.MapAssetEndpoints();
 app.MapDashboardEndpoints();
 app.MapProbeScanEndpoints();
 app.MapChannelEndpoints();
+app.MapDeviceSettingsEndpoints();
 app.MapCalibrationEndpoints();
 app.MapBoltEndpoints();
 app.MapAlarmEndpoints();

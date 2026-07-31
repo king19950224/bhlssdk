@@ -18,7 +18,9 @@ namespace BoltPreload.Api.Runtime;
 /// </para>
 /// <para>
 /// 职责二：消费 <see cref="ChannelPresenceTracker"/> 的在位变化事件——
-/// 更新 channels.hardware_state / last_seen_at（重启后状态可恢复），SignalR 推 OnChannelPresence 给前端。
+/// 更新 channels.hardware_state / last_seen_at / last_present_at（重启后状态可恢复），
+/// 在位且未绑定螺栓时触发 <see cref="BoltAutoEnroller"/> 自动建档（检测即螺栓，Fx:HotPlug:AutoEnroll 可关），
+/// SignalR 推 OnChannelPresence 给前端（事件带上新建螺栓编号）。
 /// </para>
 /// <para>
 /// 职责三：周期调用 <see cref="ChannelPresenceTracker.Sweep"/> 做拔出静默判定；
@@ -36,6 +38,7 @@ public sealed class ChannelPresenceService : BackgroundService
     private readonly IChannelPresencePublisher _publisher;
     private readonly ProbeScanState _probeScan;
     private readonly NpgsqlDataSource _ds;
+    private readonly BoltAutoEnroller _enroller;
     private readonly ChannelPresenceOptions _opt;
     private readonly ILogger<ChannelPresenceService> _logger;
 
@@ -48,6 +51,7 @@ public sealed class ChannelPresenceService : BackgroundService
         IChannelPresencePublisher publisher,
         ProbeScanState probeScan,
         NpgsqlDataSource ds,
+        BoltAutoEnroller enroller,
         IOptions<ChannelPresenceOptions> opt,
         ILogger<ChannelPresenceService> logger)
     {
@@ -56,6 +60,7 @@ public sealed class ChannelPresenceService : BackgroundService
         _publisher = publisher;
         _probeScan = probeScan;
         _ds = ds;
+        _enroller = enroller;
         _opt = opt.Value;
         _logger = logger;
     }
@@ -166,6 +171,10 @@ public sealed class ChannelPresenceService : BackgroundService
                     // 固定 20s 余量为零会导致在位灯抖动（详见 ChannelPresenceOptions 注释）。
                     // 验收会话期间轮询集缩小、刷新变快，仍按全通道口径取阈值——只会更稳，不会误报。
                     deviceId => _opt.EffectiveUnplugSilenceSeconds(_deviceManager.Find(deviceId)?.Options.ChannelCount ?? 0));
+
+                // 自动建档的瞬时失败（DB 抖动等）随 sweep 重试，成功或条件不再成立即出队
+                if (_opt.AutoEnroll)
+                    await _enroller.RetryPendingAsync(ct);
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex) { _logger.LogError(ex, "在位静默扫描异常"); }
@@ -200,12 +209,25 @@ public sealed class ChannelPresenceService : BackgroundService
                 try
                 {
                     var (channelId, boltId, boltCode) = await PersistAsync(change, ct);
+
+                    // 检测即螺栓：在位确认且通道无绑定螺栓 → 自动建档（编号自动、缺省规格）。
+                    // PersistAsync 已先把 hardware_state 置 healthy，enroller 事务内会复核在位+未绑定。
+                    if (change.Present && boltId is null && channelId is not null && _opt.AutoEnroll)
+                    {
+                        var enrolled = await _enroller.TryEnrollAsync(change.DeviceId, change.ChannelNo, ct);
+                        if (enrolled is not null) (boltId, boltCode) = (enrolled.BoltId, enrolled.Code);
+                    }
+
                     try { await _publisher.PublishAsync(change, channelId, boltId, boltCode, ct); }
                     catch (Exception ex) { _logger.LogDebug(ex, "在位事件推送失败 device={DeviceId} ch={Ch}", change.DeviceId, change.ChannelNo); }
 
                     if (change.Present)
                         _logger.LogInformation("探头插入 device={DeviceId} ch={Ch} bolt={Bolt}{Initial}",
                             change.DeviceId, change.ChannelNo, boltCode ?? "未绑定", change.Initial ? "（启动确认）" : "");
+                    else if (change.Initial)
+                        // 启动后的首次"无探头"确认：空口的常态 + 陈旧 hardware_state 自愈，不是告警事件
+                        _logger.LogDebug("通道无探头（启动确认）device={DeviceId} ch={Ch} bolt={Bolt}",
+                            change.DeviceId, change.ChannelNo, boltCode ?? "未绑定");
                     else
                         _logger.LogWarning("探头断开 device={DeviceId} ch={Ch} bolt={Bolt}（UI 在位显示；signal_lost 告警由 SignalHealth 独立判定）",
                             change.DeviceId, change.ChannelNo, boltCode ?? "未绑定");
@@ -221,8 +243,11 @@ public sealed class ChannelPresenceService : BackgroundService
     }
 
     /// <summary>
-    /// 更新 channels.hardware_state / last_seen_at 并带回绑定信息。
+    /// 更新 channels.hardware_state / last_seen_at / last_present_at 并带回绑定信息。
     /// 插入 → healthy；拔出 → no_data（与 probe-scan verdict→hardware_state 映射同一词表）。
+    /// last_present_at 是「曾在位」的专用标记（识别页据此区分"失联"与"待接入"）——
+    /// 只在 Present=true 时写，别的写入方没有（last_seen_at 会被任意上报刷新，语义不同）。
+    /// Present=false 时清 auto_enroll_hold（人工删除抑制：真正离位后才允许再自动建档）。
     /// 通道行可能尚未由自动发现创建（首条测量入库前）——0 行受影响时不报错，绑定信息返回空。
     /// </summary>
     private async Task<(long? ChannelId, long? BoltId, string? BoltCode)> PersistAsync(ChannelPresenceChange change, CancellationToken ct)
@@ -232,6 +257,8 @@ public sealed class ChannelPresenceService : BackgroundService
                 UPDATE channels
                    SET hardware_state = @state,
                        last_seen_at = CASE WHEN @present THEN @at ELSE last_seen_at END,
+                       last_present_at = CASE WHEN @present THEN @at ELSE last_present_at END,
+                       auto_enroll_hold = CASE WHEN @present THEN auto_enroll_hold ELSE false END,
                        updated_at = now()
                  WHERE device_id = @device_id AND channel_no = @ch AND deleted_at IS NULL
                  RETURNING id

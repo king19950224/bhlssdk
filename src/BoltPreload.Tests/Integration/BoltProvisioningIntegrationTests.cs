@@ -47,7 +47,7 @@ public sealed class BoltProvisioningIntegrationTests
         resp.StatusCode.Should().Be(HttpStatusCode.OK);
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
         var boltId = body.GetProperty("boltId").GetInt64();
-        body.GetProperty("code").GetString().Should().Be($"{s.GroupCode}-CH{s.ChannelNo:D2}", "code 缺省按 组code-CH通道号 生成");
+        body.GetProperty("code").GetString().Should().Be("通道1-5号螺栓", "code 缺省按 10 口一束的中文命名生成（CH5 → 通道1-5号）");
         body.GetProperty("backfilled").GetInt64().Should().Be(3, "绑定前暂存的 3 条测量应全部回填");
 
         // 螺栓档案落库：规格按 M16 预设（截面积 157），未标定状态
@@ -185,6 +185,36 @@ public sealed class BoltProvisioningIntegrationTests
             .StatusCode.Should().Be(HttpStatusCode.BadRequest);
         (await client.PatchAsJsonAsync("/api/monitor-groups/999999999", new { expectedBoltCount = 12 }))
             .StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    [PostgresFact]
+    public async Task PatchDeviceSettings_BackfillsPresentUnbound_ReturnsEnrolledBolts()
+    {
+        _fx.EnsureAvailable();
+
+        var s = await SeedAsync();
+        // 设备尚未设默认组；通道在位且未建档
+        var reviewerId = await SeedUserAsync("reviewer");
+
+        using var factory = TestApi.CreateFactory(_fx);
+        using var client = TestApi.AuthedClient(factory, reviewerId, "reviewer");
+
+        var resp = await client.PatchAsJsonAsync(
+            $"/api/devices/{s.DeviceId}/settings", new { defaultGroupId = s.GroupId });
+
+        resp.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        body.GetProperty("defaultGroupId").GetInt64().Should().Be(s.GroupId);
+        var enrolled = body.GetProperty("enrolledBolts");
+        enrolled.GetArrayLength().Should().Be(1, "在位未建档通道应立即补建档");
+        enrolled[0].GetProperty("channelNo").GetInt32().Should().Be(s.ChannelNo);
+        enrolled[0].GetProperty("code").GetString().Should().Be("通道1-5号螺栓");
+
+        (await ScalarAsync<long>(
+            "SELECT count(*) FROM bolts WHERE channel_id = @p0 AND deleted_at IS NULL", s.ChannelId))
+            .Should().Be(1);
+        (await ScalarAsync<long?>("SELECT default_group_id FROM devices WHERE id = @p0", s.DeviceId))
+            .Should().Be(s.GroupId);
     }
 
     // ===================== seed =====================
