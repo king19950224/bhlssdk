@@ -97,7 +97,7 @@ flowchart LR
 - **有效期从【激活】起算**：正式载荷标定 `expires_at` 在会签（countersign）时按 `CURRENT_DATE + (expires_at - created_at::date)` 重锚，
   审核期不消耗有效期（久审后的标定不会一激活就临近过期）。
 - **通道标定缓存随绑定关系清理**：unbind 与 move 的【源通道】都要清空 `k_l / k_l_uncertainty / k_l_intercept_ns / active_calibration_id`
-  （[MeasurementEndpoints](../src/BoltPreload.Api/Endpoints/MeasurementEndpoints.cs)），避免空通道仍显示 calibrated 或下次绑定误用旧 K_L。
+  （[BoltBindingEndpoints](../src/BoltPreload.Api/Endpoints/BoltBindingEndpoints.cs)），避免空通道仍显示 calibrated 或下次绑定误用旧 K_L。
 - **状态机闭环**：`pending` 有两条出口——countersign（异人激活，写通道 + supersede 旧标定）或 reject（置 `rejected`，不激活、不动通道）；
   两条出口都写审计。四眼底线：countersign 会签人必须 ≠ 提交人。
 

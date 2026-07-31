@@ -479,7 +479,8 @@ bhlssdk/
 3. 禁止修改 `external/FxSDK/` 下的 `.cs` 文件；需要扩展行为时在 `BoltPreload.Fx` 适配层实现；
 4. K_L 量纲约定：全系统 `K_L = Δt/F`，单位 ns/N，量级约 1e-4。标定证书上 1/N 量纲（约 1e-11）的数值不可直接录入，接口已设量级护栏，详见 sdk-api-facts.md §12；
 5. 工程开启编译警告即错误（TreatWarningsAsErrors），提交前须保证 `dotnet build` 无警告、`dotnet test` 全部通过；
-6. 连接串、JWT 密钥、license 公钥等敏感配置不得提交仓库。开发环境置于 `appsettings.Development.json`（已 gitignore），生产环境通过环境变量（如 `ConnectionStrings__Postgres`）或 user-secrets 注入。
+6. 连接串、JWT 密钥、license 公钥等敏感配置不得提交仓库。开发环境置于 `appsettings.Development.json`（已 gitignore），生产环境通过环境变量（如 `ConnectionStrings__Postgres`）或 user-secrets 注入；
+7. 提交/接手前跑 `python3 tools/code-audit.py`（零依赖）复核代码卫生：后端 public 类型注释覆盖、前端文件头注释、活文档引用有效性、TODO/调试残留等五类门禁须全部归零。豁免清单与理由内联在脚本头部，新增豁免必须写明原因。
 
 ## 9. 常见问题
 
