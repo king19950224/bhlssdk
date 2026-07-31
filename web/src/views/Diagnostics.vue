@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 页面:信号诊断(复核员+)——A-Scan 波形查看与参考对比、通道参数读回核对。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import EChart from '../components/EChart.vue'

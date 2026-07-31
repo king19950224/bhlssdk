@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 标定对话框:快速标定(直接录 K_L)与扭矩分步标定(逐档加扭矩取样拟合),均为自签临时标定,正式载荷标定须异人会签。
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { calibrationApi, boltApi, reportApi, type CalibRecord, type TorqueTestPoint, type TorqueFitSummary } from '../api'
@@ -337,3 +338,4 @@ async function downloadReport(id: number) {
 .rv-pending { color: var(--warn); border-color: var(--warn); }
 .rv-rej { color: var(--crit); border-color: var(--crit); }
 </style>
+g

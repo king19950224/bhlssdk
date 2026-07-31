@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 应用外壳:侧边导航 + 顶栏(设备/采集/告警状态灯、实时连接指示、用户菜单),登录后所有页面都套在这里面。
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'

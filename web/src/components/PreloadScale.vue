@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 预紧力刻度条:当前值指针 + 目标/下限刻度,直观显示单栓预紧力位于安全区间的位置。
 import { computed } from 'vue'
 import { fmtN } from '../utils/preload'
 

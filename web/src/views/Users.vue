@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 页面:用户管理(仅管理员)——建号、停启用、角色分配。
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { userApi, type UserRow } from '../api'

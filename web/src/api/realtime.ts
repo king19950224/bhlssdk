@@ -1,3 +1,4 @@
+// SignalR 实时通道:连接生命周期管理(懒启动/自动重连/登出关闭)与按事件类型的订阅分发。
 import * as signalR from '@microsoft/signalr'
 import { ref } from 'vue'
 import { getAuthToken } from './client'
@@ -80,7 +81,7 @@ export async function stopRealtime(): Promise<void> {
   if (c) { try { await c.stop() } catch { /* ignore */ } }
 }
 
-/** 订阅事件，返回取消订阅函数（组件 onUnmounted 调用）。 */
+/** 订阅一类实时事件,返回退订函数(组件 onUnmounted 时调用,防泄漏)。 */
 export function onRealtime<K extends keyof EventMap>(evt: K, handler: (p: EventMap[K]) => void): () => void {
   const h = handler as (p: unknown) => void
   handlers[evt].add(h)

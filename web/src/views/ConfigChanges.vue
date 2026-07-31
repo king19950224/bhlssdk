@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 页面:配置变更——通道配置变更申请的待审列表与复核/驳回(会签流),含读回验证状态。
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { configChangeApi, type ConfigChange } from '../api'

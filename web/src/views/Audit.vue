@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 页面:审计日志(复核员+)——全库操作流水,按动作/时间检索。
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { auditApi, type AuditEntry } from '../api'

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 页面:总览——全场预紧力健康统计、分组健康、松动 TOP、残余分布与告警趋势。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 监测组预紧力趋势图:组内各螺栓 24h/7d 曲线叠画,按状态着色。
 import { ref, computed, onMounted, watch } from 'vue'
 import EChart from './EChart.vue'
 import { boltApi, type GroupBolt } from '../api'

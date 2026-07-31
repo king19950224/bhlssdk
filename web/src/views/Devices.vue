@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 页面:设备管理——连接状态、通道在位矩阵与绑定情况、探头热插拔提示、默认监测组设置。
 import { onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
