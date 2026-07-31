@@ -101,7 +101,7 @@ async function sign() {
   signing.value = true
   try {
     await reportApi.sign(id)
-    ElMessage.success('已审核签发,报告已锁定')
+    ElMessage.success('已审核签发，报告已锁定')
     await load()
   } catch (e) {
     ElMessage.error((e as Error)?.message || '签发失败')

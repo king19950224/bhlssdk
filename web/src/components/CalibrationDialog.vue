@@ -115,7 +115,7 @@ async function submitQuick() {
   if (quick.kL < 1e-6 || quick.kL > 1e-2) {
     try {
       await ElMessageBox.confirm(
-        `kL=${quick.kL} 偏离常见量级(约 1e-4 ns/N)。请确认按本系统 ns/N 约定填写,而非标定证书的 1/N 约定。继续提交？`,
+        `kL=${quick.kL} 偏离常见量级（约 1e-4 ns/N）。请确认按本系统 ns/N 约定填写，而非标定证书的 1/N 约定。继续提交？`,
         'kL 量级确认', { type: 'warning', confirmButtonText: '确认提交', cancelButtonText: '返回修改' })
     } catch { return }
   }

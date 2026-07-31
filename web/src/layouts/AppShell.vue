@@ -164,7 +164,7 @@ async function submitChangePwd() {
   try {
     await authApi.changePassword(pwd.oldPassword, pwd.newPassword)
     pwd.visible = false
-    ElMessage.success('密码已修改,请用新密码重新登录')
+    ElMessage.success('密码已修改，请用新密码重新登录')
     // 改密后服务端已吊销全部旧令牌,本地直接清会话回登录页
     await stopRealtime()
     auth.clearLocal()
@@ -277,7 +277,7 @@ function onUserCommand(c: string) {
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item command="changePwd"><el-icon><Lock /></el-icon> 修改密码</el-dropdown-item>
-              <el-dropdown-item command="sound"><el-icon><BellFilled /></el-icon> 告警提示音:{{ soundOn ? '开' : '关' }}</el-dropdown-item>
+              <el-dropdown-item command="sound"><el-icon><BellFilled /></el-icon> 告警提示音：{{ soundOn ? '开' : '关' }}</el-dropdown-item>
               <el-dropdown-item command="logout" divided><el-icon><SwitchButton /></el-icon> 退出登录</el-dropdown-item>
             </el-dropdown-menu>
           </template>

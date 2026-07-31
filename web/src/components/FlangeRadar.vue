@@ -106,7 +106,7 @@ const holes = computed<Hole[]>(() => {
 const conflictHoles = computed(() => holes.value.filter((h) => h.others.length > 0))
 const conflictDesc = computed(() =>
   conflictHoles.value
-    .map((h) => `${h.seq}号(${[h.bolt!, ...h.others].map((b) => b.code).join('、')})`)
+    .map((h) => `${h.seq}号（${[h.bolt!, ...h.others].map((b) => b.code).join('、')}）`)
     .join('；'),
 )
 // 监测数超过配置孔位：圆盘已按实际数自适应，但配置很可能没跟上现场

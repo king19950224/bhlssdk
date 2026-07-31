@@ -116,7 +116,7 @@ async function setBaseline() {
   if (!echoStable.value) {
     try {
       await ElMessageBox.confirm(
-        `当前信号波动${echoSpreadNs.value != null ? ` ${echoSpreadNs.value.toFixed(1)} ns` : ''}偏大,基线可能不可靠。建议检查探头耦合后等待显示"稳定"再记录。仍要以当前读数设基线吗？`,
+        `当前信号波动${echoSpreadNs.value != null ? ` ${echoSpreadNs.value.toFixed(1)} ns` : ''}偏大，基线可能不可靠。建议检查探头耦合后等待显示"稳定"再记录。仍要以当前读数设基线吗？`,
         '信号未达稳定判据', { type: 'warning', confirmButtonText: '仍要记录', cancelButtonText: '再等等' })
     } catch { return }
   }
@@ -135,7 +135,7 @@ async function setBaseline() {
       emit('done')
     }
   } catch (e) {
-    errText.value = (e as Error)?.message || '记录基准失败(设备需在线且声时稳定)'
+    errText.value = (e as Error)?.message || '记录基准失败（设备需在线且声时稳定）'
   } finally {
     busy.value = false
   }
@@ -160,7 +160,7 @@ let sampleTimer: number | undefined
 let samplingStartedAt = 0
 
 async function startCalibrate() {
-  if (torque.torqueNm == null || torque.torqueNm <= 0) return ElMessage.warning('请输入拧紧时使用的扭矩(N·m)')
+  if (torque.torqueNm == null || torque.torqueNm <= 0) return ElMessage.warning('请输入拧紧时使用的扭矩（N·m）')
   step.value = 'calibrating'
   errText.value = ''
   sampleCount.value = 0
@@ -180,7 +180,7 @@ async function startCalibrate() {
       if (Date.now() - samplingStartedAt > SAMPLE_TIMEOUT_MS) {
         if (sampleTimer) { clearInterval(sampleTimer); sampleTimer = undefined }
         stopPoll()
-        errText.value = `采样超时:${Math.round(SAMPLE_TIMEOUT_MS / 60000)} 分钟内有效声时样本不足(${sampleCount.value}/${SAMPLE_TARGET})。请确认设备在线、探头耦合正常后重试。`
+        errText.value = `采样超时：${Math.round(SAMPLE_TIMEOUT_MS / 60000)} 分钟内有效声时样本不足（${sampleCount.value}/${SAMPLE_TARGET}）。请确认设备在线、探头耦合正常后重试。`
         step.value = 'torque-input'
       }
     } catch { /* 下轮再试 */ }
@@ -194,7 +194,7 @@ async function submitTorque() {
     await calibrationApi.torqueCalibrate(props.channelId, {
       torqueNm: torque.torqueNm!,
       sampleWindowSeconds: SAMPLE_WINDOW_SEC,
-      note: `引导标定:安装扭矩 ${torque.torqueNm} N·m(向导流程:零载基线+扭矩反推)`,
+      note: `引导标定：安装扭矩 ${torque.torqueNm} N·m(向导流程：零载基线+扭矩反推)`,
     })
     bolt.value = await boltApi.get(props.boltId!)
     step.value = 'done'
@@ -232,36 +232,36 @@ const doneKn = computed(() => {
 
     <!-- 场景选择 -->
     <template v-if="step === 'scene'">
-      <p class="wz-lead">标定的作用:告诉系统"这颗螺栓拧到多紧时声音走多快",之后系统才能把超声读数换算成预紧力。请选择这颗螺栓的实际情况:</p>
+      <p class="wz-lead">标定的作用：告诉系统"这颗螺栓拧到多紧时声音走多快"，之后系统才能把超声读数换算成预紧力。请选择这颗螺栓的实际情况：</p>
       <div class="scene-cards">
         <div class="scene-card" @click="chooseScene('fresh')">
-          <div class="sc-head"><el-icon><CircleCheckFilled /></el-icon> 新安装,或允许松开重新拧紧<span class="sc-tag">推荐</span></div>
-          <div class="sc-body">两步完成:先在<b>未拧紧</b>状态记录基准,再拧紧到位并输入扭矩。标定后即可显示预紧力数值。</div>
-          <div class="sc-req">需要:力矩扳手 · 全程约 3~5 分钟(不含拧紧时间)</div>
+          <div class="sc-head"><el-icon><CircleCheckFilled /></el-icon> 新安装，或允许松开重新拧紧<span class="sc-tag">推荐</span></div>
+          <div class="sc-body">两步完成：先在<b>未拧紧</b>状态记录基准，再拧紧到位并输入扭矩。标定后即可显示预紧力数值。</div>
+          <div class="sc-req">需要：力矩扳手 · 全程约 3~5 分钟（不含拧紧时间）</div>
         </div>
         <div class="scene-card" @click="chooseScene('inservice')">
-          <div class="sc-head"><el-icon><View /></el-icon> 已拧紧在役,不能松开</div>
-          <div class="sc-body">把<b>当前状态记录为基准</b>,系统持续监测它相对现在是变松还是变紧(趋势与告警可用,<b>不显示绝对吨位</b>)。待检修窗口可升级为完整标定。</div>
-          <div class="sc-req">需要:无工具 · 1 分钟</div>
+          <div class="sc-head"><el-icon><View /></el-icon> 已拧紧在役，不能松开</div>
+          <div class="sc-body">把<b>当前状态记录为基准</b>，系统持续监测它相对现在是变松还是变紧（趋势与告警可用，<b>不显示绝对吨位</b>）。待检修窗口可升级为完整标定。</div>
+          <div class="sc-req">需要：无工具 · 1 分钟</div>
         </div>
       </div>
       <div class="wz-foot-links">
-        <span class="link" @click="resumeAfterTighten">已做过第一步基准,直接输入扭矩 →</span>
-        <span class="link dim" @click="emit('expert'); close()">专家模式(载荷标定/手动参数)</span>
+        <span class="link" @click="resumeAfterTighten">已做过第一步基准，直接输入扭矩 →</span>
+        <span class="link dim" @click="emit('expert'); close()">专家模式（载荷标定/手动参数）</span>
       </div>
     </template>
 
     <!-- 基准确认 + 实时稳定性 -->
     <template v-else-if="step === 'baseline-confirm' || step === 'baseline-sampling'">
-      <div class="wz-stepline">{{ scene === 'fresh' ? '第 1 步 / 共 3 步:记录未拧紧基准' : '记录当前状态为基准' }}</div>
+      <div class="wz-stepline">{{ scene === 'fresh' ? '第 1 步 / 共 3 步：记录未拧紧基准' : '记录当前状态为基准' }}</div>
       <p class="wz-lead" v-if="scene === 'fresh'">
-        请确认螺栓处于<b>未拧紧</b>状态(刚穿入、螺母仅手拧贴合,不受力)。确认后点下方按钮,系统会把当前的超声读数记录为"零载基准"。
+        请确认螺栓处于<b>未拧紧</b>状态（刚穿入、螺母仅手拧贴合，不受力）。确认后点下方按钮，系统会把当前的超声读数记录为"零载基准"。
       </p>
       <p class="wz-lead warn-lead" v-if="scene === 'fresh' && bolt?.state === 'calibrated'">
-        注意:该螺栓已在监测中,松开它会触发"预紧力脱落"告警。请先到告警中心对它做<b>维护抑制</b>(填写检修原因),再松开重标,避免值班误响应。
+        注意：该螺栓已在监测中，松开它会触发"预紧力脱落"告警。请先到告警中心对它做<b>维护抑制</b>（填写检修原因），再松开重标，避免值班误响应。
       </p>
       <p class="wz-lead" v-else>
-        无需任何操作,系统将把<b>此刻</b>的超声读数记录为比较基准。之后页面上会显示这颗螺栓相对现在的松紧变化。
+        无需任何操作，系统将把<b>此刻</b>的超声读数记录为比较基准。之后页面上会显示这颗螺栓相对现在的松紧变化。
       </p>
       <div class="live-box">
         <div class="lb-row">
@@ -275,42 +275,42 @@ const doneKn = computed(() => {
         <div class="lb-row">
           <span class="lb-k">信号稳定性</span>
           <b v-if="echoSpreadNs == null" class="dim">评估中…</b>
-          <b v-else-if="echoStable" style="color: var(--ok)">稳定(波动 {{ echoSpreadNs.toFixed(1) }} ns)</b>
-          <b v-else style="color: var(--warn)">波动较大({{ echoSpreadNs.toFixed(1) }} ns),请检查探头耦合后再试</b>
+          <b v-else-if="echoStable" style="color: var(--ok)">稳定（波动 {{ echoSpreadNs.toFixed(1) }} ns）</b>
+          <b v-else style="color: var(--warn)">波动较大（{{ echoSpreadNs.toFixed(1) }} ns），请检查探头耦合后再试</b>
         </div>
       </div>
       <div class="wz-actions">
         <el-button @click="step = 'scene'; stopPoll()">上一步</el-button>
         <el-button type="primary" :loading="busy" :disabled="liveEcho == null" @click="setBaseline">
-          {{ scene === 'fresh' ? '确认未拧紧,记录基准' : '记录当前为基准' }}
+          {{ scene === 'fresh' ? '确认未拧紧，记录基准' : '记录当前为基准' }}
         </el-button>
       </div>
     </template>
 
     <!-- A:去拧紧 -->
     <template v-else-if="step === 'tighten'">
-      <div class="wz-stepline">第 2 步 / 共 3 步:拧紧螺栓</div>
-      <div class="wz-ok-note"><el-icon><CircleCheckFilled /></el-icon> 基准已记录({{ baselineResult ? baselineResult.refNs.toFixed(0) + ' ns' : '' }})</div>
+      <div class="wz-stepline">第 2 步 / 共 3 步：拧紧螺栓</div>
+      <div class="wz-ok-note"><el-icon><CircleCheckFilled /></el-icon> 基准已记录（{{ baselineResult ? baselineResult.refNs.toFixed(0) + ' ns' : '' }}）</div>
       <p class="wz-lead">
-        现在请按安装工艺,用力矩扳手把螺栓<b>拧紧到规定扭矩</b>。<br />
-        拧紧期间可以关闭本窗口——回来后在向导首页点“已做过第一步基准,直接输入扭矩”继续。
+        现在请按安装工艺，用力矩扳手把螺栓<b>拧紧到规定扭矩</b>。<br />
+        拧紧期间可以关闭本窗口——回来后在向导首页点“已做过第一步基准，直接输入扭矩”继续。
       </p>
       <div class="wz-actions">
-        <el-button @click="close">先去拧紧,稍后继续</el-button>
-        <el-button type="primary" @click="step = 'torque-input'">已拧紧完成,下一步</el-button>
+        <el-button @click="close">先去拧紧，稍后继续</el-button>
+        <el-button type="primary" @click="step = 'torque-input'">已拧紧完成，下一步</el-button>
       </div>
     </template>
 
     <!-- A:输入扭矩 -->
     <template v-else-if="step === 'torque-input'">
-      <div class="wz-stepline">第 3 步 / 共 3 步:输入安装扭矩</div>
-      <p class="wz-lead">输入刚才拧紧时力矩扳手设定的扭矩值,系统将自动完成换算与标定:</p>
+      <div class="wz-stepline">第 3 步 / 共 3 步：输入安装扭矩</div>
+      <p class="wz-lead">输入刚才拧紧时力矩扳手设定的扭矩值，系统将自动完成换算与标定：</p>
       <div class="torque-row">
         <el-input-number v-model="torque.torqueNm" :min="1" :step="10" :precision="0" size="large" style="width: 220px" />
         <span class="torque-unit">N·m</span>
-        <span v-if="bolt?.installTorqueNm" class="dim">(档案记录的安装扭矩:{{ Number(bolt.installTorqueNm).toFixed(0) }} N·m)</span>
+        <span v-if="bolt?.installTorqueNm" class="dim">（档案记录的安装扭矩：{{ Number(bolt.installTorqueNm).toFixed(0) }} N·m）</span>
       </div>
-      <p class="wz-hint">提交后系统会连续采集测量数据取平均(约 1~3 分钟,取决于设备轮询的通道数),期间请勿再扳动螺栓。</p>
+      <p class="wz-hint">提交后系统会连续采集测量数据取平均（约 1~3 分钟，取决于设备轮询的通道数），期间请勿再扳动螺栓。</p>
       <div class="wz-actions">
         <el-button @click="step = 'scene'">返回</el-button>
         <el-button type="primary" :disabled="torque.torqueNm == null" @click="startCalibrate">开始标定</el-button>
@@ -319,7 +319,7 @@ const doneKn = computed(() => {
 
     <!-- A:采样计算中 -->
     <template v-else-if="step === 'calibrating'">
-      <div class="wz-stepline">正在标定,请勿扳动螺栓…</div>
+      <div class="wz-stepline">正在标定，请勿扳动螺栓…</div>
       <div class="prog-box">
         <el-progress :percentage="Math.min(100, Math.round((sampleCount / SAMPLE_TARGET) * 100))" :stroke-width="14" striped striped-flow />
         <p class="dim">已采集 {{ sampleCount }}/{{ SAMPLE_TARGET }} 个稳定测量样本
@@ -335,12 +335,12 @@ const doneKn = computed(() => {
         <h3>标定完成</h3>
         <div class="done-kpi" v-if="doneKn">
           当前预紧力 <b>{{ doneKn }} kN</b>
-          <template v-if="doneRatioPct">(为目标的 <b>{{ doneRatioPct }}</b>)</template>
+          <template v-if="doneRatioPct">（为目标的 <b>{{ doneRatioPct }}</b>）</template>
         </div>
-        <div class="done-kpi dim" v-else>预紧力将在下一次测量后显示(几秒内)</div>
+        <div class="done-kpi dim" v-else>预紧力将在下一次测量后显示（几秒内）</div>
         <p class="done-note">
-          本次为<b>扭矩法现场标定</b>(可信等级:临时),已可用于日常监测与告警。<br />
-          正式验收如需计量级数据,请在实验室用载荷标定替换(专家模式)。
+          本次为<b>扭矩法现场标定</b>（可信等级：临时），已可用于日常监测与告警。<br />
+          正式验收如需计量级数据，请在实验室用载荷标定替换（专家模式）。
         </p>
         <el-button type="primary" @click="close">完成</el-button>
       </div>
@@ -350,10 +350,10 @@ const doneKn = computed(() => {
     <template v-else-if="step === 'done-rel'">
       <div class="done-box">
         <el-icon class="done-ic"><CircleCheckFilled /></el-icon>
-        <h3>基准已记录,趋势监测已开启</h3>
+        <h3>基准已记录，趋势监测已开启</h3>
         <p class="done-note">
-          螺栓详情页将显示它相对当前状态的<b>松紧变化</b>(偏松/偏紧/基线附近)。<br />
-          由于未做载荷标定,暂不显示绝对预紧力数值;待检修窗口允许松开复拧时,重新运行本向导选第一项即可升级。
+          螺栓详情页将显示它相对当前状态的<b>松紧变化</b>（偏松/偏紧/基线附近）。<br />
+          由于未做载荷标定，暂不显示绝对预紧力数值；待检修窗口允许松开复拧时，重新运行本向导选第一项即可升级。
         </p>
         <el-button type="primary" @click="close">完成</el-button>
       </div>

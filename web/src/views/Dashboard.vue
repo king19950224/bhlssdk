@@ -257,7 +257,7 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
         </div>
         <div v-if="overTension > 0" class="vd-chip">
           <b class="metric" style="color:#a78bfa">{{ overTension }}</b>
-          <span>偏高(&gt;110%)</span>
+          <span>偏高（&gt;110%）</span>
         </div>
       </div>
     </div>

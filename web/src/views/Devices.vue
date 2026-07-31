@@ -364,7 +364,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
       </div>
       <div v-if="selected.state !== 'Connected'" class="offline-note">
         <el-icon><WarningFilled /></el-icon>
-        设备当前{{ DEV_STATE[selected.state] || selected.state }},以下为最后一次已知快照;模式下发/自动检测/重标定需设备在线后执行。
+        设备当前{{ DEV_STATE[selected.state] || selected.state }}，以下为最后一次已知快照；模式下发/自动检测/重标定需设备在线后执行。
       </div>
       <el-tabs v-model="tab" class="dev-tabs">
         <!-- 通道健康 -->

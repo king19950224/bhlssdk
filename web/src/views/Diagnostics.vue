@@ -282,7 +282,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
       <EChart v-if="cur" :option="ascanOption" height="300px" />
       <div v-else class="ascan-empty" v-loading="loadingCmp">
         <el-icon><TrendCharts /></el-icon>
-        <span>{{ loading ? '加载中…' : error ? '波形加载失败,请点上方“重试”。' : '暂无波形数据。设备产生带波形的测量后,可在此实时回放并对比 A-Scan。' }}</span>
+        <span>{{ loading ? '加载中…' : error ? '波形加载失败，请点上方“重试”。' : '暂无波形数据。设备产生带波形的测量后，可在此实时回放并对比 A-Scan。' }}</span>
       </div>
 
       <div v-if="curStats" class="ascan-legend">
@@ -315,7 +315,7 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
           <span class="mono dim">{{ f.pointCount }}</span>
         </div>
         <div v-if="!loading && !error && !features.length" class="tbl-empty">
-          <span class="led led--off" /> 暂无波形特征。带波形采集启用后,这里展示 SNR / 峰峰值 / 噪声等信号质量指标。
+          <span class="led led--off" /> 暂无波形特征。带波形采集启用后，这里展示 SNR / 峰峰值 / 噪声等信号质量指标。
         </div>
       </div>
     </div>

@@ -37,9 +37,9 @@ const ST: Record<string, { label: string; color: string }> = {
 }
 // 通道超声参数的中文名（与后端 ChannelConfigUpdate 字段一一对应；历史数据可能存 PascalCase,统一小写匹配）
 const PARAM_LABEL: Record<string, string> = {
-  probefreqmhz: '探头频率(MHz)', gain: '增益(dB)', threshold: '检波阈值', measmode: '测量模式',
-  echowinns: '回波窗(ns)', echowidthus: '回波宽度(μs)', tcmode: '温补模式', tempcoefficient: '温度系数',
-  reftimens: '参考声时(ns)', reftempc: '参考温度(°C)',
+  probefreqmhz: '探头频率（MHz）', gain: '增益（dB）', threshold: '检波阈值', measmode: '测量模式',
+  echowinns: '回波窗（ns）', echowidthus: '回波宽度（μs）', tcmode: '温补模式', tempcoefficient: '温度系数',
+  reftimens: '参考声时（ns）', reftempc: '参考温度（°C）',
 }
 const paramName = (k: string) => PARAM_LABEL[k.toLowerCase()] || k
 
@@ -81,7 +81,7 @@ async function approve(c: ConfigChange) {
 async function reject(c: ConfigChange) {
   let value: string
   try {
-    ;({ value } = await ElMessageBox.prompt(`驳回变更 #${c.id},请填写原因:`, '驳回', {
+    ;({ value } = await ElMessageBox.prompt(`驳回变更 #${c.id}，请填写原因：`, '驳回', {
       inputType: 'textarea', confirmButtonText: '驳回', cancelButtonText: '取消',
       inputValidator: (v) => (v && v.trim() ? true : '请填写驳回原因'),
     }))
@@ -90,7 +90,7 @@ async function reject(c: ConfigChange) {
 }
 async function execute(c: ConfigChange) {
   try {
-    await ElMessageBox.confirm(`执行下发变更 #${c.id} 到设备?`, '执行', { type: 'warning', confirmButtonText: '执行下发', cancelButtonText: '取消' })
+    await ElMessageBox.confirm(`执行下发变更 #${c.id} 到设备？`, '执行', { type: 'warning', confirmButtonText: '执行下发', cancelButtonText: '取消' })
   } catch { return }
   act(c.id, () => configChangeApi.execute(c.id), '已下发')
 }

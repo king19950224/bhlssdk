@@ -33,7 +33,7 @@ const liveSeries = ref<{ t: number; v: number }[]>([])
 // 实时最新测量时刻（SignalR/轮询驱动）：让头部 KPI 与陈旧度判定随实时数据更新,而非停在页面加载那一刻
 const liveTs = ref<string | null>(null)
 
-const MEAS_MODE: Record<number, string> = { 0: '自动峰值', 1: '位置法(RefTime)', 2: '阈值法' }
+const MEAS_MODE: Record<number, string> = { 0: '自动峰值', 1: '位置法（RefTime）', 2: '阈值法' }
 const TC_MODE: Record<number, string> = { 0: '不补偿', 1: '材料补偿', 2: '自定义系数' }
 // 设备测量状态码（SDK ChannelResult 口径）：0 正常,负值为各类信号异常
 const STATUS_CODE: Record<number, string> = {
@@ -282,7 +282,7 @@ async function setBaseline() {
   if (!c) return
   try {
     await ElMessageBox.confirm(
-      '将把【当前回波声时】设为该螺栓的零载/参考基线(RefTime)。之后回波偏早=偏松、偏晚=偏紧。请在螺栓已拧到目标状态时执行。',
+      '将把【当前回波声时】设为该螺栓的零载/参考基线（RefTime）。之后回波偏早=偏松、偏晚=偏紧。请在螺栓已拧到目标状态时执行。',
       '设为基线', { confirmButtonText: '设为基线', cancelButtonText: '取消', type: 'warning' })
   } catch { return }
   baselining.value = true
@@ -293,7 +293,7 @@ async function setBaseline() {
     // 基线变了，旧基线算出的实时序列不再可比：清空重新累计，避免曲线出现悬崖式跳变误导现场
     liveSeries.value = []
   } catch (e) {
-    ElMessage.error((e as Error)?.message || '设基线失败(需复核员权限,或设备未测出稳定声时)')
+    ElMessage.error((e as Error)?.message || '设基线失败（需复核员权限，或设备未测出稳定声时）')
   } finally {
     baselining.value = false
   }
@@ -690,7 +690,7 @@ async function exportTrendCsv() {
     <!-- 未标定引导横幅:告诉客户"下一步做什么",而不是让页面停在一排 — -->
     <div v-if="bolt && !bolt.calibrated && !loading" class="calib-cta">
       <el-icon><InfoFilled /></el-icon>
-      <span>该螺栓尚未标定,暂无法显示预紧力。完成标定后自动开始监测(现场约 3~5 分钟)。</span>
+      <span>该螺栓尚未标定，暂无法显示预紧力。完成标定后自动开始监测（现场约 3~5 分钟）。</span>
       <el-button v-if="auth.isReviewer" size="small" type="primary" @click="wizardOpen = true">开始标定</el-button>
       <span v-else class="dim">请联系复核员执行标定</span>
     </div>
@@ -768,7 +768,7 @@ async function exportTrendCsv() {
             <span class="cm-i">
               <template v-if="isStale">数据陈旧 · 暂不预测</template>
               <template v-else-if="prediction?.trend === 'falling' && prediction.days != null">约 {{ Math.max(0, Math.round(prediction.days)) }} 天到下限</template>
-              <template v-else-if="prediction?.trend === 'insufficient'">样本不足({{ prediction.samples }})</template>
+              <template v-else-if="prediction?.trend === 'insufficient'">样本不足（{{ prediction.samples }}）</template>
               <template v-else>近{{ prediction?.windowDays ?? 7 }}天{{ prediction?.r2 != null ? ' · R² ' + prediction.r2.toFixed(2) : '' }}</template>
             </span>
           </div>
@@ -813,10 +813,10 @@ async function exportTrendCsv() {
         <el-icon><component :is="prediction.trend === 'falling' ? 'Bottom' : prediction.trend === 'rising' ? 'Top' : 'Minus'" /></el-icon>
         <span v-if="prediction.trend === 'falling'">
           预紧力下降中 · 约 {{ Math.abs(prediction.perDay).toFixed(0) }} N/天 ·
-          <b>预计 {{ prediction.days != null ? Math.max(0, Math.round(prediction.days)) : '—' }} 天后到下限</b>,建议安排复拧
+          <b>预计 {{ prediction.days != null ? Math.max(0, Math.round(prediction.days)) : '—' }} 天后到下限</b>，建议安排复拧
         </span>
         <span v-else-if="prediction.trend === 'rising'">预紧力趋势上升 · 约 {{ prediction.perDay.toFixed(0) }} N/天</span>
-        <span v-else>趋势平稳,近 {{ prediction.windowDays }} 天无明显松动风险</span>
+        <span v-else>趋势平稳，近 {{ prediction.windowDays }} 天无明显松动风险</span>
         <span class="predict-conf">基于近 {{ prediction.windowDays }} 天 · {{ prediction.samples }} 点{{ prediction.r2 != null ? ' · 拟合 R² ' + prediction.r2.toFixed(2) : '' }}</span>
       </div>
     </div>
@@ -850,7 +850,7 @@ async function exportTrendCsv() {
         <span class="tight-dt">相对基线 ΔTOF <b class="mono" :style="`color:${tightness.color}`">{{ (tightness.dt >= 0 ? '+' : '') + tightness.dt.toFixed(1) }} ns</b><template v-if="tightness.dF != null"> · ≈ <b class="mono" :style="`color:${tightness.color}`">{{ signedN(tightness.dF) }} N</b></template></span>
         <span class="tight-hint">{{ tightness.band === 'loose' ? '回波偏早 → 预紧力下降 / 松动方向' : tightness.band === 'tight' ? '回波偏晚 → 预紧力高于基线' : '回波在基线附近 · 稳定' }}</span>
       </div>
-      <div v-else-if="wave" class="tight-bar tight-nobase">未设基线 — 拧到目标状态后点“设当前为基线”,之后即可看松紧</div>
+      <div v-else-if="wave" class="tight-bar tight-nobase">未设基线 — 拧到目标状态后点“设当前为基线”，之后即可看松紧</div>
 
       <EChart v-if="wave" :option="ascanOption" height="240px" />
       <div v-if="waveStats" class="ascan-legend">
@@ -862,7 +862,7 @@ async function exportTrendCsv() {
         <span v-if="waveStats.refInWin" class="lg"><i class="lg-line" style="background:#22d3ee;border-top:1px dashed #22d3ee;background:none" />基线 {{ Number(waveStats.refNs).toFixed(0) }}ns</span>
         <span v-if="waveStats.gate" class="lg"><i class="lg-area" />测量闸门</span>
       </div>
-      <div v-if="!wave" class="chart-empty">该通道暂无回波波形(仅开启波形采样的通道上传波形)</div>
+      <div v-if="!wave" class="chart-empty">该通道暂无回波波形（仅开启波形采样的通道上传波形）</div>
     </div>
 
     <!-- 通道超声参数 + 标定基线 -->
@@ -870,7 +870,7 @@ async function exportTrendCsv() {
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />通道超声参数 · 标定基线</span>
         <!-- 提交参数变更请求走 diagnostic 组，后端要求 reviewer+：非复核员隐藏 -->
-        <el-button v-if="auth.isReviewer" size="small" @click="openAdjust"><el-icon><MagicStick /></el-icon> 调整参数(提交审批)</el-button>
+        <el-button v-if="auth.isReviewer" size="small" @click="openAdjust"><el-icon><MagicStick /></el-icon> 调整参数（提交审批）</el-button>
       </div>
       <div class="cfg-grid">
         <div class="cfg-cell"><span class="cfg-k">设备 / 通道</span><b class="mono">#{{ chCfg.deviceId }} · CH{{ chCfg.channelNo }}</b></div>
@@ -886,7 +886,7 @@ async function exportTrendCsv() {
       </div>
       <div class="cfg-note">
         <el-icon><InfoFilled /></el-icon>
-        增益 / 探头频率 / 回波窗可在线调整(经审批下发);<b>阈值、测量模式、RefTime/RefTemp/K_L 为标定基线,须经重标定流程变更</b>。配置来源:{{ CONFIG_SOURCE[chCfg.configSource || ''] || chCfg.configSource || '—' }}
+        增益 / 探头频率 / 回波窗可在线调整（经审批下发）；<b>阈值、测量模式、RefTime/RefTemp/K_L 为标定基线，须经重标定流程变更</b>。配置来源：{{ CONFIG_SOURCE[chCfg.configSource || ''] || chCfg.configSource || '—' }}
       </div>
     </div>
 
@@ -900,7 +900,7 @@ async function exportTrendCsv() {
             <span class="mono">{{ fmtTime(m.ts) }}</span>
             <span class="mono">{{ m.echoTimeNs != null ? Number(m.echoTimeNs).toFixed(0) : '—' }}</span>
             <span class="mono">{{ m.spTempC != null ? Number(m.spTempC).toFixed(1) + '°C' : '—' }}</span>
-            <span class="mono"><span class="led" :class="m.statusCode >= 0 ? 'led--ok' : 'led--crit'" /> {{ STATUS_CODE[m.statusCode] || (m.statusCode >= 0 ? '正常' : `异常(${m.statusCode})`) }}</span>
+            <span class="mono"><span class="led" :class="m.statusCode >= 0 ? 'led--ok' : 'led--crit'" /> {{ STATUS_CODE[m.statusCode] || (m.statusCode >= 0 ? '正常' : `异常（${m.statusCode}）`) }}</span>
           </div>
           <div v-if="!loading && !measurements.length" class="tbl-empty">无测量记录</div>
         </div>

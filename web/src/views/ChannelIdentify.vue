@@ -416,7 +416,7 @@ async function downloadCsv(url: string, fallback: string) {
 
 // ---- 位号标注 / 建档 / 删除（沿用原有闭环） ----
 async function savePosition(it: ChannelLive) {
-  if (it.boltId == null) return ElMessage.warning('该通道未绑定螺栓,无法标位置')
+  if (it.boltId == null) return ElMessage.warning('该通道未绑定螺栓，无法标位置')
   const label = (labelEdit.value[it.channelNo] ?? '').trim()
   if (!label && it.positionLabel) {
     try {
@@ -566,10 +566,10 @@ async function unbind(it: ChannelLive) {
             待接入——档案已建（点位表预导入），接上探头后自动进入在测
           </div>
           <div class="ch-pos">
-            <el-input v-model="labelEdit[it.channelNo]" :placeholder="it.positionLabel || '位置,如 12点'" size="small" />
+            <el-input v-model="labelEdit[it.channelNo]" :placeholder="it.positionLabel || '位置，如 12点'" size="small" />
             <el-button size="small" type="primary" :loading="savingPos === it.channelNo" @click="savePosition(it)">标注</el-button>
           </div>
-          <div v-if="it.positionLabel" class="ch-curpos">当前: {{ it.positionLabel }}</div>
+          <div v-if="it.positionLabel" class="ch-curpos">当前：{{ it.positionLabel }}</div>
           <div class="ch-actions">
             <span
               class="ch-open"
@@ -591,7 +591,7 @@ async function unbind(it: ChannelLive) {
       </div>
       <div v-if="!loading && !rows.length" class="empty">
         {{ deviceId == null
-          ? '未找到采集设备运行时,请先到“采集设备”页确认设备已接入'
+          ? '未找到采集设备运行时，请先到“采集设备”页确认设备已接入'
           : '该设备通道目录为空——请到“采集设备”页用“通道数”设置实际通道数（如 48）重建目录' }}
       </div>
     </div>

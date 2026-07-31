@@ -406,7 +406,7 @@ function limitOf(a: AlarmItem) {
           </el-radio-group>
           <div v-if="shelve.scope === 'bolt'" class="scope-hint">整颗维护（如换探头）：同时静默信号丢失与预紧力类告警</div>
         </el-form-item>
-        <el-form-item label="时长(小时)"><el-input-number v-model="shelve.hours" :min="1" :max="168" :step="1" controls-position="right" style="width:100%" /></el-form-item>
+        <el-form-item label="时长（小时）"><el-input-number v-model="shelve.hours" :min="1" :max="168" :step="1" controls-position="right" style="width:100%" /></el-form-item>
         <el-form-item label="原因"><el-input v-model="shelve.reason" type="textarea" :rows="3" placeholder="≥5 字，记入档案" /></el-form-item>
       </el-form>
       <template #footer>

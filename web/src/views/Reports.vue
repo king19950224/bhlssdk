@@ -91,7 +91,7 @@ async function download(r: ReportItem) {
     a.click()
     URL.revokeObjectURL(url)
   } catch (e) {
-    ElMessage.error((e as Error)?.message || '下载失败(报告文件可能未生成)')
+    ElMessage.error((e as Error)?.message || '下载失败（报告文件可能未生成）')
   }
 }
 function fmt(iso: string) {
@@ -131,7 +131,7 @@ function fmt(iso: string) {
           </span>
         </div>
         <div v-if="!loading && !items.length" class="tbl-empty">
-          <el-icon><Document /></el-icon> 暂无报告。完成扭矩阶梯标定等流程后,可生成可追溯报告。
+          <el-icon><Document /></el-icon> 暂无报告。完成扭矩阶梯标定等流程后，可生成可追溯报告。
         </div>
       </div>
     </div>

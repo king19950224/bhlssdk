@@ -87,9 +87,9 @@ onMounted(load)
     </div>
 
     <div class="trust-note">
-      <span><span class="dot" style="background:#10b981" /> 正式:可用于正式报告与告警阈值依据</span>
-      <span><span class="dot" style="background:#f59e0b" /> 工程估算:可用于试运行/趋势,报告须标明非载荷标定</span>
-      <span><span class="dot" style="background:#61748f" /> 临时:仅作临时参考,不用于安全结论</span>
+      <span><span class="dot" style="background:#10b981" /> 正式：可用于正式报告与告警阈值依据</span>
+      <span><span class="dot" style="background:#f59e0b" /> 工程估算：可用于试运行/趋势，报告须标明非载荷标定</span>
+      <span><span class="dot" style="background:#61748f" /> 临时：仅作临时参考，不用于安全结论</span>
     </div>
 
     <!-- 螺栓标定花名册 -->
