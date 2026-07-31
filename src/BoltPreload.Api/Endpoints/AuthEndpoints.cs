@@ -5,6 +5,10 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Endpoints;
 
+/// <summary>
+/// 认证与账号管理端点（/api/auth）：登录换 JWT、登出、当前用户信息、改密，
+/// 以及管理员建用户/停启用。登录失败锁定与 token_version 失效策略见各端点内注释。
+/// </summary>
 public static class AuthEndpoints
 {
     public static IEndpointRouteBuilder MapAuthEndpoints(this IEndpointRouteBuilder app)

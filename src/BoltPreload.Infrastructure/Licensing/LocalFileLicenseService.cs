@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 
 namespace BoltPreload.Infrastructure.Licensing;
 
+/// <summary>本地授权文件配置（appsettings 的 License 节）。</summary>
 public sealed class LocalFileLicenseOptions
 {
     public string LicensePath { get; set; } = "license.json";

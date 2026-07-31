@@ -8,6 +8,7 @@ using Npgsql;
 
 namespace BoltPreload.Api.Auth;
 
+/// <summary>JWT 签发与校验配置（appsettings 的 Jwt 节）。生产环境 SigningKey 必填。</summary>
 public sealed class JwtOptions
 {
     public string Issuer { get; set; } = "BoltPreload";

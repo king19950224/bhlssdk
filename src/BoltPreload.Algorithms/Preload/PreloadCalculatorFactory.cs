@@ -20,6 +20,7 @@ public interface IPreloadCalculatorFactory
     IPreloadCalculator Pick(BoltSpec bolt, CalibrationData? calibration, DateTimeOffset now);
 }
 
+/// <summary>默认工厂实现，路由规则见 <see cref="IPreloadCalculatorFactory"/> 注释。</summary>
 public sealed class PreloadCalculatorFactory : IPreloadCalculatorFactory
 {
     private readonly SimplifiedCalculator _simplified;

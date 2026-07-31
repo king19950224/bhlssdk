@@ -27,6 +27,7 @@ public interface IDeviceConnectorManager
     bool TryUpdateChannelCount(long deviceId, ushort channelCount);
 }
 
+/// <summary>一台设备的运行时上下文：连接器 + 采集状态 + 启动参数，由 DeviceConnectorManager 创建并持有。</summary>
 public sealed record DeviceRuntimeContext(
     long DeviceId,
     string Name,

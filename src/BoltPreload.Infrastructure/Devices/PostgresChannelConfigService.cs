@@ -1,10 +1,16 @@
-using BoltPreload.Application.Devices;
 using System.Globalization;
+using BoltPreload.Application.Devices;
 using Npgsql;
 using NpgsqlTypes;
 
 namespace BoltPreload.Infrastructure.Devices;
 
+/// <summary>
+/// 通道配置三视图查询（Postgres 实现）：
+/// desired = channels 表期望配置，actual = device_parameter_history 最近一次真实读回，
+/// effective = 读回优先、库值兜底的合并结果；另提供逐字段的库值/设备值差异对比
+/// （RefTime/RefTemp/MeasMode 不一致会影响测量口径，标记为 warn）。
+/// </summary>
 public sealed class PostgresChannelConfigService : IChannelConfigService
 {
     private readonly NpgsqlDataSource _dataSource;

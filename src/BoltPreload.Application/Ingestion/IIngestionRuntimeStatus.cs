@@ -29,6 +29,7 @@ public interface IIngestionRuntimeStatus
     void MarkWriteEnd();
 }
 
+/// <summary>无锁（Interlocked）实现，采集热路径每条消息都会调用，避免锁竞争。</summary>
 public sealed class IngestionRuntimeStatus : IIngestionRuntimeStatus
 {
     private long _lastEnvelopeTicks;

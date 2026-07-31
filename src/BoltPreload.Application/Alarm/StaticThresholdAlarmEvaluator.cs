@@ -4,6 +4,7 @@ using Microsoft.Extensions.Options;
 
 namespace BoltPreload.Application.Alarm;
 
+/// <summary>静态阈值告警配置（appsettings 的 Alarm:StaticThreshold 节），触发/恢复双阈值防抖。</summary>
 public sealed class StaticThresholdAlarmOptions
 {
     /// <summary>触发下限（preload_ratio）。低于此值连续 N 次 → preload_low 告警。</summary>

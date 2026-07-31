@@ -15,6 +15,7 @@ public interface ILicenseService
     LicenseStatus GetStatus();
 }
 
+/// <summary>授权当前状态快照：是否找到/有效/过期，及授权内容摘要（给 /api/license/status 用）。</summary>
 public sealed record LicenseStatus(
     bool Found,
     bool Valid,
@@ -29,6 +30,7 @@ public sealed record LicenseStatus(
     string? Warning,
     LicenseDocument? Document);
 
+/// <summary>license.json 反序列化后的授权文档（含 RSA-SHA256 签名，验签逻辑见 LocalFileLicenseService）。</summary>
 public sealed record LicenseDocument(
     string LicenseId,
     string LicensedTo,

@@ -6,6 +6,7 @@ using Microsoft.IdentityModel.Tokens;
 
 namespace BoltPreload.Api.Auth;
 
+/// <summary>JWT 访问令牌签发。登录成功后由 AuthEndpoints 调用。</summary>
 public interface IJwtIssuer
 {
     string Issue(long userId, string username, string role, int tokenVersion);
@@ -18,6 +19,7 @@ public static class BoltPreloadClaims
     public const string TokenVersion = "token_version";
 }
 
+/// <summary>HMAC-SHA256 对称签名的 JWT 签发实现，密钥与有效期来自 <see cref="JwtOptions"/>。</summary>
 public sealed class JwtIssuer : IJwtIssuer
 {
     private readonly JwtOptions _opt;

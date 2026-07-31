@@ -31,6 +31,7 @@ public enum ProbeScanVerdict
     ActiveGood
 }
 
+/// <summary><see cref="ProbeScanVerdict"/> 与数据库/API 中 snake_case 字符串的映射。</summary>
 public static class ProbeScanVerdictNames
 {
     public const string Inconclusive  = "inconclusive";

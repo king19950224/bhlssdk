@@ -78,4 +78,5 @@ public sealed record AlarmEvent(
     int ConsecutiveCount,
     string Message);
 
+/// <summary>告警事件动作：Trigger=新触发，Clear=自动恢复。</summary>
 public enum AlarmAction { Trigger, Clear }

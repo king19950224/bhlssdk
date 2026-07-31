@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 
 namespace BoltPreload.Infrastructure.Ingestion;
 
+/// <summary>本地文件波形存储配置（appsettings 的 WaveStore 节）。</summary>
 public sealed class LocalFileWaveStoreOptions
 {
     /// <summary>波形文件根目录。建议绝对路径，挂到工业控制器的独立分区（防止系统盘满）。</summary>

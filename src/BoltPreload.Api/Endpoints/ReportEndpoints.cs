@@ -9,6 +9,10 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Endpoints;
 
+/// <summary>
+/// 报告端点（/api/reports）：扭矩分步标定报告与法兰验收报告的生成、查询、导出。
+/// 报告内容在生成时对当时数据做快照（JSON 落库），后续数据变化不影响已出报告。
+/// </summary>
 public static class ReportEndpoints
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)

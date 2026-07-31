@@ -172,6 +172,7 @@ public sealed record ChannelConfigUpdate(
     decimal? RefTimeNs = null,
     decimal? RefTempC = null);
 
+/// <summary>连接器生命周期状态：Idle → Connecting → Connected，掉线进 Reconnecting，不可恢复进 Faulted。</summary>
 public enum FxConnectorState
 {
     Idle,

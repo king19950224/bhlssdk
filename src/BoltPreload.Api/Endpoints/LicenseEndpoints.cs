@@ -3,6 +3,10 @@ using Microsoft.AspNetCore.Authorization;
 
 namespace BoltPreload.Api.Endpoints;
 
+/// <summary>
+/// 授权管理端点（/api/license）：查机器码、查授权状态、上传 license.json。
+/// 整组匿名——授权未装好前也要能访问（配合 LicenseGateMiddleware 白名单）。
+/// </summary>
 public static class LicenseEndpoints
 {
     public static IEndpointRouteBuilder MapLicenseEndpoints(this IEndpointRouteBuilder app)

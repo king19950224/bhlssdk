@@ -26,6 +26,7 @@ public sealed record ProbeScanRunView(
     ProbeScanSummary? Summary,
     IReadOnlyList<ProbeScanChannelResultView> Results);
 
+/// <summary>一次扫描各判定结果的通道数统计。</summary>
 public sealed record ProbeScanSummary(
     int ActiveGood,
     int ActiveWeak,
@@ -33,6 +34,7 @@ public sealed record ProbeScanSummary(
     int NotReporting,
     int Inconclusive);
 
+/// <summary>单通道扫描结果：判定 + 回波统计指标（回波率/均值/抖动/峰峰值/SNR）。</summary>
 public sealed record ProbeScanChannelResultView(
     int ChannelNo,
     string? Name,
@@ -110,6 +112,7 @@ public interface IProbeScanRepository
     Task<IReadOnlyList<ushort>> LoadEnabledChannelsAsync(long deviceId, CancellationToken ct);
 }
 
+/// <summary>探头扫描编排：启动/查询/中止一次全通道探头识别扫描（同一设备同一时刻只允许一次）。</summary>
 public interface IProbeScanOrchestrator
 {
     /// <summary>同步启动一次扫描：插记录、占位 ProbeScanState、Task.Run 跑主流程，立刻返回 run view。</summary>

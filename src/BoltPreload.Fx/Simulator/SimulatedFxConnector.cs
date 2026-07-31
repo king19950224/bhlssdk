@@ -315,6 +315,7 @@ public sealed class SimulatedFxConnector : IFxConnector
     }
 }
 
+/// <summary>模拟连接器参数：设备标识、通道数与上报频率。</summary>
 public sealed record SimulatorOptions(
     long DeviceId,
     ushort Address = 1,

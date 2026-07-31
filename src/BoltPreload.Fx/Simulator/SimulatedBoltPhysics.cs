@@ -16,6 +16,7 @@ public sealed record BoltPhysics(
     decimal InitialPreloadN,
     decimal RelaxNPerHour);
 
+/// <summary>模拟螺栓的默认物理参数集与 <see cref="BoltPhysics"/> 构造入口。</summary>
 public static class SimulatedBoltPhysics
 {
     /// <summary>SDK 默认温度系数（1/°C）；与 sink 缺省一致,保证温补可逆。</summary>

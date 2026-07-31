@@ -26,6 +26,7 @@ public interface IAlarmPublisher
     Task PublishAsync(BoltPreload.Application.Alarm.AlarmEvent ev, CancellationToken ct = default);
 }
 
+/// <summary>空实现：无 web 层/测试场景下代替 SignalR 推送。</summary>
 public sealed class NoopAlarmPublisher : IAlarmPublisher
 {
     public Task PublishAsync(BoltPreload.Application.Alarm.AlarmEvent ev, CancellationToken ct = default)

@@ -73,6 +73,7 @@ public sealed record PreloadResult(
     string ModelUsed,
     Guid? CalibrationId);
 
+/// <summary>标定有效期判断扩展（过期 / 临近过期预警）。</summary>
 public static class CalibrationDataExtensions
 {
     public static bool IsExpired(this CalibrationData c, DateTimeOffset now) => now > c.ExpiresAt;

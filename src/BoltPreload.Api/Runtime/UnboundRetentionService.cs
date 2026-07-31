@@ -5,6 +5,7 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Runtime;
 
+/// <summary>未绑定测量数据保留期清理配置（appsettings 的 Ingestion:UnboundRetention 节）。</summary>
 public sealed class UnboundRetentionOptions
 {
     public bool Enabled { get; set; } = true;

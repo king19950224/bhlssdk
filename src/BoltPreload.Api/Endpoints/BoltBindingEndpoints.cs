@@ -5,8 +5,13 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Endpoints;
 
+/// <summary>bind-bolt 请求：目标螺栓 + 标定处置策略 + 是否回填 unbound 历史数据。</summary>
 public sealed record BindBoltRequest(long BoltId, string CalibrationAction = "invalidate", bool BackfillUnbound = false, string? Note = null);
+
+/// <summary>move-channel 请求：目标通道 + 标定处置策略 + 是否回填 unbound 历史数据。</summary>
 public sealed record MoveBoltChannelRequest(long ToChannelId, string CalibrationAction = "invalidate", bool BackfillUnbound = false, string? Note = null);
+
+/// <summary>unbind-bolt 请求：仅可选备注。</summary>
 public sealed record UnbindChannelRequest(string? Note = null);
 
 /// <summary>

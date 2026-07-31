@@ -47,6 +47,7 @@ public sealed class ProbeScanState
     public IReadOnlyCollection<ScanRunHandle> Snapshot() => _running.Values.ToList();
 }
 
+/// <summary>一次运行中扫描的句柄：设备/扫描 id + 取消令牌源，用于中止与诊断。</summary>
 public sealed class ScanRunHandle
 {
     public long DeviceId { get; }

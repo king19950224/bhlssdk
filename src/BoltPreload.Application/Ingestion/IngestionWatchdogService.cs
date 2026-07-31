@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 
 namespace BoltPreload.Application.Ingestion;
 
+/// <summary>采集看门狗配置（appsettings 的 Ingestion:Watchdog 节）。</summary>
 public sealed class IngestionWatchdogOptions
 {
     public bool Enabled { get; set; } = true;

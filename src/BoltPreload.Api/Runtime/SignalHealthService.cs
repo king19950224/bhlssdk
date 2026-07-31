@@ -8,6 +8,7 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Runtime;
 
+/// <summary>信号丢失告警配置（appsettings 的 Alarm:SignalHealth 节）。</summary>
 public sealed class SignalHealthOptions
 {
     public bool Enabled { get; set; } = true;

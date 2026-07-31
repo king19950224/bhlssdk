@@ -49,6 +49,7 @@ public sealed class BoltAutoEnroller
         _logger = logger;
     }
 
+    /// <summary>自动建档成功的结果：新建螺栓 id 与编号。</summary>
     public sealed record EnrolledBolt(long BoltId, string Code);
 
     /// <summary>

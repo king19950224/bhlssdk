@@ -5,6 +5,10 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Endpoints;
 
+/// <summary>
+/// 告警端点（/api/alarms）：查询、确认（ack）、闭合（clear）、抑制（shelve）。
+/// 告警的产生与自动恢复在 StaticThresholdAlarmEvaluator，本组只做人工处置与检索。
+/// </summary>
 public static class AlarmEndpoints
 {
     /// <summary>可抑制/可闭合的告警类型白名单。拼错的 type 会生成一条永远匹配不上的抑制（操作者误以为已静默），必须挡在入口。</summary>

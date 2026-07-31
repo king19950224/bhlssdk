@@ -27,6 +27,7 @@ public interface IPreloadCalculator
     PreloadResult Calculate(PreloadInput input);
 }
 
+/// <summary>预紧力计算精度档次，由所用模型决定（工厂按标定状态与螺栓规格路由）。</summary>
 public enum PreloadAccuracyLevel
 {
     /// <summary>±15%~25%（无标定，模型 A）</summary>

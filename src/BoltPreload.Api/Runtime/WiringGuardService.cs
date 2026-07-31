@@ -9,6 +9,7 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Runtime;
 
+/// <summary>接线指纹守卫配置（appsettings 的 Alarm:WiringGuard 节）。</summary>
 public sealed class WiringGuardOptions
 {
     public bool Enabled { get; set; } = true;

@@ -274,6 +274,7 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
     }
 }
 
+/// <summary>设备已有扫描在跑时再次 StartAsync 抛出；携带冲突的扫描 id 供 API 返回 409。</summary>
 public sealed class ProbeScanConflictException : InvalidOperationException
 {
     public long ExistingScanRunId { get; }

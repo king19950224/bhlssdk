@@ -18,6 +18,7 @@ public sealed record FxDecodedEnvelope(
     FxEchoWaveDto? EchoWave = null,
     FxMultiChannelResultDto? MultiChannelResult = null);
 
+/// <summary>信封承载的解码结果类型，决定 <see cref="FxDecodedEnvelope"/> 上哪个载荷字段非空。</summary>
 public enum FxResultType
 {
     ChannelResult,

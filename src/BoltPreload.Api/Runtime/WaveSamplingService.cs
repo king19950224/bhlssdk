@@ -7,6 +7,7 @@ using NpgsqlTypes;
 
 namespace BoltPreload.Api.Runtime;
 
+/// <summary>波形定时抽样配置（appsettings 的 Ingestion:WaveSampling 节）。</summary>
 public sealed class WaveSamplingOptions
 {
     /// <summary>是否启用周期性波形采集。默认关（bool 默认 false）——仅真机现场需要（真机 MultiMeas 模式不随测量带波形）。</summary>

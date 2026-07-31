@@ -8,6 +8,7 @@ namespace BoltPreload.Api.Auth;
 /// </summary>
 public static class UserContext
 {
+    /// <summary>当前请求的登录用户身份（来自 JWT claims）。</summary>
     public sealed record CurrentUser(long UserId, string Username, string Role);
 
     public static CurrentUser? TryGet(HttpContext ctx)
