@@ -21,10 +21,10 @@ public sealed class EndpointIntegrationTests
     private readonly PostgresFixture _fx;
     public EndpointIntegrationTests(PostgresFixture fx) => _fx = fx;
 
-    [Fact]
+    [PostgresFact]
     public async Task ConfigureChannel_AsAdmin_AutoApproves()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (deviceId, channelNo) = await SeedDeviceChannelAsync();
         var adminId = await SeedUserAsync("admin");
@@ -41,10 +41,10 @@ public sealed class EndpointIntegrationTests
         (await LatestRequestStatusAsync(deviceId, channelNo)).Should().Be("approved");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task ConfigureChannel_AsReviewer_StaysRequested()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (deviceId, channelNo) = await SeedDeviceChannelAsync();
         var reviewerId = await SeedUserAsync("reviewer");
@@ -61,10 +61,10 @@ public sealed class EndpointIntegrationTests
         (await LatestRequestStatusAsync(deviceId, channelNo)).Should().Be("requested");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task PreloadTrend_InvalidBucket_Returns400()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var userId = await SeedUserAsync("operator");
         using var factory = CreateFactory();

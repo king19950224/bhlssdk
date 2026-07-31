@@ -27,10 +27,10 @@ public sealed class SecurityGuardIntegrationTests
 
     // ===================== 告警抑制守卫 =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task Shelve_WithoutBoltId_Returns400()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
         var userId = await SeedUserAsync("operator");
 
         using var factory = TestApi.CreateFactory(_fx);
@@ -46,10 +46,10 @@ public sealed class SecurityGuardIntegrationTests
         resp2.StatusCode.Should().Be(HttpStatusCode.BadRequest, "trim 后不足 5 字的 reason 必须 400");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task Shelve_AndCancel_WriteAudit()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
         var s = await SeedAssetsAsync();
         var userId = await SeedUserAsync("operator");
 
@@ -72,10 +72,10 @@ public sealed class SecurityGuardIntegrationTests
 
     // ===================== 最后一名管理员保护 =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task CreateUser_DemoteLastAdmin_Returns400_ButAllowedWithSecondAdmin()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         // 场景固定：全库仅剩一名 enabled admin（其余全部停用；各测试自种用户，互不依赖）
         await DisableAllAdminsAsync();
@@ -96,10 +96,10 @@ public sealed class SecurityGuardIntegrationTests
         demote2.StatusCode.Should().Be(HttpStatusCode.OK, "还有其他 enabled admin 时允许降权");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task ToggleUser_DisableLastAdmin_Returns400()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         await DisableAllAdminsAsync();
         var lastAdminName = await SeedNamedUserAsync("admin");
@@ -120,10 +120,10 @@ public sealed class SecurityGuardIntegrationTests
 
     // ===================== 解绑权限收紧 =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task UnbindBolt_AsOperator_Returns403()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
         var s = await SeedAssetsAsync();
         var operatorId = await SeedUserAsync("operator");
         var reviewerId = await SeedUserAsync("reviewer");
@@ -145,10 +145,10 @@ public sealed class SecurityGuardIntegrationTests
 
     // ===================== 建档跨项目校验 =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task CreateBolt_CrossProject_Returns400()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var a = await SeedAssetsAsync();          // 项目 A：设备 + 未绑定通道（ExtraChannelId）
         var b = await SeedAssetsAsync();          // 项目 B：独立的组
@@ -172,10 +172,10 @@ public sealed class SecurityGuardIntegrationTests
 
     // ===================== commission 调试直发收紧 reviewer+ =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task Commission_AsOperator_Returns403_ReviewerPassesPolicy()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
         var s = await SeedAssetsAsync();
         var operatorId = await SeedUserAsync("operator");
         var reviewerId = await SeedUserAsync("reviewer");
@@ -201,10 +201,10 @@ public sealed class SecurityGuardIntegrationTests
 
     // ===================== 单螺栓查询 =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task GetBolt_ById_Returns200_And404WhenMissing()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
         var s = await SeedAssetsAsync();
         var userId = await SeedUserAsync("operator");
 
@@ -223,10 +223,10 @@ public sealed class SecurityGuardIntegrationTests
 
     // ===================== 标定"资源不存在"统一 404 =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task ApplyTorqueFit_MissingChannel_Returns404()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
         var reviewerId = await SeedUserAsync("reviewer");
 
         using var factory = TestApi.CreateFactory(_fx);

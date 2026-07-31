@@ -23,8 +23,7 @@ public sealed class PostgresFixture : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        var baseConn = Environment.GetEnvironmentVariable("ConnectionStrings__Postgres")
-            ?? "Host=localhost;Port=5432;Database=boltpreload;Username=boltpreload;Password=dev_only_NOT_for_production";
+        var baseConn = PostgresTestConnection.BaseConnectionString;
         try
         {
             _adminConn = new NpgsqlConnectionStringBuilder(baseConn) { Database = "postgres" }.ConnectionString;
@@ -67,6 +66,18 @@ public sealed class PostgresFixture : IAsyncLifetime
             await ExecAsync(admin, $"DROP DATABASE IF EXISTS {TestDb} WITH (FORCE)");
         }
         catch { /* best effort 清理 */ }
+    }
+
+    /// <summary>
+    /// 断言夹具已就绪。<b>"库连不上"由 <see cref="PostgresFactAttribute"/> 在发现期跳过</b>，
+    /// 走到这里说明库是通的、却仍然初始化失败（建库被拒、迁移脚本报错等）—— 那是真故障，必须红，
+    /// 不能像以前那样 <c>return</c> 掉装作通过。
+    /// </summary>
+    public void EnsureAvailable()
+    {
+        if (!Available)
+            throw new InvalidOperationException(
+                $"数据库可连但测试夹具初始化失败（建库/迁移出错），这是真实故障：{SkipReason}");
     }
 
     public BoltPreloadDbContext NewDbContext()

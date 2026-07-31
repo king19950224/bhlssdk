@@ -21,10 +21,10 @@ public sealed class BoltProvisioningIntegrationTests
     private readonly PostgresFixture _fx;
     public BoltProvisioningIntegrationTests(PostgresFixture fx) => _fx = fx;
 
-    [Fact]
+    [PostgresFact]
     public async Task CreateBolt_BindsChannel_BackfillsUnbound_AndAudits()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var s = await SeedAsync(unboundRows: 3);
         var userId = await SeedUserAsync("operator");
@@ -84,10 +84,10 @@ public sealed class BoltProvisioningIntegrationTests
             .Should().Be(1, "建档应写审计");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task CreateBolt_ChannelAlreadyBound_Returns409()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var s = await SeedAsync();
         var userId = await SeedUserAsync("operator");
@@ -105,10 +105,10 @@ public sealed class BoltProvisioningIntegrationTests
         body.GetProperty("existingBoltCode").GetString().Should().Be(firstCode);
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task CreateBolt_DuplicateCodeInGroup_Returns409()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var s = await SeedAsync(extraChannelNo: 9);
         var userId = await SeedUserAsync("operator");
@@ -125,10 +125,10 @@ public sealed class BoltProvisioningIntegrationTests
         second.StatusCode.Should().Be(HttpStatusCode.Conflict, "UNIQUE(group_id, code) 冲突应报 409 而非 500");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task CreateBolt_UnknownSpec_WithoutCrossSection_Returns400()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var s = await SeedAsync();
         var userId = await SeedUserAsync("operator");
@@ -141,10 +141,10 @@ public sealed class BoltProvisioningIntegrationTests
         resp.StatusCode.Should().Be(HttpStatusCode.BadRequest, "预设表没有 M99，必须显式给 crossSectionMm2");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task PatchGroup_UpdatesExpectedBoltCount_AndAudits()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var s = await SeedAsync();
         var userId = await SeedUserAsync("operator");
@@ -166,10 +166,10 @@ public sealed class BoltProvisioningIntegrationTests
             .Should().Be(1, "孔位数变更应写审计");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task PatchGroup_InvalidCount_Returns400_MissingGroup_Returns404()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var s = await SeedAsync();
         var userId = await SeedUserAsync("operator");

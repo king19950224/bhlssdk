@@ -16,10 +16,10 @@ public sealed class PredictionWindowIntegrationTests
     private readonly PostgresFixture _fx;
     public PredictionWindowIntegrationTests(PostgresFixture fx) => _fx = fx;
 
-    [Fact]
+    [PostgresFact]
     public async Task CalibrationWindow_IgnoresSupersededAndPending()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var boltId = await SeedBoltAsync();
         var userId = await SeedUserAsync();

@@ -41,10 +41,10 @@ public sealed class AlarmPipelineIntegrationTests
     private const decimal RefTempC = 20m;
     private const decimal LowEchoNs = 30100m;   // → preloadN 100kN → ratio ≈ 0.58
 
-    [Fact]
+    [PostgresFact]
     public async Task FiveLowSamples_OpenPreloadLowAlarm()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (deviceId, _, boltId, _) = await SeedCalibratedChannelAsync(channelNo: 21);
         var sink = NewSinkWithAlarms();
@@ -56,10 +56,10 @@ public sealed class AlarmPipelineIntegrationTests
         (await OpenAlarmCountAsync(boltId, "preload_low")).Should().Be(1, "连续 5 条越限样本应触发 preload_low");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task DuplicateTimestamp_DoesNotAdvanceAlarmStreak()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (deviceId, _, boltId, _) = await SeedCalibratedChannelAsync(channelNo: 22);
         var sink = NewSinkWithAlarms();
@@ -79,10 +79,10 @@ public sealed class AlarmPipelineIntegrationTests
         (await OpenAlarmCountAsync(boltId, "preload_low")).Should().Be(1);
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task ActiveShelve_SuppressesAlarm()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (deviceId, _, boltId, userId) = await SeedCalibratedChannelAsync(channelNo: 23);
         await InsertShelveAsync(boltId, "preload_low", userId, shelvedAt: null,
@@ -97,10 +97,10 @@ public sealed class AlarmPipelineIntegrationTests
             .Should().Be(0, "生效的维护抑制应吞掉 preload_low 触发");
     }
 
-    [Fact]
+    [PostgresFact]
     public async Task ExpiredShelve_DoesNotSuppress()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (deviceId, _, boltId, userId) = await SeedCalibratedChannelAsync(channelNo: 24);
         await InsertShelveAsync(boltId, "preload_low", userId,
@@ -117,10 +117,10 @@ public sealed class AlarmPipelineIntegrationTests
 
     // ===================== signal_lost 走抑制判定 =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task SignalLost_ShelvedBolt_NotTriggered_UnshelvedBolt_Triggered()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         // 两颗螺栓都"曾有测量、现已静默 10 分钟"；A 整颗抑制（alarm_type=NULL 通配），B 不抑制
         var (devA, _, boltA, userId) = await SeedCalibratedChannelAsync(channelNo: 25);
@@ -151,10 +151,10 @@ public sealed class AlarmPipelineIntegrationTests
 
     // ===================== 手动闭合复位状态机（重臂） =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task ManualClear_WhileStillViolating_RetriggersOnNextSample()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (deviceId, _, boltId, _) = await SeedCalibratedChannelAsync(channelNo: 27);
         var operatorId = await SeedUserAsync();
@@ -189,10 +189,10 @@ public sealed class AlarmPipelineIntegrationTests
 
     // ===================== 闭合原因长度（text 迁移 + API 上限） =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task ManualClear_LongReason_StoredFully_And501Rejected()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (_, channelId, boltId, _) = await SeedCalibratedChannelAsync(channelNo: 28);
         var operatorId = await SeedUserAsync();
@@ -218,10 +218,10 @@ public sealed class AlarmPipelineIntegrationTests
 
     // ===================== shelve alarmType 白名单 =====================
 
-    [Fact]
+    [PostgresFact]
     public async Task Shelve_UnknownType_Rejected_NullType_Allowed()
     {
-        if (!_fx.Available) return;
+        _fx.EnsureAvailable();
 
         var (_, _, boltId, _) = await SeedCalibratedChannelAsync(channelNo: 29);
         var operatorId = await SeedUserAsync();

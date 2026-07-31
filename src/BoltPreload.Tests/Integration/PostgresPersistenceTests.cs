@@ -24,10 +24,10 @@ public sealed class PostgresPersistenceTests
     public PostgresPersistenceTests(PostgresFixture fx) => _fx = fx;
 
     // ---- EF 模型 ↔ 手写 schema 漂移守卫 ----
-    [Fact]
+    [PostgresFact]
     public async Task EfModel_columns_match_handwritten_schema()
     {
-        if (!_fx.Available) return;  // 本地无 Docker/DB 时跳过；CI 与有库环境会实际执行下述断言
+        _fx.EnsureAvailable();
         await using var db = _fx.NewDbContext();
 
         // Take(1).ToList 会 SELECT 全部映射列：任一 HasColumnName 与 deploy/sql 不一致即抛 PostgresException。
@@ -44,10 +44,10 @@ public sealed class PostgresPersistenceTests
     }
 
     // ---- 已绑定通道：测量入 measurements，并写入测量级信号健康字段（P2 新增列） ----
-    [Fact]
+    [PostgresFact]
     public async Task Sink_writes_bound_measurement_with_health_fields()
     {
-        if (!_fx.Available) return;  // 本地无 Docker/DB 时跳过；CI 与有库环境会实际执行下述断言
+        _fx.EnsureAvailable();
 
         var (deviceId, channelId) = await SeedBoundChannelAsync(channelNo: 9);
         var sink = NewSink();
@@ -67,10 +67,10 @@ public sealed class PostgresPersistenceTests
     }
 
     // ---- 未绑定通道：自动发现 + 写 unbound_measurements ----
-    [Fact]
+    [PostgresFact]
     public async Task Sink_autodiscovers_and_writes_unbound_measurement()
     {
-        if (!_fx.Available) return;  // 本地无 Docker/DB 时跳过；CI 与有库环境会实际执行下述断言
+        _fx.EnsureAvailable();
 
         var deviceId = await SeedDeviceAsync();   // 只建设备，不建通道/螺栓
         var sink = NewSink();
@@ -87,10 +87,10 @@ public sealed class PostgresPersistenceTests
 
     // ---- 自动发现墓碑：被显式软删的通道不得被数据流"悄悄"复活（否则运维的删除操作永远不生效）----
     // 这正是 dev 库里观察到的行为：设备周期上报全部物理通道，软删通道若被自动重建，删除就形同虚设。
-    [Fact]
+    [PostgresFact]
     public async Task Sink_does_not_revive_soft_deleted_channel()
     {
-        if (!_fx.Available) return;  // 本地无 Docker/DB 时跳过；CI 与有库环境会实际执行下述断言
+        _fx.EnsureAvailable();
 
         var deviceId = await SeedDeviceAsync();
         // 显式软删一个通道（模拟运维删除空通道：deleted_at 置位）
@@ -117,10 +117,10 @@ public sealed class PostgresPersistenceTests
     }
 
     // ---- WAL 重放对真库：入库失败兜底链路的端到端验证 ----
-    [Fact]
+    [PostgresFact]
     public async Task WalReplay_persists_to_real_db()
     {
-        if (!_fx.Available) return;  // 本地无 Docker/DB 时跳过；CI 与有库环境会实际执行下述断言
+        _fx.EnsureAvailable();
 
         var deviceId = await SeedDeviceAsync();
         var sink = NewSink();
