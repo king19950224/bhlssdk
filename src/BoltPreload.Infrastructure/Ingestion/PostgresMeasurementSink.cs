@@ -27,6 +27,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     private readonly IAlarmPublisher? _alarmPublisher;
     private readonly IPreloadCalculatorFactory _calculatorFactory;
     private readonly ProbeScanState? _probeScan;
+    /// <summary>回波声时下限（与在位状态机同一配置 Fx:HotPlug:MinPlausibleEchoNs，单一"什么算信号"口径）。</summary>
+    private readonly int _minPlausibleEchoNs;
 
     private static readonly System.Text.Json.JsonSerializerOptions JsonOpts = new()
     {
@@ -67,7 +69,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         IAlarmSink? alarmSink = null,
         IAlarmPublisher? alarmPublisher = null,
         IPreloadCalculatorFactory? calculatorFactory = null,
-        ProbeScanState? probeScan = null)
+        ProbeScanState? probeScan = null,
+        Microsoft.Extensions.Options.IOptions<ChannelPresenceOptions>? presenceOptions = null)
     {
         _dataSource = dataSource;
         _resolver = resolver;
@@ -77,6 +80,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         _alarmSink = alarmSink;
         _alarmPublisher = alarmPublisher;
         _probeScan = probeScan;
+        _minPlausibleEchoNs = presenceOptions?.Value.MinPlausibleEchoNs ?? 0;
         // 未注入工厂时（如单测直接 new）退化为默认工厂，保持原单波法行为
         _calculatorFactory = calculatorFactory ?? new PreloadCalculatorFactory(
             new SimplifiedCalculator(), new GbSingleWaveCalculator(), new GbBiWaveCalculator());
@@ -136,12 +140,15 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 break;
 
             case { BoltId: 0, ChannelId: > 0 } r:
-                // 全通道轮询（热插拔识别）下，空口会 7×24 持续上报无回波结果；unbound_measurements
-                // 没有保留期清理，照单全收会无限膨胀（40 通道每天可达数十万行垃圾）。
-                // 无回波的未绑定数据仅在通道扫描期间落库——probe-scan 依赖无回波样本区分
-                // active_no_echo / not_reporting；其余时间直接丢弃（在位判定走内存状态机，不依赖此表）。
-                // 有回波的未绑定数据（真实探头，等待绑定）照常落库。
-                if (cr.EchoTimeNs is null && !(_probeScan?.IsRunning(envelope.DeviceId) ?? false))
+                // 全通道轮询（热插拔识别）下，空口会 7×24 持续上报无回波结果；照单全收会让
+                // unbound_measurements 无限膨胀（40 通道每天可达数十万行垃圾）。
+                // 无回波或低于下限门的杂散触发（"有回波"≠"有信号"，空口会偶发 µs 级以下假回波，
+                // 与在位状态机同一道 MinPlausibleEchoNs 门）仅在通道扫描期间落库——
+                // probe-scan 依赖原始样本区分 active_no_echo / not_reporting；其余时间直接丢弃
+                //（在位判定走内存状态机，不依赖此表）。合理回波的未绑定数据（真实探头，等待绑定）照常落库。
+                var plausibleEcho = cr.EchoTimeNs is not null
+                    && (_minPlausibleEchoNs <= 0 || cr.EchoTimeNs.Value >= _minPlausibleEchoNs);
+                if (!plausibleEcho && !(_probeScan?.IsRunning(envelope.DeviceId) ?? false))
                     break;
                 await WriteUnboundAsync(r.ChannelId, envelope, cr, ct);
                 break;

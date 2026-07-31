@@ -161,7 +161,11 @@ public sealed class ChannelPresenceService : BackgroundService
                     DateTimeOffset.UtcNow,
                     IsDeviceSuspended,
                     (deviceId, channelNo) =>
-                        !mcrByDevice.TryGetValue(deviceId, out var mcr) || mcr.Count == 0 || mcr.Contains(channelNo));
+                        !mcrByDevice.TryGetValue(deviceId, out var mcr) || mcr.Count == 0 || mcr.Contains(channelNo),
+                    // 拔出静默阈值随通道数自适应：48 通道全轮询下每通道 ~4.8s 才被测一次，
+                    // 固定 20s 余量为零会导致在位灯抖动（详见 ChannelPresenceOptions 注释）。
+                    // 验收会话期间轮询集缩小、刷新变快，仍按全通道口径取阈值——只会更稳，不会误报。
+                    deviceId => _opt.EffectiveUnplugSilenceSeconds(_deviceManager.Find(deviceId)?.Options.ChannelCount ?? 0));
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex) { _logger.LogError(ex, "在位静默扫描异常"); }
