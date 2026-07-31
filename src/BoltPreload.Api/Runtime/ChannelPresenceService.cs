@@ -1,4 +1,5 @@
 using BoltPreload.Application.Devices;
+using BoltPreload.Application.Devices.Acceptance;
 using BoltPreload.Application.Devices.ProbeScan;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Application.Realtime;
@@ -37,6 +38,7 @@ public sealed class ChannelPresenceService : BackgroundService
     private readonly ChannelPresenceTracker _tracker;
     private readonly IChannelPresencePublisher _publisher;
     private readonly ProbeScanState _probeScan;
+    private readonly AcceptanceSessionState _acceptance;
     private readonly NpgsqlDataSource _ds;
     private readonly BoltAutoEnroller _enroller;
     private readonly ChannelPresenceOptions _opt;
@@ -50,6 +52,7 @@ public sealed class ChannelPresenceService : BackgroundService
         ChannelPresenceTracker tracker,
         IChannelPresencePublisher publisher,
         ProbeScanState probeScan,
+        AcceptanceSessionState acceptance,
         NpgsqlDataSource ds,
         BoltAutoEnroller enroller,
         IOptions<ChannelPresenceOptions> opt,
@@ -59,6 +62,7 @@ public sealed class ChannelPresenceService : BackgroundService
         _tracker = tracker;
         _publisher = publisher;
         _probeScan = probeScan;
+        _acceptance = acceptance;
         _ds = ds;
         _enroller = enroller;
         _opt = opt.Value;
@@ -96,6 +100,13 @@ public sealed class ChannelPresenceService : BackgroundService
         {
             if (_probeScan.IsRunning(rt.DeviceId))
             {
+                _mcrConfigured.Remove(rt.DeviceId);
+                continue;
+            }
+            if (_acceptance.IsActive(rt.DeviceId))
+            {
+                // 接入验收会话把 MCR 临时缩到待验收通道集，本服务不抢：清确认标记，
+                // 会话结束/过期后下一轮自动收敛回全通道（会话的恢复路径就押在这里）
                 _mcrConfigured.Remove(rt.DeviceId);
                 continue;
             }
@@ -156,6 +167,11 @@ public sealed class ChannelPresenceService : BackgroundService
 
             try
             {
+                // 过期的验收会话先清掉，下面的收敛马上把 MCR 拉回全通道（会话恢复路径的兜底）
+                foreach (var expired in _acceptance.ExpireStale(DateTimeOffset.UtcNow))
+                    _logger.LogInformation("接入验收会话过期自动结束 device={DeviceId} channels={Count}（全通道轮询即将收敛恢复）",
+                        expired.DeviceId, expired.Channels.Count);
+
                 await EnsureFullChannelPollingAsync(ct);
 
                 // 每轮预取一次各设备的会话 MCR 快照（避免每通道重复取），空快照 = 无 MCR 概念，全部可观测

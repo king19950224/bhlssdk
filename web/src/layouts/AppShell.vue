@@ -33,7 +33,7 @@ const navGroups = [
     title: '设备与诊断',
     items: [
       { name: 'devices', label: '采集设备', icon: 'Cpu' },
-      { name: 'identify', label: '通道识别', icon: 'Aim' },
+      { name: 'identify', label: '点位与验收', icon: 'Aim' },
       { name: 'diagnostics', label: '波形诊断', icon: 'TrendCharts', reviewerOnly: true },
     ],
   },

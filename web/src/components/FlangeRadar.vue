@@ -69,7 +69,7 @@ function tipOf(list: GroupBolt[], seq: number): string {
   if (list.length <= 1) return base
   return `位号冲突：${list.length} 颗螺栓同标 ${seq} 号位 —— ${list
     .map((x) => `${x.code}(CH${x.channelNo})`)
-    .join('、')}。点击可逐颗查看，请到「通道识别」重标位号`
+    .join('、')}。点击可逐颗查看，请到「点位与验收」重标位号`
 }
 
 const holes = computed<Hole[]>(() => {
@@ -189,7 +189,7 @@ const ticks = [-90, 0, 90, 180].map((a) => {
     </svg>
 
     <div v-if="conflictHoles.length" class="flange-warn">
-      位号冲突 {{ conflictHoles.length }} 处：{{ conflictDesc }} —— 点击冲突孔位可逐颗查看，请到「通道识别」重标位号
+      位号冲突 {{ conflictHoles.length }} 处：{{ conflictDesc }} —— 点击冲突孔位可逐颗查看，请到「点位与验收」重标位号
     </div>
     <div v-if="overCapacity" class="flange-warn">
       监测 {{ bolts.length }} 颗 &gt; 配置孔位 {{ totalHoles }}，圆盘已按 {{ holes.length }} 孔重排 —— 请核对组孔位数或位号
@@ -215,7 +215,7 @@ const ticks = [-90, 0, 90, 180].map((a) => {
           <span class="mono dim">{{ b.preloadRatio != null ? pct(Number(b.preloadRatio)) : '—' }}</span>
         </div>
       </div>
-      <p class="pick-hint">同一孔位出现多颗螺栓，多为现场位号标注重复，请到「通道识别」重标位号。</p>
+      <p class="pick-hint">同一孔位出现多颗螺栓，多为现场位号标注重复，请到「点位与验收」重标位号。</p>
     </el-dialog>
   </div>
 </template>

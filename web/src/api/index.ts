@@ -336,7 +336,7 @@ export const deviceApi = {
   // 重标定：把当前回波声时设为零载/参考基线（设备侧整组写入 RefTime/RefTemp）
   recalibrate: (deviceId: number, channel: number, body: { refTimeNs?: number; refTempC?: number } = {}) =>
     http.post<{ newRefTimeNs: number; newRefTempC: number }>(`/api/devices/${deviceId}/channels/${channel}/recalibrate`, body),
-  // 实时通道识别：各通道最新回波 + 信号强度（敲击识别法）
+  // 点位与验收页数据源：各通道最新回波 + 信号强度 + 在位/验收状态
   channelsLive: (deviceId: number) =>
     http.get<{ deviceId: number; count: number; items: ChannelLive[] }>(`/api/devices/${deviceId}/channels/live`),
   // 下发设备工作模式（Standby / MultiMeas / Reboot ...；扫描期间会被拒绝）
@@ -396,6 +396,59 @@ export interface ChannelLive {
   channelNo: number; boltId: number | null; boltCode: string | null; positionLabel: string | null
   echoNs: number | null; tempC: number | null; lastTs: string | null
   peakToPeak: number | null; snrDb: number | null
+  // 点位与验收页增删螺栓用：通道 id（建档绑定/解绑入参）+ 在位状态 + 验收时间
+  channelId: number; channelName: string | null; hardwareState: string; lastSeenAt: string | null
+  acceptedAt: string | null
+  /** 曾在位标记（仅在位事件写入）：失联=建档且曾在位但当前无信号；待接入=建档但从未在位 */
+  lastPresentAt: string | null
+  /** 目标预紧力；自动建档缺省为空 →「待补规格」 */
+  targetPreloadN: number | null
+}
+
+// ---- 点位与验收 ----
+export interface AcceptanceSessionView {
+  active: boolean; deviceId: number
+  channels?: number[]; startedAt?: string; expiresAt?: string
+  remainingSeconds?: number; estimatedRefreshSeconds?: number; startedByUserId?: number
+}
+export interface AcceptanceItem {
+  channelNo: number; channelId: number; channelName: string | null
+  boltId: number | null; boltCode: string | null
+  acceptedAt: string | null; method: string | null; cableLabel: string | null
+  tofNs: number | null; acceptedBy: string | null; note: string | null
+}
+export interface AcceptResult {
+  acceptanceId: number; deviceId: number; channelNo: number; channelId: number; method: string
+  boltId: number | null; boltCode: string | null; tofNs: number | null
+  peakToPeak: number | null; snrDb: number | null; positionLabel: string | null; warning: string | null
+}
+// 点位表一行（CSV 前 7 列解析结果）
+export interface WiringRowBody {
+  channelNo: number; positionLabel?: string; boltCode?: string
+  nominalDiam?: string; grade?: string; targetPreloadN?: number; minPreloadN?: number
+}
+export interface WiringImportResult {
+  deviceId: number; total: number; updatedPositions: number
+  createdBolts: { channelNo: number; boltId: number; code: string }[]
+  skippedBound: number[]; backfilled: number
+}
+export const acceptanceApi = {
+  // 验收会话：MCR 临时缩到待验收通道集，插拔确认提速（reviewer+；TTL 过期自动恢复全通道轮询）
+  session: (deviceId: number) => http.get<AcceptanceSessionView>(`/api/devices/${deviceId}/acceptance-session/`),
+  startSession: (deviceId: number, body: { channels?: number[]; ttlMinutes?: number } = {}) =>
+    http.post<AcceptanceSessionView>(`/api/devices/${deviceId}/acceptance-session/`, body),
+  endSession: (deviceId: number) =>
+    http.delete<{ ended: boolean; fullPollingRestored?: boolean; note?: string }>(`/api/devices/${deviceId}/acceptance-session/`),
+  // 确认验收：sequential=顺序接入 / loopcheck=拔插确认 / manual=人工登记；落记录 + 声时指纹快照
+  accept: (deviceId: number, channelNo: number, body: { method: string; cableLabel?: string; positionLabel?: string; note?: string }) =>
+    http.post<AcceptResult>(`/api/devices/${deviceId}/channels/${channelNo}/accept`, body),
+  list: (deviceId: number) =>
+    http.get<{ deviceId: number; total: number; accepted: number; items: AcceptanceItem[] }>(`/api/devices/${deviceId}/acceptance/`),
+  reportUrl: (deviceId: number) => `/api/devices/${deviceId}/acceptance/export.csv`,
+  // 点位表：导出 CSV（前 7 列可修改后回导）；导入（reviewer+，全或无事务，可批量建档）
+  wiringExportUrl: (deviceId: number) => `/api/devices/${deviceId}/wiring-table/export.csv`,
+  importWiring: (deviceId: number, body: { rows: WiringRowBody[]; groupId?: number; createBolts?: boolean; note?: string }) =>
+    http.post<WiringImportResult>(`/api/devices/${deviceId}/wiring-table/import`, body),
 }
 
 // ---- 波形诊断 ----

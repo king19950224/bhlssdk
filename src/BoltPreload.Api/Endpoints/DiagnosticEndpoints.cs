@@ -902,15 +902,21 @@ public static class DiagnosticEndpoints
         .WithName("DeviceChannelsHealth")
         .WithSummary("多通道健康总览：每通道 Session、绑定、测量、波形与设备读回参数");
 
-        // 实时通道识别：返回各通道最新回波声时 + 信号强度(峰峰值/SNR)，供"敲击识别法"用——
-        // 现场依次轻敲/微动每颗螺栓,前端高亮信号跳动的通道,即可确定 通道↔螺栓 对应并标位置。
+        // 点位与验收页数据源：返回【全部活跃通道】的最新回波声时 + 信号强度(峰峰值/SNR) + 验收状态。
+        // 未绑定通道的回波来自 unbound_measurements（绑定后才进 measurements）——这样新插探头、
+        // 还没建档的通道也能在页面看到实时信号并就地建档；无数据通道也返回（前端要能显示整个通道面板）。
         app.MapGet("/api/devices/{deviceId:long}/channels/live", async (
             long deviceId, NpgsqlDataSource ds, CancellationToken ct) =>
         {
             const string sql = @"
                 SELECT c.channel_no, b.id, b.code, b.position_label,
-                       le.echo_time_ns, le.sp_temp_c, le.ts,
-                       wf.peak_to_peak, wf.snr_db
+                       COALESCE(le.echo_time_ns, ule.echo_time_ns) AS echo_ns,
+                       COALESCE(le.sp_temp_c, ule.sp_temp_c) AS temp_c,
+                       COALESCE(le.ts, ule.ts) AS last_ts,
+                       wf.peak_to_peak, wf.snr_db,
+                       c.id AS channel_id, c.name AS channel_name,
+                       c.hardware_state, c.last_seen_at, c.accepted_at, c.last_present_at,
+                       b.target_preload_n
                 FROM channels c
                 LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 LEFT JOIN LATERAL (
@@ -918,12 +924,15 @@ public static class DiagnosticEndpoints
                     WHERE m.channel_id = c.id AND m.ts > now() - interval '20 seconds'
                     ORDER BY ts DESC LIMIT 1) le ON true
                 LEFT JOIN LATERAL (
+                    SELECT echo_time_ns, sp_temp_c, ts FROM unbound_measurements um
+                    WHERE um.channel_id = c.id AND um.ts > now() - interval '20 seconds'
+                    ORDER BY ts DESC LIMIT 1) ule ON true
+                LEFT JOIN LATERAL (
                     SELECT peak_to_peak, snr_db FROM wave_features w
                     WHERE w.channel_id = c.id AND w.ts > now() - interval '20 seconds'
                     ORDER BY ts DESC LIMIT 1) wf ON true
                 WHERE c.device_id = @d AND c.deleted_at IS NULL
-                  AND (le.ts IS NOT NULL OR wf.peak_to_peak IS NOT NULL)
-                ORDER BY wf.peak_to_peak DESC NULLS LAST, c.channel_no";
+                ORDER BY c.channel_no";
             await using var cmd = ds.CreateCommand(sql);
             cmd.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
             var items = new List<object>();
@@ -940,13 +949,22 @@ public static class DiagnosticEndpoints
                     lastTs = r.IsDBNull(6) ? (DateTime?)null : r.GetDateTime(6),
                     peakToPeak = r.IsDBNull(7) ? (int?)null : r.GetInt32(7),
                     snrDb = r.IsDBNull(8) ? (decimal?)null : r.GetDecimal(8),
+                    channelId = r.GetInt64(9),
+                    channelName = r.IsDBNull(10) ? null : r.GetString(10),
+                    hardwareState = r.GetString(11),
+                    lastSeenAt = r.IsDBNull(12) ? (DateTime?)null : r.GetDateTime(12),
+                    acceptedAt = r.IsDBNull(13) ? (DateTime?)null : r.GetDateTime(13),
+                    // 曾在位标记：识别页据此区分"失联"（曾在位，红色警示）与"待接入"（从未在位，中性）
+                    lastPresentAt = r.IsDBNull(14) ? (DateTime?)null : r.GetDateTime(14),
+                    // 自动建档缺省无目标值 → 识别页「待补规格」引导
+                    targetPreloadN = r.IsDBNull(15) ? (decimal?)null : r.GetDecimal(15),
                 });
             return Results.Ok(new { deviceId, count = items.Count, items });
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)
         .WithTags("Channels")
         .WithName("DeviceChannelsLive")
-        .WithSummary("实时通道识别：各通道最新回波声时 + 信号强度(敲击识别法)");
+        .WithSummary("点位与验收：全部通道的最新回波声时 + 信号强度 + 验收状态（含未绑定通道）");
 
         // ========== 重标定（用当前 TOF/Temp 写成新基线） ==========
         //

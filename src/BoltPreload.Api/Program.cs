@@ -5,6 +5,7 @@ using BoltPreload.Api.Hubs;
 using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Alarm;
 using BoltPreload.Application.Devices;
+using BoltPreload.Application.Devices.Acceptance;
 using BoltPreload.Application.Devices.ProbeScan;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Application.Licensing;
@@ -139,6 +140,9 @@ builder.Services.Configure<ProbeScanOptions>(builder.Configuration.GetSection("P
 builder.Services.AddSingleton<ProbeScanState>();
 builder.Services.AddSingleton<IProbeScanRepository, PostgresProbeScanRepository>();
 builder.Services.AddSingleton<IProbeScanOrchestrator, ProbeScanOrchestrator>();
+
+// 接入验收会话（MCR 临时缩窄，与 probe-scan 互斥；恢复由 ChannelPresenceService 收敛兜底）
+builder.Services.AddSingleton<AcceptanceSessionState>();
 builder.Services.Configure<LocalFileLicenseOptions>(builder.Configuration.GetSection("License"));
 // 把真实环境写入 License 选项：AllowMissingLicenseInDevelopment 只有在 Development 才会被采纳，
 // 防止该开关被误配到生产导致无 license 也"有效"。
@@ -181,6 +185,10 @@ builder.Services.AddHostedService<BoltPreload.Api.Runtime.SignalHealthService>()
 // 波形采集：真机 MultiMeas 模式不随测量带波形，定期主动读 LEchoWave 补波形诊断数据源（默认关，现场接真机后开）
 builder.Services.Configure<BoltPreload.Api.Runtime.WaveSamplingOptions>(builder.Configuration.GetSection("Ingestion:WaveSampling"));
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.WaveSamplingService>();
+
+// 接线指纹守卫：已验收通道声时偏离验收指纹 → wiring_suspect 告警（检修换接电缆的最后防线，只告警不停发）
+builder.Services.Configure<BoltPreload.Api.Runtime.WiringGuardOptions>(builder.Configuration.GetSection("Alarm:WiringGuard"));
+builder.Services.AddHostedService<BoltPreload.Api.Runtime.WiringGuardService>();
 
 // 仿真模式：为模拟器驱动的螺栓通道写入真实标定，使采集链路算出真实预紧力（不再注入演示数据）。
 if (string.Equals(builder.Configuration["Fx:Mode"] ?? "Simulated", "Simulated", StringComparison.OrdinalIgnoreCase))
@@ -347,6 +355,8 @@ app.MapDashboardEndpoints();
 app.MapProbeScanEndpoints();
 app.MapChannelEndpoints();
 app.MapDeviceSettingsEndpoints();
+app.MapAcceptanceEndpoints();
+app.MapWiringTableEndpoints();
 app.MapCalibrationEndpoints();
 app.MapBoltEndpoints();
 app.MapAlarmEndpoints();

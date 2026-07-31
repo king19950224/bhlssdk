@@ -1,3 +1,4 @@
+using BoltPreload.Application.Devices.Acceptance;
 using BoltPreload.Fx;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -18,6 +19,7 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
     private readonly IDeviceConnectorManager _deviceManager;
     private readonly IProbeScanRepository _repo;
     private readonly ProbeScanState _state;
+    private readonly AcceptanceSessionState _acceptance;
     private readonly ProbeScanOptions _options;
     private readonly ILogger<ProbeScanOrchestrator> _logger;
 
@@ -25,12 +27,14 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
         IDeviceConnectorManager deviceManager,
         IProbeScanRepository repo,
         ProbeScanState state,
+        AcceptanceSessionState acceptance,
         IOptions<ProbeScanOptions> options,
         ILogger<ProbeScanOrchestrator> logger)
     {
         _deviceManager = deviceManager;
         _repo = repo;
         _state = state;
+        _acceptance = acceptance;
         _options = options.Value;
         _logger = logger;
     }
@@ -42,6 +46,10 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
 
         if (runtime.Connector.State != FxConnectorState.Connected)
             throw new InvalidOperationException($"设备未连接，无法启动扫描：state={runtime.Connector.State}");
+
+        // 与接入验收会话互斥：两者都要独占改写 MCR 轮询集，并发会把对方的通道集踩掉
+        if (_acceptance.IsActive(req.DeviceId))
+            throw new InvalidOperationException($"设备 {req.DeviceId} 正在进行接入验收会话，请先结束验收再启动扫描");
 
         var existingOpenId = await _repo.FindOpenRunAsync(req.DeviceId, ct);
         if (existingOpenId is not null)

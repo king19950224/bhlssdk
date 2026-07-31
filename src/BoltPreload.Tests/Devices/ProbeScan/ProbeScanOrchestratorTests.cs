@@ -37,7 +37,7 @@ public class ProbeScanOrchestratorTests
         });
 
         var orchestrator = new ProbeScanOrchestrator(
-            deviceManager, repo, state, options,
+            deviceManager, repo, state, new BoltPreload.Application.Devices.Acceptance.AcceptanceSessionState(), options,
             NullLogger<ProbeScanOrchestrator>.Instance);
 
         var req = new ProbeScanRequest(
@@ -84,7 +84,7 @@ public class ProbeScanOrchestratorTests
         });
 
         var orchestrator = new ProbeScanOrchestrator(
-            deviceManager, repo, state, options,
+            deviceManager, repo, state, new BoltPreload.Application.Devices.Acceptance.AcceptanceSessionState(), options,
             NullLogger<ProbeScanOrchestrator>.Instance);
 
         var req = new ProbeScanRequest(
@@ -130,7 +130,7 @@ public class ProbeScanOrchestratorTests
         });
 
         var orchestrator = new ProbeScanOrchestrator(
-            deviceManager, repo, state, options,
+            deviceManager, repo, state, new BoltPreload.Application.Devices.Acceptance.AcceptanceSessionState(), options,
             NullLogger<ProbeScanOrchestrator>.Instance);
 
         var req = new ProbeScanRequest(
@@ -170,7 +170,7 @@ public class ProbeScanOrchestratorTests
         var options = Options.Create(new ProbeScanOptions());
 
         var orchestrator = new ProbeScanOrchestrator(
-            deviceManager, repo, state, options,
+            deviceManager, repo, state, new BoltPreload.Application.Devices.Acceptance.AcceptanceSessionState(), options,
             NullLogger<ProbeScanOrchestrator>.Instance);
 
         var req = new ProbeScanRequest(
@@ -200,7 +200,7 @@ public class ProbeScanOrchestratorTests
         });
 
         var orchestrator = new ProbeScanOrchestrator(
-            deviceManager, repo, state, options, NullLogger<ProbeScanOrchestrator>.Instance);
+            deviceManager, repo, state, new BoltPreload.Application.Devices.Acceptance.AcceptanceSessionState(), options, NullLogger<ProbeScanOrchestrator>.Instance);
 
         var req = new ProbeScanRequest(
             DeviceId: 1, Channels: new ushort[] { 3, 5 },
@@ -230,7 +230,7 @@ public class ProbeScanOrchestratorTests
         });
 
         var orchestrator = new ProbeScanOrchestrator(
-            deviceManager, repo, state, options, NullLogger<ProbeScanOrchestrator>.Instance);
+            deviceManager, repo, state, new BoltPreload.Application.Devices.Acceptance.AcceptanceSessionState(), options, NullLogger<ProbeScanOrchestrator>.Instance);
 
         var req = new ProbeScanRequest(
             DeviceId: 1, Channels: new ushort[] { 1, 2, 3 },
@@ -319,6 +319,7 @@ public class ProbeScanOrchestratorTests
         public IReadOnlyCollection<DeviceRuntimeContext> Runtimes => new[] { _ctx };
         public DeviceRuntimeContext Primary => _ctx;
         public DeviceRuntimeContext? Find(long deviceId) => deviceId == _ctx.DeviceId ? _ctx : null;
+        public bool TryUpdateChannelCount(long deviceId, ushort channelCount) => deviceId == _ctx.DeviceId;
     }
 
     private sealed class FakeRepository : IProbeScanRepository
