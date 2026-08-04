@@ -22,6 +22,8 @@ const trend = ref<DashboardTrendPoint[]>([])
 const loaded = ref(false)
 const firstLoad = ref(true)
 const error = ref<string | null>(null)
+// 趋势单独失败态：容错不拖垮整页，但"取不到"不能显示成"没有数据"
+const trendError = ref<string | null>(null)
 
 const SEV_LABEL: Record<string, string> = { critical: '严重', crit: '严重', warn: '预警', warning: '预警', info: '提示' }
 const alarmBreakdown = computed(() =>
@@ -91,7 +93,14 @@ function goTile(to: string) { router.push({ name: to }) }
 
 async function refresh() {
   try {
-    const [d, t] = await Promise.all([dashboardApi.preloadHealth(), dashboardApi.trend(24).catch(() => null)])
+    // 趋势是较重聚合，挂了不拖整页；失败记到 trendError，别显示成"暂无数据"
+    const [d, t] = await Promise.all([
+      dashboardApi.preloadHealth(),
+      dashboardApi.trend(24).catch((e) => {
+        trendError.value = e instanceof Error ? e.message : '趋势加载失败'
+        return null
+      }),
+    ])
     if (disposed) return
     health.value = d.global
     byGroup.value = d.byGroup
@@ -100,7 +109,7 @@ async function refresh() {
     approaching.value = d.approachingLimit
     openAlarms.value = d.openAlarms
     alarmsBySeverity.value = d.alarmsBySeverity ?? []
-    if (t) trend.value = t.points
+    if (t) { trend.value = t.points; trendError.value = null }
     error.value = null
   } catch (e) {
     if (disposed) return
@@ -284,6 +293,9 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
       </div>
       <div class="trend-body">
         <EChart v-if="hasTrend" :option="trendOption" height="260px" />
+        <div v-else-if="trendError" class="trend-empty trend-empty--err">
+          趋势加载失败：{{ trendError }}
+        </div>
         <div v-else-if="loaded" class="trend-empty">暂无足够时序数据</div>
       </div>
     </div>
@@ -438,6 +450,7 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
 /* ③ 趋势 */
 .trend-body { padding: 2px 12px 12px; }
 .trend-empty { color: var(--text-3); font-size: 13px; text-align: center; padding: 80px 0; }
+.trend-empty--err { color: var(--warn); }
 
 /* ④ 明细折叠区 */
 .more { padding: 0; }

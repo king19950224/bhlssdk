@@ -46,10 +46,13 @@ const bolt = ref<BoltListItem | null>(null)
 const trend = ref<TrendPoint[]>([])
 const measurements = ref<{ ts: string; echoTimeNs: number | null; spTempC: number | null; statusCode: number; preloadN: number | null; preloadRatio: number | null }[]>([])
 const calibrations = ref<CalibRecord[]>([])
+// 标定档案单独失败态：退成空数组不能显示成"该通道暂无标定档案"
+const calibError = ref<string | null>(null)
 const events = ref<{ at: string; kind: string; title: string; note: string; color: string }[]>([])
 const rangeKey = ref<'1h' | '24h' | '7d'>('24h')
 const showTemp = ref(false)
 const loading = ref(true)
+const trendError = ref<string | null>(null)
 
 const wave = ref<WaveFile | null>(null)
 const waveFeat = ref<WaveFeature | null>(null)
@@ -150,9 +153,14 @@ async function loadTrend() {
   const hours = rangeKey.value === '1h' ? 1 : rangeKey.value === '24h' ? 24 : 168
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
   const seq = ++trendSeq
-  const items = (await boltApi.preloadTrend(boltId, `?bucket=auto&since=${since}`)).items
-  // 快速切换 1h/24h/7d 时丢弃过期响应，避免旧时段数据覆盖新选择
-  if (seq === trendSeq) trend.value = items
+  try {
+    const items = (await boltApi.preloadTrend(boltId, `?bucket=auto&since=${since}`)).items
+    // 快速切换 1h/24h/7d 时丢弃过期响应
+    if (seq === trendSeq) { trend.value = items; trendError.value = null }
+  } catch (e) {
+    if (seq !== trendSeq) return
+    trendError.value = e instanceof Error ? e.message : '趋势加载失败'
+  }
 }
 
 async function loadWave() {
@@ -334,9 +342,14 @@ async function init() {
     try { pred.value = await boltApi.prediction(boltId) } catch { /* 预测不可用 */ }
     measurements.value = (await boltApi.measurements(boltId, 24)).items
     if (bolt.value) {
-      // 单独兜底：标定档案拉取失败（网络抖动等）不应打断波形/实时订阅等后续区块
-      try { calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items }
-      catch { calibrations.value = [] }
+      // 标定档案挂了不拖后续区块，但要记下失败，别显示成"暂无档案"
+      try {
+        calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items
+        calibError.value = null
+      } catch (e) {
+        calibrations.value = []
+        calibError.value = e instanceof Error ? e.message : '标定档案加载失败'
+      }
       const al = await alarmApi.list('?includeCleared=true&limit=200')
       // 审计履历是 reviewer+ 专属接口：operator 请求会 403。仅 reviewer 拉取，且单独 try 兜底，
       // 避免因审计 403 让 Promise.all 整体失败、后续波形/实时订阅不执行（operator 打开详情页残缺）。
@@ -403,8 +416,10 @@ watch(() => route.params.boltId, (nv, ov) => {
   unsubMeas = undefined
   bolt.value = null
   trend.value = []
+  trendError.value = null
   measurements.value = []
   calibrations.value = []
+  calibError.value = null
   events.value = []
   wave.value = null
   waveFeat.value = null
@@ -518,7 +533,11 @@ async function saveSettings() {
     })
     ElMessage.success('预紧力设置已保存')
     settings.visible = false
-    bolt.value = await boltApi.get(boltId).catch(() => bolt.value)
+    // 回读失败不是保存失败（库里已经改了），但不能静默留着旧数字
+    bolt.value = await boltApi.get(boltId).catch(() => {
+      ElMessage.warning('已保存，但页面刷新失败，当前显示的仍是保存前的数值')
+      return bolt.value
+    })
   } catch (e) {
     ElMessage.error((e as Error)?.message || '保存失败')
   } finally {
@@ -787,7 +806,8 @@ async function exportTrendCsv() {
         </div>
       </div>
       <EChart v-if="trend.length" :option="trendOption" height="280px" />
-      <div v-if="!loading && !trend.length" class="chart-empty">该时段无测量数据</div>
+      <div v-else-if="trendError" class="chart-empty chart-empty--err">趋势加载失败：{{ trendError }}</div>
+      <div v-else-if="!loading" class="chart-empty">该时段无测量数据</div>
       <div v-if="isStale && !loading && trend.length" class="predict stale">
         <el-icon><WarningFilled /></el-icon>
         <span v-if="offlineStale">数据已陈旧（{{ fmtAgo(effLastTs, now) }}无新测量），趋势预测已暂停，恢复采集后自动恢复。</span>
@@ -916,7 +936,8 @@ async function exportTrendCsv() {
               <span class="cl-date mono">{{ new Date(c.createdAt).toLocaleDateString('zh-CN') }}</span>
             </div>
           </li>
-          <li v-if="!loading && !calibrations.length" class="calib-empty">该通道暂无标定档案</li>
+          <li v-if="!loading && calibError" class="calib-empty calib-empty--err">标定档案加载失败：{{ calibError }}</li>
+          <li v-else-if="!loading && !calibrations.length" class="calib-empty">该通道暂无标定档案</li>
         </ul>
       </div>
     </div>
@@ -1045,6 +1066,7 @@ async function exportTrendCsv() {
 .range-tab:hover { color: var(--text-1); }
 .range-tab.active { color: var(--accent); border-color: var(--panel-border-strong); background: rgba(34, 211, 238, 0.08); }
 .chart-empty { text-align: center; color: var(--text-3); padding: 16px; font-size: 13px; }
+.chart-empty--err, .calib-empty--err { color: var(--warn); }
 .bolt-missing { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 60px 20px; color: var(--text-2); }
 .bolt-missing .el-icon { font-size: 34px; color: var(--warn); }
 .bolt-missing p { margin: 0; font-size: 15px; }

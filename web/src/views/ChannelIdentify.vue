@@ -20,6 +20,8 @@ const auth = useAuth()
 const deviceId = ref<number | null>(null)
 const rows = ref<ChannelLive[]>([])
 const loading = ref(true)
+// 设备列表 / 通道列表加载失败。deviceId=null 或 rows=[] 不能一律当成"没设备/没通道"
+const loadError = ref<string | null>(null)
 const labelEdit = ref<Record<number, string>>({})
 const savingPos = ref<number | null>(null)
 let pollTimer: number | undefined
@@ -40,13 +42,16 @@ async function poll() {
   try {
     const d = await deviceApi.channelsLive(deviceId.value)
     rows.value = d.items
+    loadError.value = null
     // 输入框用现有位号预填（仅首次，不覆盖正在编辑的内容）
     for (const it of d.items) {
       if (labelEdit.value[it.channelNo] === undefined && it.positionLabel)
         labelEdit.value[it.channelNo] = it.positionLabel
     }
-  } catch {
-    /* 尽力轮询 */
+  } catch (e) {
+    // 有旧数据就保留；只有空表时才报错，否则每 10s 刷一次横幅
+    if (!rows.value.length)
+      loadError.value = e instanceof Error ? e.message : '通道列表加载失败'
   } finally {
     loading.value = false
   }
@@ -75,8 +80,10 @@ onMounted(async () => {
       ?? rt.items.find((x) => x.isPrimary)?.deviceId
       ?? rt.items[0]?.deviceId
       ?? null
-  } catch {
+    loadError.value = null
+  } catch (e) {
     deviceId.value = null
+    loadError.value = e instanceof Error ? e.message : '设备列表加载失败'
   }
   if (deviceId.value == null) {
     loading.value = false
@@ -590,10 +597,12 @@ async function unbind(it: ChannelLive) {
           </div>
         </template>
       </div>
-      <div v-if="!loading && !rows.length" class="empty">
-        {{ deviceId == null
-          ? '未找到采集设备运行时，请先到“采集设备”页确认设备已接入'
-          : '该设备通道目录为空——请到“采集设备”页用“通道数”设置实际通道数（如 48）重建目录' }}
+      <div v-if="!loading && !rows.length" class="empty" :class="{ 'empty--err': loadError }">
+        {{ loadError
+          ? `加载失败：${loadError}`
+          : deviceId == null
+            ? '未找到采集设备运行时，请先到“采集设备”页确认设备已接入'
+            : '该设备通道目录为空——请到“采集设备”页用“通道数”设置实际通道数（如 48）重建目录' }}
       </div>
     </div>
 
@@ -726,6 +735,7 @@ async function unbind(it: ChannelLive) {
 .bind-hint { font-size: 11px; color: var(--ok); }
 .bind-hint.dim { color: var(--text-3); }
 .empty { grid-column: 1 / -1; text-align: center; color: var(--text-3); padding: 40px; }
+.empty--err { color: var(--warn); }
 
 .fld-hint { font-size: 11.5px; color: var(--text-3); line-height: 1.5; margin-top: 4px; }
 .fld-hint.inline { margin: 0 0 0 10px; }

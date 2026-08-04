@@ -9,6 +9,8 @@ const props = defineProps<{ bolts: GroupBolt[] }>()
 const range = ref<'24h' | '7d'>('24h')
 const loading = ref(false)
 const seriesData = ref<{ bolt: GroupBolt; pts: [number, number | null][] }[]>([])
+// 趋势查询失败的螺栓编号。缺一条线看着像没在采，其实是查询挂了。
+const failedBolts = ref<string[]>([])
 
 const STATUS_COLOR: Record<string, string> = {
   normal: 'rgba(56,189,248,0.7)',
@@ -35,21 +37,27 @@ const limitIsUniform = computed(() => {
 
 let loadSeq = 0
 async function load() {
-  if (!props.bolts.length) { seriesData.value = []; return }
+  if (!props.bolts.length) { seriesData.value = []; failedBolts.value = []; return }
   const seq = ++loadSeq // 竞态令牌：bolts/range 快速切换时，只保留最后一次发起的结果
   loading.value = true
   const hours = range.value === '24h' ? 24 : 168
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
+  const failed: string[] = []
   try {
+    // 单颗失败不连坐：其余照画，失败的记下编号在图下说明
     const results = await Promise.all(
       props.bolts.map((b) =>
         boltApi
           .preloadTrend(b.id, `?bucket=auto&since=${since}`)
           .then((r) => ({ bolt: b, items: r.items }))
-          .catch(() => ({ bolt: b, items: [] as { ts: string; avgRatio: number | null }[] })),
+          .catch(() => {
+            failed.push(b.code)
+            return { bolt: b, items: [] as { ts: string; avgRatio: number | null }[] }
+          }),
       ),
     )
     if (seq !== loadSeq) return // 已有更新的加载在途，丢弃这次陈旧结果
+    failedBolts.value = failed
     seriesData.value = results.map(({ bolt, items }) => ({
       bolt,
       pts: items.map((p) => [new Date(p.ts).getTime(), p.avgRatio == null ? null : Number(p.avgRatio) * 100] as [number, number | null]),
@@ -105,7 +113,13 @@ const option = computed(() => {
     </div>
     <EChart v-if="hasData" :option="option" height="370px" />
     <div v-else-if="loading" class="gt-empty" v-loading="true" style="min-height:120px" />
+    <div v-else-if="failedBolts.length" class="gt-empty gt-empty--err">
+      趋势加载失败：{{ failedBolts.join('、') }}
+    </div>
     <div v-else class="gt-empty">该部位暂无可对比的趋势数据</div>
+    <div v-if="hasData && failedBolts.length" class="gt-warn">
+      以下螺栓趋势查询失败，图上没有对应曲线：{{ failedBolts.join('、') }}
+    </div>
   </div>
 </template>
 
@@ -119,4 +133,6 @@ const option = computed(() => {
 .range-tab:hover { color: var(--text-1); }
 .range-tab.active { color: var(--accent); border-color: var(--panel-border-strong); background: rgba(34, 211, 238, 0.08); }
 .gt-empty { text-align: center; color: var(--text-3); padding: 40px; font-size: 13px; }
+.gt-empty--err { color: var(--warn); }
+.gt-warn { color: var(--warn); font-size: 12px; padding: 0 4px 8px; }
 </style>
