@@ -21,16 +21,39 @@ namespace BoltPreload.Tests.Integration;
 /// </summary>
 internal static class TestApi
 {
+    /// <summary>测试里用的固定签名密钥，免得依赖 Development 环境的兜底 key。</summary>
+    private const string TestSigningKey = "integration_test_signing_key_do_not_use_in_production_64_bytes!!";
+
     /// <param name="configure">
     /// 个别用例要改配置时用（如把波形根目录指到临时目录）。在默认设置之后执行，可以覆盖它们。
     /// </param>
     public static WebApplicationFactory<Program> CreateFactory(
         PostgresFixture fx, Action<IWebHostBuilder>? configure = null) =>
+        BuildFactory(fx, configure, useTestAuth: true);
+
+    /// <summary>
+    /// 保留<b>真实 JWT 鉴权链</b>的工厂：签发、签名/有效期校验、以及 OnTokenValidated 里
+    /// 按 users.token_version 与 enabled 的吊销复核，全部照生产路径走。
+    /// <para>
+    /// 为什么要单独有这一个：<see cref="CreateFactory"/> 把认证方案整个换成了
+    /// <c>TestAuthHandler</c>，好处是铺数据便宜，代价是真实鉴权那一段一行都跑不到。
+    /// 于是"停用/改密/登出后旧令牌立即失效"这条安全红线曾经零覆盖——库里 token_version
+    /// 有没有自增测了，自增之后那个旧令牌到底还能不能用，没有任何测试问过。
+    /// 只有验这条红线的用例才该用这个工厂，其余的用 <see cref="CreateFactory"/> 更省事。
+    /// </para>
+    /// </summary>
+    public static WebApplicationFactory<Program> CreateRealAuthFactory(
+        PostgresFixture fx, Action<IWebHostBuilder>? configure = null) =>
+        BuildFactory(fx, configure, useTestAuth: false);
+
+    private static WebApplicationFactory<Program> BuildFactory(
+        PostgresFixture fx, Action<IWebHostBuilder>? configure, bool useTestAuth) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Development");
             builder.UseSetting("ConnectionStrings:Postgres", fx.ConnectionString);
             builder.UseSetting("Fx:Mode", "Simulated");
+            builder.UseSetting("Jwt:SigningKey", TestSigningKey);
             configure?.Invoke(builder);
             builder.ConfigureTestServices(services =>
             {
@@ -40,8 +63,9 @@ internal static class TestApi
                 services.RemoveAll<ILicenseService>();
                 services.AddSingleton<ILicenseService, AlwaysValidLicenseService>();
                 // 用测试认证方案覆盖默认（JWT）：按 X-Test-UserId / X-Test-Role 请求头认证
-                services.AddAuthentication(TestAuthHandler.SchemeName)
-                    .AddScheme<AuthenticationSchemeOptions, TestAuthHandler>(TestAuthHandler.SchemeName, _ => { });
+                if (useTestAuth)
+                    services.AddAuthentication(TestAuthHandler.SchemeName)
+                        .AddScheme<AuthenticationSchemeOptions, TestAuthHandler>(TestAuthHandler.SchemeName, _ => { });
             });
         });
 
