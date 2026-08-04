@@ -59,7 +59,8 @@ public sealed class WaveRetentionService : BackgroundService
         }
     }
 
-    private async Task RunOnceAsync(CancellationToken ct)
+    // internal 供集成测试直调单轮清理（BoltPreload.Tests，见 csproj InternalsVisibleTo）
+    internal async Task RunOnceAsync(CancellationToken ct)
     {
         try
         {
