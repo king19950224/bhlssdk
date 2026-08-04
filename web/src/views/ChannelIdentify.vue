@@ -441,6 +441,9 @@ async function onBoltCreated() {
 async function unbind(it: ChannelLive) {
   if (it.boltId == null) return
   const stillPresent = hasSignal(it)
+  // 询问与执行分两段 catch：合成一段会把 unbind 的 403/网络错误当成"用户取消"一起吞掉，
+  // 而这一步是停用螺栓档案、清除标定基线的破坏性操作，失败了必须让操作员看见。
+  let reason: string
   try {
     const { value } = await ElMessageBox.prompt(
       `删除螺栓 ${it.boltCode}（通道 CH${it.channelNo}）。档案将停用，该通道标定基线清除，历史数据保留可查。` +
@@ -450,14 +453,19 @@ async function unbind(it: ChannelLive) {
       '请填原因：',
       '删除螺栓', { confirmButtonText: '删除', cancelButtonText: '取消', inputType: 'textarea',
         inputValidator: (v) => (v && v.trim() ? true : '请填原因') })
-    await channelApi.unbind(it.channelId, value)
+    reason = value
+  } catch { return }
+  try {
+    await channelApi.unbind(it.channelId, reason)
     ElMessage.success(
       stillPresent
         ? `螺栓 ${it.boltCode} 已删除；探头仍在位，自动建档已抑制至离位后再插入`
         : `螺栓 ${it.boltCode} 已删除，通道 CH${it.channelNo} 回到未绑定`)
     delete labelEdit.value[it.channelNo]
     await poll()
-  } catch { /* 取消 */ }
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '删除螺栓失败（需复核员权限）')
+  }
 }
 </script>
 

@@ -213,10 +213,34 @@ public sealed class IngestionService : BackgroundService
         }
     }
 
+    private long _publishFailures;
+    private long _lastPublishWarnTicks;
+
     private async Task SafePublishAsync(FxDecodedEnvelope envelope, CancellationToken ct)
     {
         try { await _publisher.PublishAsync(envelope, ct); }
         catch (OperationCanceledException) { /* 进程退出 */ }
-        catch (Exception ex) { _logger.LogDebug(ex, "实时推送失败 device={DeviceId}", envelope.DeviceId); }
+        catch (Exception ex) { WarnPublishFailureThrottled(ex, envelope.DeviceId); }
+    }
+
+    /// <summary>
+    /// 实时推送失败告警（节流：每秒最多一条，参照 FxSdkConnector 的背压告警写法）。
+    /// <para>
+    /// 原先记的是 Debug —— 默认日志级别下等于没记。数据仍然落库、告警判定也照常，
+    /// 但大屏和操作台从此不再刷新，现场看到的是一屏冻住的旧数字，而日志里一片安静。
+    /// 对以实时页面值守为主的现场，这正是最需要被看见的一类失效。
+    /// </para>
+    /// <para>必须节流：50Hz × N 通道下推送一旦持续失败，不节流会把日志刷爆。</para>
+    /// </summary>
+    private void WarnPublishFailureThrottled(Exception ex, long deviceId)
+    {
+        var total = Interlocked.Increment(ref _publishFailures);
+        var now = DateTime.UtcNow.Ticks;
+        var last = Interlocked.Read(ref _lastPublishWarnTicks);
+        if (now - last < TimeSpan.TicksPerSecond) return;
+        if (Interlocked.CompareExchange(ref _lastPublishWarnTicks, now, last) != last) return;
+        _logger.LogWarning(ex,
+            "实时推送失败，前端将停止刷新（数据已入库，不影响告警判定）device={DeviceId} 累计失败={Total}",
+            deviceId, total);
     }
 }

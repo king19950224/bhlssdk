@@ -234,15 +234,24 @@ async function abortScan() {
 }
 
 async function unbind(c: ChannelRow) {
+  // 询问与执行必须分成两段 catch。合成一段的话，channelApi.unbind 抛的 403/网络错误会和
+  // "用户点了取消"落进同一个 catch 被一起吞掉：解绑会停用螺栓、清除标定基线，界面却毫无反应，
+  // 操作员要么以为没点上而反复点，要么以为已解绑而去现场拔线。
+  let reason: string
   try {
     const { value } = await ElMessageBox.prompt(
       `解绑通道 CH${c.channelNo}（螺栓 ${c.boltCode}）。该螺栓将被停用，标定基线清除。请填原因：`,
       '解绑通道', { confirmButtonText: '解绑', cancelButtonText: '取消', inputType: 'textarea',
         inputValidator: (v) => (v && v.trim() ? true : '请填原因') })
-    await channelApi.unbind(c.id, value)
+    reason = value
+  } catch { return }
+  try {
+    await channelApi.unbind(c.id, reason)
     ElMessage.success('已解绑')
     await loadBinding()
-  } catch { /* 取消 */ }
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '解绑失败（需复核员权限）')
+  }
 }
 
 // 通道目录重建（reviewer+）：设置设备实际物理通道数（如 48），复活被删通道、补插缺失行，

@@ -97,6 +97,148 @@ public class StaticThresholdAlarmEvaluatorTests
         events.Should().BeEmpty("preload_high 已恢复为 active，不应重复触发");
     }
 
+    // ===== 上限分支：过拧告警 =====
+    // 此前只有 Restore_PreloadHigh_PreventsDuplicateRetrigger 从"已 active"那一侧碰过一下，
+    // 触发路径本身从未被走过 —— 也就是说"过拧根本报不出来"这种失效当时测不出来。
+
+    [Fact]
+    public void PreloadHigh_FifthConsecutiveSample_Triggers()
+    {
+        var sut = NewEvaluator();   // TriggerConsecutive 默认 5
+
+        for (int i = 0; i < 4; i++)
+            sut.Evaluate(Input(1.20m)).Should().BeEmpty($"第 {i + 1} 条还没攒够 on-delay");
+
+        var ev = sut.Evaluate(Input(1.20m));
+
+        ev.Should().ContainSingle();
+        ev[0].Action.Should().Be(AlarmAction.Trigger);
+        ev[0].Type.Should().Be("preload_high");
+        ev[0].Severity.Should().Be("warn", "偏差 0.20 未达 critical 档的 0.30");
+        ev[0].ConsecutiveCount.Should().Be(5);
+    }
+
+    [Fact]
+    public void PreloadHigh_DeviationExactlyAtCriticalCut_IsCritical()
+    {
+        // |1 - 1.30| 恰好 0.30，分级判定用 >=，应当升到 critical。差一个等号这里就退成 warn，
+        // 而 warn 在现场是不弹窗的。
+        var sut = NewEvaluator();
+
+        IReadOnlyList<AlarmEvent> ev = System.Array.Empty<AlarmEvent>();
+        for (int i = 0; i < 5; i++) ev = sut.Evaluate(Input(1.30m));
+
+        ev.Should().ContainSingle();
+        ev[0].Severity.Should().Be("critical");
+    }
+
+    [Fact]
+    public void PreloadHigh_StreakInterruptedByNormalSample_DoesNotTrigger()
+    {
+        // on-delay 要求"连续"。中间夹一条正常值必须清零，否则零星尖峰会慢慢攒成一条误报。
+        var sut = NewEvaluator();
+
+        for (int i = 0; i < 4; i++) sut.Evaluate(Input(1.20m));
+        sut.Evaluate(Input(1.00m)).Should().BeEmpty();
+
+        for (int i = 0; i < 4; i++)
+            sut.Evaluate(Input(1.20m)).Should().BeEmpty("计数已被正常值清零，要重新攒满 5 条");
+    }
+
+    [Fact]
+    public void PreloadHigh_ClearsAfterOffDelay()
+    {
+        var opt = new StaticThresholdAlarmOptions { ClearConsecutive = 3 };
+        var sut = NewEvaluator(opt);
+        for (int i = 0; i < opt.TriggerConsecutive; i++) sut.Evaluate(Input(1.20m));
+
+        IReadOnlyList<AlarmEvent> last = System.Array.Empty<AlarmEvent>();
+        for (int i = 0; i < opt.ClearConsecutive; i++) last = sut.Evaluate(Input(1.00m));
+
+        last.Should().ContainSingle();
+        last[0].Action.Should().Be(AlarmAction.Clear);
+        last[0].Type.Should().Be("preload_high");
+    }
+
+    // ===== 阈值边界 =====
+    // 触发与恢复之间的滞回带只有 0.02（0.70/0.72、1.10/1.08）。任何一个比较符少写或多写一个等号，
+    // 后果要么是恰好压线的螺栓反复触发又恢复地刷屏，要么是该报的不报，而且两种都不会抛异常。
+
+    [Theory]
+    [InlineData(0.6999, true, "低于触发下限，判定用 <")]
+    [InlineData(0.7000, false, "恰好等于触发下限，不该触发")]
+    [InlineData(0.7100, false, "在触发线之上")]
+    public void PreloadLow_TriggerBoundary_IsExclusive(decimal ratio, bool shouldTrigger, string why)
+    {
+        var sut = NewEvaluator();
+
+        IReadOnlyList<AlarmEvent> ev = System.Array.Empty<AlarmEvent>();
+        for (int i = 0; i < 5; i++) ev = sut.Evaluate(Input(ratio));
+
+        if (shouldTrigger) ev.Should().ContainSingle(why).Which.Type.Should().Be("preload_low");
+        else ev.Should().BeEmpty(why);
+    }
+
+    [Theory]
+    [InlineData(1.1001, true, "高于触发上限，判定用 >")]
+    [InlineData(1.1000, false, "恰好等于触发上限，不该触发")]
+    [InlineData(1.0900, false, "在触发线之下")]
+    public void PreloadHigh_TriggerBoundary_IsExclusive(decimal ratio, bool shouldTrigger, string why)
+    {
+        var sut = NewEvaluator();
+
+        IReadOnlyList<AlarmEvent> ev = System.Array.Empty<AlarmEvent>();
+        for (int i = 0; i < 5; i++) ev = sut.Evaluate(Input(ratio));
+
+        if (shouldTrigger) ev.Should().ContainSingle(why).Which.Type.Should().Be("preload_high");
+        else ev.Should().BeEmpty(why);
+    }
+
+    [Theory]
+    [InlineData(0.0500, true, "恰好等于脱落阈值，判定用 <= 应当计入")]
+    [InlineData(0.0501, false, "略高于阈值就不算脱落，走普通下限的 on-delay")]
+    public void PreloadLoss_Boundary_IsInclusive(decimal ratio, bool isLoss, string why)
+    {
+        var sut = NewEvaluator();
+
+        var ev = sut.Evaluate(Input(ratio));
+
+        if (isLoss) ev.Should().ContainSingle(why).Which.Type.Should().Be("preload_loss");
+        else ev.Should().BeEmpty(why);
+    }
+
+    [Theory]
+    [InlineData(0.7200, true, "恰好等于恢复线，判定用 >= 应当计入")]
+    [InlineData(0.7199, false, "仍在滞回带内，不算恢复")]
+    public void PreloadLow_ClearBoundary_IsInclusive(decimal ratio, bool shouldClear, string why)
+    {
+        var opt = new StaticThresholdAlarmOptions { ClearConsecutive = 3 };
+        var sut = NewEvaluator(opt);
+        for (int i = 0; i < opt.TriggerConsecutive; i++) sut.Evaluate(Input(0.60m));
+
+        IReadOnlyList<AlarmEvent> last = System.Array.Empty<AlarmEvent>();
+        for (int i = 0; i < opt.ClearConsecutive; i++) last = sut.Evaluate(Input(ratio));
+
+        if (shouldClear) last.Should().ContainSingle(why).Which.Action.Should().Be(AlarmAction.Clear);
+        else last.Should().BeEmpty(why);
+    }
+
+    [Theory]
+    [InlineData(1.0800, true, "恰好等于恢复线，判定用 <= 应当计入")]
+    [InlineData(1.0801, false, "仍在滞回带内，不算恢复")]
+    public void PreloadHigh_ClearBoundary_IsInclusive(decimal ratio, bool shouldClear, string why)
+    {
+        var opt = new StaticThresholdAlarmOptions { ClearConsecutive = 3 };
+        var sut = NewEvaluator(opt);
+        for (int i = 0; i < opt.TriggerConsecutive; i++) sut.Evaluate(Input(1.20m));
+
+        IReadOnlyList<AlarmEvent> last = System.Array.Empty<AlarmEvent>();
+        for (int i = 0; i < opt.ClearConsecutive; i++) last = sut.Evaluate(Input(ratio));
+
+        if (shouldClear) last.Should().ContainSingle(why).Which.Action.Should().Be(AlarmAction.Clear);
+        else last.Should().BeEmpty(why);
+    }
+
     // ===== C1：无状态 critical 安全网（WAL 重放兜底，不污染状态机）=====
 
     [Fact]
