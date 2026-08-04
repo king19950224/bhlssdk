@@ -83,7 +83,8 @@ public sealed class WaveSamplingService : BackgroundService
         }
     }
 
-    private async Task SampleOnceAsync(CancellationToken ct)
+    // internal 供集成测试直调单轮采集（BoltPreload.Tests，见 csproj InternalsVisibleTo）
+    internal async Task SampleOnceAsync(CancellationToken ct)
     {
         foreach (var rt in _manager.Runtimes)
         {

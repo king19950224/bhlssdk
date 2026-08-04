@@ -260,67 +260,6 @@ public class ProbeScanOrchestratorTests
 
     // ============ 测试替身 ============
 
-    private sealed class FakeConnector : IFxConnector
-    {
-        private readonly Channel<FxDecodedEnvelope> _channel =
-            System.Threading.Channels.Channel.CreateUnbounded<FxDecodedEnvelope>();
-        public ConcurrentQueue<(FxWorkMode Mode, ushort Channel)> WorkModeCalls = new();
-
-        public FakeConnector(long deviceId) { DeviceId = deviceId; }
-        public FxConnectorState State => FxConnectorState.Connected;
-        public long DeviceId { get; }
-        public ChannelReader<FxDecodedEnvelope> Results => _channel.Reader;
-        public long DroppedCount => 0;
-        public Func<FxDecodedEnvelope, ValueTask>? OverflowSink { get; set; }
-
-        public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task DisconnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-        public Task ReconnectAsync(CancellationToken ct = default) => Task.CompletedTask;
-
-        public Task SetWorkModeAsync(FxWorkMode mode, ushort channel = 0, ushort address = 1, CancellationToken ct = default)
-        {
-            WorkModeCalls.Enqueue((mode, channel));
-            return Task.CompletedTask;
-        }
-        public Task ReadDeviceParamAsync(string propertyName, ushort address = 1, CancellationToken ct = default)
-            => Task.CompletedTask;
-        public Task ReadChannelParamAsync(string propertyName, ushort channel = 1, ushort address = 1, CancellationToken ct = default)
-            => Task.CompletedTask;
-        public ConcurrentQueue<ushort[]> McrConfigCalls = new();
-        public Task ConfigureMultiChannelPollingAsync(
-            IReadOnlyCollection<ushort> enabledChannels, ushort? singleCount = null, ushort? dailyCount = null,
-            uint? startSeconds = null, CancellationToken ct = default)
-        {
-            McrConfigCalls.Enqueue(enabledChannels.ToArray());
-            return Task.CompletedTask;
-        }
-        public Task ConfigureChannelAsync(ushort channel, ChannelConfigUpdate updates, ushort address = 1, CancellationToken ct = default)
-            => Task.CompletedTask;
-        public Task<RecalibrateResult> RecalibrateChannelAsync(ushort channel, ushort address = 1,
-            decimal? explicitRefTimeNs = null, decimal? explicitRefTempC = null, CancellationToken ct = default)
-            => Task.FromResult(new RecalibrateResult(channel, address, 0, 0, 0, DateTimeOffset.UtcNow));
-        public IReadOnlyList<FxSessionChannelConfigSnapshot> GetSessionChannelConfigs() => Array.Empty<FxSessionChannelConfigSnapshot>();
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
-    }
-
-    private sealed class FakeDeviceManager : IDeviceConnectorManager
-    {
-        private readonly DeviceRuntimeContext _ctx;
-        public FakeDeviceManager(IFxConnector connector)
-        {
-            _ctx = new DeviceRuntimeContext(
-                DeviceId: connector.DeviceId,
-                Name: "fake",
-                IsPrimary: true,
-                Connector: connector,
-                RuntimeStatus: new IngestionRuntimeStatus(),
-                Options: new DeviceRuntimeOptions("Sim", "n/a", 1, 1, 3));
-        }
-        public IReadOnlyCollection<DeviceRuntimeContext> Runtimes => new[] { _ctx };
-        public DeviceRuntimeContext Primary => _ctx;
-        public DeviceRuntimeContext? Find(long deviceId) => deviceId == _ctx.DeviceId ? _ctx : null;
-        public bool TryUpdateChannelCount(long deviceId, ushort channelCount) => deviceId == _ctx.DeviceId;
-    }
 
     private sealed class FakeRepository : IProbeScanRepository
     {
