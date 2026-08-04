@@ -128,36 +128,27 @@ public class LeastSquaresFitterTests
     }
 
     /// <summary>
-    /// 剔除门槛必须是双侧临界值（N=20/α=0.05 → G_crit≈2.708，GB/T 4883-2008 表 A.2），
-    /// 不是单侧的 ≈2.557。
-    /// <para>
-    /// 这条用例是为一个文档缺陷立的桩：<c>FindGrubbsOutlier</c> 的注释曾把"可手工核对"的锚点
-    /// 写成 2.557（那是单侧值），而实现取的是双侧尾 α/(2N)。照注释去核对的人会算出 2.71、
-    /// 以为实现有 bug，顺手"改对"成单侧就把安全相关标定数据的异常剔除放松了约 6%。
-    /// </para>
-    /// <para>
-    /// 判别办法是让偏移量卡在两个门槛之间：δ=0.242 ns 在双侧门槛下保留、单侧门槛下会被剔。
-    /// 直接断言临界值本身做不到这件事——那只能在测试里重算一遍同样的公式，改了实现照样过。
-    /// </para>
+    /// 剔除门槛是双侧临界值（N=20/α=0.05 → ≈2.708，GB/T 4883-2008 表 A.2），不是单侧的 ≈2.557。
+    /// 之所以要单独测：FindGrubbsOutlier 的注释一度把可手工核对的锚点写成 2.557，照它核对会算出
+    /// 2.71、以为实现错了，真改成单侧剔除就松了约 6%。
+    /// 办法是把偏移量卡在两个门槛之间；直接断言临界值不行，那只是在测试里重算一遍公式。
     /// </summary>
     [Fact]
     public void Fit_GrubbsGate_IsTheTwoSidedCriticalValue()
     {
-        // 双侧门槛（≈2.708）之下：保留。实现若换成单侧（≈2.557），这个点就会被剔掉。
+        // 双侧门槛之下：保留。换成单侧（≈2.557）这个点就会被剔掉。
         Sut.Fit(ScatteredPoints(extraNs: 0.242), applyGrubbs: true)
-            .RemovedIndices.Should().BeEmpty(
-                "标准化残差落在单侧与双侧临界值之间的点，按双侧口径应当保留");
+            .RemovedIndices.Should().BeEmpty("残差落在单侧与双侧临界值之间的点，按双侧口径该留着");
 
-        // 明显超过双侧门槛：剔除。少了这一半，上面那条可能只是因为剔除压根没生效而通过。
+        // 明显超过门槛：剔除。少了这一半，上面那条可能只是因为剔除根本没生效才过的。
         Sut.Fit(ScatteredPoints(extraNs: 0.30), applyGrubbs: true)
-            .RemovedIndices.Should().ContainSingle().Which.Should().Be(9,
-                "超过双侧临界值的点必须被剔除");
+            .RemovedIndices.Should().ContainSingle().Which.Should().Be(9, "超过临界值就该剔掉");
     }
 
     /// <summary>
     /// 20 点：全点带固定散布，index 9 再额外偏 <paramref name="extraNs"/>。
-    /// 全点都有散布是关键——只有一个点偏离时残差标准差全由它自己撑起，标准化残差会饱和在
-    /// (N-1)/√N≈4.25，怎么调都落不到临界值附近，测不出门槛在哪。
+    /// 散布得铺在全部点上。只有一个点偏离时，残差标准差全由它自己撑起，标准化残差会饱和在
+    /// (N-1)/√N≈4.25，偏多少都一样，落不到临界值附近。
     /// </summary>
     private static List<CalibrationPoint> ScatteredPoints(double extraNs)
     {

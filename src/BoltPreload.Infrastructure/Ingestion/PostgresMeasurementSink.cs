@@ -625,7 +625,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             SdkStatusCode: cr.StatusCode);
 
         // 条件仍命中时刷新开启告警的 last_active_at（节流，与是否产生转移事件无关：
-        // 稳定越限期状态机不产生任何事件，恰是最需要"仍在命中"证据的阶段）
+        // 稳定越限期状态机不产生任何事件，而这段时间恰恰需要"仍在命中"的证据）
         await TouchOpenAlarmsIfStillHitAsync(input, ct);
 
         var events = _alarmEvaluator.Evaluate(input);
@@ -753,12 +753,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
 
     /// <summary>
     /// 推送告警到前端（fire-and-forget，不能让推送反压入库）。
-    /// <para>
-    /// 失败留痕由推送实现自己负责——<see cref="IAlarmPublisher"/> 约定"失败不抛"，
-    /// 所以下面这个 catch 是实现违约时的兜底，不是正常路径。
-    /// 真实的可见性在 <c>SignalRAlarmPublisher</c> 里：告警行已经落库、告警中心页面查得到，
-    /// 但值班盯的是大屏弹窗，推送悄悄失败就等于"操作员以为没有告警"。
-    /// </para>
+    /// <see cref="IAlarmPublisher"/> 约定失败不抛，留痕在实现里做，下面这个 catch 只是实现违约时的兜底。
     /// </summary>
     private async Task SafePublishAlarmAsync(AlarmEvent ev, CancellationToken ct)
     {

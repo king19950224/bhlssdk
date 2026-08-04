@@ -224,13 +224,9 @@ public sealed class IngestionService : BackgroundService
     }
 
     /// <summary>
-    /// 实时推送失败告警（节流：每秒最多一条，参照 FxSdkConnector 的背压告警写法）。
-    /// <para>
-    /// 这是 <see cref="IMeasurementPublisher"/> "失败不抛"约定的兜底，不是正常路径：
-    /// SignalR 实现只在 PublishAsync 里入队，发送异常出在它内部的泵任务里，由它自己记 Warning。
-    /// 换成会抛的实现时这条才会响，所以同样按"前端停止刷新"的口径记，且同样必须节流
-    /// —— 50Hz × N 通道下推送一旦持续失败，不节流会把日志刷爆。
-    /// </para>
+    /// 实时推送失败告警（节流：每秒最多一条，写法参照 FxSdkConnector 的背压告警）。
+    /// 这是 <see cref="IMeasurementPublisher"/> 约定失败不抛的兜底：SignalR 实现只在 PublishAsync 里入队，
+    /// 发送异常出在它自己的泵任务里、由它自己记。换成会抛的实现这条才会响，口径和节流都跟着一致。
     /// </summary>
     private void WarnPublishFailureThrottled(Exception ex, long deviceId)
     {

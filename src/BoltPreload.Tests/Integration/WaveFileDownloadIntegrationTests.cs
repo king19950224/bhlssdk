@@ -8,13 +8,13 @@ namespace BoltPreload.Tests.Integration;
 /// <summary>
 /// 波形文件下载（<c>GET /api/waves/file?path=...</c>）。
 /// <para>
-/// 这是全系统唯一一处"把用户传进来的字符串当路径去读盘"的端点。读到框外面去，
-/// 泄的就是 appsettings.json 里的库连接串和 JWT 签名密钥——攻击者拿到后不必再打接口。
+/// 全系统唯一一处把用户传进来的字符串当路径去读盘的端点。读到框外面，泄的是 appsettings.json
+/// 里的库连接串和 JWT 签名密钥。
 /// </para>
 /// <para>
-/// <c>LocalFileWaveStore.TryResolveSafePath</c> 有单元测试，但端点有没有真的接上它此前没测过：
-/// 换成 <c>File.ReadAllBytes(Path.Combine(root, path))</c> 一样跑得通，一样返回波形，
-/// 只是顺带把整块盘也交出去了。这里要钉的是接线，不是那个函数本身。
+/// <c>LocalFileWaveStore.TryResolveSafePath</c> 有单元测试，但端点有没有接上它没测过——换成
+/// <c>File.ReadAllBytes(Path.Combine(root, path))</c> 一样跑得通、一样返回波形，顺带把整块盘交出去。
+/// 这里钉的是接线，不是那个函数。
 /// </para>
 /// </summary>
 [Collection("postgres")]

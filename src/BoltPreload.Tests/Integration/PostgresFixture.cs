@@ -69,8 +69,8 @@ public sealed class PostgresFixture : IAsyncLifetime
     }
 
     /// <summary>
-    /// 断言夹具已就绪。<b>"库连不上"由 <see cref="PostgresFactAttribute"/> 在发现期跳过</b>，
-    /// 走到这里说明库是通的、却仍然初始化失败（建库被拒、迁移脚本报错等）—— 那是真故障，必须红，
+    /// 断言夹具已就绪。库连不上的情况由 <see cref="PostgresFactAttribute"/> 在发现期跳过，
+    /// 走到这里说明库是通的却仍然初始化失败（建库被拒、迁移脚本报错等），那是真故障，得红，
     /// 不能像以前那样 <c>return</c> 掉装作通过。
     /// </summary>
     public void EnsureAvailable()

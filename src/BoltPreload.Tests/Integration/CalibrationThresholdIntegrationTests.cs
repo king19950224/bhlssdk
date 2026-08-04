@@ -11,15 +11,15 @@ namespace BoltPreload.Tests.Integration;
 /// 临时扭矩阶梯拟合的 R² 三段判定（apply-torque-fit，门槛值见 <c>CalibrationThresholds</c>）。
 /// <list type="bullet">
 /// <item>R² ≥ 0.98：通过，激活并顶替旧标定</item>
-/// <item>0.95 ≤ R² &lt; 0.98：留档 passed=false，但<b>不激活</b>，通道继续沿用原标定</item>
+/// <item>0.95 ≤ R² &lt; 0.98：留档 passed=false，但不激活，通道继续沿用原标定</item>
 /// <item>R² &lt; 0.95：拒绝，400，什么都不写</item>
 /// </list>
 /// <para>
-/// 中间那档是最凶险的：判错方向就会把在产的好标定 supersede 掉，而 sink 对 passed=false
-/// 又不出预紧力，通道于是从"能出数"变成"无数据"——现场看到的是一个安静的空白，不是报错。
+/// 中间那档最容易出事：判错方向会把在产的好标定 supersede 掉，而 sink 对 passed=false 不出预紧力，
+/// 通道就从能出数变成无数据，现场看到的是一片空白而不是报错。
 /// </para>
 /// <para>
-/// 注意这三段只适用于<b>临时</b>扭矩法。正式载荷标定没有中间层，见
+/// 这三段只适用于临时扭矩法，正式载荷标定没有中间层，见
 /// <see cref="LoadCalibrationCountersignIntegrationTests"/>。
 /// </para>
 /// </summary>

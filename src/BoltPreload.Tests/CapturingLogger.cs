@@ -4,16 +4,14 @@ namespace BoltPreload.Tests;
 
 /// <summary>
 /// 捕获日志条目（级别 + 已格式化消息），供断言。
-/// <para>
-/// 存在的理由是"日志级别本身就是需求"的那类代码：推送失败若记 Debug，默认级别下等于没记，
-/// 功能测试全绿而现场无迹可查。这种缺陷只能靠断言级别来钉住。
-/// </para>
+/// 有些地方日志级别本身就是需求：推送失败记成 Debug，默认级别下等于没记，功能测试照样全绿。
+/// 这种只能靠断言级别来钉。
 /// </summary>
 internal sealed class CapturingLogger<T> : ILogger<T>
 {
     private readonly List<(LogLevel Level, string Message)> _entries = new();
 
-    /// <summary>命中关键字的 Warning 消息。空集合即"这件事没被记在 Warning 上"。</summary>
+    /// <summary>命中关键字的 Warning 消息。返回空就说明这件事没记在 Warning 上。</summary>
     public List<string> Warnings(string contains) => Messages(LogLevel.Warning, contains);
 
     public List<string> Messages(LogLevel level, string contains)

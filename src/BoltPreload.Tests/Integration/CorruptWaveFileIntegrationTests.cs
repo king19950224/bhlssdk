@@ -10,17 +10,10 @@ using Xunit;
 namespace BoltPreload.Tests.Integration;
 
 /// <summary>
-/// 波形文件损坏时的报法：必须和"没有这个文件"分开。
-/// <para>
-/// 这不是假想场景。波形落盘走"写 .tmp 再 rename"，rename 只保证读者看不到半截文件，
-/// 而 rename 前没有 fsync（<c>LocalFileWaveStore</c> 里写明了这个取舍：波形是 30 天即删的
-/// 辅助诊断数据，权威记录在 Postgres，不值得在采集路径上每条波形付一次刷盘）。
-/// 于是断电后最终路径上完全可能是个截断的 JSON。
-/// </para>
-/// <para>
-/// 这两种情况以前都报成"该通道暂无波形"。看到这句话的人会判断探头没采到数据、去现场查线，
-/// 而真相是文件坏了——正在查信号质量的时候，这是最糟的一种指错方向。
-/// </para>
+/// 波形文件损坏要和"没有这个文件"分开报。
+/// 波形落盘是写 .tmp 再 rename，rename 前没有 fsync（<c>LocalFileWaveStore</c> 里写了为什么不补），
+/// 所以断电后最终路径上可能是个截断的 JSON。这两种情况以前都显示成"该通道暂无波形"，
+/// 看的人会以为探头没采到数据、跑去现场查线。
 /// </summary>
 [Collection("postgres")]
 public sealed class CorruptWaveFileIntegrationTests : IDisposable
@@ -56,9 +49,9 @@ public sealed class CorruptWaveFileIntegrationTests : IDisposable
         var body = await JsonOfAsync(client, $"/api/waves/compare/{seed.ChannelId}");
 
         body.GetProperty("hasCurrent").GetBoolean().Should().BeFalse("解析不出来就没有可比对的波形");
-        body.TryGetProperty("waveError", out var err).Should().BeTrue("必须给出错误说明，不能只是 hasCurrent=false");
+        body.TryGetProperty("waveError", out var err).Should().BeTrue("光给 hasCurrent=false 说明不了原因");
         err.GetString().Should().Contain("损坏")
-            .And.Contain("不代表", "要明确否掉'该通道没采到波形'这个错误结论");
+            .And.Contain("不代表", "得把'该通道没采到波形'这个结论明确否掉");
     }
 
     [PostgresFact]
@@ -67,7 +60,7 @@ public sealed class CorruptWaveFileIntegrationTests : IDisposable
         _fx.EnsureAvailable();
         var seed = await _fx.SeedCalibratableChannelAsync("波形缺失");
 
-        // 指向一个压根不存在的文件：过了保留期被清理掉就是这样，属正常情况
+        // 指向一个不存在的文件：过了保留期被清理掉就是这样，属正常情况
         await InsertWaveFeatureAsync(seed.ChannelId, $"{seed.DeviceId}/5/20260101/nonexistent.json");
 
         using var factory = CreateFactory();
@@ -76,9 +69,9 @@ public sealed class CorruptWaveFileIntegrationTests : IDisposable
         var body = await JsonOfAsync(client, $"/api/waves/compare/{seed.ChannelId}");
 
         body.GetProperty("hasCurrent").GetBoolean().Should().BeFalse();
-        // 文件不存在是正常态，不该报成损坏，否则又变成另一个方向的误导
+        // 反过来也别错：文件不存在是正常的，报成损坏又成了另一头的误导
         (body.TryGetProperty("waveError", out var err) && err.ValueKind != JsonValueKind.Null)
-            .Should().BeFalse("文件不存在不是损坏，不该给出损坏提示");
+            .Should().BeFalse("文件不存在不是损坏");
     }
 
     // ---- helpers ----

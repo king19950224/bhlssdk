@@ -12,18 +12,13 @@ using Xunit;
 namespace BoltPreload.Tests.Integration;
 
 /// <summary>
-/// 真实 JWT 鉴权链：登录换令牌、签名与有效期校验、以及吊销复核（<c>OnTokenValidated</c> 里
-/// 按 users.token_version 与 enabled 二次比对）。
+/// 真实 JWT 鉴权链：登录换令牌、签名与有效期校验、吊销复核（<c>OnTokenValidated</c> 里按
+/// users.token_version 与 enabled 二次比对）。
 /// <para>
-/// 这条链此前<b>整条零覆盖</b>。其余端点测试都跑在 <c>TestAuthHandler</c> 上，按请求头认身份，
-/// 根本不经过 JWT。于是安全红线"停用 / 改密 / 登出后旧令牌立即失效"从来没被验证过：
-/// 已有测试只断言了 users.token_version 在库里自增，而自增之后那个旧令牌还能不能用——
-/// 也就是这套机制唯一存在的理由——没有任何测试问过。把 <c>OnTokenValidated</c> 整段删掉，
-/// 351 个测试照样全绿，而被停用的账号还能拿旧令牌写数据，最长到令牌自然过期（默认 8 小时）。
-/// </para>
-/// <para>
-/// 令牌默认 8 小时有效，共享工控机、人员离岗、账号被撤这些场景全靠这条复核收口，
-/// 所以这里逐条把它钉住。
+/// 这条链之前整条零覆盖——其余端点测试跑在 <c>TestAuthHandler</c> 上按请求头认身份，不经过 JWT。
+/// 已有测试只断言了 token_version 在库里自增，没人问过自增之后那个旧令牌还能不能用。
+/// 把 <c>OnTokenValidated</c> 整段删掉，351 个测试照样全绿，而被停用的账号还能拿旧令牌写数据，
+/// 最长到令牌自然过期（默认 8 小时）。共享工控机、人员离岗、账号被撤都指着这条复核，所以逐条钉住。
 /// </para>
 /// </summary>
 [Collection("postgres")]

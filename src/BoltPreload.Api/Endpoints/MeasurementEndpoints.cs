@@ -12,12 +12,9 @@ namespace BoltPreload.Api.Endpoints;
 public sealed record ReferenceWaveRequest(string? Reason = null, string? Note = null);
 
 /// <summary>
-/// 一次波形文件读取的结果。三态而不是两态：文件不存在、文件在但解析不了、读到了。
-/// <para>
-/// 中间那一态必须单独存在。波形写入没有 fsync（见 <c>LocalFileWaveStore</c> 里的取舍说明），
-/// 断电后最终路径上可能是个截断的 JSON；把它和"没有这个文件"一起报成"暂无波形"，
-/// 会把正在查信号质量的人引去现场查探头，而根因是那个文件坏了。
-/// </para>
+/// 一次波形文件读取的结果。三态：读到了、没这个文件、文件在但解析不了。
+/// 中间那态得单独留着——波形写入没有 fsync（见 <c>LocalFileWaveStore</c>），断电后可能是个截断的
+/// JSON，跟"没这个文件"一起报成"暂无波形"，看的人会去现场查探头。
 /// </summary>
 internal readonly record struct WaveLoad(
     short[]? Wave, double EchoStart, double ClockInt, short? Threshold, bool Corrupt)
@@ -495,9 +492,7 @@ public static class MeasurementEndpoints
         .WithSummary("波形对比诊断：当前波形 vs 通道参考波形（相似度/衰减/健康度，§8.6）");
 
         // 从 WaveStore 读回并解析一条波形 JSON（LocalFileWaveStore 存的 camelCase 结构）。
-        // 解析失败要和"文件不存在"分开报：波形写入没有 fsync，断电可能在最终路径上留下截断的
-        // JSON（见 LocalFileWaveStore 的取舍说明）。两种都报成"暂无波形"的话，正在查信号质量的
-        // 人会以为通道没数据而去现场查探头，而根因是那个文件坏了。
+        // 解析失败和"文件不存在"分开报，原因见 WaveLoad。
         static async Task<WaveLoad> LoadWaveAsync(
             IWaveStore store, string path, ILogger log, CancellationToken ct)
         {

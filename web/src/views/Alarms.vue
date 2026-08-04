@@ -75,7 +75,7 @@ const filtered = computed(() => {
 const openSelected = computed(() => filtered.value.filter((a) => a.isOpen && sel.value[a.id]))
 
 const loadError = ref<string | null>(null)
-/// 抑制列表单独的失败态：它容错退成空数组，但"空"和"没查到"必须能区分开。
+// 抑制列表单独一个失败态：它容错退成空数组，但"空"和"没查到"得分开。
 const shelvingError = ref<string | null>(null)
 async function load() {
   loading.value = true
@@ -85,9 +85,9 @@ async function load() {
     const [list, sum, shv] = await Promise.all([
       alarmApi.list(`?includeCleared=${withCleared}&limit=300`),
       alarmApi.summary(),
-      // 抑制列表单独容错：它挂了不该连带把告警列表也拖没（Promise.all 一拒全拒）。
-      // 但失败必须记在 shelvingError 上——静默退成空数组会让"生效抑制"显示 0、
-      // 下方面板整个消失，等于告诉值班"没有告警被静默"，而这恰是最需要能查的一件事。
+      // 抑制列表单独容错：它挂了不该把告警列表一起拖没（Promise.all 一拒全拒）。
+      // 但失败得记在 shelvingError 上，不然静默退成空数组，"生效抑制"显示 0、下方面板消失，
+      // 看着就像没有告警被静默。
       alarmApi.shelvings().catch((e) => {
         shelvingError.value = e instanceof Error ? e.message : '抑制规则加载失败'
         return { count: 0, items: [] as AlarmShelving[] }

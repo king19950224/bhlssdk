@@ -12,7 +12,7 @@
     G4 遗留标记归零   TODO/FIXME/HACK/debugger/console.log 等开发残留必须为零
     G5 未引用导出     web/src 中疑似无人引用的 export(动态引用会误报,故仅报告)
     G6 文风统一       禁表情符号入库(状态用文字写);引号统一中文弯引号;
-                      禁辅助工具路径/署名字样混入代码与文档
+                      禁辅助工具路径/署名字样混入代码与文档;禁套话与给后果加戏的注释
 
 所有豁免显式列在下方常量区并附理由,新增豁免必须写明原因。
 """
@@ -290,6 +290,13 @@ G6_CLICHE = re.compile(
     r"一句话(概览|说明|总结)|一图看懂|等核心能力|核心亮点|旨在为|赋能|助力|保驾护航|"
     r"无缝(对接|集成|切换)|开箱即用|极大地|显著提升|全方位|深度融合|综上所述|值得注意的是|"
     r"强大的|轻松实现|为您提供|一览无余")
+
+# 注释里给后果加戏的写法。同一件事说一句就够,堆到三四句是为了渲染而不是为了讲清楚
+# ——“大屏不弹窗,日志里一片安静,值班看到的就是没有告警”,后两句没带来新信息。
+# 也别替读者下判断(“这正是最需要被看见的”)或先自证重要性(“这不是假想场景”)。
+G6_DRAMA = re.compile(
+    r"一片安静|安安静静|等于告诉|这不是假想|正是最需要|恰是最需要|这是最糟|"
+    r"最需要被看见|值得单独留|无迹可查|悄悄地|静静地")
 G6_SUFFIXES = (".cs", ".ts", ".vue", ".md", ".sql", ".ps1", ".sh", ".py",
                ".yml", ".yaml", ".json", ".html", ".css")
 
@@ -320,6 +327,9 @@ def gate6() -> list[str]:
             m = G6_CLICHE.search(line)
             if m:
                 violations.append(f"{f.relative_to(ROOT)}:{n}: 套话 '{m.group(0)}' -> {line.strip()[:80]}")
+            m = G6_DRAMA.search(line)
+            if m:
+                violations.append(f"{f.relative_to(ROOT)}:{n}: 注释加戏 '{m.group(0)}' -> {line.strip()[:80]}")
             if f.suffix == ".md":
                 m = G6_HEADING_EN.match(line)
                 if m and m.group(1) not in G6_HEADING_OK:

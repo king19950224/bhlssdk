@@ -65,9 +65,8 @@ public sealed class SignalRMeasurementPublisher : IMeasurementPublisher, IDispos
                 catch (OperationCanceledException) when (_cts.IsCancellationRequested) { return; }
                 catch (Exception ex)
                 {
-                    // 单条推送失败不影响后续（客户端断线等瞬态问题），但必须留痕：
-                    // 数据仍然落库、告警判定也照常，只是大屏和操作台从此不再刷新，
-                    // 现场看到的是一屏冻住的旧数字。这正是最需要被看见的一类失效。
+                    // 单条推丢不影响后续（多半是客户端断线这类瞬态问题），但得留痕：
+                    // 数据照样入库、告警照样判，就是大屏不再刷新，现场看到的是一屏冻住的旧数字。
                     WarnSendFailureThrottled(ex, envelope.DeviceId);
                 }
             }
@@ -76,12 +75,9 @@ public sealed class SignalRMeasurementPublisher : IMeasurementPublisher, IDispos
     }
 
     /// <summary>
-    /// 发送失败告警，每秒最多一条。
-    /// <para>
-    /// 必须节流：50Hz × N 通道下推送一旦持续失败，不节流会把日志刷爆。
-    /// 也必须记在这里——<see cref="PublishAsync"/> 只入队不发送，异常出在泵任务里，
-    /// 上层调用方的 catch 按契约（实现不抛）永远不会执行到。
-    /// </para>
+    /// 发送失败告警，每秒最多一条。50Hz × N 通道下推送要是一直失败，不节流会把日志刷爆。
+    /// 记在这里而不是上层：<see cref="PublishAsync"/> 只入队不发送，异常出在泵任务里，
+    /// 调用方的 catch 按契约（实现不抛）执行不到。
     /// </summary>
     private void WarnSendFailureThrottled(Exception ex, long deviceId)
     {

@@ -8,16 +8,12 @@ using Xunit;
 namespace BoltPreload.Tests.Integration;
 
 /// <summary>
-/// 路由表层面的授权契约：不看某一个端点做了什么，而是把全部端点拉出来，检查它们的授权口径本身立不立得住。
+/// 路由表层面的授权契约：不看单个端点做了什么，而是把全部端点拉出来，看授权口径本身立不立得住。
 /// <para>
-/// 起因是 <c>/api/license/detail</c>：端点上明明写了 <c>RequireAuthorization(LoggedIn)</c>，
-/// 但整组挂了 <c>AllowAnonymous</c>，授权中间件直接短路，那句话是死代码，
-/// 客户名/授权号/容量上限对匿名敞开。写的人以为收紧了，代码读起来也像收紧了。
-/// </para>
-/// <para>
-/// 逐个端点补用例堵不住这类错——下次换个端点还会再犯一次。这里改成对着路由表判：
-/// 一个端点同时带 AllowAnonymous 和授权要求，一定是笔误，因为后者恒不生效。
-/// 新端点漏写授权口径也在这里拦。
+/// 起因是 <c>/api/license/detail</c>——端点上写了 <c>RequireAuthorization(LoggedIn)</c>，
+/// 但整组挂了 <c>AllowAnonymous</c>，授权中间件短路，那句话是死代码，客户名和容量上限对匿名敞开。
+/// 逐个端点补用例堵不住这种事，下次换个端点还会犯，所以对着路由表判：同时带 AllowAnonymous
+/// 和授权要求的一定是笔误，后者恒不生效。新端点漏写授权口径也在这里拦。
 /// </para>
 /// </summary>
 [Collection("postgres")]

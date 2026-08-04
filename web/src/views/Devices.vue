@@ -115,8 +115,7 @@ const settings = ref<DeviceSettings | null>(null)
 const groupDlgOpen = ref(false)
 const groupDlgSel = ref<number | null>(null)
 const savingGroup = ref(false)
-// 读不到时不能显示成"未设置"：那等于告诉运维自动建档是关着的，而实际可能开着——
-// 照这个误判去补设一遍，反而会把原有的归属组改掉。
+// 读不到时别显示成"未设置"：实际可能是开着的，照这个去补设一遍会把原有的归属组改掉。
 const settingsError = ref<string | null>(null)
 async function loadSettings() {
   const did = selected.value?.deviceId

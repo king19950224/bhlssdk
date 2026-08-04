@@ -129,16 +129,13 @@ public sealed class LeastSquaresFitter : ICalibrationFitter
 
     /// <summary>
     /// Grubbs 单点检验：对当前点集做普通 OLS，找标准化残差最大且超过临界值的点，返回其原始下标；无则返回 -1。
-    /// 临界值用精确公式 G_crit = ((N-1)/√N)·√( t²/(N-2+t²) )，t 取自学生 t 分布。
+    /// 临界值用精确公式 G_crit = ((N-1)/√N)·√( t²/(N-2+t²) )，t 取自学生 t 分布，
+    /// 尾部取双侧 α/(2N)——判的是绝对值最大的残差，两个方向都得算。N=20/α=0.05 给出 ≈2.708，
+    /// 与 GB/T 4883-2008 表 A.2 的双侧临界值一致。
     /// <para>
-    /// 取双侧尾 α/(2N)：判的是"绝对值最大的残差"，两个方向都要算进去。
-    /// 对 N=20/α=0.05 给出 ≈2.708，与 GB/T 4883-2008 表 A.2 的双侧临界值一致。
-    /// </para>
-    /// <para>
-    /// 别把这个数记成 2.557 —— 那是同一张表的<b>单侧</b>值（尾部取 α/N）。
-    /// 照单侧值核对会以为本实现算错，改成单侧则会把异常剔除放松约 6%：
-    /// 标准化残差在 2.56~2.71 之间的标定点会从"剔除"变成"保留"。
-    /// 这条口径由 <c>LeastSquaresFitterTests.Fit_GrubbsGate_IsTheTwoSidedCriticalValue</c> 钉住。
+    /// 这个数别记成 2.557，那是同一张表的单侧值（尾部取 α/N）。照单侧值核对会以为实现算错了，
+    /// 真改成单侧则剔除会松约 6%：标准化残差 2.56~2.71 之间的点从剔除变成保留。
+    /// 口径由 <c>LeastSquaresFitterTests.Fit_GrubbsGate_IsTheTwoSidedCriticalValue</c> 钉着。
     /// </para>
     /// </summary>
     private static int FindGrubbsOutlier(IReadOnlyList<CalibrationPoint> points, IReadOnlyList<int> indices)

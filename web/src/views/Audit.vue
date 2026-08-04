@@ -25,8 +25,7 @@ function qs() {
   p.set('offset', String(offset.value))
   return '?' + p.toString()
 }
-// 查询失败不能显示成"无审计记录"：这一页是出事后追责的入口，
-// 把"查不到"和"没发生过"混为一谈，等于告诉查证的人当时没人动过。
+// 查询失败别显示成"无审计记录"。这一页是出事后追责的入口，"查不到"和"没发生过"是两回事。
 const loadError = ref<string | null>(null)
 async function load() {
   loading.value = true
@@ -73,9 +72,9 @@ function fmt(iso: string) {
   return new Date(iso).toLocaleString('zh-CN', { hour12: false })
 }
 onMounted(async () => {
-  // actions() 只是筛选下拉的候选项，属于附属数据；它失败绝不能拦住主查询。
-  // 不接这个 catch 的话 load() 根本不会执行，页面 loading=false、loadError=null、items 为空，
-  // 于是安安静静显示成"无审计记录"——正是本文件开头那条注释要避免的误导。
+  // actions() 只是筛选下拉的候选项，它失败不该拦住主查询。
+  // 不接这个 catch，load() 就不会执行，页面 loading=false、loadError=null、items 为空，
+  // 显示出来就是"无审计记录"——正是开头那条注释要避免的。
   try {
     actions.value = (await auditApi.actions()).items
   } catch {
