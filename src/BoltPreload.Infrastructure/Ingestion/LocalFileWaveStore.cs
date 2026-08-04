@@ -49,7 +49,8 @@ public sealed class LocalFileWaveStore : IWaveStore
         _opt = opt.Value;
         _logger = logger;
         Directory.CreateDirectory(_opt.RootPath);
-        // 缓存"标准化后的根路径"，后续所有路径检查都和这个比对（防止 .. / 符号链接逃逸）
+        // 缓存"标准化后的根路径"，后续所有路径检查都和这个比对（挡 ".." 逃逸）。
+        // 结尾一定要带分隔符：否则 "…/waves_backup/x" 会因前缀相同被判成在 "…/waves" 里面。
         _rootAbs = Path.GetFullPath(_opt.RootPath);
         if (!_rootAbs.EndsWith(Path.DirectorySeparatorChar))
             _rootAbs += Path.DirectorySeparatorChar;
@@ -223,7 +224,12 @@ public sealed class LocalFileWaveStore : IWaveStore
 
     /// <summary>
     /// 把相对路径解析成绝对路径，并校验最终绝对路径仍在 RootPath 下。
-    /// 防御 ".." 逃逸、Windows drive-relative（"C:bad"）、绝对路径、符号链接出框等情况。
+    /// <para>挡住 ".." 逃逸、绝对路径、Windows drive-relative（"C:bad"）三类。</para>
+    /// <para>
+    /// 挡不住符号链接：<see cref="Path.GetFullPath(string)"/> 只做词法归一化，不解析软链，
+    /// 根目录里若有一条指向框外的软链，读取会跟过去。没有去堵是因为放这条软链需要根目录写权限，
+    /// 有那个权限的人已经能直接读盘了。见 <c>LocalFileWaveStoreTests</c> 里记录该行为的用例。
+    /// </para>
     /// </summary>
     private bool TryResolveSafePath(string relativePath, out string absPath)
     {

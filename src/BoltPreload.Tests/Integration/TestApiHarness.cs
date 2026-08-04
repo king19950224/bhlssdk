@@ -21,12 +21,17 @@ namespace BoltPreload.Tests.Integration;
 /// </summary>
 internal static class TestApi
 {
-    public static WebApplicationFactory<Program> CreateFactory(PostgresFixture fx) =>
+    /// <param name="configure">
+    /// 个别用例要改配置时用（如把波形根目录指到临时目录）。在默认设置之后执行，可以覆盖它们。
+    /// </param>
+    public static WebApplicationFactory<Program> CreateFactory(
+        PostgresFixture fx, Action<IWebHostBuilder>? configure = null) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Development");
             builder.UseSetting("ConnectionStrings:Postgres", fx.ConnectionString);
             builder.UseSetting("Fx:Mode", "Simulated");
+            configure?.Invoke(builder);
             builder.ConfigureTestServices(services =>
             {
                 // 测试里不跑后台服务（采集/看门狗/信号健康/WAL 重放/仿真标定供给等）

@@ -69,3 +69,18 @@ public sealed class PostgresFactAttribute : FactAttribute
             Skip = PostgresAvailability.SkipReason;
     }
 }
+
+/// <summary>
+/// <see cref="PostgresFactAttribute"/> 的参数化版本，用于一个场景要拿多组输入各跑一遍的情况
+/// （如同一个端点对多种攻击形状的路径）。跳过口径与 Fact 版完全一致。
+/// </summary>
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1813:避免使用未密封的特性",
+    Justification = "需要继承 TheoryAttribute；本类型自身已 sealed。")]
+public sealed class PostgresTheoryAttribute : TheoryAttribute
+{
+    public PostgresTheoryAttribute()
+    {
+        if (!PostgresAvailability.IsAvailable)
+            Skip = PostgresAvailability.SkipReason;
+    }
+}
