@@ -628,12 +628,16 @@ export interface AuditEntry {
   userId: number | null
   username: string | null
   action: string
+  // 中文名由后端 AuditLabels 统一给，前端不再自己维护一份对照表——
+  // 以前两边各有一份，后端加了动作前端忘了补，页面上就直接显示英文码了
+  actionLabel: string
   targetType: string | null
+  targetTypeLabel: string | null
   targetId: number | null
   note: string | null
   at: string
 }
 export const auditApi = {
   query: (qs = '') => http.get<{ count: number; hasMore: boolean; items: AuditEntry[] }>(`/api/audit-log/${qs}`),
-  actions: () => http.get<{ items: { action: string; count: number }[] }>('/api/audit-log/actions'),
+  actions: () => http.get<{ items: { action: string; label: string; count: number }[] }>('/api/audit-log/actions'),
 }

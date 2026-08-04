@@ -4,8 +4,8 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { reportApi, channelApi, type ReportItem, type ChannelRow } from '../api'
-import { getAuthToken } from '../api/client'
 import { useAuth } from '../stores/auth'
+import { downloadFile } from '../utils/download'
 
 const router = useRouter()
 const auth = useAuth()
@@ -71,25 +71,10 @@ onMounted(load)
 
 async function download(r: ReportItem) {
   try {
-    const res = await fetch(`/api/reports/${r.id}/download`, { headers: { Authorization: `Bearer ${getAuthToken()}` } })
-    if (!res.ok) {
-      // 后端会带具体原因（404 文件缺失 / 400 完整性校验失败等），透传给用户而不是一律"可能未生成"
-      let msg = `下载失败（HTTP ${res.status}）`
-      try {
-        const body = await res.json() as { error?: string }
-        if (body?.error) msg = body.error
-      } catch { /* 非 JSON 响应 */ }
-      throw new Error(msg)
-    }
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    // 后端报告是 HTML（非 PDF）；按 fileUrl 实际扩展名命名，避免误导
+    // 名字以服务端为准（那边按报告标题清洗过）；这里只备一个兜底名。
+    // 后端报告是 HTML（非 PDF），兜底名按 fileUrl 的实际扩展名走，避免误导。
     const ext = r.fileUrl?.split('.').pop()?.toLowerCase() || 'html'
-    a.download = `${r.title || 'report'}.${ext}`
-    a.click()
-    URL.revokeObjectURL(url)
+    await downloadFile(`/api/reports/${r.id}/download`, `${r.title || '报告-' + r.id}.${ext}`)
   } catch (e) {
     ElMessage.error((e as Error)?.message || '下载失败（报告文件可能未生成）')
   }

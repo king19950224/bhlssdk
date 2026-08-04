@@ -7,8 +7,10 @@ import EChart from '../components/EChart.vue'
 import PreloadScale from '../components/PreloadScale.vue'
 import CalibrationWizard from '../components/CalibrationWizard.vue'
 import { computePreloadHealth, pct, signedN, fmtAgo, STATUS_META } from '../utils/preload'
+import { alarmTypeLabel, calibrationMethodLabel } from '../utils/labels'
 import { useNow } from '../utils/useNow'
 import { analyzeAscan } from '../utils/ascan'
+import { downloadFile } from '../utils/download'
 import { boltApi, alarmApi, auditApi, waveApi, configChangeApi, deviceApi, calibrationApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction } from '../api'
 import { ApiError } from '../api/client'
 import { onRealtime } from '../api/realtime'
@@ -80,19 +82,9 @@ const form = reactive({
 
 // 状态元数据用全局共享表（含 high/偏高——本地副本曾缺 high，凡偏高螺栓详情页渲染即崩、卡死在加载遮罩）
 const STATUS = STATUS_META
-// 标定方法枚举的中文映射（与标定中心/标定弹窗保持一致，未知值回退原值）
-const METHOD_LABEL: Record<string, string> = {
-  load_calibrated: '正式载荷标定', gb_single_wave: 'GB 单波法', gb_bi_wave: 'GB 双波法',
-  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定', sim_baseline: '初始基线',
-}
 // 通道标定生命周期状态：仅在“过期/停用”时覆盖标签（避免把仍有 K_L、在出数的临时标定误标为未标定），
 // 其余回退到 calibrated 布尔。让“标定过期”不再笼统显示为“已标定”，与总览“未标定/过期”桶口径一致。
 const STATE_LABEL: Record<string, string> = { expired: '标定过期', disabled: '已停用' }
-// 告警类型中文映射（与告警中心一致；履历时间线用）
-const ALARM_TYPE_LABEL: Record<string, string> = {
-  preload_low: '预紧力偏低', preload_loss: '预紧力脱落', preload_high: '预紧力偏高',
-  signal_lost: '信号丢失', no_data: '数据中断',
-}
 // 趋势时段 Tab 的中文标签
 const RANGE_LABEL: Record<string, string> = { '1h': '1 小时', '24h': '24 小时', '7d': '7 天' }
 // 通道配置来源枚举的中文映射
@@ -358,7 +350,7 @@ async function init() {
       for (const c of calibrations.value)
         ev.push({ at: c.createdAt, kind: 'calib', title: `标定 · ${c.method}`, note: c.passed ? '通过' : '未通过', color: c.passed ? '#10b981' : '#f43f5e' })
       for (const a of al.items.filter((x) => x.boltId === boltId))
-        ev.push({ at: a.triggeredAt, kind: 'alarm', title: `告警 · ${ALARM_TYPE_LABEL[a.type] || a.type}`, note: a.message || '', color: '#f59e0b' })
+        ev.push({ at: a.triggeredAt, kind: 'alarm', title: `告警 · ${alarmTypeLabel(a.type)}`, note: a.message || '', color: '#f59e0b' })
       for (const e of auditItems)
         ev.push({ at: e.at, kind: 'audit', title: e.action, note: e.note || '', color: '#38bdf8' })
       events.value = ev.sort((x, y) => new Date(y.at).getTime() - new Date(x.at).getTime())
@@ -656,18 +648,9 @@ async function exportTrendCsv() {
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
   const until = new Date().toISOString()
   try {
-    const { getAuthToken } = await import('../api/client')
-    const res = await fetch(
+    await downloadFile(
       `/api/bolts/${boltId}/preload-trend/export.csv?since=${since}&until=${until}&bucket=auto`,
-      { headers: { Authorization: `Bearer ${getAuthToken()}` } })
-    if (!res.ok) throw new Error(String(res.status))
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `趋势-${bolt.value?.code || boltId}-${RANGE_LABEL[rangeKey.value]}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
+      `趋势-${bolt.value?.code || boltId}-${RANGE_LABEL[rangeKey.value]}.csv`)
     ElMessage.success('趋势数据已导出')
   } catch {
     ElMessage.error('导出失败')
@@ -914,7 +897,7 @@ async function exportTrendCsv() {
               <span class="led" :class="c.isActive && c.passed ? 'led--ok' : c.passed ? 'led--off' : 'led--crit'" />
               <div>
                 <div class="cl-method">
-                  {{ METHOD_LABEL[c.method] || c.method }}
+                  {{ calibrationMethodLabel(c.method) }}
                   <span v-if="c.isActive" class="cl-active">生效中</span>
                   <span v-if="c.reviewState === 'pending'" class="cl-pending">待会签</span>
                   <span v-else-if="c.countersigned" class="cl-signed">两人会签</span>

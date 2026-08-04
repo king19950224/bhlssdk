@@ -7,6 +7,7 @@ import { dashboardApi, alarmApi, type PreloadHealthCounts, type LooseBolt, type 
 import { useRuntime } from '../stores/runtime'
 import { onRealtime, startRealtime, realtimeState } from '../api/realtime'
 import { pctParts } from '../utils/preload'
+import { alarmTypeLabel } from '../utils/labels'
 
 const router = useRouter()
 const runtime = useRuntime()
@@ -33,11 +34,6 @@ const STATUS: Record<string, { label: string; color: string; cls: string }> = {
 }
 const ORDER = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata'] as const
 const SEV: Record<string, string> = { critical: '#f43f5e', crit: '#f43f5e', warn: '#f59e0b', warning: '#f59e0b', info: '#38bdf8' }
-// 告警类型兜底文案：message 为空时不能把 preload_low 之类英文枚举打上大屏
-const ALARM_TYPE_LABEL: Record<string, string> = {
-  preload_low: '预紧力偏低', preload_loss: '预紧力脱落', preload_high: '预紧力偏高',
-  signal_lost: '信号丢失', no_data: '数据中断',
-}
 // 各状态整数百分比（最大余数法，合计恰为 100%）
 const healthPct = computed<Record<string, number>>(() => {
   const parts = pctParts(ORDER.map((k) => health.value[k]), health.value.total)
@@ -154,7 +150,8 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
           <li v-for="a in recentAlarms" :key="a.id">
             <span class="led" :style="`background:${SEV[a.severity] || '#61748f'}`" />
             <span class="al-code mono">{{ a.boltCode }}</span>
-            <span class="al-msg">{{ a.message || ALARM_TYPE_LABEL[a.type] || a.type }}</span>
+            <!-- message 为空时退到类型中文名，不能把 preload_low 这种英文码打上大屏 -->
+            <span class="al-msg">{{ a.message || alarmTypeLabel(a.type) }}</span>
           </li>
           <li v-if="!recentAlarms.length" class="bs-empty"><span class="led led--ok" /> 无未闭合告警</li>
         </ul>

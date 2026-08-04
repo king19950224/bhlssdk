@@ -6,9 +6,9 @@ import {
   acceptanceApi, assetApi, boltApi, channelApi, deviceApi, runtimeApi,
   type AcceptanceSessionView, type ChannelLive, type WiringRowBody,
 } from '../api'
-import { getAuthToken } from '../api/client'
 import { onRealtime, startRealtime } from '../api/realtime'
 import { useAuth } from '../stores/auth'
+import { downloadFile } from '../utils/download'
 import BoltCreateDialog from '../components/BoltCreateDialog.vue'
 
 // 点位与验收：检测即螺栓——通道确认在位即自动建档并显示（有几颗显示几颗）；
@@ -321,7 +321,7 @@ const parsedImport = computed<{ rows: WiringRowBody[]; errors: string[] }>(() =>
   const header = splitCsvLine(lines[0]).map((h) => h.toLowerCase())
   const colMap: (keyof WiringRowBody | null)[] = header.map((h) => HEADER_ALIASES[h] ?? null)
   if (!colMap.includes('channelNo')) {
-    errors.push('缺少 channel_no（通道号）列——表头需含 channel_no,position_label,... （导出的点位表即为此格式）')
+    errors.push('找不到通道号那一列——表头要含“通道号”，直接用导出的点位表改最省事（旧的英文表头 channel_no 也照样认）')
     return { rows: rowsOut, errors }
   }
   for (let i = 1; i < lines.length; i++) {
@@ -401,14 +401,7 @@ async function submitImport() {
 
 async function downloadCsv(url: string, fallback: string) {
   try {
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${getAuthToken()}` } })
-    if (!res.ok) throw new Error(`下载失败（${res.status}）`)
-    const blob = await res.blob()
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = res.headers.get('content-disposition')?.match(/filename="?([^";]+)/)?.[1] ?? fallback
-    a.click()
-    URL.revokeObjectURL(a.href)
+    await downloadFile(url, fallback)
   } catch (e) {
     ElMessage.error((e as Error)?.message || '下载失败')
   }
@@ -486,8 +479,8 @@ async function unbind(it: ChannelLive) {
         <template v-if="deviceId != null">
           <el-button v-if="auth.isReviewer && !session?.active" size="small" type="primary" :loading="sessionBusy" @click="startSession">开启验收会话</el-button>
           <el-button v-if="auth.isReviewer" size="small" @click="openImport">导入点位表</el-button>
-          <el-button size="small" text @click="downloadCsv(acceptanceApi.wiringExportUrl(deviceId), 'wiring.csv')">导出点位表</el-button>
-          <el-button size="small" text @click="downloadCsv(acceptanceApi.reportUrl(deviceId), 'acceptance.csv')">验收报告</el-button>
+          <el-button size="small" text @click="downloadCsv(acceptanceApi.wiringExportUrl(deviceId), '点位表.csv')">导出点位表</el-button>
+          <el-button size="small" text @click="downloadCsv(acceptanceApi.reportUrl(deviceId), '验收报告.csv')">验收报告</el-button>
         </template>
       </div>
     </div>

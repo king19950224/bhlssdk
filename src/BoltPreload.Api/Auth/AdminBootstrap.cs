@@ -5,13 +5,20 @@ using NpgsqlTypes;
 namespace BoltPreload.Api.Auth;
 
 /// <summary>
-/// 启动时检查 users 表是否有 enabled admin。
-/// 开发模式：无 admin 时自动创建 admin / admin123，方便本地起服务即可登录。
-/// 生产模式：无 admin 时只 LogWarning，等运维通过 dotnet user-secrets 或 POST /api/auth/users 注入。
+/// 启动时检查 users 表里有没有可用的 admin，没有就按环境决定怎么补。
+/// 开发模式：直接建 admin / admin123，本地起了服务就能登。
+/// 生产模式：不会凭空造账号。先告警，然后只有在配了
+/// <c>BoltPreload__BootstrapAdminPassword</c> 时才用这个口令建一次首装管理员；
+/// 没配就什么都不做，等运维走 POST /api/auth/users 建。
+/// 首装口令的来源与轮换见部署手册 §5。
 /// </summary>
 public static class AdminBootstrap
 {
-    public static async Task EnsureDevAdminAsync(IServiceProvider services, IConfiguration cfg, bool isDevelopment, ILogger logger, CancellationToken ct)
+    /// <summary>
+    /// 确保有可用 admin。开发与生产两条路都走这里，
+    /// 由 <paramref name="isDevelopment"/> 决定是直接建缺省账号还是只认首装口令。
+    /// </summary>
+    public static async Task EnsureAdminAsync(IServiceProvider services, IConfiguration cfg, bool isDevelopment, ILogger logger, CancellationToken ct)
     {
         var ds = services.GetRequiredService<NpgsqlDataSource>();
         var hasher = services.GetRequiredService<IPasswordHasher<UserAccount>>();

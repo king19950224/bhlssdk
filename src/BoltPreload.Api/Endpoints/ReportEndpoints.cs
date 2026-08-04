@@ -269,6 +269,7 @@ public static class ReportEndpoints
                 return Results.NotFound(new { error = "该报告没有可下载的文件", reportId });
 
             var relative = r.GetString(0);
+            var title = r.IsDBNull(1) ? null : r.GetString(1);
             var expectedSha = r.IsDBNull(2) ? null : r.GetString(2);
 
             // 路径安全边界：拼接后必须仍在 ContentRootPath/data 下。
@@ -311,7 +312,9 @@ public static class ReportEndpoints
                 }
             }
 
-            return Results.File(bytes, "text/html; charset=utf-8", Path.GetFileName(fullPath));
+            // 存盘名是 flange-group-1-2026....html 这种 ASCII，为的是文件系统和 URL 上不出岔子；
+            // 但客户存下来的应该是报告标题。两者分开，别为了下载好看去动落盘的名字。
+            return Results.File(bytes, "text/html; charset=utf-8", DownloadName(title, fullPath));
         })
         .WithName("DownloadReport")
         .WithSummary("下载报告 HTML（带 sha256 防篡改校验）");
@@ -604,6 +607,27 @@ public static class ReportEndpoints
             Conclusion: conclusion);
     }
 
+    /// <summary>
+    /// 下载时给客户看到的文件名，用报告标题。标题里可能被人打进斜杠、冒号之类，
+    /// 直接塞进 Content-Disposition 会被浏览器当成路径，逐个换成下划线。
+    /// 标题为空或清干净后什么都不剩，就退回存盘用的那个名字。
+    /// </summary>
+    internal static string DownloadName(string? title, string fullPath)
+    {
+        var fallback = Path.GetFileName(fullPath);
+        if (string.IsNullOrWhiteSpace(title)) return fallback;
+
+        var cleaned = new string(title.Trim()
+            .Select(c => char.IsControl(c) || c is '/' or '\\' or ':' or '*' or '?' or '"' or '<' or '>' or '|' ? '_' : c)
+            .ToArray());
+        if (string.IsNullOrWhiteSpace(cleaned.Replace('_', ' '))) return fallback;
+
+        var ext = Path.GetExtension(fallback);
+        // 文件名太长有的系统存不下，截到 80 个字符够表达标题了
+        if (cleaned.Length > 80) cleaned = cleaned[..80];
+        return cleaned.EndsWith(ext, StringComparison.OrdinalIgnoreCase) ? cleaned : cleaned + ext;
+    }
+
     private static string RenderTorqueStepHtml(string title, TorqueStepReportSnapshot snapshot)
     {
         static string H(string? value) => WebUtility.HtmlEncode(value ?? "");
@@ -675,23 +699,10 @@ public static class ReportEndpoints
         static string H(string? v) => WebUtility.HtmlEncode(v ?? "");
         static string N(decimal? v) => v.HasValue ? v.Value.ToString("F0") : "—";
         static string R(decimal? v) => v.HasValue ? (v.Value * 100).ToString("F1") + "%" : "—";
-        // 归档文书里标定方法必须是中文，不能把 load_calibrated 之类枚举原样打给客户
-        static string M(string? method) => method switch
-        {
-            "load_calibrated" => "正式载荷标定",
-            "gb_single_wave" => "GB 单波法",
-            "gb_bi_wave" => "GB 双波法",
-            "torque_fit" => "扭矩阶梯拟合",
-            "torque_estimate" => "扭矩估算",
-            "quick" => "快速标定",
-            "sim_baseline" => "初始基线",
-            null or "" => "—",
-            _ => method,
-        };
         var rows = string.Join("\n", bolts.Select((b, i) => $"""
             <tr><td>{i + 1}</td><td>{H(b.Code)}</td><td>{H(b.Spec)}</td><td>{H(b.Position)}</td>
             <td>{N(b.TargetN)}</td><td>{N(b.MinN)}</td><td>{N(b.PreloadN)}</td><td>{R(b.Ratio)}</td>
-            <td>{M(b.CalibMethod)}</td><td>{H(b.Trust)}</td><td>{(b.RSquared.HasValue ? b.RSquared.Value.ToString("F3") : "—")}</td>
+            <td>{DisplayLabels.CalibrationMethod(b.CalibMethod)}</td><td>{H(b.Trust)}</td><td>{(b.RSquared.HasValue ? b.RSquared.Value.ToString("F3") : "—")}</td>
             <td>{H(b.Result)}</td></tr>
             """));
         var verdictClass = overall == "合格" ? "ok" : "warn";

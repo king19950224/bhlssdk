@@ -124,7 +124,7 @@ public static class AlarmEndpoints
             }
 
             await WriteAlarmAuditAsync(conn, tx, currentUser.UserId, "alarm_ack", ackId,
-                $"确认告警 #{ackId}（{ackType}）", ct);
+                $"确认告警 #{ackId}（{DisplayLabels.AlarmType(ackType)}）", ct);
             await tx.CommitAsync(ct);
 
             return Results.Ok(new
@@ -187,7 +187,7 @@ public static class AlarmEndpoints
             }
 
             await WriteAlarmAuditAsync(conn, tx, u.UserId, "alarm_clear", id,
-                $"手动闭合告警 #{id}（{alarmType}）原因：{clearedReason}", ct);
+                $"手动闭合告警 #{id}（{DisplayLabels.AlarmType(alarmType)}）原因：{clearedReason}", ct);
             await tx.CommitAsync(ct);
 
             // 复位评估器状态机（重臂）：手动闭合时条件可能仍在越限——若不复位，内存槽位停在 active，
@@ -261,7 +261,7 @@ public static class AlarmEndpoints
             }
 
             await WriteAlarmAuditAsync(conn, tx, u.UserId, "alarm_shelve", shelvingId,
-                $"抑制告警 {boltCode} · {req.AlarmType ?? "全部类型"} {req.Hours} 小时，原因：{reason}",
+                $"抑制告警 {boltCode} · {(req.AlarmType is null ? "全部类型" : DisplayLabels.AlarmType(req.AlarmType))} {req.Hours} 小时，原因：{reason}",
                 ct, targetType: "alarm_shelving");
             await tx.CommitAsync(ct);
 
@@ -335,7 +335,7 @@ public static class AlarmEndpoints
             }
 
             await WriteAlarmAuditAsync(conn, tx, u.UserId, "alarm_shelve_cancel", id,
-                $"取消抑制 #{id}（{boltCode ?? "全部螺栓"} · {alarmType ?? "全部类型"}）",
+                $"取消抑制 #{id}（{boltCode ?? "全部螺栓"} · {(alarmType is null ? "全部类型" : DisplayLabels.AlarmType(alarmType))}）",
                 ct, targetType: "alarm_shelving");
             await tx.CommitAsync(ct);
             return Results.Ok(new { id, cancelled = true });

@@ -40,8 +40,10 @@ public static class WiringTableEndpoints
 
             var csv = new StringBuilder();
             csv.Append('\uFEFF');
-            // 前 7 列与导入格式一致（可导出→修改→回导）；其后为只读信息列，导入时忽略
-            csv.AppendLine("channel_no,position_label,bolt_code,nominal_diam,grade,target_preload_n,min_preload_n,hardware_state,accepted_at,bolt_position_label");
+            // 前 7 列与导入格式一致（可导出→修改→回导）；其后为只读信息列，导入时忽略。
+            // 表头这几个中文词必须原样出现在前端 HEADER_ALIASES 里，否则导回来认不出列。
+            // 末列特意叫"螺栓位号"而不是"位号"——"位号"在别名表里指向通道位置，同名会和第 2 列抢同一个字段。
+            csv.AppendLine("通道号,位置,螺栓编号,规格,等级,目标预紧力,报警下限,探头状态,验收时间,螺栓位号");
 
             await using var cmd = ds.CreateCommand(@"
                 SELECT c.channel_no, c.name, b.code, b.nominal_diam, b.grade,
@@ -62,12 +64,12 @@ public static class WiringTableEndpoints
                    .Append(r.IsDBNull(4) ? "" : r.GetString(4)).Append(',')
                    .Append(r.IsDBNull(5) ? "" : r.GetDecimal(5).ToString("F0")).Append(',')
                    .Append(r.IsDBNull(6) ? "" : r.GetDecimal(6).ToString("F0")).Append(',')
-                   .Append(r.IsDBNull(7) ? "" : r.GetString(7)).Append(',')
+                   .Append(r.IsDBNull(7) ? "" : DisplayLabels.HardwareState(r.GetString(7))).Append(',')
                    .Append(r.IsDBNull(8) ? "" : r.GetDateTime(8).ToString("yyyy-MM-dd HH:mm:ss")).Append(',')
                    .Append(AcceptanceEndpoints.Csv(r.IsDBNull(9) ? "" : r.GetString(9))).Append('\n');
             }
             return Results.File(Encoding.UTF8.GetBytes(csv.ToString()), "text/csv; charset=utf-8",
-                $"wiring-{deviceCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
+                $"点位表-{deviceCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)
         .WithName("ExportWiringTable")

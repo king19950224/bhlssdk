@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { alarmApi, type AlarmItem, type AlarmSummaryRow, type AlarmShelving } from '../api'
 import { onRealtime } from '../api/realtime'
 import { useNow } from '../utils/useNow'
+import { alarmTypeLabel } from '../utils/labels'
 
 // 告警中心（工业告警管理口径，参照 ISA-18.2 生命周期）：
 // 触发(未确认) → 确认(已知悉,仍开启) → 闭合(恢复/处置完成)。
@@ -31,11 +32,6 @@ const SEV: Record<string, { label: string; cls: string; color: string; bucket: '
   warning: { label: '预警', cls: 'led--warn', color: '#f59e0b', bucket: 'warn', rank: 1 },
   info: { label: '提示', cls: 'led--off', color: '#38bdf8', bucket: 'info', rank: 2 },
 }
-const TYPE_LABEL: Record<string, string> = {
-  preload_low: '预紧力偏低', preload_loss: '预紧力脱落', preload_high: '预紧力偏高',
-  signal_lost: '信号丢失', no_data: '数据中断',
-}
-
 // ---- 摘要（summary 接口口径：仅未闭合） ----
 const openTotal = computed(() => summary.value.reduce((a, r) => a + r.open, 0))
 const openUnacked = computed(() => summary.value.reduce((a, r) => a + r.openUnacked, 0))
@@ -61,7 +57,7 @@ const filtered = computed(() => {
     if (view.value === 'cleared' && a.isOpen) return false
     if (filterSeverity.value && SEV[a.severity]?.bucket !== filterSeverity.value) return false
     if (filterType.value && a.type !== filterType.value) return false
-    if (q && !`${a.boltCode} ${a.message ?? ''} ${TYPE_LABEL[a.type] ?? a.type}`.toLowerCase().includes(q)) return false
+    if (q && !`${a.boltCode} ${a.message ?? ''} ${alarmTypeLabel(a.type)}`.toLowerCase().includes(q)) return false
     return true
   })
   // 处置优先级排序：未确认在前 → 级别（严重>预警>提示）→ 时间新在前
@@ -214,7 +210,7 @@ async function confirmShelve() {
 }
 async function cancelShelving(s: AlarmShelving) {
   try {
-    await ElMessageBox.confirm(`取消对【${s.boltCode ?? '全部螺栓'} · ${s.alarmType ? (TYPE_LABEL[s.alarmType] || s.alarmType) : '全部类型'}】的抑制？告警将恢复触发。`, '取消抑制', { type: 'warning' })
+    await ElMessageBox.confirm(`取消对【${s.boltCode ?? '全部螺栓'} · ${s.alarmType ? alarmTypeLabel(s.alarmType) : '全部类型'}】的抑制？告警将恢复触发。`, '取消抑制', { type: 'warning' })
   } catch { return }
   try {
     await alarmApi.cancelShelve(s.id)
@@ -297,7 +293,7 @@ function limitOf(a: AlarmItem) {
         <span class="panel-title"><i class="hd-mark" />类型 × 级别（未闭合）</span>
         <div class="mx">
           <div v-for="m in matrix" :key="m.type" class="mx-row">
-            <span class="mx-type">{{ TYPE_LABEL[m.type] || m.type }}</span>
+            <span class="mx-type">{{ alarmTypeLabel(m.type) }}</span>
             <span class="mx-c crit" :class="{ z: !m.crit }">{{ m.crit }}</span>
             <span class="mx-c warn" :class="{ z: !m.warn }">{{ m.warn }}</span>
             <span class="mx-c info" :class="{ z: !m.info }">{{ m.info }}</span>
@@ -319,7 +315,7 @@ function limitOf(a: AlarmItem) {
       </el-select>
       <el-select v-model="filterType" size="small" style="width: 140px">
         <el-option label="全部类型" value="" />
-        <el-option v-for="t in typeOptions" :key="t" :label="TYPE_LABEL[t] || t" :value="t" />
+        <el-option v-for="t in typeOptions" :key="t" :label="alarmTypeLabel(t)" :value="t" />
       </el-select>
       <el-input v-model="search" size="small" placeholder="搜索螺栓 / 信息" clearable style="width: 180px">
         <template #prefix><el-icon><Search /></el-icon></template>
@@ -347,7 +343,7 @@ function limitOf(a: AlarmItem) {
         >
           <span><el-checkbox v-if="a.isOpen" v-model="sel[a.id]" /></span>
           <span class="sev"><span class="led" :class="SEV[a.severity]?.cls || 'led--off'" />{{ SEV[a.severity]?.label || a.severity }}</span>
-          <span>{{ TYPE_LABEL[a.type] || a.type }}</span>
+          <span>{{ alarmTypeLabel(a.type) }}</span>
           <span class="mono link" @click="openBolt(a)">{{ a.boltCode }}</span>
           <span class="mono val">
             <template v-if="valueOf(a)">{{ valueOf(a) }}<i v-if="limitOf(a)" class="lim">{{ limitOf(a) }}</i></template>
@@ -387,7 +383,7 @@ function limitOf(a: AlarmItem) {
         </div>
         <div v-for="s in shelvings" :key="s.id" class="tr shv">
           <span class="mono">{{ s.boltCode ?? '全部螺栓' }}</span>
-          <span>{{ s.alarmType ? (TYPE_LABEL[s.alarmType] || s.alarmType) : '全部类型' }}</span>
+          <span>{{ s.alarmType ? alarmTypeLabel(s.alarmType) : '全部类型' }}</span>
           <span class="dim">{{ s.shelvedByName ?? '—' }}</span>
           <span class="msg" :title="s.reason">{{ s.reason }}</span>
           <span class="mono time"><b>{{ fmtAbs(s.expiresAt) }}</b><i>设置于 {{ ago(s.shelvedAt) }}</i></span>
@@ -401,7 +397,7 @@ function limitOf(a: AlarmItem) {
       <el-form label-width="90px" label-position="left">
         <el-form-item label="范围">
           <el-radio-group v-model="shelve.scope">
-            <el-radio value="type">仅 {{ shelve.alarm ? (TYPE_LABEL[shelve.alarm.type] || shelve.alarm.type) : '此类型' }}</el-radio>
+            <el-radio value="type">仅 {{ shelve.alarm ? alarmTypeLabel(shelve.alarm.type) : '此类型' }}</el-radio>
             <el-radio value="bolt">该螺栓全部类型</el-radio>
           </el-radio-group>
           <div v-if="shelve.scope === 'bolt'" class="scope-hint">整颗维护（如换探头）：同时静默信号丢失与预紧力类告警</div>

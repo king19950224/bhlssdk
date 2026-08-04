@@ -1,0 +1,167 @@
+namespace BoltPreload.Api.Endpoints;
+
+/// <summary>
+/// 库里存的是 load_calibrate_countersign、no_data 这类机器码，交到客户手上的东西不能带着它们出去。
+/// 报告、CSV 导出、审计页面要显示的中文名都在这里，全系统就这一份。
+///
+/// 以前前端自己维护了一份动作对照表，后端加动作时没人记得去补，
+/// 结果 user_change_password、wiring_import 这些直接以英文出现在审计页面上。
+/// 现在由后端出中文名，前端照着显示。
+///
+/// 加新的动作码/状态码时这里必须一起补，<c>DisplayLabelsTests</c> 会拦住漏补的。
+/// </summary>
+public static class DisplayLabels
+{
+    private static readonly Dictionary<string, string> AuditActions = new(StringComparer.Ordinal)
+    {
+        // 标定
+        ["load_calibrate_submit"] = "提交正式标定",
+        ["load_calibrate_countersign"] = "标定会签",
+        ["load_calibrate_reject"] = "标定驳回",
+        ["quick_calibrate"] = "快速标定",
+        ["torque_calibrate"] = "扭矩标定",
+        ["apply_torque_fit"] = "应用扭矩拟合",
+        ["torque_point_capture"] = "采集扭矩点",
+        ["calibration_renew"] = "标定续期",
+
+        // 参数变更审批
+        ["config_change_approve"] = "参数审批",
+        ["config_change_reject"] = "参数驳回",
+        ["config_change_execute"] = "参数执行",
+        ["config_change_verify"] = "参数验证",
+
+        // 告警处置
+        ["alarm_ack"] = "告警确认",
+        ["alarm_clear"] = "告警闭合",
+        ["alarm_shelve"] = "告警抑制",
+        ["alarm_shelve_cancel"] = "取消抑制",
+
+        // 通道与螺栓
+        ["sync_channel_config"] = "同步通道配置",
+        ["move_bolt_channel"] = "螺栓换通道",
+        ["bolt_move_channel"] = "螺栓换通道",
+        ["channel_bind"] = "绑定通道",
+        ["channel_unbind"] = "解绑通道",
+        ["channel_commission"] = "调试期直发参数",
+        ["channel_recalibrate"] = "重标定基线",
+        ["channel_rename"] = "通道重命名",
+        ["channel_accept"] = "通道验收",
+        ["create_bolt"] = "螺栓建档",
+        ["update_bolt"] = "更新螺栓信息",
+        ["update_bolt_spec"] = "更新螺栓规格",
+        ["update_target_preload"] = "更新目标预紧力",
+        ["update_group_config"] = "更新部位配置",
+
+        // 设备与点位
+        ["device_default_group_update"] = "设置默认监测部位",
+        ["device_channel_catalog_update"] = "重建通道目录",
+        ["restore_multichannel_loading"] = "恢复多通道轮询",
+        ["wiring_import"] = "导入点位表",
+
+        // 报告与账号
+        ["report_sign"] = "报告签发",
+        ["user_create"] = "创建/重置用户",
+        ["user_toggle"] = "启停用户",
+        ["user_change_password"] = "修改密码",
+    };
+
+    private static readonly Dictionary<string, string> AuditTargetTypes = new(StringComparer.Ordinal)
+    {
+        ["channel"] = "通道",
+        ["bolt"] = "螺栓",
+        ["alarm"] = "告警",
+        ["alarm_shelving"] = "告警抑制",
+        ["calibration"] = "标定",
+        ["report"] = "报告",
+        ["user"] = "用户",
+        ["device"] = "设备",
+        ["monitor_group"] = "监测部位",
+    };
+
+    // 用接线语境的叫法（"在位"而不是"健康"）：点位表是照着现场线缆核对的，
+    // 关心的是这一路到底有没有探头。设备页那边用"健康"，是在说信号质量，别混。
+    private static readonly Dictionary<string, string> HardwareStates = new(StringComparer.Ordinal)
+    {
+        ["healthy"] = "在位",
+        ["noisy"] = "噪声",
+        ["suspect"] = "可疑",
+        ["no_data"] = "无信号",
+        ["no_probe"] = "无探头",
+        ["unknown"] = "未知",
+    };
+
+    private static readonly Dictionary<string, string> AcceptanceMethods = new(StringComparer.Ordinal)
+    {
+        ["sequential"] = "顺序接入",
+        ["loopcheck"] = "拔插确认",
+        ["manual"] = "人工登记",
+    };
+
+    // 告警类型会拼进审计备注，跟着 CSV 一起导出去，所以后端也得有一份中文。
+    // 用词跟前端告警中心保持一致，同一条告警在页面上和导出表里不该是两个叫法。
+    private static readonly Dictionary<string, string> AlarmTypes = new(StringComparer.Ordinal)
+    {
+        ["preload_low"] = "预紧力偏低",
+        ["preload_high"] = "预紧力偏高",
+        ["preload_loss"] = "预紧力脱落",
+        ["signal_lost"] = "信号丢失",
+        ["no_data"] = "数据中断",
+    };
+
+    private static readonly Dictionary<string, string> CalibrationMethods = new(StringComparer.Ordinal)
+    {
+        ["load_calibrated"] = "正式载荷标定",
+        ["gb_single_wave"] = "GB 单波法",
+        ["gb_bi_wave"] = "GB 双波法",
+        ["torque_fit"] = "扭矩阶梯拟合",
+        ["torque_estimate"] = "扭矩估算",
+        ["quick"] = "快速标定",
+        ["sim_baseline"] = "初始基线",
+    };
+
+    /// <summary>各词表已登记的码，供测试核对覆盖率。</summary>
+    public static IReadOnlyCollection<string> KnownAuditActions => AuditActions.Keys;
+
+    /// <summary>已登记的审计对象类型码。</summary>
+    public static IReadOnlyCollection<string> KnownAuditTargetTypes => AuditTargetTypes.Keys;
+
+    /// <summary>已登记的通道硬件状态码。</summary>
+    public static IReadOnlyCollection<string> KnownHardwareStates => HardwareStates.Keys;
+
+    /// <summary>已登记的验收方式码。</summary>
+    public static IReadOnlyCollection<string> KnownAcceptanceMethods => AcceptanceMethods.Keys;
+
+    /// <summary>已登记的标定方法码。</summary>
+    public static IReadOnlyCollection<string> KnownCalibrationMethods => CalibrationMethods.Keys;
+
+    /// <summary>已登记的告警类型码。</summary>
+    public static IReadOnlyCollection<string> KnownAlarmTypes => AlarmTypes.Keys;
+
+    /// <summary>
+    /// 查不到就把原码括进来标一句"未登记"，不要直接吐英文、也不要抹成空。
+    /// 审计和报告都要能追溯，宁可让人看见一个没登记的码，也不能把这条记录悄悄弄丢。
+    /// </summary>
+    private static string Lookup(Dictionary<string, string> table, string? code, string kind) =>
+        string.IsNullOrEmpty(code) ? ""
+        : table.TryGetValue(code, out var label) ? label
+        : $"未登记{kind}（{code}）";
+
+    /// <summary>审计动作码转中文。</summary>
+    public static string AuditAction(string? code) => Lookup(AuditActions, code, "动作");
+
+    /// <summary>审计对象类型码转中文。</summary>
+    public static string AuditTargetType(string? code) => Lookup(AuditTargetTypes, code, "类型");
+
+    /// <summary>通道硬件状态码转中文。</summary>
+    public static string HardwareState(string? code) => Lookup(HardwareStates, code, "状态");
+
+    /// <summary>验收方式码转中文。</summary>
+    public static string AcceptanceMethod(string? code) => Lookup(AcceptanceMethods, code, "方式");
+
+    /// <summary>告警类型码转中文。传空表示"不限类型"，由调用方给措辞。</summary>
+    public static string AlarmType(string? code) => Lookup(AlarmTypes, code, "告警类型");
+
+    /// <summary>标定方法码转中文。空值给破折号，报告里"没标定过"和"标定方法不认识"要能分开。</summary>
+    public static string CalibrationMethod(string? code) =>
+        string.IsNullOrEmpty(code) ? "—" : Lookup(CalibrationMethods, code, "标定方法");
+}

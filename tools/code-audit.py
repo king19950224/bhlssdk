@@ -328,6 +328,154 @@ def gate6() -> list[str]:
     return violations
 
 
+# ---------------- G7 导出物中文覆盖 ----------------
+
+# 报告和 CSV 是打印出来交给客户的,上面不能出现 load_calibrate_countersign 这种码。
+# 中文名统一放在 DisplayLabels.cs,这里核对代码里写进 audit_log 的每个码都登记过了。
+# 之所以要这道门:这套对照表原来前端后端各存一份,后端加动作没人记得补前端那份,
+# 结果 user_change_password / wiring_import 直接以英文出现在审计页面上。
+LABELS_FILE = ROOT / "src/BoltPreload.Api/Endpoints/DisplayLabels.cs"
+API_DIR = ROOT / "src/BoltPreload.Api"
+
+G7_DICT = re.compile(
+    r"Dictionary<string, string>\s+(\w+)\s*=\s*new\(StringComparer\.Ordinal\)\s*\{(.*?)\n    \};",
+    re.S)
+G7_CS_ENTRY = re.compile(r'\["([^"]+)"\]\s*=\s*"([^"]*)"')
+# 三种写法都会往 audit_log 落动作:辅助方法、参数绑定、SQL 里直接写死
+G7_HELPER = re.compile(r"Write\w*AuditAsync\((.{0,200}?)\)\s*;", re.S)
+G7_BIND = re.compile(r'AddWithValue\("action",\s*NpgsqlDbType\.\w+,\s*([^;]{0,120}?)\)\s*;', re.S)
+G7_SQL = re.compile(r"INSERT INTO audit_log.{0,400}?VALUES\s*\(\s*[^,]+,\s*'([a-z_]+)'\s*,\s*'([a-z_]+)'", re.S)
+G7_LIT = re.compile(r'"([a-z][a-z_]{3,})"')
+
+
+def _cs_label_tables() -> dict[str, dict[str, str]]:
+    """后端 DisplayLabels.cs 里的各张词表,解析成 表名 -> {码: 中文名}。"""
+    text = LABELS_FILE.read_text(encoding="utf-8")
+    return {name: dict(G7_CS_ENTRY.findall(body)) for name, body in G7_DICT.findall(text)}
+
+
+def _registered_labels() -> dict[str, set[str]]:
+    return {name: set(table) for name, table in _cs_label_tables().items()}
+
+
+# 告警类型、标定方法这两张表前后端各要一份:后端出报告和 CSV,前端出页面。
+# 同一条记录在页面上和在导出件里必须是同一个叫法。以前漂过——标定方法在四个页面
+# 分别写成"正式载荷标定 / 正式载荷""GB 单波法 / GB单波""快速标定 / 快速",
+# 各自为政谁也没发现。前端收敛到 labels.ts 之后,靠这道门盯住两边不再各改各的。
+FRONT_LABELS = ROOT / "web/src/utils/labels.ts"
+LABEL_TABLE_PAIRS = {          # 前端常量名 -> 后端词表名
+    "ALARM_TYPE_LABELS": "AlarmTypes",
+    "CALIBRATION_METHOD_LABELS": "CalibrationMethods",
+}
+G7_TS_ENTRY = re.compile(r"(\w+):\s*'([^']*)'")
+
+
+def _frontend_label_sync() -> list[str]:
+    if not FRONT_LABELS.exists():
+        return [f"{FRONT_LABELS.relative_to(ROOT)} 不见了,前端对照表没了"]
+    ts_text = FRONT_LABELS.read_text(encoding="utf-8")
+    cs_tables = _cs_label_tables()
+
+    out = []
+    for ts_name, cs_name in LABEL_TABLE_PAIRS.items():
+        blk = re.search(rf"\bconst {ts_name}[^{{]*\{{(.*?)\n\}}", ts_text, re.S)
+        if not blk:
+            out.append(f"前端 {ts_name} 找不到了,与后端 {cs_name} 的一致性无法核对")
+            continue
+        back = cs_tables.get(cs_name)
+        if back is None:
+            out.append(f"后端 DisplayLabels.{cs_name} 找不到了,与前端 {ts_name} 的一致性无法核对")
+            continue
+        front = dict(G7_TS_ENTRY.findall(blk.group(1)))
+        for code in sorted(set(front) | set(back)):
+            f, b = front.get(code), back.get(code)
+            if f is None:
+                out.append(f"'{code}' 后端 {cs_name} 登记了 '{b}',前端 {ts_name} 没有,页面上会露出英文码")
+            elif b is None:
+                out.append(f"'{code}' 前端 {ts_name} 登记了 '{f}',后端 {cs_name} 没有,导出件里会露出英文码")
+            elif f != b:
+                out.append(f"'{code}' 两边叫法不一致:页面写 '{f}',导出件写 '{b}'")
+    return out
+
+
+# 点位表要能导出→改→回导。表头在 C# 里写死,认表头的别名表在 Vue 里,
+# 中间没有编译期约束:改了一边忘了另一边,现场导回来就是"缺通道号列"。
+WIRING_EXPORT = ROOT / "src/BoltPreload.Api/Endpoints/WiringTableEndpoints.cs"
+WIRING_IMPORT = ROOT / "web/src/views/ChannelIdentify.vue"
+WIRING_FIELDS = ["channelNo", "positionLabel", "boltCode",
+                 "nominalDiam", "grade", "targetPreloadN", "minPreloadN"]
+# 按结构认表头行:非插值的 AppendLine、至少 7 列、不是 # 开头的说明行。
+# 别拿某个中文词当锚点——表头一改就连行都找不到,门禁会报成"文件缺失"而不是"列对不上"。
+G7_HDR = re.compile(r'csv\.AppendLine\("(?!#)([^"{}]*(?:,[^"{},]*){6,})"\);')
+G7_ALIAS_BLOCK = re.compile(r"const HEADER_ALIASES[^{]*\{(.*?)\n\}", re.S)
+G7_ALIAS = re.compile(r"([^\s,{]+):\s*'(\w+)'")
+
+
+def _wiring_roundtrip() -> list[str]:
+    if not (WIRING_EXPORT.exists() and WIRING_IMPORT.exists()):
+        return []
+    hdr_m = G7_HDR.search(WIRING_EXPORT.read_text(encoding="utf-8"))
+    blk_m = G7_ALIAS_BLOCK.search(WIRING_IMPORT.read_text(encoding="utf-8"))
+    if not hdr_m or not blk_m:
+        return ["点位表导出表头或导入别名表找不到了,往返契约无法核对"]
+    headers = hdr_m.group(1).split(",")
+    alias = dict(G7_ALIAS.findall(blk_m.group(1)))
+
+    out = []
+    for i, field in enumerate(WIRING_FIELDS):
+        if i >= len(headers):
+            out.append(f"点位表导出少了第 {i + 1} 列(应为 {field}),导回去会认不出")
+            continue
+        h = headers[i]
+        got = alias.get(h.lower() if h.isascii() else h)
+        if got != field:
+            out.append(f"点位表第 {i + 1} 列表头 '{h}' 在导入别名表里指向 {got or '无'},应为 {field}")
+    # 只读列不能撞上可编辑字段,否则导入会拿错列覆盖数据
+    for i, h in enumerate(headers[len(WIRING_FIELDS):], start=len(WIRING_FIELDS) + 1):
+        got = alias.get(h.lower() if h.isascii() else h)
+        if got is not None:
+            out.append(f"点位表第 {i} 列 '{h}' 是只读信息列,却被导入别名表映射到 {got}")
+    # 客户手里存着旧的英文表头文件,别名表不能把这些入口删掉
+    legacy = ["channel_no", "position_label", "bolt_code",
+              "nominal_diam", "grade", "target_preload_n", "min_preload_n"]
+    for h, field in zip(legacy, WIRING_FIELDS):
+        if alias.get(h) != field:
+            out.append(f"旧英文表头 '{h}' 的兼容入口没了,客户存量点位表会导不进来")
+    return out
+
+
+def gate7() -> list[str]:
+    if not LABELS_FILE.exists():
+        return [f"{LABELS_FILE.relative_to(ROOT)} 不见了,导出物的中文对照表没了"]
+    tables = _registered_labels()
+    actions = tables.get("AuditActions", set())
+    targets = tables.get("AuditTargetTypes", set())
+
+    violations = []
+    for f in sorted(API_DIR.rglob("*.cs")):
+        if f == LABELS_FILE:
+            continue
+        text = f.read_text(encoding="utf-8")
+        rel = f.relative_to(ROOT)
+        found_a, found_t = set(), set()
+        for m in G7_HELPER.finditer(text):
+            found_a.update(G7_LIT.findall(m.group(1)))
+        for m in G7_BIND.finditer(text):
+            found_a.update(G7_LIT.findall(m.group(1)))
+        for act, tgt in G7_SQL.findall(text):
+            found_a.add(act)
+            found_t.add(tgt)
+        # 辅助方法/参数绑定那两种取法会连带扫到同一处的 target_type、备注等字面量,
+        # 凡是已登记为对象类型的就不再当动作追究,避免误报。
+        for code in sorted(found_a - actions - targets):
+            violations.append(f"{rel}: 审计动作 '{code}' 没在 DisplayLabels.AuditActions 里登记中文名")
+        for code in sorted(found_t - targets):
+            violations.append(f"{rel}: 审计对象类型 '{code}' 没在 DisplayLabels.AuditTargetTypes 里登记中文名")
+    violations.extend(_wiring_roundtrip())
+    violations.extend(_frontend_label_sync())
+    return violations
+
+
 # ---------------- 主入口 ----------------
 
 GATES = {
@@ -337,6 +485,7 @@ GATES = {
     "g4": ("遗留标记归零", gate4, True),
     "g5": ("前端未引用导出(报告级,不拦截)", gate5, False),
     "g6": ("文风统一(表情/引号/工具痕迹)", gate6, True),
+    "g7": ("导出物中文覆盖(审计动作/对象类型)", gate7, True),
 }
 
 

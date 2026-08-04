@@ -4,8 +4,9 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { calibrationApi, boltApi, reportApi, type CalibRecord, type TorqueTestPoint, type TorqueFitSummary } from '../api'
-import { getAuthToken } from '../api/client'
 import { useAuth } from '../stores/auth'
+import { downloadFile } from '../utils/download'
+import { calibrationMethodLabel } from '../utils/labels'
 
 const auth = useAuth()
 
@@ -38,10 +39,6 @@ const loadPoints = ref<{ forceN: number | undefined; deltaTofNs: number | undefi
 
 const busy = ref('')
 
-const METHOD_LABEL: Record<string, string> = {
-  load_calibrated: '正式载荷', gb_single_wave: 'GB单波', gb_bi_wave: 'GB双波',
-  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速', sim_baseline: '初始基线',
-}
 const REVIEW: Record<string, { label: string; cls: string }> = {
   approved: { label: '两人会签', cls: 'rv-ok' },
   self_signed: { label: '自签', cls: 'rv-self' },
@@ -193,15 +190,7 @@ async function genReport() {
 }
 async function downloadReport(id: number) {
   try {
-    const res = await fetch(reportApi.downloadUrl(id), { headers: { Authorization: `Bearer ${getAuthToken()}` } })
-    if (!res.ok) throw new Error()
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `torque-step-report-${id}.html`
-    a.click()
-    URL.revokeObjectURL(url)
+    await downloadFile(reportApi.downloadUrl(id), `扭矩阶梯报告-${id}.html`)
   } catch {
     ElMessage.error('下载失败')
   }
@@ -294,7 +283,7 @@ async function downloadReport(id: number) {
         <div v-loading="loadingData" class="tbl hist">
           <div class="tr th"><span>方法</span><span>K_L</span><span>R²</span><span>状态</span><span>到期</span><span>操作</span></div>
           <div v-for="c in history" :key="c.id" class="tr">
-            <span>{{ METHOD_LABEL[c.method] || c.method }} <i v-if="c.isActive" class="active">生效</i></span>
+            <span>{{ calibrationMethodLabel(c.method) }} <i v-if="c.isActive" class="active">生效</i></span>
             <span class="mono">{{ Number(c.kL).toExponential(2) }}</span>
             <!-- 单点法(快速/扭矩估算)无回归,R² 占位 0 显示成"0.000 拟合极差"会误导 → 显示 — -->
             <span class="mono">{{ ['quick', 'torque_estimate', 'sim_baseline'].includes(c.method) && Number(c.rSquared) === 0 ? '—' : Number(c.rSquared).toFixed(3) }}</span>

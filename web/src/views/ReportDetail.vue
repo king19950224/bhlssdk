@@ -1,11 +1,13 @@
 <script setup lang="ts">
 // 报告详情：把归档的报告快照渲染出来（扭矩分步/法兰验收），能签字复核，也能下载 HTML。
-import { onMounted, ref } from 'vue'
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { reportApi, type FlangeSnapshot, type TorqueStepSnapshot } from '../api'
+import { getAuthToken } from '../api/client'
 import { useAuth } from '../stores/auth'
+import { downloadFile } from '../utils/download'
+import { calibrationMethodLabel } from '../utils/labels'
 
 const route = useRoute()
 const router = useRouter()
@@ -61,10 +63,6 @@ function verdictClass(overall: string): string {
 }
 // 报告状态徽标（与列表页口径一致；archived 等不再一律显示"待签发"）
 const STATUS_LABEL: Record<string, string> = { signed: '已签发 · 已锁定', generated: '已生成 · 待签发', archived: '已归档' }
-const METHOD: Record<string, string> = {
-  load_calibrated: '正式载荷标定', gb_single_wave: 'GB单波', gb_bi_wave: 'GB双波',
-  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定', sim_baseline: '初始基线',
-}
 
 const loadError = ref<string | null>(null)
 async function load() {
@@ -119,10 +117,10 @@ function ratio(v: number | null) {
 function fmt(iso: string | null) {
   return iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '—'
 }
-// 取归档 HTML 文本（带 token 的受保护接口不能用裸 <a href>）
+// 取归档 HTML 文本（带 token 的受保护接口不能用裸 <a href>）。
+// 只给"导出 PDF"用：那条路要把 HTML 写进新窗口打印，需要文本本身；下载走 downloadFile。
 async function fetchArchivedHtml(): Promise<string | null> {
   try {
-    const { getAuthToken } = await import('../api/client')
     const res = await fetch(reportApi.downloadUrl(id), { headers: { Authorization: `Bearer ${getAuthToken()}` } })
     if (!res.ok) throw new Error(String(res.status))
     return await res.text()
@@ -155,17 +153,13 @@ async function exportPdf() {
   }
 }
 
-// 下载归档 HTML（与列表页一致）
+// 下载归档 HTML（与列表页一致，名字都以服务端给的为准）
 async function download() {
-  const html = await fetchArchivedHtml()
-  if (html == null) { ElMessage.error('下载失败，报告文件可能不可用'); return }
-  const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `${title.value || 'report-' + id}.html`
-  a.click()
-  URL.revokeObjectURL(url)
+  try {
+    await downloadFile(reportApi.downloadUrl(id), `${title.value || '报告-' + id}.html`)
+  } catch {
+    ElMessage.error('下载失败，报告文件可能不可用')
+  }
 }
 </script>
 
@@ -235,7 +229,7 @@ async function download() {
             <td class="mono">{{ n(b.minN) }}</td>
             <td class="mono">{{ n(b.preloadN) }}</td>
             <td class="mono">{{ ratio(b.ratio) }}</td>
-            <td>{{ b.calibMethod ? (METHOD[b.calibMethod] || b.calibMethod) : '—' }}</td>
+            <td>{{ calibrationMethodLabel(b.calibMethod) }}</td>
             <td>{{ b.trust }}</td>
             <td class="mono">{{ b.rSquared != null ? Number(b.rSquared).toFixed(3) : '—' }}</td>
             <td><span class="res" :style="`color:${RESULT[b.result]}`">{{ b.result }}</span></td>

@@ -310,7 +310,7 @@ public static class AcceptanceEndpoints
                     acceptanceId, method, cableLabel = req?.CableLabel, positionLabel = pos, tofNs = tof
                 }));
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
-                    $"通道接入验收 device={deviceId} CH{channelNo} 方式={MethodLabel(method)} 电缆={req?.CableLabel ?? "—"} 声时={tof?.ToString("F0") ?? "—"}ns");
+                    $"通道接入验收 device={deviceId} CH{channelNo} 方式={DisplayLabels.AcceptanceMethod(method)} 电缆={req?.CableLabel ?? "—"} 声时={tof?.ToString("F0") ?? "—"}ns");
                 await audit.ExecuteNonQueryAsync(ct);
             }
 
@@ -396,7 +396,7 @@ public static class AcceptanceEndpoints
                    .Append(Csv(reader.IsDBNull(2) ? "" : reader.GetString(2))).Append(',')
                    .Append(Csv(reader.IsDBNull(7) ? "" : reader.GetString(7))).Append(',')
                    .Append(Csv(reader.IsDBNull(4) ? "" : reader.GetString(4))).Append(',')
-                   .Append(reader.IsDBNull(6) ? "未验收" : MethodLabel(reader.GetString(6))).Append(',')
+                   .Append(reader.IsDBNull(6) ? "未验收" : DisplayLabels.AcceptanceMethod(reader.GetString(6))).Append(',')
                    .Append(reader.IsDBNull(8) ? "" : reader.GetDecimal(8).ToString("F0")).Append(',')
                    .Append(Csv(reader.IsDBNull(9) ? "" : reader.GetString(9))).Append(',')
                    .Append(reader.IsDBNull(5) ? "" : reader.GetDateTime(5).ToString("yyyy-MM-dd HH:mm:ss")).Append(',')
@@ -404,7 +404,7 @@ public static class AcceptanceEndpoints
             }
             var bytes = Encoding.UTF8.GetBytes(csv.ToString());
             return Results.File(bytes, "text/csv; charset=utf-8",
-                $"acceptance-{deviceCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
+                $"通道验收报告-{deviceCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
         })
         .WithName("ExportAcceptanceReport")
         .WithSummary("导出验收报告 CSV（竣工资料）");
@@ -438,14 +438,6 @@ public static class AcceptanceEndpoints
         // 会话内单通道刷新周期估算（前端提示"插入确认约 N 秒"）
         estimatedRefreshSeconds = Math.Max(1, (int)Math.Ceiling(s.Channels.Count * Math.Max(10, opt.PerChannelMeasureMs) / 1000.0)),
         startedByUserId = s.StartedByUserId
-    };
-
-    internal static string MethodLabel(string method) => method switch
-    {
-        "sequential" => "顺序接入",
-        "loopcheck" => "拔插确认",
-        "manual" => "人工登记",
-        _ => method
     };
 
     /// <summary>CSV 字段转义：含逗号/引号/换行时加引号包裹。</summary>

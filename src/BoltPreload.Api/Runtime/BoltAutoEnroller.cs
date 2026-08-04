@@ -263,7 +263,7 @@ public sealed class BoltAutoEnroller
             cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
             cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
             cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text,
-                $"[system:auto-enroll] 探头在位自动建档 CH{channelNo}（检测即螺栓）");
+                $"[系统自动建档] 探头在位自动建档 CH{channelNo}（检测即螺栓）");
             await cmd.ExecuteNonQueryAsync(ct);
         }
         await using (var audit = new NpgsqlCommand(@"
@@ -273,7 +273,7 @@ public sealed class BoltAutoEnroller
         {
             audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
             audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
-                $"[system:auto-enroll] 探头在位自动建档：{code} 绑定 CH{channelNo}（设备 {deviceId}，监测组 {groupCode}），缺省规格 M20/8.8，待补位置与目标值");
+                $"[系统自动建档] 探头在位自动建档：{code} 绑定 CH{channelNo}（设备 {deviceId}，监测组 {groupCode}），缺省规格 M20/8.8，待补位置与目标值");
             await audit.ExecuteNonQueryAsync(ct);
         }
 

@@ -41,7 +41,7 @@ public sealed class BoltAutoEnrollerTests
             "SELECT count(*) FROM channel_binding_history WHERE bolt_id = @p0 AND action = 'bind'", first.BoltId))
             .Should().Be(1);
         (await ScalarAsync<long>(
-            "SELECT count(*) FROM audit_log WHERE target_id = @p0 AND action = 'create_bolt' AND note LIKE '%system:auto-enroll%'",
+            "SELECT count(*) FROM audit_log WHERE target_id = @p0 AND action = 'create_bolt' AND note LIKE '%系统自动建档%'",
             first.BoltId))
             .Should().Be(1);
 

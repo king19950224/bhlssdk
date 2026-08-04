@@ -344,7 +344,7 @@ public static class DiagnosticEndpoints
                     audit.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
                     audit.Parameters.AddWithValue("before", NpgsqlDbType.Jsonb, beforeJson);
                     audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, afterJson);
-                    audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, "从 device_parameter_history 最新读回值同步通道配置");
+                    audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, "按设备参数历史里最新的读回值同步通道配置");
                     await audit.ExecuteNonQueryAsync(ct);
                 }
 

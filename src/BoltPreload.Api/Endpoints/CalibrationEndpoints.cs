@@ -184,7 +184,7 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("eh", NpgsqlDbType.Numeric, (object?)req.EnvHumidity ?? DBNull.Value);
                     // points_jsonb 必填，quick 模式给一个空数组 + 说明
                     var pointsJson = req.Points is null
-                        ? """[{"_note":"quick calibration, no multi-point data"}]"""
+                        ? """[{"_note":"快速标定，无多点数据"}]"""
                         : System.Text.Json.JsonSerializer.Serialize(req.Points);
                     cmd.Parameters.AddWithValue("pts", NpgsqlDbType.Jsonb, pointsJson);
                     cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, req.KL);
@@ -192,7 +192,7 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, req.RefTimeNs);
                     cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, req.RefTempC);
                     cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text,
-                        (object?)(req.Note ?? "quick calibration via API") ?? DBNull.Value);
+                        (object?)(req.Note ?? "快速标定（接口直调）") ?? DBNull.Value);
                     // 默认 30 天过期（GB/T 43232 推荐≤180 天，quick 模式更保守）
                     cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date,
                         DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? 30)));
@@ -236,7 +236,7 @@ public static class CalibrationEndpoints
                     req.RefTempC
                 });
                 await WriteChannelAuditAsync(conn, tx, userId, "quick_calibrate", channelId,
-                    afterJson, $"quick calibration for bolt {boltId}", ct);
+                    afterJson, $"快速标定 螺栓 {boltId}", ct);
 
                 await tx.CommitAsync(ct);
 

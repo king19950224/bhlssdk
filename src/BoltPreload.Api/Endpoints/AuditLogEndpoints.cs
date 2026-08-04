@@ -53,7 +53,9 @@ public static class AuditLogEndpoints
                         username = r.IsDBNull(2) ? null : r.GetString(2),
                         ipAddr = r.IsDBNull(3) ? null : r.GetString(3),
                         action = r.GetString(4),
+                        actionLabel = DisplayLabels.AuditAction(r.GetString(4)),
                         targetType = r.IsDBNull(5) ? null : r.GetString(5),
+                        targetTypeLabel = r.IsDBNull(5) ? null : DisplayLabels.AuditTargetType(r.GetString(5)),
                         targetId = r.IsDBNull(6) ? (long?)null : r.GetInt64(6),
                         before = r.IsDBNull(7) ? null : r.GetString(7),
                         after = r.IsDBNull(8) ? null : r.GetString(8),
@@ -78,7 +80,7 @@ public static class AuditLogEndpoints
             var items = new List<object>();
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
-                items.Add(new { action = r.GetString(0), count = r.GetInt64(1) });
+                items.Add(new { action = r.GetString(0), label = DisplayLabels.AuditAction(r.GetString(0)), count = r.GetInt64(1) });
             return Results.Ok(new { items });
         })
         .WithName("AuditLogActions")
@@ -101,7 +103,8 @@ public static class AuditLogEndpoints
 
             var csv = new StringBuilder();
             csv.Append('\uFEFF'); // UTF-8 BOM
-            csv.AppendLine("id,at_utc,user_id,username,action,target_type,target_id,note,before,after");
+            // 表头与动作名都用中文：这份文件是打印出来给客户和第三方审查看的
+            csv.AppendLine("序号,时间(UTC),用户编号,用户名,动作,对象类型,对象编号,备注,变更前,变更后");
             await using (var r = await cmd.ExecuteReaderAsync(ct))
             {
                 while (await r.ReadAsync(ct))
@@ -110,8 +113,8 @@ public static class AuditLogEndpoints
                        .Append(Csv(r.GetDateTime(10).ToString("o"))).Append(',')
                        .Append(r.IsDBNull(1) ? "" : r.GetInt64(1).ToString()).Append(',')
                        .Append(Csv(r.IsDBNull(2) ? "" : r.GetString(2))).Append(',')
-                       .Append(Csv(r.GetString(4))).Append(',')
-                       .Append(Csv(r.IsDBNull(5) ? "" : r.GetString(5))).Append(',')
+                       .Append(Csv(DisplayLabels.AuditAction(r.GetString(4)))).Append(',')
+                       .Append(Csv(r.IsDBNull(5) ? "" : DisplayLabels.AuditTargetType(r.GetString(5)))).Append(',')
                        .Append(r.IsDBNull(6) ? "" : r.GetInt64(6).ToString()).Append(',')
                        .Append(Csv(r.IsDBNull(9) ? "" : r.GetString(9))).Append(',')
                        .Append(Csv(r.IsDBNull(7) ? "" : r.GetString(7))).Append(',')
@@ -121,7 +124,7 @@ public static class AuditLogEndpoints
 
             var bytes = Encoding.UTF8.GetBytes(csv.ToString());
             return Results.File(bytes, "text/csv; charset=utf-8",
-                $"audit-log-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
+                $"审计日志-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
         })
         .WithName("ExportAuditLogCsv")
         .WithSummary("导出审计日志 CSV（合规归档）");

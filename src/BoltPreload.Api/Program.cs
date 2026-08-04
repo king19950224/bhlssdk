@@ -448,7 +448,7 @@ _ = app.Lifetime.ApplicationStarted.Register(() =>
         try
         {
             var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
-            await AdminBootstrap.EnsureDevAdminAsync(app.Services, app.Configuration, isDevelopment, logger, CancellationToken.None);
+            await AdminBootstrap.EnsureAdminAsync(app.Services, app.Configuration, isDevelopment, logger, CancellationToken.None);
 
             // 清理上次崩溃残留的 probe scan 脏记录（status=pending/running）
             var probeScanOpts = app.Services.GetRequiredService<IOptions<ProbeScanOptions>>().Value;

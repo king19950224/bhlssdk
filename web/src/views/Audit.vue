@@ -3,28 +3,16 @@
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { auditApi, type AuditEntry } from '../api'
-import { getAuthToken } from '../api/client'
+import { downloadFile } from '../utils/download'
 
 const items = ref<AuditEntry[]>([])
-const actions = ref<{ action: string; count: number }[]>([])
+const actions = ref<{ action: string; label: string; count: number }[]>([])
 const action = ref<string>('')
 const range = ref<[Date, Date] | null>(null)
 const offset = ref(0)
 const limit = 100
 const hasMore = ref(false)
 const loading = ref(false)
-
-const ACTION_LABEL: Record<string, string> = {
-  load_calibrate_submit: '提交正式标定', load_calibrate_countersign: '标定会签', load_calibrate_reject: '标定驳回',
-  quick_calibrate: '快速标定', torque_calibrate: '扭矩标定', apply_torque_fit: '应用扭矩拟合', torque_point_capture: '采集扭矩点',
-  config_change_approve: '参数审批', config_change_reject: '参数驳回', config_change_execute: '参数执行', config_change_verify: '参数验证',
-  alarm_ack: '告警确认', alarm_clear: '告警闭合', alarm_shelve: '告警抑制', alarm_shelve_cancel: '取消抑制',
-  sync_channel_config: '同步通道配置', move_bolt_channel: '螺栓换通道', bolt_move_channel: '螺栓换通道', channel_bind: '绑定通道', channel_unbind: '解绑通道',
-  update_bolt_spec: '更新螺栓规格', update_target_preload: '更新目标预紧力', update_group_config: '更新部位配置', create_bolt: '螺栓建档',
-  channel_commission: '调试期直发参数', channel_recalibrate: '重标定基线', channel_rename: '通道重命名',
-  report_sign: '报告签发', user_create: '创建/重置用户', user_toggle: '启停用户',
-}
-const TYPE_LABEL: Record<string, string> = { channel: '通道', alarm: '告警', bolt: '螺栓', calibration: '标定', report: '报告', user: '用户', monitor_group: '监测部位' }
 
 function qs() {
   const p = new URLSearchParams()
@@ -69,17 +57,7 @@ async function exportCsv() {
       p.set('to', range.value[1].toISOString())
     }
     const q = p.toString()
-    const res = await fetch(`/api/audit-log/export.csv${q ? '?' + q : ''}`, {
-      headers: { Authorization: `Bearer ${getAuthToken()}` },
-    })
-    if (!res.ok) throw new Error(String(res.status))
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `audit-log-${Date.now()}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
+    await downloadFile(`/api/audit-log/export.csv${q ? '?' + q : ''}`, `审计日志-${Date.now()}.csv`)
     ElMessage.success('已导出 CSV')
   } catch {
     ElMessage.error('导出失败')
@@ -98,7 +76,7 @@ onMounted(async () => {
   <div class="audit rise">
     <div class="filters panel">
       <el-select v-model="action" placeholder="全部动作" clearable size="default" class="f-action">
-        <el-option v-for="a in actions" :key="a.action" :label="`${ACTION_LABEL[a.action] || a.action} (${a.count})`" :value="a.action" />
+        <el-option v-for="a in actions" :key="a.action" :label="`${a.label}（${a.count}）`" :value="a.action" />
       </el-select>
       <el-date-picker v-model="range" type="datetimerange" range-separator="至" start-placeholder="开始" end-placeholder="结束" size="default" />
       <el-button type="primary" :loading="loading" @click="apply"><el-icon><Search /></el-icon> 查询</el-button>
@@ -115,8 +93,8 @@ onMounted(async () => {
         <div v-for="e in items" :key="e.id" class="tr">
           <span class="mono dim">{{ fmt(e.at) }}</span>
           <span>{{ e.username || ('用户' + e.userId) }}</span>
-          <span><span class="act">{{ ACTION_LABEL[e.action] || e.action }}</span></span>
-          <span class="mono dim">{{ e.targetType ? (TYPE_LABEL[e.targetType] || e.targetType) + '#' + e.targetId : '—' }}</span>
+          <span><span class="act">{{ e.actionLabel }}</span></span>
+          <span class="mono dim">{{ e.targetTypeLabel ? e.targetTypeLabel + '#' + e.targetId : '—' }}</span>
           <span class="note">{{ e.note || '—' }}</span>
         </div>
         <div v-if="!loading && !items.length" class="tbl-empty">无审计记录</div>

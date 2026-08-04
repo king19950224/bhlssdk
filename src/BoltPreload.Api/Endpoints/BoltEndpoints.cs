@@ -312,7 +312,7 @@ public static class BoltEndpoints
                    .Append(r.GetInt64(7)).Append(',').Append(r.GetInt64(8)).Append('\n');
             }
             var bytes = Encoding.UTF8.GetBytes(csv.ToString());
-            return Results.File(bytes, "text/csv; charset=utf-8", $"trend-{boltCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
+            return Results.File(bytes, "text/csv; charset=utf-8", $"预紧力趋势-{boltCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
         })
         .WithName("BoltPreloadTrendCsv")
         .WithSummary("导出螺栓预紧力趋势 CSV（月报/年报原始数据）");

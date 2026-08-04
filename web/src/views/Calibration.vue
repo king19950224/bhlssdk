@@ -6,6 +6,7 @@ import { calibrationApi, boltApi, type CalibMethod, type BoltListItem } from '..
 import { useAuth } from '../stores/auth'
 import CalibrationDialog from '../components/CalibrationDialog.vue'
 import CalibrationWizard from '../components/CalibrationWizard.vue'
+import { calibrationMethodLabel } from '../utils/labels'
 
 const router = useRouter()
 const auth = useAuth()
@@ -31,10 +32,6 @@ const TRUST: Record<string, { label: string; color: string }> = {
   engineering_estimate: { label: '工程估算', color: '#f59e0b' },
   temporary: { label: '临时', color: '#61748f' },
   unknown: { label: '未分级', color: '#61748f' },
-}
-const METHOD_LABEL: Record<string, string> = {
-  load_calibrated: '正式载荷标定', gb_single_wave: 'GB 单波法', gb_bi_wave: 'GB 双波法',
-  torque_fit: '扭矩拟合', torque_estimate: '扭矩估算', quick: '快速标定', sim_baseline: '初始基线',
 }
 // 单点标定（无回归）方法：R² 无意义，避免界面把占位的 0.000 当成"拟合极差"
 const SINGLE_POINT = new Set(['quick', 'torque_estimate'])
@@ -73,7 +70,7 @@ onMounted(load)
     <div class="methods">
       <div v-for="m in methods" :key="m.method" class="m-card panel">
         <div class="m-top">
-          <span class="m-name">{{ METHOD_LABEL[m.method] || m.method }}</span>
+          <span class="m-name">{{ calibrationMethodLabel(m.method) }}</span>
           <span class="trust" :style="`color:${trustView(m).color};border-color:${trustView(m).color}`">{{ trustView(m).label }}</span>
         </div>
         <div class="m-stats">
