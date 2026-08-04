@@ -100,7 +100,8 @@ public sealed class ChannelPresenceService : BackgroundService
     /// 扫描期间跳过且【清除已确认标记】：扫描恢复的 MCR 快照可能是扫描前的旧集
     /// （扫描恰在本服务首次下发前快照的竞态），扫完后下一轮重新校验收敛。
     /// </summary>
-    private async Task EnsureFullChannelPollingAsync(CancellationToken ct)
+    // internal 供集成测试直调单轮收敛（BoltPreload.Tests，见 csproj InternalsVisibleTo）
+    internal async Task EnsureFullChannelPollingAsync(CancellationToken ct)
     {
         foreach (var rt in _deviceManager.Runtimes)
         {

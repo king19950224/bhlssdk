@@ -55,8 +55,17 @@ internal sealed class FakeConnector : IFxConnector
         uint? startSeconds = null, CancellationToken ct = default)
     {
         McrConfigCalls.Enqueue(enabledChannels.ToArray());
+        SessionMcr = enabledChannels.ToArray();
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// 设备端当前的 MCR 轮询集。真机上这是下发后的会话状态，所以下发要改它——
+    /// 不跟着改的话"已是全通道就不重下发"这类判断在测试里永远走不到。
+    /// </summary>
+    public IReadOnlyList<ushort> SessionMcr { get; set; } = [];
+
+    public IReadOnlyList<ushort> GetSessionMcrChannels() => SessionMcr;
 
     public Task ConfigureChannelAsync(
         ushort channel, ChannelConfigUpdate updates, ushort address = 1, CancellationToken ct = default)
@@ -75,10 +84,13 @@ internal sealed class FakeConnector : IFxConnector
 /// <summary>只装一台设备的运行时管理器。</summary>
 internal sealed class FakeDeviceManager : IDeviceConnectorManager
 {
-    private readonly DeviceRuntimeContext _ctx;
+    private DeviceRuntimeContext _ctx;
 
     /// <param name="mode">运行模式。真机路径专有的逻辑（如波形主动采集）只对 <c>Real</c> 生效。</param>
-    public FakeDeviceManager(IFxConnector connector, string mode = "Sim")
+    /// <param name="model">设备型号。MCR 多通道轮询只有 model=3 支持。</param>
+    /// <param name="channelCount">物理通道数。0 表示没有这项信息（老配置路径）。</param>
+    public FakeDeviceManager(
+        IFxConnector connector, string mode = "Sim", ushort model = 3, ushort channelCount = 0)
     {
         _ctx = new DeviceRuntimeContext(
             DeviceId: connector.DeviceId,
@@ -86,11 +98,17 @@ internal sealed class FakeDeviceManager : IDeviceConnectorManager
             IsPrimary: true,
             Connector: connector,
             RuntimeStatus: new IngestionRuntimeStatus(),
-            Options: new DeviceRuntimeOptions(mode, "n/a", 1, 1, 3));
+            Options: new DeviceRuntimeOptions(mode, "n/a", 1, 1, model, channelCount));
     }
 
     public IReadOnlyCollection<DeviceRuntimeContext> Runtimes => [_ctx];
     public DeviceRuntimeContext Primary => _ctx;
     public DeviceRuntimeContext? Find(long deviceId) => deviceId == _ctx.DeviceId ? _ctx : null;
-    public bool TryUpdateChannelCount(long deviceId, ushort channelCount) => deviceId == _ctx.DeviceId;
+
+    public bool TryUpdateChannelCount(long deviceId, ushort channelCount)
+    {
+        if (deviceId != _ctx.DeviceId) return false;
+        _ctx = _ctx with { Options = _ctx.Options with { ChannelCount = channelCount } };
+        return true;
+    }
 }
