@@ -28,6 +28,15 @@ const cur = computed(() => cmp.value?.current ?? null)
 const refWave = computed(() => cmp.value?.reference ?? null)
 const metrics = computed(() => cmp.value?.metrics ?? null)
 const hasRef = computed(() => !!cmp.value?.hasReference)
+// 波形文件损坏：请求是成功的（HTTP 200），所以不会进 error 那条横幅，但也绝不是"暂无波形"。
+// 三种情况要有三句话：请求失败 / 文件损坏 / 确实还没采到波形。
+const waveFileError = computed(() => cmp.value?.waveError ?? null)
+const ascanEmptyText = computed(() => {
+  if (loading.value) return '加载中…'
+  if (error.value) return '波形加载失败，请点上方“重试”。'
+  if (waveFileError.value) return waveFileError.value
+  return '暂无波形数据。设备产生带波形的测量后，可在此实时回放并对比 A-Scan。'
+})
 
 async function loadFeatures() {
   const res = await waveApi.features(60)
@@ -280,9 +289,9 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
       </div>
 
       <EChart v-if="cur" :option="ascanOption" height="300px" />
-      <div v-else class="ascan-empty" v-loading="loadingCmp">
-        <el-icon><TrendCharts /></el-icon>
-        <span>{{ loading ? '加载中…' : error ? '波形加载失败，请点上方“重试”。' : '暂无波形数据。设备产生带波形的测量后，可在此实时回放并对比 A-Scan。' }}</span>
+      <div v-else class="ascan-empty" :class="{ 'ascan-empty--bad': waveFileError }" v-loading="loadingCmp">
+        <el-icon><WarningFilled v-if="waveFileError" /><TrendCharts v-else /></el-icon>
+        <span>{{ ascanEmptyText }}</span>
       </div>
 
       <div v-if="curStats" class="ascan-legend">
@@ -355,6 +364,9 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
 
 .ascan-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; height: 300px; color: var(--text-3); text-align: center; padding: 0 40px; }
 .ascan-empty .el-icon { font-size: 34px; color: var(--text-3); opacity: 0.5; }
+/* 文件损坏与"还没采到波形"用不同的观感，别让人一眼扫过去当成正常空态 */
+.ascan-empty--bad { color: var(--text-1); }
+.ascan-empty--bad .el-icon { color: var(--crit); opacity: 1; }
 .ascan-legend { display: flex; flex-wrap: wrap; gap: 16px; padding: 4px 20px 6px; }
 .ascan-legend .lg { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-3); }
 .lg-line { width: 14px; height: 2px; border-radius: 2px; }

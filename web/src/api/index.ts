@@ -492,6 +492,9 @@ export interface WaveCompareResult {
   channelId: number; hasCurrent: boolean; hasReference: boolean
   referenceFeatureId?: number | null
   current?: WaveCompareWave; reference?: WaveCompareWave; metrics?: WaveCompareMetrics
+  // 文件在但解析不了（断电可能留下截断的 JSON）。这条和 hasCurrent=false 一起回来，
+  // 但含义完全不同：不是"该通道没采到波形"，别把两者显示成同一句话。
+  waveError?: string | null
 }
 export const waveApi = {
   features: (limit = 50) => http.get<{ count: number; items: WaveFeature[] }>(`/api/waves/features/recent?limit=${limit}`),

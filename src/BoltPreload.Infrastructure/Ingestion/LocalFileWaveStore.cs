@@ -31,7 +31,19 @@ public sealed class LocalFileWaveStoreOptions
 /// 本地文件波形存储。
 /// <para>路径规则：<c>{RootPath}/{deviceId}/{channelNo}/{yyyyMMdd}/{tsUnixMs}.json</c></para>
 /// <para>按日分目录，便于按时间清理 + 列表查询（GB/T 17626 要求历史数据归档可追溯）。</para>
-/// <para>写操作走"写临时文件 + 原子 rename"，保证断电不留下半截 JSON。</para>
+/// <para>
+/// 写操作走"写临时文件 + rename"。这挡住的是<b>读者看到半截文件</b>和<b>进程崩溃</b>：
+/// rename 在文件系统命名空间里是原子的，最终路径上要么是上一个完整版本要么是新的完整版本，
+/// 中途挂掉最多留个 .tmp。
+/// </para>
+/// <para>
+/// 挡不住断电：rename 前没有 fsync，元数据可能先于数据块落盘，重启后最终路径上可以是
+/// 一个零长度或被截断的 JSON。没有去补 fsync 是权衡后的选择——波形是辅助诊断数据
+/// （保留 <see cref="LocalFileWaveStoreOptions.RetentionDays"/> 天后即删），权威测量记录在
+/// Postgres 里由数据库自己保证持久化，为它在采集路径上每条波形付一次刷盘不值得。
+/// </para>
+/// <para>因此读取方必须容忍解析失败，且要把"文件坏了"和"没有这个文件"分开报，别让断电后的
+/// 损坏波形显示成"该通道没有波形"。见 <c>MeasurementEndpoints</c> 的波形读取路径。</para>
 /// </summary>
 public sealed class LocalFileWaveStore : IWaveStore
 {
@@ -88,7 +100,9 @@ public sealed class LocalFileWaveStore : IWaveStore
             json = SerializePayload(deviceId, channelNo, ts, truncatedWave, truncated: true);
         }
 
-        // 原子写：先写 .tmp 再 rename。Rename 是 POSIX 原子操作，断电要么完整要么不存在。
+        // 先写 .tmp 再 rename。Rename 在命名空间里原子：读者不会在最终路径上看到半截文件，
+        // 中途崩溃最多留个 .tmp。但没有 fsync，所以断电仍可能在最终路径上留下截断的 JSON
+        // —— 这是刻意的取舍，理由见类注释。
         // 每次写用独立 .tmp（带 GUID），避免并发写共享同一个 .tmp 造成竞态/串扰。
         var tmpPath = $"{absPath}.{Guid.NewGuid():N}.tmp";
         await File.WriteAllBytesAsync(tmpPath, json, ct);

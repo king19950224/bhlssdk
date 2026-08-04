@@ -9,8 +9,10 @@ namespace FxSDK.Utility;
 /// </summary>
 public static class CalculateExtensions
 {
-    private const string EchoTimeExpression = "2 * l * 1000000 / v"; // 乘1,000,000，用于将秒转换为纳秒(l为mm, v为m/s)
-    private const string LengthMmExpression = "v * t / 2000000";//依据时间和声速，获取长度
+    // 1,000,000 不是"秒转纳秒"（那是 1e9），而是 mm→m(1e-3) 与 s→ns(1e9) 两个换算的乘积。
+    // l 为 mm、v 为 m/s，结果为 ns。若把 l 改成以 m 为单位，这个系数要变 1e9，别照旧值抄。
+    private const string EchoTimeExpression = "2 * l * 1000000 / v";
+    private const string LengthMmExpression = "v * t / 2000000";//依据时间和声速，获取长度(t 为 ns，同上 1e6 系数，另含往返的 2)
     private const decimal CalculationInterval = 1M;//计算用插值时间间隔
     private const double SoundVelocity = 5890.0d;
     public const decimal DefaultTempCoeff = 0.00010269M;//默认温度补偿系数

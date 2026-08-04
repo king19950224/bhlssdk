@@ -23,7 +23,10 @@ public class TcpSession : IoSession
     private Task _heartbeatTask = Task.CompletedTask;
     private Task _decodeTask = Task.CompletedTask;
     private Task[] _backgroundTasks = Array.Empty<Task>();
-    
+
+    /// <summary>关闭时给后台任务自然退出的宽限期。超时文案共用它，见 CloseAsync。</summary>
+    private static readonly TimeSpan TaskExitGrace = TimeSpan.FromSeconds(10);
+
     // 使用原子操作确保线程安全
     private int _isClosed = 0;
 
@@ -300,13 +303,14 @@ public class TcpSession : IoSession
         {
             try
             {
-                // 延长到 5~10 秒，确保任务能响应取消
-                await Task.WhenAll(_backgroundTasks).WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+                // 10 秒足够让任务响应取消
+                await Task.WhenAll(_backgroundTasks).WaitAsync(TaskExitGrace).ConfigureAwait(false);
                 Logger.Debug($"Session {SessionId} all tasks completed successfully");
             }
             catch (TimeoutException)
             {
-                Logger.Warn($"Session {SessionId} tasks did not exit cleanly after 5s.");
+                // 用同一个常量，别在日志里写死秒数：改了超时忘改文案，看日志的人会照错的数字排查
+                Logger.Warn($"Session {SessionId} tasks did not exit cleanly after {TaskExitGrace.TotalSeconds:F0}s.");
             }
         }
 

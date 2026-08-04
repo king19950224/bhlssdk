@@ -12,6 +12,28 @@ namespace BoltPreload.Api.Endpoints;
 public sealed record ReferenceWaveRequest(string? Reason = null, string? Note = null);
 
 /// <summary>
+/// 一次波形文件读取的结果。三态而不是两态：文件不存在、文件在但解析不了、读到了。
+/// <para>
+/// 中间那一态必须单独存在。波形写入没有 fsync（见 <c>LocalFileWaveStore</c> 里的取舍说明），
+/// 断电后最终路径上可能是个截断的 JSON；把它和"没有这个文件"一起报成"暂无波形"，
+/// 会把正在查信号质量的人引去现场查探头，而根因是那个文件坏了。
+/// </para>
+/// </summary>
+internal readonly record struct WaveLoad(
+    short[]? Wave, double EchoStart, double ClockInt, short? Threshold, bool Corrupt)
+{
+    /// <summary>没有这个文件（正常情况：该通道还没采到波形，或已过保留期被清理）。</summary>
+    public static WaveLoad Missing => new(null, 0, 1, null, Corrupt: false);
+
+    /// <summary>文件在，但解析不出来。</summary>
+    public static WaveLoad Broken => new(null, 0, 1, null, Corrupt: true);
+
+    /// <summary>读到了可用波形。为真时 <see cref="Wave"/> 一定非空（编译器据此放行后续解引用）。</summary>
+    [System.Diagnostics.CodeAnalysis.MemberNotNullWhen(true, nameof(Wave))]
+    public bool Ok => Wave is not null;
+}
+
+/// <summary>
 /// 测量数据查询端点：最新测量 / 按螺栓历史 / 设备参数历史 / 波形特征与对比 /
 /// 通道清单（含未绑定暂存汇总、多通道矩阵）。
 /// 通道-螺栓绑定管理（bind/move/unbind）见 <see cref="BoltBindingEndpoints"/>。
@@ -354,7 +376,8 @@ public static class MeasurementEndpoints
         // 波形对比诊断（§8.6）：当前波形 vs 通道 active 参考波形 → 相似度 / 衰减 / 健康度。
         // 只做诊断计算与返回，不触发告警（阈值是否驱动告警须由可追溯的告警规则单独决定）。
         waveGroup.MapGet("/compare/{channelId:long}", async (
-            long channelId, NpgsqlDataSource ds, IWaveStore store, IMemoryCache cache, CancellationToken ct) =>
+            long channelId, NpgsqlDataSource ds, IWaveStore store, IMemoryCache cache,
+            ILoggerFactory lf, CancellationToken ct) =>
         {
             // 1. 当前（最新）波形特征
             string? curUrl = null; DateTime curTs = default; decimal? curSnr = null; int? curPp = null; long curId = 0;
@@ -401,10 +424,14 @@ public static class MeasurementEndpoints
             if (cache.TryGetValue(cacheKey, out object? cachedCmp) && cachedCmp is not null)
                 return Results.Ok(cachedCmp);
 
-            var cur = await LoadWaveAsync(store, curUrl, ct);
-            if (cur is null)
-                return Results.Ok(new { channelId, hasCurrent = false, hasReference = false });
-            var c = cur.Value;
+            var cur = await LoadWaveAsync(store, curUrl, lf.CreateLogger("Waves"), ct);
+            if (!cur.Ok)
+                return Results.Ok(new
+                {
+                    channelId, hasCurrent = false, hasReference = false,
+                    waveError = cur.Corrupt ? "当前波形文件已损坏，无法解析（不代表该通道没有采到波形）" : null,
+                });
+            var c = cur;
             object currentDto = new
             {
                 featureId = curId, ts = curTs,
@@ -417,10 +444,14 @@ public static class MeasurementEndpoints
             if (refUrl is null)
                 return Results.Ok(new { channelId, hasCurrent = true, hasReference = false, current = currentDto });
 
-            var refer = await LoadWaveAsync(store, refUrl, ct);
-            if (refer is null)
-                return Results.Ok(new { channelId, hasCurrent = true, hasReference = false, current = currentDto });
-            var rf = refer.Value;
+            var refer = await LoadWaveAsync(store, refUrl, lf.CreateLogger("Waves"), ct);
+            if (!refer.Ok)
+                return Results.Ok(new
+                {
+                    channelId, hasCurrent = true, hasReference = false, current = currentDto,
+                    waveError = refer.Corrupt ? "参考波形文件已损坏，无法比对（需重新设定参考波形）" : null,
+                });
+            var rf = refer;
 
             var cmp = WaveDiagnostics.Compare(
                 new WaveSeries(c.Wave, c.EchoStart, c.ClockInt),
@@ -463,12 +494,15 @@ public static class MeasurementEndpoints
         .WithName("CompareWave")
         .WithSummary("波形对比诊断：当前波形 vs 通道参考波形（相似度/衰减/健康度，§8.6）");
 
-        // 从 WaveStore 读回并解析一条波形 JSON（LocalFileWaveStore 存的 camelCase 结构）
-        static async Task<(short[] Wave, double EchoStart, double ClockInt, short? Threshold)?> LoadWaveAsync(
-            IWaveStore store, string path, CancellationToken ct)
+        // 从 WaveStore 读回并解析一条波形 JSON（LocalFileWaveStore 存的 camelCase 结构）。
+        // 解析失败要和"文件不存在"分开报：波形写入没有 fsync，断电可能在最终路径上留下截断的
+        // JSON（见 LocalFileWaveStore 的取舍说明）。两种都报成"暂无波形"的话，正在查信号质量的
+        // 人会以为通道没数据而去现场查探头，而根因是那个文件坏了。
+        static async Task<WaveLoad> LoadWaveAsync(
+            IWaveStore store, string path, ILogger log, CancellationToken ct)
         {
             var bytes = await store.ReadRawAsync(path, ct);
-            if (bytes is null) return null;
+            if (bytes is null) return WaveLoad.Missing;
             try
             {
                 using var doc = JsonDocument.Parse(bytes);
@@ -484,9 +518,14 @@ public static class MeasurementEndpoints
                     foreach (var el in wd.EnumerateArray())
                         wave[i++] = (short)el.GetInt32();
                 }
-                return (wave, echoStart, clockInt, threshold);
+                return new WaveLoad(wave, echoStart, clockInt, threshold, Corrupt: false);
             }
-            catch { return null; }
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException or OverflowException)
+            {
+                log.LogWarning(ex,
+                    "波形文件存在但解析失败，按损坏处理 path={Path} size={Size}B", path, bytes.Length);
+                return WaveLoad.Broken;
+            }
         }
 
         // ========== 通道自动发现 / 未绑定测量 ==========
