@@ -77,20 +77,4 @@ public class PostgresMeasurementSinkLoggingTests
         public void Invalidate(long deviceId, ushort channelNo) { }
         public void InvalidateAll() { }
     }
-
-    /// <summary>捕获日志条目（级别 + 已格式化消息），供断言。</summary>
-    private sealed class CapturingLogger<T> : ILogger<T>
-    {
-        private readonly List<(LogLevel Level, string Message)> _entries = new();
-
-        public List<string> Warnings(string contains) => _entries
-            .Where(e => e.Level == LogLevel.Warning && e.Message.Contains(contains, StringComparison.Ordinal))
-            .Select(e => e.Message)
-            .ToList();
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-        public bool IsEnabled(LogLevel logLevel) => true;
-        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-            => _entries.Add((logLevel, formatter(state, exception)));
-    }
 }

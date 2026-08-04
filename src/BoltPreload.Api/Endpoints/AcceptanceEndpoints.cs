@@ -384,7 +384,8 @@ public static class AcceptanceEndpoints
 
             var csv = new StringBuilder();
             csv.Append('\uFEFF');
-            csv.AppendLine($"# 通道接入验收报告  设备 {deviceCode}  导出时间(UTC) {DateTime.UtcNow:yyyy-MM-dd HH:mm}");
+            // 设备编号压成一行：见 CsvExport.Inline —— 注释行上的引号不转义，带 CRLF 的编号能另起一行伪造公式
+            csv.AppendLine($"# 通道接入验收报告  设备 {CsvExport.Inline(deviceCode)}  导出时间(UTC) {DateTime.UtcNow:yyyy-MM-dd HH:mm}");
             csv.AppendLine("通道,位置,电缆标签,螺栓编号,验收方式,声时ns,验收人,验收时间(UTC),备注");
 
             await using var cmd = ds.CreateCommand(AcceptanceListSql);
@@ -404,7 +405,7 @@ public static class AcceptanceEndpoints
             }
             var bytes = Encoding.UTF8.GetBytes(csv.ToString());
             return Results.File(bytes, "text/csv; charset=utf-8",
-                $"通道验收报告-{deviceCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
+                $"通道验收报告-{CsvExport.FileNameSegment(deviceCode)}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
         })
         .WithName("ExportAcceptanceReport")
         .WithSummary("导出验收报告 CSV（竣工资料）");

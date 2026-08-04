@@ -157,7 +157,9 @@ public sealed class WiringGuardService : BackgroundService
                         $"偏离验收指纹 {row.Fingerprint:F0}ns 达 {deviationNs:F0}ns（容差 {_opt.ToleranceNs:F0}ns）。" +
                         "请核对该通道电缆是否被换接/移位；确认接线无误（如更换过螺栓/重新装配）请重新验收以刷新指纹");
                     await _sink.PersistAsync(ev, ct);
-                    try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
+                    // 兜底：推送实现按 IAlarmPublisher 约定不抛，真抛了说明实现坏了，不能连带把巡检循环打断
+                    try { await _publisher.PublishAsync(ev, ct); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "告警推送实现抛异常 bolt={Bolt} ch=CH{Ch}", row.Code, row.ChannelNo); }
                     _logger.LogWarning("接线可疑告警：bolt={Bolt} ch=CH{Ch} 偏差 {Dev:F0}ns", row.Code, row.ChannelNo, deviationNs);
                 }
                 else if (!hit && isOpen)
@@ -165,7 +167,9 @@ public sealed class WiringGuardService : BackgroundService
                     var ev = MakeEvent(AlarmAction.Clear, row.BoltId, row.ChannelId, "info",
                         $"接线指纹恢复一致：{row.Code}（CH{row.ChannelNo}）声时回到验收指纹容差内");
                     await _sink.PersistAsync(ev, ct);
-                    try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
+                    // 兜底：推送实现按 IAlarmPublisher 约定不抛，真抛了说明实现坏了，不能连带把巡检循环打断
+                    try { await _publisher.PublishAsync(ev, ct); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "告警推送实现抛异常 bolt={Bolt} ch=CH{Ch}", row.Code, row.ChannelNo); }
                     _logger.LogInformation("接线可疑告警闭合：bolt={Bolt} ch=CH{Ch}", row.Code, row.ChannelNo);
                 }
                 else if (hit && isOpen)

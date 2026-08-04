@@ -25,4 +25,33 @@ internal static class CsvExport
         // 恒加引号并把内部引号翻倍，避免逗号/换行/引号破坏列
         return "\"" + value.Replace("\"", "\"\"") + "\"";
     }
+
+    /// <summary>
+    /// 把用户文本嵌进"整行不是标准字段"的位置（表头前的注释行、标题行）时用这个。
+    /// <para>
+    /// 这种位置不能靠 <see cref="Field"/>：CSV 的引号只在字段起始处才有转义含义，
+    /// 嵌在 <c>"# 螺栓 …"</c> 中间的引号是字面量，值里的 CRLF 照样能把行截断。
+    /// 而新起那一行的首字符完全由输入决定 —— 一个编号叫 <c>"A\r\n=HYPERLINK(…)"</c> 的螺栓，
+    /// 导出的表在客户 Excel 里就多出一行公式并被执行。
+    /// </para>
+    /// <para>所以这里的要点是"压成一行"：所有控制字符（含 CR/LF/Tab）折成空格。</para>
+    /// </summary>
+    public static string Inline(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return "";
+        return new string(value.Select(c => char.IsControl(c) ? ' ' : c).ToArray()).Trim();
+    }
+
+    /// <summary>
+    /// 把用户文本嵌进下载文件名时用这个：控制字符会破坏 Content-Disposition 头，
+    /// 路径分隔符会被浏览器当成目录。逐个换成下划线，口径与
+    /// <see cref="ReportEndpoints.DownloadName(string?, string)"/> 一致。
+    /// </summary>
+    public static string FileNameSegment(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "";
+        return new string(value.Trim()
+            .Select(c => char.IsControl(c) || c is '/' or '\\' or ':' or '*' or '?' or '"' or '<' or '>' or '|' ? '_' : c)
+            .ToArray());
+    }
 }

@@ -128,14 +128,18 @@ public sealed class SignalHealthService : BackgroundService
                     var ev = MakeEvent(AlarmAction.Trigger, boltId, channelId, "warn",
                         $"通道信号丢失：{code} 已 {(int)idle}s 无回波数据（探头脱落 / 接头松动 / 设备异常?）");
                     await _sink.PersistAsync(ev, ct);
-                    try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
+                    // 兜底：推送实现按 IAlarmPublisher 约定不抛，真抛了说明实现坏了，不能连带把巡检循环打断
+                    try { await _publisher.PublishAsync(ev, ct); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "告警推送实现抛异常 bolt={Bolt} ch={Ch}", code, channelId); }
                     _logger.LogWarning("信号丢失告警：bolt={Bolt} ch={Ch} 已 {Idle}s 无回波", code, channelId, (int)idle);
                 }
                 else if (!silent && isOpen)
                 {
                     var ev = MakeEvent(AlarmAction.Clear, boltId, channelId, "info", $"信号已恢复：{code} 回波重新上报");
                     await _sink.PersistAsync(ev, ct);
-                    try { await _publisher.PublishAsync(ev, ct); } catch { /* 推送尽力 */ }
+                    // 兜底：推送实现按 IAlarmPublisher 约定不抛，真抛了说明实现坏了，不能连带把巡检循环打断
+                    try { await _publisher.PublishAsync(ev, ct); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "告警推送实现抛异常 bolt={Bolt} ch={Ch}", code, channelId); }
                     _logger.LogInformation("信号恢复，闭合 signal_lost：bolt={Bolt} ch={Ch}", code, channelId);
                 }
                 else if (silent && isOpen)

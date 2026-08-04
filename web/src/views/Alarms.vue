@@ -75,14 +75,23 @@ const filtered = computed(() => {
 const openSelected = computed(() => filtered.value.filter((a) => a.isOpen && sel.value[a.id]))
 
 const loadError = ref<string | null>(null)
+/// 抑制列表单独的失败态：它容错退成空数组，但"空"和"没查到"必须能区分开。
+const shelvingError = ref<string | null>(null)
 async function load() {
   loading.value = true
+  shelvingError.value = null
   try {
     const withCleared = view.value === 'cleared' || view.value === 'all'
     const [list, sum, shv] = await Promise.all([
       alarmApi.list(`?includeCleared=${withCleared}&limit=300`),
       alarmApi.summary(),
-      alarmApi.shelvings().catch(() => ({ count: 0, items: [] as AlarmShelving[] })),
+      // 抑制列表单独容错：它挂了不该连带把告警列表也拖没（Promise.all 一拒全拒）。
+      // 但失败必须记在 shelvingError 上——静默退成空数组会让"生效抑制"显示 0、
+      // 下方面板整个消失，等于告诉值班"没有告警被静默"，而这恰是最需要能查的一件事。
+      alarmApi.shelvings().catch((e) => {
+        shelvingError.value = e instanceof Error ? e.message : '抑制规则加载失败'
+        return { count: 0, items: [] as AlarmShelving[] }
+      }),
     ])
     items.value = list.items
     summary.value = sum.items
@@ -284,9 +293,10 @@ function limitOf(a: AlarmItem) {
         <div class="stat-foot">严重 {{ openCrit }} · 预警 {{ openWarn }}</div>
       </div>
       <div class="stat panel">
-        <div class="stat-hd"><span class="stat-label">生效抑制</span><span class="led" :class="shelvings.length ? 'led--warn' : 'led--off'" /></div>
-        <div class="stat-val metric" :style="shelvings.length ? 'color:var(--warn)' : ''">{{ shelvings.length }}</div>
-        <div class="stat-foot">被临时静默的规则</div>
+        <div class="stat-hd"><span class="stat-label">生效抑制</span><span class="led" :class="shelvingError || shelvings.length ? 'led--warn' : 'led--off'" /></div>
+        <!-- 查不到时显示 — 而不是 0：0 是"确实没有被静默的规则"，这个结论此刻并不成立 -->
+        <div class="stat-val metric" :style="shelvingError || shelvings.length ? 'color:var(--warn)' : ''">{{ shelvingError ? '—' : shelvings.length }}</div>
+        <div class="stat-foot">{{ shelvingError ? '查询失败，可能有规则正被静默' : '被临时静默的规则' }}</div>
       </div>
 
       <div class="matrix panel" v-if="matrix.length">
@@ -371,11 +381,17 @@ function limitOf(a: AlarmItem) {
       </div>
     </div>
 
-    <!-- 生效中的抑制：被静默的规则必须可见、可取消 -->
-    <div class="panel" v-if="shelvings.length">
+    <!-- 生效中的抑制：被静默的规则必须可见、可取消。查询失败时面板也要留着并挂错误条，
+         整块消失会让值班以为没有任何告警被静默 -->
+    <div class="panel" v-if="shelvings.length || shelvingError">
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark hd-mark--warn" />生效中的抑制</span>
         <span class="hd-sub">到期自动恢复；取消后立即恢复触发</span>
+      </div>
+      <div v-if="shelvingError" class="load-error">
+        <el-icon><WarningFilled /></el-icon>
+        抑制规则查询失败，无法确认当前有哪些告警被静默（可能有规则正在生效）：{{ shelvingError }}
+        <el-button size="small" text type="primary" @click="load">重试</el-button>
       </div>
       <div class="tbl">
         <div class="tr th shv">

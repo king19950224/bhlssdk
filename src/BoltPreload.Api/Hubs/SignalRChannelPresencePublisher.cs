@@ -36,7 +36,11 @@ public sealed class SignalRChannelPresencePublisher : IChannelPresencePublisher
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "SignalR 在位推送失败 device={Device} ch={Ch}", change.DeviceId, change.ChannelNo);
+            // 与告警推送同理，可见性归实现层负责（契约要求失败不抛，调用方的 catch 轮不到）。
+            // 不节流：插拔探头才有事件，频率极低。
+            _logger.LogWarning(ex,
+                "在位事件推送失败，前端不会收到探头插拔提示 device={Device} ch={Ch}",
+                change.DeviceId, change.ChannelNo);
         }
     }
 }

@@ -5,11 +5,15 @@ using Xunit;
 namespace BoltPreload.Tests.Api;
 
 /// <summary>
-/// CsvExport.Field 的转义与公式注入防护。
+/// CsvExport 的转义与公式注入防护。
 /// <para>
 /// 验收资料、审计日志、点位表这三份 CSV 都是直接交给客户、由客户在 Excel 里打开的，
 /// 而且都含用户自由填写的备注列。备注里写一句 <c>=HYPERLINK(...)</c> 或 <c>=cmd|...</c>，
 /// Excel 打开时会当公式执行 —— 这条防线之前没有任何测试守着，谁顺手改一下没人发现。
+/// </para>
+/// <para>
+/// <c>Field</c> 管标准字段；<c>Inline</c> 管表头前的注释行（那里引号不转义，只能靠折换行）；
+/// <c>FileNameSegment</c> 管下载名。三处的威胁模型不同，不能互相替代。
 /// </para>
 /// </summary>
 public class CsvExportTests
@@ -71,4 +75,61 @@ public class CsvExportTests
         // 所以数值列必须直接拼接、不走本方法（CsvExport.Field 的文档注释里写了这条约束）。
         CsvExport.Field("-12.5").Should().Be("\"'-12.5\"");
     }
+
+    // ---- Inline：表头前的注释行 ----
+
+    [Fact]
+    public void Inline_NewlineInValue_CannotForgeAnExtraFormulaRow()
+    {
+        // 趋势导出的注释行长这样："# 螺栓 {code} 预紧力趋势导出 …"。
+        // 编号里塞进 CRLF 就能结束该行、另起一行，而新行的首字符由输入决定 ——
+        // 于是客户在 Excel 里打开时多出一行 =HYPERLINK(...) 并被执行。
+        var attack = "B-1\r\n=HYPERLINK(\"http://evil\",\"发票\")";
+
+        var line = $"# 螺栓 {CsvExport.Inline(attack)} 预紧力趋势导出";
+
+        line.Should().NotContain("\n").And.NotContain("\r");
+        line.Should().StartWith("# 螺栓 B-1", "编号原文要留着，只是折成一行");
+    }
+
+    [Fact]
+    public void Inline_IsRequiredThere_BecauseFieldCannotEscapeMidLine()
+    {
+        // 记录这个反直觉的事实，免得以后有人"统一都改成 Field"把防护改没了：
+        // CSV 的引号只在字段起始处才有转义含义，嵌在行中间的引号是字面量。
+        var attack = "B-1\r\n=1+1";
+
+        $"# 螺栓 {CsvExport.Field(attack)}".Should().Contain("\n",
+            "Field 会把值包进引号，但行中间的引号不转义，CRLF 照样把行截断");
+        $"# 螺栓 {CsvExport.Inline(attack)}".Should().NotContain("\n");
+    }
+
+    [Theory]
+    [InlineData("A\tB", "A B")]
+    [InlineData("A\u0000B", "A B")]
+    [InlineData("  A  ", "A")]
+    public void Inline_CollapsesControlCharsAndTrims(string input, string expected)
+        => CsvExport.Inline(input).Should().Be(expected);
+
+    // ---- FileNameSegment：下载名 ----
+
+    [Fact]
+    public void FileNameSegment_ControlChars_WouldOtherwiseBreakTheHeader()
+    {
+        // Content-Disposition 里出现裸 CRLF，Kestrel 写响应头时会直接抛，下载变 500
+        CsvExport.FileNameSegment("B-1\r\n1").Should().Be("B-1__1");
+    }
+
+    [Fact]
+    public void FileNameSegment_PathSeparators_AreReplaced()
+    {
+        CsvExport.FileNameSegment("A/B\\C:D").Should().Be("A_B_C_D",
+            "带斜杠的名字浏览器会当成路径");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("   ")]
+    public void FileNameSegment_NullOrBlank_ProducesEmpty(string? value)
+        => CsvExport.FileNameSegment(value).Should().Be("");
 }

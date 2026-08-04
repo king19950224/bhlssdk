@@ -61,8 +61,10 @@ public static class WiringTableEndpoints
                 csv.Append(r.GetInt16(0)).Append(',')
                    .Append(AcceptanceEndpoints.Csv(r.IsDBNull(1) ? "" : r.GetString(1))).Append(',')
                    .Append(AcceptanceEndpoints.Csv(r.IsDBNull(2) ? "" : r.GetString(2))).Append(',')
-                   .Append(r.IsDBNull(3) ? "" : r.GetString(3)).Append(',')
-                   .Append(r.IsDBNull(4) ? "" : r.GetString(4)).Append(',')
+                   // 规格与等级也是文本列：未知规格允许调用方显式带 crossSectionMm2/rp02Mpa 通过校验，
+                   // 所以这两列的内容同样是自由文本，得走转义
+                   .Append(AcceptanceEndpoints.Csv(r.IsDBNull(3) ? "" : r.GetString(3))).Append(',')
+                   .Append(AcceptanceEndpoints.Csv(r.IsDBNull(4) ? "" : r.GetString(4))).Append(',')
                    .Append(r.IsDBNull(5) ? "" : r.GetDecimal(5).ToString("F0")).Append(',')
                    .Append(r.IsDBNull(6) ? "" : r.GetDecimal(6).ToString("F0")).Append(',')
                    .Append(r.IsDBNull(7) ? "" : DisplayLabels.HardwareState(r.GetString(7))).Append(',')
@@ -70,7 +72,7 @@ public static class WiringTableEndpoints
                    .Append(AcceptanceEndpoints.Csv(r.IsDBNull(9) ? "" : r.GetString(9))).Append('\n');
             }
             return Results.File(Encoding.UTF8.GetBytes(csv.ToString()), "text/csv; charset=utf-8",
-                $"点位表-{deviceCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
+                $"点位表-{CsvExport.FileNameSegment(deviceCode)}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)
         .WithName("ExportWiringTable")

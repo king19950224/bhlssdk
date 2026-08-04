@@ -300,7 +300,9 @@ public static class BoltEndpoints
 
             var csv = new StringBuilder();
             csv.Append('\uFEFF');
-            csv.AppendLine($"# 螺栓 {boltCode} 预紧力趋势导出  窗口(UTC) {sinceUtc:yyyy-MM-dd HH:mm} ~ {untilUtc:yyyy-MM-dd HH:mm}  聚合 {bucketInterval}");
+            // 编号是人填的自由文本，必须压成一行：带 CRLF 的编号会在这条注释行后面另起一行，
+            // 而新行的首字符由输入决定，"=…" 就成了客户 Excel 里被执行的公式。
+            csv.AppendLine($"# 螺栓 {CsvExport.Inline(boltCode)} 预紧力趋势导出  窗口(UTC) {sinceUtc:yyyy-MM-dd HH:mm} ~ {untilUtc:yyyy-MM-dd HH:mm}  聚合 {bucketInterval}");
             csv.AppendLine("时间(UTC),平均预紧力N,最小预紧力N,最大预紧力N,平均保持率,平均温度C,平均声时ns,样本数,有效预紧力数");
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
@@ -312,7 +314,8 @@ public static class BoltEndpoints
                    .Append(r.GetInt64(7)).Append(',').Append(r.GetInt64(8)).Append('\n');
             }
             var bytes = Encoding.UTF8.GetBytes(csv.ToString());
-            return Results.File(bytes, "text/csv; charset=utf-8", $"预紧力趋势-{boltCode}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
+            return Results.File(bytes, "text/csv; charset=utf-8",
+                $"预紧力趋势-{CsvExport.FileNameSegment(boltCode)}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
         })
         .WithName("BoltPreloadTrendCsv")
         .WithSummary("导出螺栓预紧力趋势 CSV（月报/年报原始数据）");

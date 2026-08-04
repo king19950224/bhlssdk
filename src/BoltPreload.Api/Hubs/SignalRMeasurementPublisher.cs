@@ -26,6 +26,8 @@ public sealed class SignalRMeasurementPublisher : IMeasurementPublisher, IDispos
     private readonly System.Threading.Channels.Channel<FxDecodedEnvelope> _queue;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _pump;
+    private long _sendFailures;
+    private long _lastWarnTicks;
 
     public SignalRMeasurementPublisher(IHubContext<MeasurementsHub> hub, ILogger<SignalRMeasurementPublisher> logger)
     {
@@ -63,12 +65,34 @@ public sealed class SignalRMeasurementPublisher : IMeasurementPublisher, IDispos
                 catch (OperationCanceledException) when (_cts.IsCancellationRequested) { return; }
                 catch (Exception ex)
                 {
-                    // 单条推送失败不影响后续（客户端断线等瞬态问题）
-                    _logger.LogDebug(ex, "SignalR 推送失败 device={DeviceId}", envelope.DeviceId);
+                    // 单条推送失败不影响后续（客户端断线等瞬态问题），但必须留痕：
+                    // 数据仍然落库、告警判定也照常，只是大屏和操作台从此不再刷新，
+                    // 现场看到的是一屏冻住的旧数字。这正是最需要被看见的一类失效。
+                    WarnSendFailureThrottled(ex, envelope.DeviceId);
                 }
             }
         }
         catch (OperationCanceledException) { /* 停机 */ }
+    }
+
+    /// <summary>
+    /// 发送失败告警，每秒最多一条。
+    /// <para>
+    /// 必须节流：50Hz × N 通道下推送一旦持续失败，不节流会把日志刷爆。
+    /// 也必须记在这里——<see cref="PublishAsync"/> 只入队不发送，异常出在泵任务里，
+    /// 上层调用方的 catch 按契约（实现不抛）永远不会执行到。
+    /// </para>
+    /// </summary>
+    private void WarnSendFailureThrottled(Exception ex, long deviceId)
+    {
+        var total = Interlocked.Increment(ref _sendFailures);
+        var now = DateTime.UtcNow.Ticks;
+        var last = Interlocked.Read(ref _lastWarnTicks);
+        if (now - last < TimeSpan.TicksPerSecond) return;
+        if (Interlocked.CompareExchange(ref _lastWarnTicks, now, last) != last) return;
+        _logger.LogWarning(ex,
+            "实时推送失败，前端将停止刷新（数据已入库，不影响告警判定）device={DeviceId} 累计失败={Total}",
+            deviceId, total);
     }
 
     private async Task SendAsync(FxDecodedEnvelope envelope, CancellationToken ct)
