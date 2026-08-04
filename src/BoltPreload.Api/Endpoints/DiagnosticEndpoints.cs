@@ -1027,11 +1027,15 @@ public static class DiagnosticEndpoints
                     deviceId, channel, result.NewRefTimeNs, result.NewRefTempC, result.EchoWaveBytes);
 
                 // 同步基线到库（否则前端/换算仍按旧 RefTime 算 ΔTOF），并失效路由缓存让热路径立刻读到新基线。
+                // 基线写库与审计同事务（§0 责任链）：重标定覆盖的是安全攸关的标定基线，
+                // 设备侧那一步已经无法回滚了，库这侧至少要保证"改了基线必有谁改的记录"。
                 long channelId = 0;
-                await using (var upd = ds.CreateCommand(@"
+                await using var conn = await ds.OpenConnectionAsync(ct);
+                await using var tx = await conn.BeginTransactionAsync(ct);
+                await using (var upd = new NpgsqlCommand(@"
                     UPDATE channels SET ref_time_ns=@rt, ref_temp_c=@rtemp, updated_at=now()
                     WHERE device_id=@d AND channel_no=@ch AND deleted_at IS NULL
-                    RETURNING id"))
+                    RETURNING id", conn, tx))
                 {
                     upd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, result.NewRefTimeNs);
                     upd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, result.NewRefTempC);
@@ -1039,20 +1043,23 @@ public static class DiagnosticEndpoints
                     upd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channel);
                     if (await upd.ExecuteScalarAsync(ct) is long id) channelId = id;
                 }
-                resolver.Invalidate(deviceId, channel);
 
                 if (channelId > 0)
                 {
                     var uid = UserContext.Require(http).UserId;
-                    await using var audit = ds.CreateCommand(@"
+                    await using var audit = new NpgsqlCommand(@"
                         INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                        VALUES (@uid, 'channel_recalibrate', 'channel', @cid, NULL, @after::jsonb, @note, now())");
+                        VALUES (@uid, 'channel_recalibrate', 'channel', @cid, NULL, @after::jsonb, @note, now())", conn, tx);
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, uid);
                     audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                     audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new { result.NewRefTimeNs, result.NewRefTempC, explicit_ = body?.RefTimeNs != null }));
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"重标定基线 device={deviceId} ch={channel} → RefTime={result.NewRefTimeNs}ns");
                     await audit.ExecuteNonQueryAsync(ct);
                 }
+                await tx.CommitAsync(ct);
+
+                // 缓存失效放在提交之后：提前失效会让热路径回读到尚未提交的旧值，白失效一次。
+                resolver.Invalidate(deviceId, channel);
 
                 return Results.Ok(new
                 {

@@ -199,11 +199,11 @@ public static class AuthEndpoints
                 cmd.Parameters.AddWithValue("r", NpgsqlDbType.Varchar, req.Role);
                 id = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
             }
-            await tx.CommitAsync(ct);
 
             var actor = UserContext.Require(http);
-            await WriteUserAuditAsync(ds, actor.UserId, "user_create", id,
+            await WriteUserAuditAsync(conn, tx, actor.UserId, "user_create", id,
                 $"创建/重置用户 {req.Username}（角色 {req.Role}）", ct);
+            await tx.CommitAsync(ct);
 
             return Results.Ok(new { id, username = req.Username, role = req.Role });
         })
@@ -293,9 +293,10 @@ public static class AuthEndpoints
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
                 enabled = (bool)(await cmd.ExecuteScalarAsync(ct))!;
             }
+
+            await WriteUserAuditAsync(conn, tx, actor.UserId, "user_toggle", id, $"{(enabled ? "启用" : "停用")}用户 {username}", ct);
             await tx.CommitAsync(ct);
 
-            await WriteUserAuditAsync(ds, actor.UserId, "user_toggle", id, $"{(enabled ? "启用" : "停用")}用户 {username}", ct);
             return Results.Ok(new { id, username, enabled });
         })
         .RequireAuthorization(AuthPolicies.AdminAccess)
@@ -337,15 +338,19 @@ public static class AuthEndpoints
                 return Results.BadRequest(new { error = "旧密码不正确" });
 
             var newHash = hasher.HashPassword(account, req.NewPassword);
-            await using (var upd = ds.CreateCommand(@"
-                UPDATE users SET password_hash = @h, token_version = token_version + 1 WHERE id = @id"))
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            await using (var upd = new NpgsqlCommand(@"
+                UPDATE users SET password_hash = @h, token_version = token_version + 1 WHERE id = @id", conn, tx))
             {
                 upd.Parameters.AddWithValue("h", NpgsqlDbType.Varchar, newHash);
                 upd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, actor.UserId);
                 await upd.ExecuteNonQueryAsync(ct);
             }
 
-            await WriteUserAuditAsync(ds, actor.UserId, "user_change_password", actor.UserId, $"用户 {username} 自助修改密码", ct);
+            await WriteUserAuditAsync(conn, tx, actor.UserId, "user_change_password", actor.UserId, $"用户 {username} 自助修改密码", ct);
+            await tx.CommitAsync(ct);
+
             return Results.Ok(new { changed = true, note = "密码已修改,请用新密码重新登录" });
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)
@@ -355,11 +360,22 @@ public static class AuthEndpoints
         return app;
     }
 
-    private static async Task WriteUserAuditAsync(NpgsqlDataSource ds, long actorId, string action, long targetUserId, string note, CancellationToken ct)
+    /// <summary>
+    /// 写账号类审计（§0 责任链：与数据变更同事务）。
+    /// <para>
+    /// 必须传调用方的 conn/tx，不能自己从数据源另开连接：账号变更是安全敏感操作，
+    /// "改了但没记录"正是审计日志要防的那种情况。此前三个调用点都是先提交变更、
+    /// 再用另一条连接补审计，中间任何一次失败（连接池耗尽、进程被杀、网络抖动）
+    /// 都会留下一个改了密码/角色却查无此账的窟窿，而且请求本身还是返回 200。
+    /// </para>
+    /// </summary>
+    private static async Task WriteUserAuditAsync(
+        NpgsqlConnection conn, NpgsqlTransaction tx,
+        long actorId, string action, long targetUserId, string note, CancellationToken ct)
     {
-        await using var cmd = ds.CreateCommand(@"
+        await using var cmd = new NpgsqlCommand(@"
             INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@uid, @action, 'user', @tid, NULL, NULL, @note, now())");
+            VALUES (@uid, @action, 'user', @tid, NULL, NULL, @note, now())", conn, tx);
         cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, actorId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("tid", NpgsqlDbType.Bigint, targetUserId);

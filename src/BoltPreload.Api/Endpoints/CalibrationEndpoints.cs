@@ -614,7 +614,9 @@ public static class CalibrationEndpoints
             deltaTof = normalizedEcho - refTime.Value;
 
             long pointId;
-            await using (var cmd = ds.CreateCommand(@"
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            await using (var cmd = new NpgsqlCommand(@"
                 INSERT INTO torque_test_points (
                     bolt_id, channel_id, torque_nm, nut_factor, nominal_diameter_mm,
                     estimated_preload_n, sample_window_seconds, sample_count,
@@ -632,7 +634,7 @@ public static class CalibrationEndpoints
                     @normalized_echo, @delta_tof,
                     @user_id, @note
                 )
-                RETURNING id"))
+                RETURNING id", conn, tx))
             {
                 cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
                 cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
@@ -660,10 +662,11 @@ public static class CalibrationEndpoints
                 pointId = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
             }
 
-            // 标定实验数据写入必须可追溯（同文件 quick/torque/load 均有审计，此前唯独采点漏了）
-            await using (var audit = ds.CreateCommand(@"
+            // 标定实验数据写入必须可追溯（同文件 quick/torque/load 均有审计，此前唯独采点漏了）。
+            // 与采点插入同事务：载荷点是标定曲线的原始证据，多一个来路不明的点就够把拟合带偏。
+            await using (var audit = new NpgsqlCommand(@"
                 INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'torque_point_capture', 'channel', @cid, NULL, @after::jsonb, @note, now())"))
+                VALUES (@uid, 'torque_point_capture', 'channel', @cid, NULL, @after::jsonb, @note, now())", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
                 audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
@@ -676,6 +679,7 @@ public static class CalibrationEndpoints
                     $"采集扭矩阶梯点 #{pointId}：{req.TorqueNm} N·m，估算预紧力 {estimatedPreloadN:0} N（bolt #{boltId}）");
                 await audit.ExecuteNonQueryAsync(ct);
             }
+            await tx.CommitAsync(ct);
 
             return Results.Ok(new
             {

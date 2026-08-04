@@ -444,8 +444,12 @@ public static class BoltEndpoints
             if (req.MinPreloadN is > 0 && req.TargetPreloadN is > 0 && req.MinPreloadN > req.TargetPreloadN)
                 return Results.BadRequest(new { error = "报警下限不能大于目标预紧力" });
 
+            // §0 责任链：阈值变更与审计同事务。报警下限/目标预紧力直接决定何时报警，
+            // 改了却没留痕，事后就说不清"当时的阈值是谁设的"。
             string code;
-            await using (var cmd = ds.CreateCommand(@"
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+            await using (var cmd = new NpgsqlCommand(@"
                 UPDATE bolts SET
                     target_preload_n   = COALESCE(@target, target_preload_n),
                     min_preload_n      = COALESCE(@min, min_preload_n),
@@ -461,7 +465,7 @@ public static class BoltEndpoints
                     grade              = COALESCE(@grade, grade),
                     updated_at = now()
                 WHERE id=@id AND deleted_at IS NULL
-                RETURNING code"))
+                RETURNING code", conn, tx))
             {
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
                 cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, (object?)req.TargetPreloadN ?? DBNull.Value);
@@ -480,9 +484,9 @@ public static class BoltEndpoints
                 code = (string)scalar;
             }
 
-            await using (var audit = ds.CreateCommand(@"
+            await using (var audit = new NpgsqlCommand(@"
                 INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'update_bolt_spec', 'bolt', @id, NULL, @after::jsonb, @note, now())"))
+                VALUES (@uid, 'update_bolt_spec', 'bolt', @id, NULL, @after::jsonb, @note, now())", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
@@ -490,11 +494,13 @@ public static class BoltEndpoints
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"更新螺栓 {code} 预紧力设置（目标/下限/规格）");
                 await audit.ExecuteNonQueryAsync(ct);
             }
+            await tx.CommitAsync(ct);
 
             // 失效解析器缓存：目标/规格变更必须让热路径立刻重读（缓存默认 5min TTL）。
             // 否则旧值仍在用——例如旧的过小 target_preload_n 会让 preload_ratio 持续超量程。
-            await using (var look = ds.CreateCommand(
-                "SELECT c.device_id, c.channel_no FROM channels c JOIN bolts b ON b.channel_id=c.id WHERE b.id=@id AND c.deleted_at IS NULL"))
+            // 提交后再查，复用同一条连接，别为一次只读再去连接池要一条。
+            await using (var look = new NpgsqlCommand(
+                "SELECT c.device_id, c.channel_no FROM channels c JOIN bolts b ON b.channel_id=c.id WHERE b.id=@id AND c.deleted_at IS NULL", conn))
             {
                 look.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
                 await using var lr = await look.ExecuteReaderAsync(ct);
