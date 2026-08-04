@@ -187,6 +187,9 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
     {
         var logger = loggerFactory.GetRequiredLogger<FxSdkConnector>();
         var deviceId = configuration.GetValue<long>("Fx:Real:DeviceId", 1);
+        // 配置优先，缺了才读库：GetValue(key, default) 的默认值是先求值再传进去的，
+        // 写成默认参数会让配置已给出通道数时也白查一次库，还可能打出一条与实际取值无关的回退警告
+        var configuredChannelCount = configuration.GetValue<ushort?>("Fx:Real:ChannelCount");
         var spec = new FxRealDeviceSpec(
             DeviceId: deviceId,
             Model: configuration.GetValue<ushort>("Fx:Real:Model", 3),
@@ -195,9 +198,8 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
                 ?? throw new InvalidOperationException("缺少 Fx:Real:CommParams 配置"),
             Address: configuration.GetValue<ushort>("Fx:Real:Address", 1),
             TransferMode: configuration.GetValue<ushort>("Fx:Real:TransferMode", 1),
-            ChannelCount: configuration.GetValue<ushort>(
-                "Fx:Real:ChannelCount",
-                LoadDeviceChannelCount(dataSource, deviceId, fallback: DeviceLimits.DefaultChannelCount)));
+            ChannelCount: configuredChannelCount
+                ?? LoadDeviceChannelCount(dataSource, deviceId, DeviceLimits.DefaultChannelCount, logger));
 
         var initialChannels = FxInitialChannelConfigLoader.Load(
             dataSource, configuration, spec.Address, deviceId, logger);
@@ -250,7 +252,16 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         return rows;
     }
 
-    private static ushort LoadDeviceChannelCount(NpgsqlDataSource dataSource, long deviceId, ushort fallback)
+    /// <summary>
+    /// 从 devices 表读该设备的通道数，读不到时回退。
+    /// <para>
+    /// 回退必须留痕：采集按这个数轮询，真机通道比它多的话，多出来的探头就永远不会被采样。
+    /// 那些通道在界面上表现为"暂无数据"，和探头没插、线没通完全分不出来，
+    /// 排查的人会去现场查线，而根因在这条读库上。
+    /// </para>
+    /// </summary>
+    private static ushort LoadDeviceChannelCount(
+        NpgsqlDataSource dataSource, long deviceId, ushort fallback, ILogger log)
     {
         try
         {
@@ -261,12 +272,23 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             cmd.Parameters.AddWithValue("device_id", NpgsqlTypes.NpgsqlDbType.Bigint, deviceId);
             cmd.Parameters.AddWithValue("fallback", NpgsqlTypes.NpgsqlDbType.Smallint, (short)fallback);
             var scalar = cmd.ExecuteScalar();
-            return scalar is null || scalar is DBNull
-                ? fallback
-                : (ushort)Math.Clamp(Convert.ToInt32(scalar), 1, DeviceLimits.MaxChannelsPerDevice);
+            // COALESCE 保证行存在就有值，所以取不到值只有一种含义：这个 device_id 在表里没有（或已软删）
+            if (scalar is null or DBNull)
+            {
+                log.LogWarning(
+                    "devices 表里没有 id={DeviceId} 的启用设备，通道数回退为 {Fallback}；" +
+                    "真机通道多于此数时，多出的探头不会被采样（表现为通道无数据）",
+                    deviceId, fallback);
+                return fallback;
+            }
+            return (ushort)Math.Clamp(Convert.ToInt32(scalar), 1, DeviceLimits.MaxChannelsPerDevice);
         }
-        catch
+        catch (Exception ex)
         {
+            log.LogWarning(ex,
+                "读取 device={DeviceId} 的通道数失败，回退为 {Fallback}；" +
+                "真机通道多于此数时，多出的探头不会被采样（表现为通道无数据）",
+                deviceId, fallback);
             return fallback;
         }
     }

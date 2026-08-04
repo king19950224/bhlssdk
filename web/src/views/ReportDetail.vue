@@ -135,8 +135,16 @@ const exporting = ref(false)
 async function exportPdf() {
   exporting.value = true
   try {
-    const html = fileUrl.value ? await fetchArchivedHtml() : null
-    if (html) {
+    // "这份报告本来就没有归档件"和"有归档件但取不回来"必须分开处理。
+    // 后者原先也悄悄回退到打印当前页面，客户手里那张纸看着就是归档的规范验收件，
+    // 而它其实是实时渲染的结果。下载接口还会做 sha256 防篡改校验，取不回来有可能
+    // 正是校验没过 —— 那更不该拿实时页面替上去，等于把篡改迹象盖掉。
+    if (fileUrl.value) {
+      const html = await fetchArchivedHtml()
+      if (!html) {
+        ElMessage.error('取归档验收件失败，未导出。当前页面的打印结果不等于归档件，请重试或用“下载”核对原件')
+        return
+      }
       const w = window.open('', '_blank')
       if (!w) { ElMessage.warning('浏览器拦截了新窗口，请允许弹窗后重试，或使用“下载”'); return }
       w.document.open()
@@ -145,9 +153,10 @@ async function exportPdf() {
       // 等资源渲染完再唤起打印对话框
       w.onload = () => { w.focus(); w.print() }
       setTimeout(() => { try { w.focus(); w.print() } catch { /* onload 已触发 */ } }, 600)
-    } else {
-      window.print()
+      return
     }
+    // 旧报告没有归档文件，只能打印当前页面
+    window.print()
   } finally {
     exporting.value = false
   }

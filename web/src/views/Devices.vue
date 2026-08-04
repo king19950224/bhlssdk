@@ -52,6 +52,9 @@ async function selectDevice(d: RuntimeDevice) {
   selected.value = d
   await Promise.all([loadHealth(), loadScan(), loadBinding(), loadSettings()])
 }
+// 与 bindError 同一口径：这个函数还挂在 8 秒轮询上，没有 catch 时每次失败都是
+// 一条无人接管的 promise rejection，界面则安静地显示成"该设备暂无通道数据"。
+const healthError = ref<string | null>(null)
 async function loadHealth() {
   const did = selected.value?.deviceId
   if (did == null) return
@@ -59,10 +62,16 @@ async function loadHealth() {
   try {
     const items = (await deviceApi.channelHealth(did)).items
     // 快速切换设备时，仅当结果仍属当前选中设备才写入，避免把 A 的健康显示在 B 下。
-    if (selected.value?.deviceId === did) channels.value = items
+    if (selected.value?.deviceId === did) {
+      channels.value = items
+      healthError.value = null
+    }
+  } catch (e) {
+    if (selected.value?.deviceId === did) healthError.value = e instanceof Error ? e.message : '通道健康加载失败'
   }
   finally { if (selected.value?.deviceId === did) loading.value = false }
 }
+const scanError = ref<string | null>(null)
 async function loadScan() {
   const did = selected.value?.deviceId
   if (did == null) return
@@ -70,10 +79,18 @@ async function loadScan() {
     const v = await probeScanApi.latest(did)
     if (selected.value?.deviceId !== did) return
     scan.value = v
+    scanError.value = null
     scanning.value = scan.value?.status === 'running' || scan.value?.status === 'pending'
     // 页面刷新/切换设备时若有扫描在跑,自动恢复轮询(否则进度卡住不动)
     if (scanning.value && !scanTimer) pollScan()
-  } catch { if (selected.value?.deviceId === did) { scan.value = null; scanning.value = false } }
+  } catch (e) {
+    if (selected.value?.deviceId !== did) return
+    // 这里绝不能清掉 scan/scanning。原先失败时把 scanning 置 false，而 pollScan 的定时器
+    // 每轮跑完就检查这个标志并清掉自己 —— 于是一次瞬时失败就让这轮扫描的进度永久停更，
+    // 同时界面显示成"尚无扫描结果"，而设备其实还在一个个通道地扫。
+    // 保留上一次已知状态、挂错误条，让轮询有机会自己恢复。
+    scanError.value = e instanceof Error ? e.message : '扫描状态获取失败'
+  }
 }
 // 拉取失败不能显示成"该设备暂无通道"：那会让人以为通道目录还没建，转头去重建一遍目录；
 // 更要紧的是"有未绑定数据堆积"这条线索也会一并消失，而它正是现场多接/新接探头的信号。
@@ -406,6 +423,10 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
             <span class="mb-hint" v-if="scanning">通道自动检测进行中，暂不可切换</span>
             <span class="mb-hint" v-else-if="!auth.isReviewer">需复核员权限</span>
           </div>
+          <div v-if="healthError" class="load-error">
+            <el-icon><WarningFilled /></el-icon> 通道健康加载失败（下方可能是旧数据，不代表这些通道没有回波）：{{ healthError }}
+            <el-button size="small" text type="primary" @click="loadHealth">重试</el-button>
+          </div>
           <div class="tbl">
             <div class="tr th"><span>CH</span><span>螺栓</span><span>链路</span><span>测量</span><span>回波声时</span><span>温度</span><span>SNR</span><span>峰峰</span><span>操作</span></div>
             <div v-for="c in channels" :key="c.channelId" class="tr">
@@ -420,7 +441,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
               <span class="mono">{{ c.latestWave.peakToPeak ?? '—' }}</span>
               <span><el-button v-if="auth.isReviewer && c.bolt" size="small" text type="primary" @click="recalibrate(c)">重标定</el-button></span>
             </div>
-            <EmptyState v-if="!loading && !channels.length" empty empty-text="该设备暂无通道数据" />
+            <EmptyState v-if="!loading && !healthError && !channels.length" empty empty-text="该设备暂无通道数据" />
           </div>
         </el-tab-pane>
 
@@ -435,6 +456,10 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
             </span>
             <span class="mb-hint">扫描期间设备业务监测会短暂中断</span>
           </div>
+          <div v-if="scanError" class="load-error">
+            <el-icon><WarningFilled /></el-icon> 扫描状态获取失败（下方是最后一次已知进度，设备可能仍在扫）：{{ scanError }}
+            <el-button size="small" text type="primary" @click="loadScan">重试</el-button>
+          </div>
           <div v-if="scan?.results?.length" class="tbl">
             <div class="tr th scan"><span>CH</span><span>判定</span><span>SNR</span><span>声时σ</span><span>峰峰</span><span>样本</span><span>说明</span></div>
             <div v-for="rrow in scan.results" :key="rrow.channelNo" class="tr scan">
@@ -447,7 +472,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
               <span class="dim">{{ rrow.reason || '—' }}</span>
             </div>
           </div>
-          <EmptyState v-else :empty="!scanning" :loading="scanning" empty-text="尚无扫描结果，点“发起自动检测”逐通道判定有无探头" />
+          <EmptyState v-else-if="!scanError" :empty="!scanning" :loading="scanning" empty-text="尚无扫描结果，点“发起自动检测”逐通道判定有无探头" />
         </el-tab-pane>
 
         <!-- 通道与绑定 -->
