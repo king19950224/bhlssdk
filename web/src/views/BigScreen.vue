@@ -40,6 +40,23 @@ const healthPct = computed<Record<string, number>>(() => {
   return Object.fromEntries(ORDER.map((k, i) => [k, parts[i]]))
 })
 
+/*
+ * 数据新鲜度。大屏的失败方式和别的页面不一样：它不会变空，只会安静地停在最后一屏数字上，
+ * 而旁边时钟还在走秒、空态还挂着"无未闭合告警"的绿灯——从值班室那头看过去，
+ * 一块死屏和一切正常长得一模一样。顶栏那盏灯跟的是 SignalR，不是喂这些数字的 5s 轮询，
+ * 接口 500 而长连接尚在时它仍然是绿的，指望不上。
+ * 所以单独盯一个"上次成功刷新"的时刻：偶发一两次失败不惊动人，连续 STALE_AFTER_MS
+ * 拿不到数据就必须在屏上说出来。
+ */
+const STALE_AFTER_MS = 30000
+const lastOkAt = ref(Date.now())
+const staleMs = computed(() => now.value.getTime() - lastOkAt.value)
+const stale = computed(() => staleMs.value >= STALE_AFTER_MS)
+const staleText = computed(() => {
+  const s = Math.round(staleMs.value / 1000)
+  return s < 120 ? `${s} 秒` : `${Math.floor(s / 60)} 分钟`
+})
+
 let disposed = false
 // inFlight 防重入：5s 轮询 + OnAlarm 推送可能并发触发 refresh，慢响应后到会覆盖新数据造成大屏"闪一下又回退"
 let inFlight = false
@@ -56,8 +73,12 @@ async function refresh() {
     openAlarms.value = d.openAlarms
     const alarms = (await alarmApi.list('?includeCleared=false&limit=10')).items
     if (!disposed) recentAlarms.value = alarms
-  } catch { /* 尽力刷新 */ } finally { inFlight = false }
+    lastOkAt.value = Date.now()
+  } catch { /* 单次失败不打断画面；连续失败由陈旧横幅兜底 */ } finally { inFlight = false }
 }
+// 隐藏期间 refresh 直接跳过，不刷新时间戳；重新可见时立刻补一次，
+// 免得刚切回来就先看到一条其实已经不成立的陈旧告警。
+function onVisibilityChange() { if (!document.hidden) refresh() }
 // OnAlarm 去抖：告警风暴时合并 1s 内的推送为一次刷新（与总览页同思路）
 let alarmDebounce: number | undefined
 onMounted(() => {
@@ -71,6 +92,7 @@ onMounted(() => {
     if (alarmDebounce) return
     alarmDebounce = window.setTimeout(() => { alarmDebounce = undefined; refresh() }, 1000)
   })
+  document.addEventListener('visibilitychange', onVisibilityChange)
 })
 onUnmounted(() => {
   disposed = true
@@ -78,6 +100,7 @@ onUnmounted(() => {
   if (clock) clearInterval(clock)
   if (alarmDebounce) clearTimeout(alarmDebounce)
   unsub?.()
+  document.removeEventListener('visibilitychange', onVisibilityChange)
   runtime.stop()
 })
 
@@ -115,7 +138,13 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
       </div>
     </header>
 
-    <div class="bs-grid">
+    <!-- 数据停更横幅：做得比卡片标题还显眼是刻意的，它要在几米外一眼可见 -->
+    <div v-if="stale" class="bs-stale">
+      <span class="led led--crit" />
+      数据已停止刷新 {{ staleText }} · 以下为最后一次成功获取的画面，不代表当前状态
+    </div>
+
+    <div class="bs-grid" :class="{ 'bs-grid--stale': stale }">
       <!-- 左：健康分布 + KPI -->
       <section class="bs-card">
         <h3>预紧力健康分布 <span class="h3-sub">全部监测螺栓（含待接入）</span></h3>
@@ -197,7 +226,25 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
 .bs-sys b { color: var(--text-1); }
 .bs-exit { color: var(--text-3); }
 
-.bs-grid { flex: 1; display: grid; grid-template-columns: 1fr 1.3fr 1fr; grid-template-rows: 1.4fr 1fr; gap: 16px; min-height: 0; }
+/*
+ * 停更横幅。尺寸和呼吸动画都是按"几米外扫一眼"定的，不是按坐在屏前看定的；
+ * 同时把下方内容压暗一档，让"这屏数字不是现在的"这件事不用读字也能看出来。
+ */
+.bs-stale {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 18px; border-radius: 12px;
+  border: 1px solid var(--crit); background: rgba(244,63,94,0.12); color: var(--crit);
+  font-size: 18px; font-weight: 600; letter-spacing: 0.02em;
+  animation: bs-stale-pulse 2s ease-in-out infinite;
+}
+@keyframes bs-stale-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(244,63,94,0); }
+  50% { box-shadow: 0 0 26px -6px var(--crit); }
+}
+.bs-grid--stale { opacity: 0.55; }
+@media (prefers-reduced-motion: reduce) { .bs-stale { animation: none; } }
+
+.bs-grid { flex: 1; display: grid; grid-template-columns: 1fr 1.3fr 1fr; grid-template-rows: 1.4fr 1fr; gap: 16px; min-height: 0; transition: opacity 0.4s ease; }
 .bs-card { background: rgba(13,19,32,0.7); border: 1px solid var(--panel-border); border-radius: 14px; padding: 16px 20px; display: flex; flex-direction: column; min-height: 0; backdrop-filter: blur(6px); }
 .bs-card h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; color: var(--text-2); letter-spacing: 0.04em; }
 .h3-sub { font-size: 11px; color: var(--text-3); font-weight: 400; margin-left: 8px; }

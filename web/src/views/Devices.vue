@@ -75,6 +75,9 @@ async function loadScan() {
     if (scanning.value && !scanTimer) pollScan()
   } catch { if (selected.value?.deviceId === did) { scan.value = null; scanning.value = false } }
 }
+// 拉取失败不能显示成"该设备暂无通道"：那会让人以为通道目录还没建，转头去重建一遍目录；
+// 更要紧的是"有未绑定数据堆积"这条线索也会一并消失，而它正是现场多接/新接探头的信号。
+const bindError = ref<string | null>(null)
 async function loadBinding() {
   const did = selected.value?.deviceId
   if (did == null) return
@@ -84,7 +87,10 @@ async function loadBinding() {
     if (selected.value?.deviceId !== did) return
     chanRows.value = list.items
     unbound.value = ub.items.filter((u) => u.deviceId === did)
-  } catch { /* ignore */ }
+    bindError.value = null
+  } catch (e) {
+    if (selected.value?.deviceId === did) bindError.value = e instanceof Error ? e.message : '通道与绑定加载失败'
+  }
 }
 
 // 默认监测组（检测即螺栓：探头在位自动建档的归属组）
@@ -92,13 +98,22 @@ const settings = ref<DeviceSettings | null>(null)
 const groupDlgOpen = ref(false)
 const groupDlgSel = ref<number | null>(null)
 const savingGroup = ref(false)
+// 读不到时不能显示成"未设置"：那等于告诉运维自动建档是关着的，而实际可能开着——
+// 照这个误判去补设一遍，反而会把原有的归属组改掉。
+const settingsError = ref<string | null>(null)
 async function loadSettings() {
   const did = selected.value?.deviceId
   if (did == null) return
   try {
     const s = await deviceApi.getSettings(did)
-    if (selected.value?.deviceId === did) settings.value = s
-  } catch { /* ignore */ }
+    if (selected.value?.deviceId !== did) return
+    settings.value = s
+    settingsError.value = null
+  } catch (e) {
+    if (selected.value?.deviceId !== did) return
+    settings.value = null
+    settingsError.value = e instanceof Error ? e.message : '默认组读取失败'
+  }
 }
 function openGroupDlg() {
   groupDlgSel.value = settings.value?.defaultGroupId ?? null
@@ -363,9 +378,14 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
               通道数 {{ selected.options?.channelCount || '—' }}
             </el-button>
           </el-tooltip>
-          <el-tooltip content="探头在位自动建档的归属监测组。未设置时新探头只采集不建档" placement="bottom">
-            <el-button size="small" text :type="settings?.defaultGroupId ? 'primary' : 'warning'" :disabled="!auth.isReviewer" @click="openGroupDlg">
-              默认组 {{ settings?.defaultGroupCode || '未设置' }}
+          <el-tooltip :content="settingsError ? `默认组读取失败：${settingsError}` : '探头在位自动建档的归属监测组。未设置时新探头只采集不建档'" placement="bottom">
+            <el-button
+              size="small" text
+              :type="settingsError ? 'danger' : settings?.defaultGroupId ? 'primary' : 'warning'"
+              :disabled="!auth.isReviewer"
+              @click="settingsError ? loadSettings() : openGroupDlg()"
+            >
+              默认组 {{ settingsError ? '读取失败，点击重试' : settings?.defaultGroupCode || '未设置' }}
             </el-button>
           </el-tooltip>
           <router-link :to="{ name: 'identify', query: { deviceId: selected.deviceId } }" class="hd-link">点位与验收 →</router-link>
@@ -432,6 +452,10 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
 
         <!-- 通道与绑定 -->
         <el-tab-pane label="通道与绑定" name="bind">
+          <div v-if="bindError" class="load-error">
+            <el-icon><WarningFilled /></el-icon> 通道与绑定加载失败（下方可能是旧数据，不代表该设备没有通道或没有未绑定堆积）：{{ bindError }}
+            <el-button size="small" text type="primary" @click="loadBinding">重试</el-button>
+          </div>
           <div v-if="unbound.length" class="unbound-note">
             <el-icon><WarningFilled /></el-icon>
             <span class="un-text">{{ unbound.length }} 个通道有未绑定数据堆积（等待绑定螺栓）：{{ unbound.map(u => 'CH' + u.channelNo + '(' + u.count + ')').join('、') }}</span>
@@ -451,7 +475,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
                 <el-button v-if="auth.isReviewer && c.boltId" size="small" text type="danger" @click="unbind(c)">解绑</el-button>
               </span>
             </div>
-            <EmptyState v-if="!chanRows.length" empty empty-text="该设备暂无通道" />
+            <EmptyState v-if="!bindError && !chanRows.length" empty empty-text="该设备暂无通道" />
           </div>
         </el-tab-pane>
       </el-tabs>
