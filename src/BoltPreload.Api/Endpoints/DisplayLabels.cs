@@ -80,6 +80,10 @@ public static class DisplayLabels
 
     // 用接线语境的叫法（"在位"而不是"健康"）：点位表是照着现场线缆核对的，
     // 关心的是这一路到底有没有探头。设备页那边用"健康"，是在说信号质量，别混。
+    //
+    // no_probe 现在没有任何代码会写：探头扫描的 verdict 映射只到 healthy/noisy/suspect/no_data
+    // （见 deploy/sql/0013_channel_probe_scan.sql 的映射表）。留着是因为词表只增不删——
+    // 老库里存过的值也得翻得出中文，别为了"看着没人用"把它删了。
     private static readonly Dictionary<string, string> HardwareStates = new(StringComparer.Ordinal)
     {
         ["healthy"] = "在位",

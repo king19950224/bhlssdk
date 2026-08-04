@@ -344,7 +344,10 @@ G7_CS_ENTRY = re.compile(r'\["([^"]+)"\]\s*=\s*"([^"]*)"')
 # 三种写法都会往 audit_log 落动作:辅助方法、参数绑定、SQL 里直接写死
 G7_HELPER = re.compile(r"Write\w*AuditAsync\((.{0,200}?)\)\s*;", re.S)
 G7_BIND = re.compile(r'AddWithValue\("action",\s*NpgsqlDbType\.\w+,\s*([^;]{0,120}?)\)\s*;', re.S)
-G7_SQL = re.compile(r"INSERT INTO audit_log.{0,400}?VALUES\s*\(\s*[^,]+,\s*'([a-z_]+)'\s*,\s*'([a-z_]+)'", re.S)
+# 落库有 VALUES (...) 和 INSERT...SELECT 两种写法,后者用在"顺带把刚插入的行 to_jsonb 存进
+# after_jsonb"的场合(自动建档、点位表导入等)。只认 VALUES 会漏掉这些文件里新增的动作码。
+G7_SQL = re.compile(
+    r"INSERT INTO audit_log.{0,400}?(?:VALUES\s*\(|SELECT)\s*[^,]+,\s*'([a-z_]+)'\s*,\s*'([a-z_]+)'", re.S)
 G7_LIT = re.compile(r'"([a-z][a-z_]{3,})"')
 
 

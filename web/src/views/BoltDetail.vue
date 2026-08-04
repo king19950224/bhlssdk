@@ -340,19 +340,20 @@ async function init() {
       const al = await alarmApi.list('?includeCleared=true&limit=200')
       // 审计履历是 reviewer+ 专属接口：operator 请求会 403。仅 reviewer 拉取，且单独 try 兜底，
       // 避免因审计 403 让 Promise.all 整体失败、后续波形/实时订阅不执行（operator 打开详情页残缺）。
-      let auditItems: { at: string; action: string; note: string | null }[] = []
+      let auditItems: { at: string; actionLabel: string; note: string | null }[] = []
       if (auth.isReviewer) {
         try {
           auditItems = (await auditApi.query(`?targetId=${bolt.value.channelId}&limit=80`)).items
         } catch { /* 审计不可用不阻断本页其它区块 */ }
       }
       const ev: typeof events.value = []
+      // 履历三种来源的标题都要出中文：标定方法、告警类型走本地词表，审计动作用后端给的 actionLabel
       for (const c of calibrations.value)
-        ev.push({ at: c.createdAt, kind: 'calib', title: `标定 · ${c.method}`, note: c.passed ? '通过' : '未通过', color: c.passed ? '#10b981' : '#f43f5e' })
+        ev.push({ at: c.createdAt, kind: 'calib', title: `标定 · ${calibrationMethodLabel(c.method)}`, note: c.passed ? '通过' : '未通过', color: c.passed ? '#10b981' : '#f43f5e' })
       for (const a of al.items.filter((x) => x.boltId === boltId))
         ev.push({ at: a.triggeredAt, kind: 'alarm', title: `告警 · ${alarmTypeLabel(a.type)}`, note: a.message || '', color: '#f59e0b' })
       for (const e of auditItems)
-        ev.push({ at: e.at, kind: 'audit', title: e.action, note: e.note || '', color: '#38bdf8' })
+        ev.push({ at: e.at, kind: 'audit', title: e.actionLabel, note: e.note || '', color: '#38bdf8' })
       events.value = ev.sort((x, y) => new Date(y.at).getTime() - new Date(x.at).getTime())
 
       try {

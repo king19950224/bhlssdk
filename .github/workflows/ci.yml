@@ -66,9 +66,13 @@ jobs:
         run: dotnet build BoltPreload.sln --no-restore --configuration Release
 
       - name: 单元测试
-        run: dotnet test BoltPreload.sln --no-build --configuration Release \
-              --logger "console;verbosity=normal" \
-              --collect:"XPlat Code Coverage"
+        # 必须是 | 块标量：不带 | 的话 YAML 会把换行折成空格、反斜杠原样留下，
+        # 到 shell 手里 "\ " 成了转义空格，参数变成 " --logger"，
+        # dotnet test 当成第二个项目路径，报 MSB1008 直接失败，一条测试都不会跑。
+        run: |
+          dotnet test BoltPreload.sln --no-build --configuration Release \
+            --logger "console;verbosity=normal" \
+            --collect:"XPlat Code Coverage"
         env:
           ConnectionStrings__Postgres: "Host=localhost;Port=5432;Database=boltpreload;Username=boltpreload;Password=ci_password_only"
 
@@ -112,3 +116,21 @@ jobs:
 
       - name: 依赖漏洞审计
         run: npm audit --audit-level=high
+
+  # 七道门禁此前只能靠人记得手动敲一次，从没进过 CI —— 等于没有门禁，
+  # 注释覆盖、遗留标记、文风、前后端对照表一致性全靠自觉。
+  # 脚本只用 Python 标准库，不需要数据库和 .NET，单独一个轻量 job 就够。
+  audit:
+    name: Code Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 代码审计门禁
+        # G1-G4、G6、G7 全部归零才退出 0；G5 是报告级，只提示不拦截
+        run: python3 tools/code-audit.py
