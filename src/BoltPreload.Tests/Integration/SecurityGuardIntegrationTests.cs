@@ -16,7 +16,8 @@ namespace BoltPreload.Tests.Integration;
 /// 4) 建档绑定：通道设备与监测组必须同项目；
 /// 5) commission 调试直发：随诊断组收紧为 reviewer+（operator 403）；
 /// 6) 单螺栓查询 GET /api/bolts/{id}：详情页替代"全量列表再 find"；
-/// 7) 标定模块"资源不存在"统一 404（原 400/404 混用）。
+/// 7) 标定模块"资源不存在"统一 404（原 400/404 混用）；
+/// 8) 账号变更与阈值变更必须留痕，且被守卫拒绝时不得留痕（§0 责任链：审计与变更同事务）。
 /// 测试替身见共享 harness <see cref="TestApi"/>。
 /// </summary>
 [Collection("postgres")]
@@ -112,10 +113,81 @@ public sealed class SecurityGuardIntegrationTests
         var resp = await client.PostAsync($"/api/auth/users/{lastAdminId}/toggle", null);
         resp.StatusCode.Should().Be(HttpStatusCode.BadRequest, "唯一 enabled admin 不允许被停用");
 
+        // 被守卫拒绝 = 事务整体回滚，审计也不该留下半条（审计与变更同事务的反向验证）
+        (await CountAsync("SELECT count(*) FROM audit_log WHERE action='user_toggle' AND target_id=@p0", lastAdminId))
+            .Should().Be(0, "变更被拒就不该有审计");
+
         // 有第二名 enabled admin 后可以停用
         await SeedNamedUserAsync("admin");
         var resp2 = await client.PostAsync($"/api/auth/users/{lastAdminId}/toggle", null);
         resp2.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        (await CountAsync("SELECT count(*) FROM audit_log WHERE action='user_toggle' AND target_id=@p0", lastAdminId))
+            .Should().Be(1, "停用成功必须留痕");
+    }
+
+    // ===================== 变更留痕（§0 责任链：审计与变更同事务） =====================
+
+    [PostgresFact]
+    public async Task AccountChanges_WriteAudit_CreateChangePasswordToggle()
+    {
+        _fx.EnsureAvailable();
+        var adminId = await SeedUserAsync("admin");
+
+        using var factory = TestApi.CreateFactory(_fx);
+        using var admin = TestApi.AuthedClient(factory, adminId, "admin");
+
+        var username = "u_" + Guid.NewGuid().ToString("N")[..12];
+        var created = await admin.PostAsJsonAsync("/api/auth/users",
+            new { username, password = "password123", role = "operator" });
+        created.StatusCode.Should().Be(HttpStatusCode.OK);
+        var newUserId = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetInt64();
+
+        (await CountAsync(
+            "SELECT count(*) FROM audit_log WHERE action='user_create' AND target_type='user' AND target_id=@p0", newUserId))
+            .Should().Be(1, "建号必须留痕");
+
+        // 改密以本人身份走：建号时写的是真实 hash，旧密码校验能过（harness 只替换认证，不替换 hasher）
+        using (var self = TestApi.AuthedClient(factory, newUserId, "operator"))
+        {
+            var changed = await self.PostAsJsonAsync("/api/auth/change-password",
+                new { oldPassword = "password123", newPassword = "password456" });
+            changed.StatusCode.Should().Be(HttpStatusCode.OK);
+        }
+        (await CountAsync(
+            "SELECT count(*) FROM audit_log WHERE action='user_change_password' AND target_type='user' AND target_id=@p0", newUserId))
+            .Should().Be(1, "改密必须留痕");
+
+        var toggled = await admin.PostAsync($"/api/auth/users/{newUserId}/toggle", null);
+        toggled.StatusCode.Should().Be(HttpStatusCode.OK);
+        (await CountAsync(
+            "SELECT count(*) FROM audit_log WHERE action='user_toggle' AND target_type='user' AND target_id=@p0", newUserId))
+            .Should().Be(1, "启停用必须留痕");
+    }
+
+    [PostgresFact]
+    public async Task UpdateBoltSettings_WritesAudit_AndNothingWhenBoltMissing()
+    {
+        _fx.EnsureAvailable();
+        var s = await SeedAssetsAsync();
+        var userId = await SeedUserAsync("operator");
+
+        using var factory = TestApi.CreateFactory(_fx);
+        using var client = TestApi.AuthedClient(factory, userId, "operator");
+
+        // 报警下限决定何时报警，改了必须说得清是谁改的
+        var resp = await client.PostAsJsonAsync($"/api/bolts/{s.BoltId}/settings",
+            new { targetPreloadN = 120000m, minPreloadN = 90000m });
+        resp.StatusCode.Should().Be(HttpStatusCode.OK);
+        (await CountAsync(
+            "SELECT count(*) FROM audit_log WHERE action='update_bolt_spec' AND target_type='bolt' AND target_id=@p0", s.BoltId))
+            .Should().Be(1, "阈值变更必须留痕");
+
+        const long missingBoltId = 999999999L;
+        var missing = await client.PostAsJsonAsync($"/api/bolts/{missingBoltId}/settings", new { targetPreloadN = 1m });
+        missing.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        (await CountAsync("SELECT count(*) FROM audit_log WHERE action='update_bolt_spec' AND target_id=@p0", missingBoltId))
+            .Should().Be(0, "螺栓不存在、变更未生效，就不该有审计");
     }
 
     // ===================== 解绑权限收紧 =====================
