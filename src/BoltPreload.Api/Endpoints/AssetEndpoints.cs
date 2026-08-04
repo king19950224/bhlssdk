@@ -224,8 +224,12 @@ public static class AssetEndpoints
             var csa = body.CrossSectionMm2 ?? (BoltSpecPresets.StressAreaMm2.TryGetValue(nominal, out var a) ? a : (decimal?)null);
             if (csa is null)
                 return Results.BadRequest(new { error = $"未知螺栓规格 {nominal}，请显式提供 crossSectionMm2", knownSpecs = BoltSpecPresets.StressAreaMm2.Keys });
+            // 未知等级与未知规格同口径显式拒绝：屈服强度要喂给 GB 适用范围判断（30%~90% Rp0.2），
+            // 静默套用 8.8 级的 640 会让 9.8 级（Rp0.2≈720）或手误的等级拿到错的安全边界。
             var grade = string.IsNullOrWhiteSpace(body.Grade) ? "8.8" : body.Grade.Trim();
-            var rp02 = body.Rp02Mpa ?? (BoltSpecPresets.GradeRp02Mpa.TryGetValue(grade, out var rp) ? rp : 640m);
+            if (body.Rp02Mpa is null && !BoltSpecPresets.GradeRp02Mpa.ContainsKey(grade))
+                return Results.BadRequest(new { error = $"未知性能等级 {grade}，请显式提供 rp02Mpa", knownGrades = BoltSpecPresets.GradeRp02Mpa.Keys });
+            var rp02 = body.Rp02Mpa ?? BoltSpecPresets.GradeRp02Mpa[grade];
 
             var user = UserContext.Require(http);
             await using var conn = await ds.OpenConnectionAsync(ct);

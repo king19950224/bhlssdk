@@ -181,7 +181,7 @@ public sealed class BoltAutoEnroller
 
         // ---------- 建档（缺省规格与点位表导入同源：42CrMo/M20/8.8/206GPa/5890m/s） ----------
         var csa = BoltSpecPresets.StressAreaMm2["M20"];
-        var rp02 = BoltSpecPresets.GradeRp02Mpa.TryGetValue("8.8", out var rp) ? rp : 640m;
+        var rp02 = BoltSpecPresets.GradeRp02Mpa["8.8"];
 
         long boltId;
         await using (var cmd = new NpgsqlCommand(@"

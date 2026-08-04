@@ -118,7 +118,6 @@ public sealed class ChannelPresenceTracker
     private readonly ConcurrentDictionary<long, DateTimeOffset> _silenceFloor = new();
     private readonly Channel<ChannelPresenceChange> _events;
     private readonly ChannelPresenceOptions _options;
-    private long _droppedEvents;
 
     public ChannelPresenceTracker(IOptions<ChannelPresenceOptions> options)
     {
@@ -134,9 +133,6 @@ public sealed class ChannelPresenceTracker
 
     /// <summary>在位变化事件流（消费方：ChannelPresenceService）。</summary>
     public ChannelReader<ChannelPresenceChange> Events => _events.Reader;
-
-    /// <summary>事件队列满被挤掉的事件数（仅观测；正常运行应恒为 0）。</summary>
-    public long DroppedEvents => Interlocked.Read(ref _droppedEvents);
 
     /// <summary>
     /// 采集热路径喂入一条测量观察。echoNs = 该条 ChannelResult 的 EchoTime（null=设备没算出声时）。
@@ -282,8 +278,8 @@ public sealed class ChannelPresenceTracker
 
     private void Emit(ChannelPresenceChange change)
     {
-        // DropOldest 模式下 TryWrite 恒成功；计数仅观测拥塞
-        if (!_events.Writer.TryWrite(change))
-            Interlocked.Increment(ref _droppedEvents);
+        // DropOldest：在位变化只关心最新状态，挤掉最旧的一条不影响判定。
+        // 该模式下 TryWrite 恒成功，无需判返回值 —— 原先据此累加的丢弃计数永远是 0，也无人读取。
+        _events.Writer.TryWrite(change);
     }
 }

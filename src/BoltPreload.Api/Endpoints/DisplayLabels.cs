@@ -103,12 +103,20 @@ public static class DisplayLabels
 
     // 告警类型会拼进审计备注，跟着 CSV 一起导出去，所以后端也得有一份中文。
     // 用词跟前端告警中心保持一致，同一条告警在页面上和导出表里不该是两个叫法。
+    //
+    // 产生方各在一处：preload_* 在 StaticThresholdAlarmEvaluator，signal_lost 在 SignalHealthService，
+    // wiring_suspect 在 WiringGuardService。加新告警类型时四处要一起改（本表、前端 labels.ts、
+    // DisplayLabelsTests 的清单、AlarmEndpoints 的可抑制白名单），漏了前两处 G7 门禁会拦。
+    //
+    // no_data 没有任何评估器会产生，它是 channels.hardware_state 的取值不是告警类型；
+    // 保留同样是因为词表只增不删，老库里若存过这个 type 也得翻得出中文。
     private static readonly Dictionary<string, string> AlarmTypes = new(StringComparer.Ordinal)
     {
         ["preload_low"] = "预紧力偏低",
         ["preload_high"] = "预紧力偏高",
         ["preload_loss"] = "预紧力脱落",
         ["signal_lost"] = "信号丢失",
+        ["wiring_suspect"] = "接线疑似变动",
         ["no_data"] = "数据中断",
     };
 

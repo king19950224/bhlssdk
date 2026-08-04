@@ -152,13 +152,5 @@ public static class AuditLogEndpoints
         if (to is not null) { sql.Append(" AND a.at <= @to"); cmd.Parameters.AddWithValue("to", NpgsqlDbType.TimestampTz, to.Value); }
     }
 
-    private static string Csv(string? value)
-    {
-        if (string.IsNullOrEmpty(value)) return "";
-        // CSV 公式注入防护：note 等字段含用户输入（告警备注/驳回原因），
-        // 以 = + - @ 开头的值在 Excel 打开时会被当公式执行，前置单引号中和
-        if (value[0] is '=' or '+' or '-' or '@') value = "'" + value;
-        // 始终加引号并把内部引号翻倍，避免逗号/换行/引号破坏列
-        return "\"" + value.Replace("\"", "\"\"") + "\"";
-    }
+    private static string Csv(string? value) => CsvExport.Field(value);
 }

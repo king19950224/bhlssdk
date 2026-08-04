@@ -440,9 +440,8 @@ public static class AcceptanceEndpoints
         startedByUserId = s.StartedByUserId
     };
 
-    /// <summary>CSV 字段转义：含逗号/引号/换行时加引号包裹。</summary>
-    internal static string Csv(string s)
-        => s.IndexOfAny([',', '"', '\n', '\r']) >= 0 ? $"\"{s.Replace("\"", "\"\"")}\"" : s;
+    /// <summary>CSV 字段转义。实现见 <see cref="CsvExport.Field"/>（含公式注入防护）。</summary>
+    internal static string Csv(string s) => CsvExport.Field(s);
 }
 
 /// <summary>POST /acceptance-session 请求体。</summary>

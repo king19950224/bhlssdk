@@ -13,7 +13,7 @@ public static class AlarmEndpoints
 {
     /// <summary>可抑制/可闭合的告警类型白名单。拼错的 type 会生成一条永远匹配不上的抑制（操作者误以为已静默），必须挡在入口。</summary>
     private static readonly HashSet<string> KnownAlarmTypes =
-        new(StringComparer.Ordinal) { "preload_low", "preload_high", "preload_loss", "signal_lost" };
+        new(StringComparer.Ordinal) { "preload_low", "preload_high", "preload_loss", "signal_lost", "wiring_suspect" };
 
     public static IEndpointRouteBuilder MapAlarmEndpoints(this IEndpointRouteBuilder app)
     {

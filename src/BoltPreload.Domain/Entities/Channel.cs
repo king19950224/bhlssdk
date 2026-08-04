@@ -65,7 +65,12 @@ public class Channel
     /// <summary>是否应加载到 SDK Session / 参与采集诊断。</summary>
     public bool SamplingEnabled { get; set; } = true;
 
-    /// <summary>物理/链路状态：unknown/healthy/no_data/noisy/fault/suspect。</summary>
+    /// <summary>
+    /// 物理/链路状态。实际会被写入的只有五个值：建库缺省 unknown，
+    /// 在位跟踪写 healthy/no_data（ChannelPresenceService），探头扫描按 verdict 写
+    /// healthy/noisy/suspect/no_data（ProbeScanResultJudge.ToHardwareState）。
+    /// 中文名在 DisplayLabels.HardwareStates。
+    /// </summary>
     public string HardwareState { get; set; } = "unknown";
 
     /// <summary>业务绑定状态：unbound/bound/moved/disabled。</summary>

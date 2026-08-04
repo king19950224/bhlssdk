@@ -184,8 +184,6 @@ public static class MeasurementEndpoints
         .WithSummary("通道当前参数快照（取每个参数最新一次的值）");
 
         // ========== 波形（EchoWave）===========
-        // 注意：IWaveStore 在 BoltPreload.Application.Ingestion 命名空间
-        // 这里用全限定名避免 using 顶部混入
 
         var waveGroup = app.MapGroup("/api/waves")
             .WithTags("Waves")

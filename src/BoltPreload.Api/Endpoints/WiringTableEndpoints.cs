@@ -207,8 +207,17 @@ public static class WiringTableEndpoints
                         knownSpecs = BoltSpecPresets.StressAreaMm2.Keys
                     });
                 }
+                // 未知等级与未知规格同口径拒绝整批：屈服强度喂给 GB 适用范围判断，不能静默套 640
                 var grade = string.IsNullOrWhiteSpace(row.Grade) ? "8.8" : row.Grade.Trim();
-                var rp02 = BoltSpecPresets.GradeRp02Mpa.TryGetValue(grade, out var rp) ? rp : 640m;
+                if (!BoltSpecPresets.GradeRp02Mpa.TryGetValue(grade, out var rp02))
+                {
+                    await tx.RollbackAsync(ct);
+                    return Results.BadRequest(new
+                    {
+                        error = $"CH{row.ChannelNo} 性能等级 {grade} 无预设屈服强度，请改用已知等级或先单颗建档",
+                        knownGrades = BoltSpecPresets.GradeRp02Mpa.Keys
+                    });
+                }
 
                 // 编号：显式优先；缺省中文“通道X-Y号螺栓”（与自动建档同一套 ChannelNaming），
                 // 与既有（含软删）冲突时追加 -2/-3…

@@ -26,7 +26,6 @@ public sealed class SignalRMeasurementPublisher : IMeasurementPublisher, IDispos
     private readonly System.Threading.Channels.Channel<FxDecodedEnvelope> _queue;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _pump;
-    private long _droppedCount;
 
     public SignalRMeasurementPublisher(IHubContext<MeasurementsHub> hub, ILogger<SignalRMeasurementPublisher> logger)
     {
@@ -44,9 +43,10 @@ public sealed class SignalRMeasurementPublisher : IMeasurementPublisher, IDispos
 
     public Task PublishAsync(FxDecodedEnvelope envelope, CancellationToken ct = default)
     {
-        // DropOldest 模式下 TryWrite 恒成功（挤掉最旧条目）；计数仅用于观测推送拥塞
-        if (!_queue.Writer.TryWrite(envelope))
-            Interlocked.Increment(ref _droppedCount);
+        // DropOldest：队满时挤掉最旧一条。实时推送要的是最新值，积压的旧帧对界面没意义，
+        // 这里丢弃是对的（与采集主链的 BackpressureWriter 刻意相反，那边一条都不能丢）。
+        // 该模式下 TryWrite 恒成功，无需判返回值 —— 原先据此累加的丢弃计数永远是 0，也无人读取。
+        _queue.Writer.TryWrite(envelope);
         return Task.CompletedTask;
     }
 
