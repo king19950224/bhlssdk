@@ -83,7 +83,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
 
     public bool TryUpdateChannelCount(long deviceId, ushort channelCount)
     {
-        var clamped = (ushort)Math.Clamp((int)channelCount, 1, 48);
+        var clamped = (ushort)Math.Clamp((int)channelCount, 1, DeviceLimits.MaxChannelsPerDevice);
         lock (_gate)
         {
             if (!_runtimes.TryGetValue(deviceId, out var rt)) return false;
@@ -158,7 +158,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             CommParams: row.CommParams,
             Address: (ushort)row.Address,
             TransferMode: (ushort)row.TransferMode,
-            ChannelCount: (ushort)Math.Clamp((int)row.ChannelCount, 1, 48));
+            ChannelCount: (ushort)Math.Clamp((int)row.ChannelCount, 1, DeviceLimits.MaxChannelsPerDevice));
 
         // 多设备严格按 channels 表加载每设备通道，不用单设备 appsettings 兜底
         var initialChannels = FxInitialChannelConfigLoader.Load(
@@ -197,7 +197,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             TransferMode: configuration.GetValue<ushort>("Fx:Real:TransferMode", 1),
             ChannelCount: configuration.GetValue<ushort>(
                 "Fx:Real:ChannelCount",
-                LoadDeviceChannelCount(dataSource, deviceId, fallback: 40)));
+                LoadDeviceChannelCount(dataSource, deviceId, fallback: DeviceLimits.DefaultChannelCount)));
 
         var initialChannels = FxInitialChannelConfigLoader.Load(
             dataSource, configuration, spec.Address, deviceId, logger);
@@ -263,7 +263,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             var scalar = cmd.ExecuteScalar();
             return scalar is null || scalar is DBNull
                 ? fallback
-                : (ushort)Math.Clamp(Convert.ToInt32(scalar), 1, 48);
+                : (ushort)Math.Clamp(Convert.ToInt32(scalar), 1, DeviceLimits.MaxChannelsPerDevice);
         }
         catch
         {

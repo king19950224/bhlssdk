@@ -155,7 +155,9 @@ public sealed class IngestionWatchdogService : BackgroundService
         try
         {
             await connector.ReconnectAsync(ct);
-            await WaitConnectedAsync(connector, runtime.DeviceId, ct);
+            if (!await FxConnectorWait.UntilConnectedAsync(connector, ct))
+                _logger.LogWarning("重连后等待 Connected 超时 device={DeviceId} state={State}",
+                    runtime.DeviceId, connector.State);
             await connector.SetWorkModeAsync(_options.WorkMode, channel: 0, address: runtime.Options.Address, ct);
 
             _logger.LogInformation(
@@ -218,14 +220,4 @@ public sealed class IngestionWatchdogService : BackgroundService
         return noDataFor > TimeSpan.FromSeconds(noDataTimeoutSeconds);
     }
 
-    private async Task WaitConnectedAsync(IFxConnector connector, long deviceId, CancellationToken ct)
-    {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < 5000)
-        {
-            if (connector.State == FxConnectorState.Connected) return;
-            await Task.Delay(50, ct);
-        }
-        _logger.LogWarning("重连后等待 Connected 超时 device={DeviceId} state={State}", deviceId, connector.State);
-    }
 }

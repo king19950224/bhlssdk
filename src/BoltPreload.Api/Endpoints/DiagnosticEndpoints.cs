@@ -1,4 +1,5 @@
 using BoltPreload.Api.Auth;
+using BoltPreload.Api.Runtime;
 using BoltPreload.Fx;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Devices.ProbeScan;
@@ -15,6 +16,11 @@ namespace BoltPreload.Api.Endpoints;
 /// </summary>
 public static class DiagnosticEndpoints
 {
+    // 通道健康的回波率线，与探头扫描判 active_good 是同一条判据，只是这里按百分数算。
+    // 换算自 ProbeScanThresholds 的默认值而不是另写一个 95：两处曾经一个写 0.95 一个写 95，
+    // 同名的 echoRate 变量却是两种单位，看代码的人很容易读错。
+    private const double HealthyEchoRatePct = ProbeScanThresholds.EchoRateGoodDefault * 100;
+
     // 仅列协议真能编码成读命令的参数（见 MultiChIotProtocolHandler.EncodeReadChannelParameter）：
     // 前 5 个是寄存器读(0x22)；RefTime 是存储读(0x42)，回包为整组基线
     // MeasMode+Threshold+RefTime+RefTemp+LEchoWave，一并落 device_parameter_history。
@@ -178,20 +184,24 @@ public static class DiagnosticEndpoints
             ushort[] channels;
             if (body?.Channels is { Length: > 0 })
             {
-                // 与默认分支同一 1..48 硬件边界：否则可对任意大通道号发起海量设备读，阻塞请求线程/冲击设备
-                channels = body.Channels.Where(x => x is >= 1 and <= 48).Distinct().OrderBy(x => x).ToArray();
+                // 与默认分支同一硬件边界：否则可对任意大通道号发起海量设备读，阻塞请求线程/冲击设备
+                channels = body.Channels
+                    .Where(x => x >= 1 && x <= DeviceLimits.MaxChannelsPerDevice)
+                    .Distinct().OrderBy(x => x).ToArray();
                 if (channels.Length == 0)
-                    return Results.BadRequest(new { error = "channels 必须在 1..48 范围内" });
+                    return Results.BadRequest(new { error = $"channels 必须在 1..{DeviceLimits.MaxChannelsPerDevice} 范围内" });
             }
             else
             {
                 await using var cmd = ds.CreateCommand(@"
-                    SELECT COALESCE(channel_count, 40)
+                    SELECT COALESCE(channel_count, @default_count)
                     FROM devices
                     WHERE id = @device_id AND deleted_at IS NULL");
                 cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
-                var n = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct) ?? 40);
-                channels = Enumerable.Range(1, Math.Clamp(n, 1, 48)).Select(x => (ushort)x).ToArray();
+                cmd.Parameters.AddWithValue("default_count", NpgsqlDbType.Smallint, (short)DeviceLimits.DefaultChannelCount);
+                var n = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct) ?? DeviceLimits.DefaultChannelCount);
+                channels = Enumerable.Range(1, Math.Clamp(n, 1, DeviceLimits.MaxChannelsPerDevice))
+                    .Select(x => (ushort)x).ToArray();
             }
 
             foreach (var ch in channels)
@@ -217,7 +227,7 @@ public static class DiagnosticEndpoints
             });
         })
         .WithName("BatchReadChannelParams")
-        .WithSummary("批量读取 1-40 通道参数（异步回包）");
+        .WithSummary("批量读取通道参数（不指定 channels 时按设备登记的通道数，异步回包）");
 
         // 把最近一次读回的通道参数同步到 channels 表。
         // 用途：设备参数以厂家真实读回为准，避免长期依赖 appsettings 兜底。
@@ -736,7 +746,7 @@ public static class DiagnosticEndpoints
             await r.ReadAsync(ct);
             var total = r.GetInt64(0);
             var withEcho = r.GetInt64(1);
-            var echoRate = total == 0 ? 0 : Math.Round(100.0 * withEcho / total, 1);
+            var echoRatePct = total == 0 ? 0 : Math.Round(100.0 * withEcho / total, 1);
             var avgTemp = r.IsDBNull(2) ? null : (decimal?)r.GetDecimal(2);
             var lastTs = r.IsDBNull(3) ? null : (DateTime?)r.GetDateTime(3);
             var paramsJson = r.IsDBNull(4) ? null : r.GetString(4);
@@ -754,10 +764,10 @@ public static class DiagnosticEndpoints
                 {
                     total,
                     withEcho,
-                    echoRatePct = echoRate,
+                    echoRatePct,
                     avgTempC = avgTemp,
                     lastTs,
-                    healthy = total > 0 && echoRate >= 95
+                    healthy = total > 0 && echoRatePct >= HealthyEchoRatePct
                 },
                 sdkSession = new
                 {
@@ -847,7 +857,7 @@ public static class DiagnosticEndpoints
                 sessionChannels.TryGetValue(channelNo, out var sessionConfig);
                 var total = r.GetInt64(14);
                 var withEcho = r.GetInt64(15);
-                var echoRate = total == 0 ? 0 : Math.Round(100.0 * withEcho / total, 1);
+                var echoRatePct = total == 0 ? 0 : Math.Round(100.0 * withEcho / total, 1);
                 items.Add(new
                 {
                     channelId = r.GetInt64(0),
@@ -870,12 +880,12 @@ public static class DiagnosticEndpoints
                     {
                         total,
                         withEcho,
-                        echoRatePct = echoRate,
+                        echoRatePct,
                         avgEchoNs = r.IsDBNull(16) ? null : (decimal?)r.GetDecimal(16),
                         echoStdNs = r.IsDBNull(17) ? null : (decimal?)r.GetDecimal(17),
                         avgTempC = r.IsDBNull(18) ? null : (decimal?)r.GetDecimal(18),
                         lastTs = r.IsDBNull(19) ? null : (DateTime?)r.GetDateTime(19),
-                        healthy = total > 0 && echoRate >= 95
+                        healthy = total > 0 && echoRatePct >= HealthyEchoRatePct
                     },
                     latestWave = new
                     {

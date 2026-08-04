@@ -317,8 +317,10 @@ public sealed class PostgresProbeScanRepository : IProbeScanRepository
             settle = r.GetInt16(5);
             sample = r.GetInt16(6);
             var thresholdsJson = r.GetString(7);
+            // 兜底取 ProbeScanOptions 的默认值，别在这里抄一份字面量：
+            // 抄过的那份不会跟着选项默认值一起改，回溯老记录时会静默给出另一套阈值
             thresholds = JsonSerializer.Deserialize<ProbeScanThresholds>(thresholdsJson)
-                         ?? new ProbeScanThresholds(20, 20, 5, 600);
+                         ?? ProbeScanThresholds.FromOptions(new ProbeScanOptions());
             requestedAt = r.GetFieldValue<DateTimeOffset>(8);
             startedAt = r.IsDBNull(9) ? null : r.GetFieldValue<DateTimeOffset>(9);
             finishedAt = r.IsDBNull(10) ? null : r.GetFieldValue<DateTimeOffset>(10);

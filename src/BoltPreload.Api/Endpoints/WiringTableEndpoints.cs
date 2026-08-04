@@ -1,5 +1,6 @@
 using System.Text;
 using BoltPreload.Api.Auth;
+using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Ingestion;
 using Npgsql;
@@ -19,7 +20,7 @@ namespace BoltPreload.Api.Endpoints;
 /// </summary>
 public static class WiringTableEndpoints
 {
-    private const int MaxRows = 64;
+    private const int MaxRows = DeviceLimits.MaxChannelsPerDevice;
 
     public static IEndpointRouteBuilder MapWiringTableEndpoints(this IEndpointRouteBuilder app)
     {
@@ -146,9 +147,9 @@ public static class WiringTableEndpoints
             var channelByNo = new Dictionary<int, (long Id, long? BoltId)>();
             foreach (var row in rows)
             {
-                if (row.ChannelNo is < 1 or > 64)
+                if (row.ChannelNo < 1 || row.ChannelNo > DeviceLimits.MaxChannelsPerDevice)
                 {
-                    errors.Add(new { channelNo = row.ChannelNo, error = "通道号超出 1..64" });
+                    errors.Add(new { channelNo = row.ChannelNo, error = $"通道号超出 1..{DeviceLimits.MaxChannelsPerDevice}" });
                     continue;
                 }
                 await using var cmd = new NpgsqlCommand(@"
@@ -197,7 +198,7 @@ public static class WiringTableEndpoints
                 if (boltId is not null) { skippedBound.Add(row.ChannelNo); continue; }
 
                 // 规格/等级预设（与单颗建档同源），未知规格拒绝整批
-                var nominal = string.IsNullOrWhiteSpace(row.NominalDiam) ? "M20" : row.NominalDiam.Trim().ToUpperInvariant();
+                var nominal = string.IsNullOrWhiteSpace(row.NominalDiam) ? BoltSpecPresets.DefaultNominalDiam : row.NominalDiam.Trim().ToUpperInvariant();
                 if (!BoltSpecPresets.StressAreaMm2.TryGetValue(nominal, out var csa))
                 {
                     await tx.RollbackAsync(ct);
@@ -208,7 +209,7 @@ public static class WiringTableEndpoints
                     });
                 }
                 // 未知等级与未知规格同口径拒绝整批：屈服强度喂给 GB 适用范围判断，不能静默套 640
-                var grade = string.IsNullOrWhiteSpace(row.Grade) ? "8.8" : row.Grade.Trim();
+                var grade = string.IsNullOrWhiteSpace(row.Grade) ? BoltSpecPresets.DefaultGrade : row.Grade.Trim();
                 if (!BoltSpecPresets.GradeRp02Mpa.TryGetValue(grade, out var rp02))
                 {
                     await tx.RollbackAsync(ct);
@@ -249,8 +250,8 @@ public static class WiringTableEndpoints
                         elastic_modulus_gpa, effective_length_mm, total_length_mm, cross_section_mm2,
                         sound_velocity_ms, target_preload_n, min_preload_n, position_label,
                         install_date, gb_compliant, state, enabled)
-                    VALUES (@gid, @cid, @code, @nd, @grade, @rp02, '42CrMo',
-                            206, 200, 220, @csa, 5890, @target, @min, @pos,
+                    VALUES (@gid, @cid, @code, @nd, @grade, @rp02, @material,
+                            @e, @eff_len, @total_len, @csa, @v, @target, @min, @pos,
                             CURRENT_DATE, true, 'uncalibrated', true)
                     ON CONFLICT (group_id, code) DO NOTHING
                     RETURNING id", conn, tx))
@@ -262,6 +263,11 @@ public static class WiringTableEndpoints
                     cmd.Parameters.AddWithValue("grade", NpgsqlDbType.Varchar, grade);
                     cmd.Parameters.AddWithValue("rp02", NpgsqlDbType.Numeric, rp02);
                     cmd.Parameters.AddWithValue("csa", NpgsqlDbType.Numeric, csa);
+                    cmd.Parameters.AddWithValue("material", NpgsqlDbType.Varchar, BoltSpecPresets.DefaultMaterial);
+                    cmd.Parameters.AddWithValue("e", NpgsqlDbType.Numeric, BoltSpecPresets.DefaultElasticModulusGpa);
+                    cmd.Parameters.AddWithValue("eff_len", NpgsqlDbType.Numeric, BoltSpecPresets.DefaultEffectiveLengthMm);
+                    cmd.Parameters.AddWithValue("total_len", NpgsqlDbType.Numeric, BoltSpecPresets.DefaultTotalLengthMm);
+                    cmd.Parameters.AddWithValue("v", NpgsqlDbType.Numeric, BoltSpecPresets.DefaultSoundVelocityMs);
                     cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, (object?)row.TargetPreloadN ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("min", NpgsqlDbType.Numeric, (object?)row.MinPreloadN ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("pos", NpgsqlDbType.Varchar, (object?)pos ?? DBNull.Value);

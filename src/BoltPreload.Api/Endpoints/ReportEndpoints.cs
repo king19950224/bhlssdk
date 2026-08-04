@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using BoltPreload.Api.Auth;
+using BoltPreload.Calibration;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -376,15 +377,10 @@ public static class ReportEndpoints
                     var method = r.IsDBNull(12) ? null : r.GetString(12);
                     if (isCal) calibrated++;
 
-                    var trust = method switch
-                    {
-                        "load_calibrated" or "gb_single_wave" or "gb_bi_wave" => "正式",
-                        "torque_fit" => "工程估算",
-                        "quick" or "torque_estimate" => "临时",
-                        "sim_baseline" => "参考",
-                        _ => "—",
-                    };
-                    var isFormal = trust == "正式";
+                    // 没标定过（method 为空）在报告里是破折号，与"标定方法不认识"分开
+                    var trustLevel = method is null ? null : DisplayLabels.TrustLevel(method);
+                    var trust = trustLevel is null ? "—" : DisplayLabels.TrustLevelLabel(trustLevel);
+                    var isFormal = trustLevel == "formal";
 
                     // 验收结论必须区分标定可信等级：临时/工程估算标定测出的"达标"只能记"合格*"，
                     // 不能与正式载荷标定的合格混为一谈（报告脚注说明 * 含义）
@@ -592,8 +588,8 @@ public static class ReportEndpoints
         {
             var tMin = valid.Min(p => p.TorqueNm);
             var tMax = valid.Max(p => p.TorqueNm);
-            var linearity = fit.RSquared >= 0.98 ? "线性关系良好"
-                : fit.RSquared >= 0.95 ? "线性关系较好"
+            var linearity = fit.RSquared >= CalibrationThresholds.R2PassDouble ? "线性关系良好"
+                : fit.RSquared >= CalibrationThresholds.R2RejectDouble ? "线性关系较好"
                 : "线性度不足（建议补采载荷点或排查耦合/过渡过程数据）";
             conclusion = $"{tMin:F0}~{tMax:F0} N·m 范围内，超声声时差 Δt 与扭矩法估算预紧力{linearity}（R²={fit.RSquared:F4}，有效点 {valid.Count} 个）。本报告为工程验证，非正式载荷标定。";
         }
@@ -675,11 +671,11 @@ public static class ReportEndpoints
             <tbody>{{rows}}</tbody>
           </table>
           <h2>拟合结果</h2>
-          <div class="{{(snapshot.Fit?.RSquared >= 0.95 ? "ok" : "warn")}}">
+          <div class="{{(snapshot.Fit?.RSquared >= CalibrationThresholds.R2RejectDouble ? "ok" : "warn")}}">
             有效点：{{snapshot.Fit?.PointCount ?? 0}}；
             K_L：{{snapshot.Fit?.KL.ToString("E4") ?? "—"}} ns/N；
             截距 b：{{snapshot.Fit?.InterceptNs.ToString("F2") ?? "—"}} ns；
-            R²：{{snapshot.Fit?.RSquared.ToString("F4") ?? "—"}}{{(snapshot.Fit is { RSquared: < 0.95 } ? "（线性度不足，建议补点重测）" : "")}}
+            R²：{{snapshot.Fit?.RSquared.ToString("F4") ?? "—"}}{{(snapshot.Fit is { RSquared: < CalibrationThresholds.R2RejectDouble } ? "（线性度不足，建议补点重测）" : "")}}
           </div>
           <h2>结论</h2>
           <p>{{H(snapshot.Conclusion)}}</p>

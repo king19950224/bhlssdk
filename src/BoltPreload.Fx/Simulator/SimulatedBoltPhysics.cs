@@ -1,3 +1,5 @@
+using BoltPreload.Domain;
+
 namespace BoltPreload.Fx.Simulator;
 
 /// <summary>
@@ -19,8 +21,8 @@ public sealed record BoltPhysics(
 /// <summary>模拟螺栓的默认物理参数集与 <see cref="BoltPhysics"/> 构造入口。</summary>
 public static class SimulatedBoltPhysics
 {
-    /// <summary>SDK 默认温度系数（1/°C）；与 sink 缺省一致,保证温补可逆。</summary>
-    public const decimal DefaultTempCoeff = 1.0269e-4m;
+    /// <summary>SDK 默认温度系数（1/°C）。权威定义见 <see cref="BoltPhysicsDefaults.SdkTempCoefficientPerC"/>。</summary>
+    public const decimal DefaultTempCoeff = BoltPhysicsDefaults.SdkTempCoefficientPerC;
 
     /// <summary>声时-载荷灵敏度 K_L = Δt/F（ns/N）。GB 单波法：F = Δt / K_L。</summary>
     public const decimal Kl = 0.003m;

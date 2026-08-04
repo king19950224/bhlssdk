@@ -27,17 +27,19 @@ function openExpert(b?: BoltListItem) {
   dialogOpen.value = true
 }
 
+// 可信等级只负责配色，文字与分档由后端 DisplayLabels.TrustLevel 定，
+// 前端不再自行归一（原先这里有一行补丁把 sim_baseline 从 unknown 掰成"参考"，
+// 于是同一条记录在标定中心和验收报告里可信级不一致）。
 const TRUST: Record<string, { label: string; color: string }> = {
   formal: { label: '正式', color: '#10b981' },
   engineering_estimate: { label: '工程估算', color: '#f59e0b' },
   temporary: { label: '临时', color: '#61748f' },
+  reference: { label: '参考', color: '#8b5cf6' },
   unknown: { label: '未分级', color: '#61748f' },
 }
 // 单点标定（无回归）方法：R² 无意义，避免界面把占位的 0.000 当成"拟合极差"
 const SINGLE_POINT = new Set(['quick', 'torque_estimate'])
-// 初始基线非载荷标定，单列“参考”可信级（后端 trustLevel 落 unknown，这里前端归一）
 function trustView(m: CalibMethod) {
-  if (m.method === 'sim_baseline') return { label: '参考', color: '#8b5cf6' }
   return TRUST[m.trustLevel] ?? { label: m.trustLevel || '未分级', color: '#61748f' }
 }
 function r2View(m: CalibMethod) {

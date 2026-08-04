@@ -1,4 +1,5 @@
 using BoltPreload.Api.Auth;
+using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Ingestion;
 using Npgsql;
 using NpgsqlTypes;
@@ -67,8 +68,8 @@ public static class ChannelEndpoints
             ILoggerFactory loggerFactory,
             CancellationToken ct) =>
         {
-            if (channelNo < 1 || channelNo > 64)
-                return Results.BadRequest(new { error = "channelNo 超出 1..64 范围" });
+            if (channelNo < 1 || channelNo > DeviceLimits.MaxChannelsPerDevice)
+                return Results.BadRequest(new { error = $"channelNo 超出 1..{DeviceLimits.MaxChannelsPerDevice} 范围" });
 
             var raw = body?.Name?.Trim();
             // 空字符串 = 清除名称（恢复成 NULL）

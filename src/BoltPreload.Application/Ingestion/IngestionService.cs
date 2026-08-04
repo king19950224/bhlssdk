@@ -97,7 +97,9 @@ public sealed class IngestionService : BackgroundService
         try
         {
             await connector.ConnectAsync(stoppingToken);
-            await WaitConnectedAsync(connector, runtime.DeviceId, stoppingToken);
+            if (!await FxConnectorWait.UntilConnectedAsync(connector, stoppingToken))
+                _logger.LogWarning("等待 connector Connected 超时 device={DeviceId} state={State}",
+                    runtime.DeviceId, connector.State);
             await connector.SetWorkModeAsync(FxWorkMode.MultiMeas, channel: 0, address: runtime.Options.Address, stoppingToken);
             _logger.LogInformation("已下发 MultiMeas device={DeviceId}", runtime.DeviceId);
         }
@@ -194,22 +196,6 @@ public sealed class IngestionService : BackgroundService
             await connector.DisconnectAsync(CancellationToken.None);
             _logger.LogInformation("Ingestion runtime 退出 device={DeviceId}", runtime.DeviceId);
         }
-    }
-
-    /// <summary>
-    /// 轮询等待 connector 进入 Connected 状态，最多等 5 秒。
-    /// 旧版本用 Task.Delay(1s) 硬等，对慢机器不准 / 对快机器浪费。
-    /// </summary>
-    private async Task WaitConnectedAsync(IFxConnector connector, long deviceId, CancellationToken ct)
-    {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < 5000)
-        {
-            if (connector.State == FxConnectorState.Connected) return;
-            await Task.Delay(50, ct);
-        }
-        _logger.LogWarning("等待 connector Connected 超时 device={DeviceId} state={State}",
-            deviceId, connector.State);
     }
 
     private void ObservePresence(FxDecodedEnvelope envelope)

@@ -179,9 +179,9 @@ public sealed class BoltAutoEnroller
         var code = baseCode;
         for (var n = 2; taken.Contains(code); n++) code = $"{baseCode}-{n}";
 
-        // ---------- 建档（缺省规格与点位表导入同源：42CrMo/M20/8.8/206GPa/5890m/s） ----------
-        var csa = BoltSpecPresets.StressAreaMm2["M20"];
-        var rp02 = BoltSpecPresets.GradeRp02Mpa["8.8"];
+        // ---------- 建档（缺省规格取 BoltSpecPresets，与单颗建档、点位表导入同一份定义） ----------
+        var csa = BoltSpecPresets.StressAreaMm2[BoltSpecPresets.DefaultNominalDiam];
+        var rp02 = BoltSpecPresets.GradeRp02Mpa[BoltSpecPresets.DefaultGrade];
 
         long boltId;
         await using (var cmd = new NpgsqlCommand(@"
@@ -190,8 +190,8 @@ public sealed class BoltAutoEnroller
                 elastic_modulus_gpa, effective_length_mm, total_length_mm, cross_section_mm2,
                 sound_velocity_ms, target_preload_n, min_preload_n, position_label,
                 install_date, gb_compliant, state, enabled)
-            VALUES (@gid, @cid, @code, 'M20', '8.8', @rp02, '42CrMo',
-                    206, 200, 220, @csa, 5890, NULL, NULL, @pos,
+            VALUES (@gid, @cid, @code, @nd, @grade, @rp02, @material,
+                    @e, @eff_len, @total_len, @csa, @v, NULL, NULL, @pos,
                     CURRENT_DATE, true, 'uncalibrated', true)
             ON CONFLICT (group_id, code) DO NOTHING
             RETURNING id", conn, tx))
@@ -199,8 +199,15 @@ public sealed class BoltAutoEnroller
             cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
             cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
             cmd.Parameters.AddWithValue("code", NpgsqlDbType.Varchar, code);
+            cmd.Parameters.AddWithValue("nd", NpgsqlDbType.Varchar, BoltSpecPresets.DefaultNominalDiam);
+            cmd.Parameters.AddWithValue("grade", NpgsqlDbType.Varchar, BoltSpecPresets.DefaultGrade);
+            cmd.Parameters.AddWithValue("material", NpgsqlDbType.Varchar, BoltSpecPresets.DefaultMaterial);
+            cmd.Parameters.AddWithValue("e", NpgsqlDbType.Numeric, BoltSpecPresets.DefaultElasticModulusGpa);
+            cmd.Parameters.AddWithValue("eff_len", NpgsqlDbType.Numeric, BoltSpecPresets.DefaultEffectiveLengthMm);
+            cmd.Parameters.AddWithValue("total_len", NpgsqlDbType.Numeric, BoltSpecPresets.DefaultTotalLengthMm);
             cmd.Parameters.AddWithValue("rp02", NpgsqlDbType.Numeric, rp02);
             cmd.Parameters.AddWithValue("csa", NpgsqlDbType.Numeric, csa);
+            cmd.Parameters.AddWithValue("v", NpgsqlDbType.Numeric, BoltSpecPresets.DefaultSoundVelocityMs);
             cmd.Parameters.AddWithValue("pos", NpgsqlDbType.Varchar, (object?)positionLabel ?? DBNull.Value);
             var scalar = await cmd.ExecuteScalarAsync(ct);
             if (scalar is not long id)

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using BoltPreload.Algorithms.Preload;
+using BoltPreload.Domain;
 using BoltPreload.Algorithms.Waveform;
 using BoltPreload.Application.Alarm;
 using BoltPreload.Application.Devices.ProbeScan;
@@ -212,9 +213,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             return (null, null, null, 0m, "phase1:raw", null);
 
         // 温度系数：优先用螺栓自带的（按材料标准值），缺则退化到 SDK 默认。
-        // SDK 默认温度系数（plan §8.4.5 引）—— 仅用于标定/物料配置缺失时兜底。
-        const decimal SdkDefaultTempCoeff = 1.0269e-4m;
-        var tempCoeff = route.BoltSpec.TempCoefficientPerC ?? SdkDefaultTempCoeff;
+        var tempCoeff = route.BoltSpec.TempCoefficientPerC ?? BoltPhysicsDefaults.SdkTempCoefficientPerC;
 
         var boltSpec = new BoltSpec(
             Grade: route.BoltSpec.Grade,

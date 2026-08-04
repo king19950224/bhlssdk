@@ -1,6 +1,7 @@
 using BoltPreload.Api.Auth;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Calibration;
+using BoltPreload.Domain;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -59,16 +60,7 @@ public static class CalibrationEndpoints
                 methods.Add(new
                 {
                     method,
-                    trustLevel = method switch
-                    {
-                        "load_calibrated" => "formal",
-                        "gb_single_wave" => "formal",
-                        "gb_bi_wave" => "formal",
-                        "torque_fit" => "engineering_estimate",
-                        "torque_estimate" => "temporary",
-                        "quick" => "temporary",
-                        _ => "unknown"
-                    },
+                    trustLevel = DisplayLabels.TrustLevel(method),
                     total = r.GetInt64(1),
                     active = r.GetInt64(2),
                     expired = r.GetInt64(3),
@@ -296,7 +288,6 @@ public static class CalibrationEndpoints
         {
             var logger = lf.CreateLogger("Calibration");
             var userId = UserContext.Require(http).UserId;  // 操作人/审核人/审计一律取自 JWT，不信任客户端 user_id
-            const decimal sdkDefaultTempCoeff = 0.00010269m;
 
             long boltId, deviceId;
             short channelNo;
@@ -368,7 +359,7 @@ public static class CalibrationEndpoints
                 return Results.BadRequest(new { error = "缺少 RefTime/RefTemp，请先同步通道配置或在请求里传 refTimeNs/refTempC" });
 
             // 用螺栓自身温度系数(缺省回退 SDK 默认)，与采集热路径(PostgresMeasurementSink)一致，避免标定/运行两套温补
-            var normalizedEcho = avgEcho / (1m + (boltTempCoeff ?? sdkDefaultTempCoeff) * (avgTemp - refTemp.Value));
+            var normalizedEcho = avgEcho / (1m + (boltTempCoeff ?? BoltPhysicsDefaults.SdkTempCoefficientPerC) * (avgTemp - refTemp.Value));
             var deltaTof = normalizedEcho - refTime.Value;
             var kL = deltaTof / estimatedPreloadN;
             if (kL <= 0)
@@ -543,7 +534,6 @@ public static class CalibrationEndpoints
             NpgsqlDataSource ds, HttpContext http, CancellationToken ct) =>
         {
             var userId = UserContext.Require(http).UserId;  // 记录是谁加的载荷点，取自 JWT
-            const decimal sdkDefaultTempCoeff = 0.00010269m;
 
             long boltId;
             string nominalDiam;
@@ -620,7 +610,7 @@ public static class CalibrationEndpoints
             }
 
             // 用螺栓自身温度系数(缺省回退 SDK 默认)，与采集热路径一致
-            normalizedEcho = avgEcho / (1m + (boltTempCoeff ?? sdkDefaultTempCoeff) * (avgTemp - refTemp.Value));
+            normalizedEcho = avgEcho / (1m + (boltTempCoeff ?? BoltPhysicsDefaults.SdkTempCoefficientPerC) * (avgTemp - refTemp.Value));
             deltaTof = normalizedEcho - refTime.Value;
 
             long pointId;
@@ -661,7 +651,7 @@ public static class CalibrationEndpoints
                 cmd.Parameters.AddWithValue("avg_temp", NpgsqlDbType.Numeric, avgTemp);
                 cmd.Parameters.AddWithValue("ref_time", NpgsqlDbType.Numeric, refTime.Value);
                 cmd.Parameters.AddWithValue("ref_temp", NpgsqlDbType.Numeric, refTemp.Value);
-                    cmd.Parameters.AddWithValue("tc", NpgsqlDbType.Numeric, boltTempCoeff ?? sdkDefaultTempCoeff);
+                    cmd.Parameters.AddWithValue("tc", NpgsqlDbType.Numeric, boltTempCoeff ?? BoltPhysicsDefaults.SdkTempCoefficientPerC);
                 cmd.Parameters.AddWithValue("normalized_echo", NpgsqlDbType.Numeric, normalizedEcho);
                 cmd.Parameters.AddWithValue("delta_tof", NpgsqlDbType.Numeric, deltaTof);
                 cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
@@ -930,14 +920,9 @@ public static class CalibrationEndpoints
                     return klReject;
                 }
 
-                // R² 拟合优度门槛（plan §8.5 / 附录 B 步骤 5）。
-                // 0.98（合格）/ 0.95（拒绝下限）为工程经验阈值——GB/T 43232 对拟合 R² 无规定，
-                // 取值依据程芳玲 2024 实测（纵波 R²=0.9998）+ 通用测量学经验（见 plan §8.5）。
-                //   R² ≥ 0.98          → 通过（passed=true）
-                //   0.95 ≤ R² < 0.98   → 警告：作为"现场临时"标定可用，但 passed=false（建议补采载荷点重拟合）
-                //   R² < 0.95          → 拒绝：线性度不达标，必须补点或全部重做
-                const decimal R2PassThreshold = 0.98m;
-                const decimal R2RejectThreshold = 0.95m;
+                // R² 拟合优度门槛与取值依据见 CalibrationThresholds
+                const decimal R2PassThreshold = CalibrationThresholds.R2Pass;
+                const decimal R2RejectThreshold = CalibrationThresholds.R2Reject;
                 if (rSquared < R2RejectThreshold)
                 {
                     await tx.RollbackAsync(ct);
@@ -1126,7 +1111,7 @@ public static class CalibrationEndpoints
                 return klReject;
 
             // 2. 正式载荷标定强制 R²≥0.98（不走 [0.95,0.98) 临时层，plan §8.5）
-            const decimal r2PassThreshold = 0.98m;
+            const decimal r2PassThreshold = CalibrationThresholds.R2Pass;
             var rSquared = (decimal)fit.RSquared;
             if (rSquared < r2PassThreshold)
                 return Results.BadRequest(new

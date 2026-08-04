@@ -120,6 +120,35 @@ public static class DisplayLabels
         ["no_data"] = "数据中断",
     };
 
+    /// <summary>
+    /// 标定方法 → 可信等级。验收结论直接依赖它：只有 formal 能记"合格"，
+    /// 其余记"合格*"并在报告脚注里说明（见 ReportEndpoints）。
+    /// <para>
+    /// 收口之前这套判定散在三处且互相矛盾：标定中心把 sim_baseline 落进 unknown，
+    /// 验收报告当它是独立的"参考"档，前端 Calibration.vue 又写了一行补丁把 unknown 掰回"参考"。
+    /// 同一条标定记录，换个页面看就换个可信级。
+    /// </para>
+    /// </summary>
+    public static string TrustLevel(string method) => method switch
+    {
+        "load_calibrated" or "gb_single_wave" or "gb_bi_wave" => "formal",
+        "torque_fit" => "engineering_estimate",
+        "quick" or "torque_estimate" => "temporary",
+        // 初始基线不是载荷标定，但也不是"不认识"：它是模拟/演示态的已知来源，单列一档
+        "sim_baseline" => "reference",
+        _ => "unknown",
+    };
+
+    /// <summary>可信等级的中文名。与 TrustLevel 的取值一一对应。</summary>
+    public static string TrustLevelLabel(string level) => level switch
+    {
+        "formal" => "正式",
+        "engineering_estimate" => "工程估算",
+        "temporary" => "临时",
+        "reference" => "参考",
+        _ => "未分级",
+    };
+
     private static readonly Dictionary<string, string> CalibrationMethods = new(StringComparer.Ordinal)
     {
         ["load_calibrated"] = "正式载荷标定",

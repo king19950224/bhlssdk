@@ -77,12 +77,12 @@ public static class ProbeScanResultJudge
         // 至此 samples >= minSamples
         var echoRate = stats.Samples > 0 ? (double)stats.SamplesWithEcho / stats.Samples : 0.0;
 
-        if (echoRate < 0.5)
+        if (echoRate < t.EchoRateNoEcho)
             return ProbeScanVerdict.ActiveNoEcho;
 
-        // echoRate >= 0.5
+        // echoRate >= t.EchoRateNoEcho
         bool good =
-            echoRate >= 0.95
+            echoRate >= t.EchoRateGood
             && stats.SnrAvgDb is not null && (double)stats.SnrAvgDb.Value >= t.SnrGoodDb
             && stats.EchoStdNs is not null && (double)stats.EchoStdNs.Value <= t.EchoStdGoodNs
             && stats.PeakToPeakAvg is not null && (double)stats.PeakToPeakAvg.Value >= t.PeakToPeakMin;

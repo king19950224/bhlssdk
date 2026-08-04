@@ -328,12 +328,7 @@ app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorMana
 app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseService licenseService, LicenseEnforcementState enforcement, IMeasurementWal wal) =>
 {
     var license = licenseService.GetStatus();
-    // 多设备下按 (deviceId, address, channel) 去重，避免不同设备同 address/channel 互相抵消
-    var channelCount = manager.Runtimes
-        .SelectMany(runtime => runtime.Connector.GetSessionChannelConfigs()
-            .Select(c => (runtime.DeviceId, c.Address, c.Channel)))
-        .Distinct()
-        .Count();
+    var channelCount = manager.CountActiveChannels();
 
     return Results.Ok(new
     {
@@ -483,11 +478,7 @@ try
     var manager = app.Services.GetRequiredService<IDeviceConnectorManager>();
     var enforcement = app.Services.GetRequiredService<LicenseEnforcementState>();
     var currentDevices = manager.Runtimes.Count;
-    var currentChannels = manager.Runtimes
-        .SelectMany(rt => rt.Connector.GetSessionChannelConfigs()
-            .Select(c => (rt.DeviceId, c.Address, c.Channel)))
-        .Distinct()
-        .Count();
+    var currentChannels = manager.CountActiveChannels();
     enforcement.Set(currentDevices, currentChannels, licenseStatus.MaxDevices, licenseStatus.MaxChannels);
     if (!enforcement.WithinLimits)
         Log.Error("授权容量超限：{Violation}（当前 设备={Dev}/通道={Ch}，授权 设备={MD}/通道={MC}）。" +

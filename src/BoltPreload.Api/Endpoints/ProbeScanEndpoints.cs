@@ -1,4 +1,5 @@
 using BoltPreload.Api.Auth;
+using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Devices.ProbeScan;
 using Microsoft.Extensions.Options;
@@ -38,8 +39,8 @@ public static class ProbeScanEndpoints
 
             if (channels.Length == 0)
                 return Results.BadRequest(new { error = "channels 不能为空" });
-            if (channels.Any(c => c < 1 || c > 64))
-                return Results.BadRequest(new { error = "通道号超出 1..64 范围" });
+            if (channels.Any(c => c < 1 || c > DeviceLimits.MaxChannelsPerDevice))
+                return Results.BadRequest(new { error = $"通道号超出 1..{DeviceLimits.MaxChannelsPerDevice} 范围" });
 
             var settle = body?.SettleSeconds ?? opt.DefaultSettleSeconds;
             var sample = body?.SampleSeconds ?? opt.DefaultSampleSeconds;
@@ -56,7 +57,9 @@ public static class ProbeScanEndpoints
                 MinSamples: body?.MinSamples ?? opt.DefaultMinSamples,
                 SnrGoodDb: body?.SnrGoodDb ?? opt.DefaultSnrGoodDb,
                 EchoStdGoodNs: body?.EchoStdGoodNs ?? opt.DefaultEchoStdGoodNs,
-                PeakToPeakMin: body?.PeakToPeakMin ?? opt.DefaultPeakToPeakMin);
+                PeakToPeakMin: body?.PeakToPeakMin ?? opt.DefaultPeakToPeakMin,
+                EchoRateGood: body?.EchoRateGood ?? opt.DefaultEchoRateGood,
+                EchoRateNoEcho: body?.EchoRateNoEcho ?? opt.DefaultEchoRateNoEcho);
 
             var req = new ProbeScanRequest(
                 DeviceId: deviceId,
@@ -168,4 +171,10 @@ public sealed class ProbeScanRequestBody
     public double? SnrGoodDb { get; set; }
     public double? EchoStdGoodNs { get; set; }
     public int? PeakToPeakMin { get; set; }
+
+    /// <summary>回波率合格线（0~1）。</summary>
+    public double? EchoRateGood { get; set; }
+
+    /// <summary>回波率"判无回波"下限（0~1）。</summary>
+    public double? EchoRateNoEcho { get; set; }
 }
