@@ -26,6 +26,9 @@ internal sealed class FakeConnector : IFxConnector
     public FxConnectorState State => FxConnectorState.Connected;
     public long DeviceId { get; }
     public ChannelReader<FxDecodedEnvelope> Results => _channel.Reader;
+
+    /// <summary>模拟设备上报一条信封，供消费循环读到。</summary>
+    public void Emit(FxDecodedEnvelope envelope) => _channel.Writer.TryWrite(envelope);
     public long DroppedCount => 0;
     public Func<FxDecodedEnvelope, ValueTask>? OverflowSink { get; set; }
 
