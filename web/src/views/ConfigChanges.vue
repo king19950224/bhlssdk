@@ -43,10 +43,16 @@ const PARAM_LABEL: Record<string, string> = {
 }
 const paramName = (k: string) => PARAM_LABEL[k.toLowerCase()] || k
 
+// 拉取失败绝不能显示成"无待办变更"：这一页的空态是绿灯，值班照着它会得出
+// "没有待审批的下发"的结论，而实际可能是一队参数变更正卡在那儿没人看。
+const loadError = ref<string | null>(null)
 async function load() {
   loading.value = true
   try {
     items.value = (await configChangeApi.list(statusFilter.value)).items
+    loadError.value = null
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : '变更队列加载失败'
   } finally {
     loading.value = false
   }
@@ -144,6 +150,10 @@ function fmt(iso: string | null) {
         <span class="panel-title"><i class="hd-mark hd-mark--warn" />变更队列</span>
         <span class="hd-sub mono">{{ items.length }} 条{{ statusFilter === 'pending' ? '待办' : '' }}</span>
       </div>
+      <div v-if="loadError" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 变更队列加载失败（下方可能是旧数据，不代表没有待办）：{{ loadError }}
+        <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
       <div class="tbl">
         <div class="tr th"><span>#</span><span>设备/通道</span><span>变更参数</span><span>状态</span><span>提交</span><span>审批</span><span>操作</span></div>
         <div v-for="c in items" :key="c.id" class="tr">
@@ -168,7 +178,7 @@ function fmt(iso: string | null) {
             <el-button v-else-if="c.status === 'executed'" size="small" text :loading="actingId === c.id" @click="verify(c)">验证</el-button>
           </span>
         </div>
-        <div v-if="!loading && !items.length" class="tbl-empty"><span class="led led--ok" /> {{ statusFilter === 'pending' ? '无待办变更' : '无变更记录' }}</div>
+        <div v-if="!loading && !loadError && !items.length" class="tbl-empty"><span class="led led--ok" /> {{ statusFilter === 'pending' ? '无待办变更' : '无变更记录' }}</div>
       </div>
     </div>
 

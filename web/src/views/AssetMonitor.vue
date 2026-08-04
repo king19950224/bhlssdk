@@ -157,6 +157,10 @@ const kn = (n: number | null) => (n == null ? '—' : (n / 1000).toFixed(1) + ' 
 // 请求序号：快速切换风场/风机/部位时，后发先至的旧响应不得覆盖当前视图（与 GroupTrend 同一防护）。
 let loadSeq = 0
 
+// 三层共用一个错误态：任一层拉取失败都要说出来。这一页的空态写的是"该项目暂无风机"
+// "该部位暂无螺栓"，把接口失败显示成这些，等于告诉值班这些资产不存在。
+const loadError = ref<string | null>(null)
+
 async function loadTurbines() {
   if (projectId.value == null) return
   const seq = ++loadSeq
@@ -165,6 +169,9 @@ async function loadTurbines() {
     const items = (await assetApi.turbines(projectId.value)).items
     if (seq !== loadSeq) return
     turbines.value = items
+    loadError.value = null
+  } catch (e) {
+    if (seq === loadSeq) loadError.value = e instanceof Error ? e.message : '风机列表加载失败'
   } finally {
     if (seq === loadSeq) loading.value = false
   }
@@ -178,6 +185,9 @@ async function openTurbine(t: TurbineNode) {
     if (seq !== loadSeq) return
     groups.value = items
     level.value = 'groups'
+    loadError.value = null
+  } catch (e) {
+    if (seq === loadSeq) loadError.value = e instanceof Error ? e.message : '监测部位加载失败'
   } finally {
     if (seq === loadSeq) loading.value = false
   }
@@ -191,6 +201,9 @@ async function openGroup(g: GroupNode) {
     if (seq !== loadSeq) return
     bolts.value = res.items
     level.value = 'bolts'
+    loadError.value = null
+  } catch (e) {
+    if (seq === loadSeq) loadError.value = e instanceof Error ? e.message : '螺栓列表加载失败'
   } finally {
     if (seq === loadSeq) loading.value = false
   }
@@ -203,6 +216,8 @@ function backTo(l: 'turbines' | 'groups') {
 
 // 实时刷新：告警变化即时刷新当前层；测量仅在螺栓层做去抖刷新（避免高频抖动）
 async function refreshCurrent() {
+  // 项目列表都没拿到时先补这一步，否则 projectId 恒为 null，重试和轮询都只会空转
+  if (projectId.value == null) { await initProjects(); return }
   const seq = ++loadSeq
   try {
     if (level.value === 'turbines') { await loadTurbines(); return }
@@ -213,7 +228,12 @@ async function refreshCurrent() {
       const [res] = await Promise.all([assetApi.groupBolts(sel.value.group.id), loadUnbound()])
       if (seq === loadSeq) bolts.value = res.items
     }
-  } catch { /* 尽力刷新 */ }
+    if (seq === loadSeq) loadError.value = null
+  } catch (e) {
+    // 定时刷新失败同样要挂横幅：这一页是值班盯预紧力状态的地方，
+    // 静默失败会让一屏冻住的旧数字看起来像是"一切正常"。这个函数也是重试按钮的入口。
+    if (seq === loadSeq) loadError.value = e instanceof Error ? e.message : '刷新失败'
+  }
 }
 let debounceTimer: number | undefined
 function scheduleRefresh() {
@@ -224,14 +244,27 @@ let unsubAlarm: (() => void) | undefined
 let unsubMeas: (() => void) | undefined
 
 let pollTimer: number | undefined
-onMounted(async () => {
-  projects.value = (await assetApi.projects()).items
-  projectId.value = projects.value[0]?.id ?? null
+// 项目列表是这一页的入口：拿不到 projectId，下面每一层都无从加载。
+// 它此前裸奔在 onMounted 里，一抛错整个钩子就中断——订阅和兜底轮询都建立不起来，
+// 页面于是永久停在"该项目暂无风机"，网络恢复了也不会自己回来。
+async function initProjects() {
+  try {
+    projects.value = (await assetApi.projects()).items
+    projectId.value = projects.value[0]?.id ?? null
+    loadError.value = null
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : '项目列表加载失败'
+    return
+  }
   await loadTurbines()
+}
+onMounted(() => {
+  // 订阅与轮询先挂上再拉数据：初始化失败时也得留着自愈的路
   unsubAlarm = onRealtime('OnAlarm', scheduleRefresh)
   unsubMeas = onRealtime('OnMeasurement', () => { if (level.value === 'bolts') scheduleRefresh() })
   // 30s 轮询兜底：SignalR 断线期间页面不能冻结在旧数据(资产页此前是全站唯一无轮询的页面)
   pollTimer = window.setInterval(() => { if (!document.hidden) refreshCurrent() }, 30000)
+  void initProjects()
 })
 onUnmounted(() => {
   if (debounceTimer) clearTimeout(debounceTimer)
@@ -278,6 +311,11 @@ function onProjectChange() {
       </div>
     </div>
 
+    <div v-if="loadError" class="load-error">
+      <el-icon><WarningFilled /></el-icon> 加载失败（下方可能是旧数据，不代表资产不存在）：{{ loadError }}
+      <el-button size="small" text type="primary" @click="refreshCurrent">重试</el-button>
+    </div>
+
     <!-- 风机 -->
     <div v-if="level === 'turbines'" class="grid">
       <div v-for="t in filteredTurbines" :key="t.id" class="card panel" @click="openTurbine(t)">
@@ -295,7 +333,7 @@ function onProjectChange() {
           <span class="loose-hint" v-if="t.health.loose > 0"><span class="led led--crit" />{{ t.health.loose }} 松动</span>
         </div>
       </div>
-      <div v-if="!loading && !filteredTurbines.length" class="empty panel">{{ search ? '无匹配风机' : '该项目暂无风机' }}</div>
+      <div v-if="!loading && !loadError && !filteredTurbines.length" class="empty panel">{{ search ? '无匹配风机' : '该项目暂无风机' }}</div>
     </div>
 
     <!-- 部位 -->
@@ -315,7 +353,7 @@ function onProjectChange() {
           <span class="loose-hint" v-if="g.health.loose > 0"><span class="led led--crit" />{{ g.health.loose }} 松动</span>
         </div>
       </div>
-      <div v-if="!loading && !filteredGroups.length" class="empty panel">{{ search ? '无匹配部位' : '该风机暂无监测部位' }}</div>
+      <div v-if="!loading && !loadError && !filteredGroups.length" class="empty panel">{{ search ? '无匹配部位' : '该风机暂无监测部位' }}</div>
     </div>
 
     <!-- 螺栓层：法兰圈 / 网格 -->
@@ -383,13 +421,13 @@ function onProjectChange() {
             :total-holes="sel.group?.expectedBoltCount ?? null"
             @select="(id) => router.push({ name: 'boltDetail', params: { boltId: id } })"
           />
-          <div v-else-if="!loading" class="empty">该部位暂无螺栓</div>
+          <div v-else-if="!loading && !loadError" class="empty">该部位暂无螺栓</div>
         </div>
       </div>
 
       <div v-else-if="boltView === 'trend'" class="panel panel--glow trend-panel">
         <GroupTrend v-if="bolts.length" :bolts="bolts" />
-        <div v-else-if="!loading" class="empty">该部位暂无螺栓</div>
+        <div v-else-if="!loading && !loadError" class="empty">该部位暂无螺栓</div>
       </div>
 
       <div v-else class="grid grid--bolts">
@@ -418,7 +456,7 @@ function onProjectChange() {
           </div>
           <div class="bolt-foot mono">{{ b.nominalDiam }}·{{ b.grade }} · CH{{ b.channelNo }}</div>
         </div>
-        <div v-if="!loading && !sortedBoltCells.length" class="empty panel">{{ search ? '无匹配螺栓' : '该部位暂无螺栓' }}</div>
+        <div v-if="!loading && !loadError && !sortedBoltCells.length" class="empty panel">{{ search ? '无匹配螺栓' : '该部位暂无螺栓' }}</div>
       </div>
     </template>
 

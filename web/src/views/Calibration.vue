@@ -54,11 +54,16 @@ const BSTATE: Record<string, { label: string; cls: string }> = {
   disabled: { label: '停用', cls: 'led--off' },
 }
 
+// 拉取失败要说出来，不能显示成"暂无螺栓"——那会让人以为这批螺栓还没建档而重复建
+const loadError = ref<string | null>(null)
 async function load() {
   loading.value = true
   try {
     methods.value = (await calibrationApi.summary()).methods
     bolts.value = (await boltApi.list()).items
+    loadError.value = null
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : '标定列表加载失败'
   } finally {
     loading.value = false
   }
@@ -97,6 +102,10 @@ onMounted(load)
         <span class="panel-title"><i class="hd-mark" />螺栓标定状态</span>
         <span class="hd-sub mono">{{ bolts.length }} 颗</span>
       </div>
+      <div v-if="loadError" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 标定列表加载失败（下方可能是旧数据）：{{ loadError }}
+        <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
       <div class="tbl" v-loading="loading">
         <div class="tr th"><span>螺栓</span><span>规格</span><span>状态</span><span>K_L</span><span>参考声时</span><span>参考温度</span><span>操作</span></div>
         <div v-for="b in bolts" :key="b.id" class="tr" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
@@ -112,7 +121,7 @@ onMounted(load)
             <el-icon class="go" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })"><ArrowRight /></el-icon>
           </span>
         </div>
-        <div v-if="!loading && !bolts.length" class="tbl-empty">暂无螺栓</div>
+        <div v-if="!loading && !loadError && !bolts.length" class="tbl-empty">暂无螺栓</div>
       </div>
     </div>
 

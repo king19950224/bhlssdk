@@ -308,6 +308,42 @@ public sealed class SecurityGuardIntegrationTests
         resp.StatusCode.Should().Be(HttpStatusCode.NotFound, "通道不存在统一 404（原 400/404 混用）");
     }
 
+    // ===================== 用户管理端点的越权防线 =====================
+
+    [PostgresFact]
+    public async Task UserManagementEndpoints_RejectNonAdmin()
+    {
+        _fx.EnsureAvailable();
+        var actorId = await SeedUserAsync("operator");
+
+        using var factory = TestApi.CreateFactory(_fx);
+
+        // 建号改角色、列账号名单、启停用——这三个直接决定谁能进系统、以什么角色进。
+        // 任何一个漏挂 AdminAccess 就是一条提权通道，而此前只有 admin 的正向路径被走过。
+        var escalated = "x_" + Guid.NewGuid().ToString("N")[..10];
+        foreach (var role in new[] { "operator", "reviewer" })
+        {
+            using var client = TestApi.AuthedClient(factory, actorId, role);
+
+            (await client.PostAsJsonAsync("/api/auth/users",
+                    new { username = escalated, password = "password123", role = "admin" }))
+                .StatusCode.Should().Be(HttpStatusCode.Forbidden, $"{role} 不得建号或改角色");
+
+            (await client.GetAsync("/api/auth/users"))
+                .StatusCode.Should().Be(HttpStatusCode.Forbidden, $"{role} 不得查看账号名单");
+
+            (await client.PostAsync($"/api/auth/users/{actorId}/toggle", null))
+                .StatusCode.Should().Be(HttpStatusCode.Forbidden, $"{role} 不得启停账号");
+        }
+
+        (await CountUsersNamedAsync(escalated)).Should().Be(0, "越权建号必须连记录都没落下");
+
+        // 确认 403 来自策略而不是端点本身坏了：同样的请求换 admin 应当走得通
+        var adminId = await SeedUserAsync("admin");
+        using var admin = TestApi.AuthedClient(factory, adminId, "admin");
+        (await admin.GetAsync("/api/auth/users")).StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
     // ===================== seed =====================
 
     private sealed record Seed(long ProjectId, long GroupId, long DeviceId, long ChannelId, long ExtraChannelId, long BoltId);
@@ -403,6 +439,13 @@ public sealed class SecurityGuardIntegrationTests
     {
         await using var cmd = _fx.DataSource.CreateCommand(sql.Replace("@p0", "@arg"));
         cmd.Parameters.AddWithValue("arg", NpgsqlDbType.Bigint, p0);
+        return (long)(await cmd.ExecuteScalarAsync())!;
+    }
+
+    private async Task<long> CountUsersNamedAsync(string username)
+    {
+        await using var cmd = _fx.DataSource.CreateCommand("SELECT count(*) FROM users WHERE username=@u");
+        cmd.Parameters.AddWithValue("u", NpgsqlDbType.Varchar, username);
         return (long)(await cmd.ExecuteScalarAsync())!;
     }
 }

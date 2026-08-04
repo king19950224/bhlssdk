@@ -187,6 +187,23 @@ body {
 /* 数据强调：用强调色即可，不加辉光描边（工程读数以清晰为先） */
 .glow-accent { color: var(--accent); }
 
+/*
+ * 列表加载失败横幅。做成全局是因为它必须在每个列表页长得一样：
+ * "拉取失败" 与 "确实没有数据" 长得像，值班就会把接口挂了当成一切正常。
+ * 用法见 Alarms.vue —— 失败时保留旧数据并挂这条横幅，同时抑制空态文案。
+ */
+.load-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 16px 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--crit);
+  border-radius: 8px;
+  color: var(--crit);
+  font-size: 12.5px;
+}
+
 /* 滚动条 */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }

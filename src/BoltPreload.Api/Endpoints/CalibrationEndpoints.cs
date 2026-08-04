@@ -985,30 +985,30 @@ public static class CalibrationEndpoints
                 // 否则会把在产的好标定 supersede 掉，而 sink 对 passed=false 又不出预紧力 → 通道从"能出数"变"无数据"。
                 if (passed)
                 {
-                await SupersedeActiveCalibrationsAsync(conn, tx, boltId, newCalibId, ct);
+                    await SupersedeActiveCalibrationsAsync(conn, tx, boltId, newCalibId, ct);
 
-                await using (var cmd = new NpgsqlCommand(@"
-                    UPDATE channels SET
-                        k_l = @kl,
-                        k_l_uncertainty = @klu,
-                        k_l_intercept_ns = @intercept,
-                        ref_time_ns = @rt,
-                        ref_temp_c = @rtemp,
-                        active_calibration_id = @cid,
-                        updated_at = now()
-                    WHERE id = @channel_id", conn, tx))
-                {
-                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, slope);
-                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, kLUncertainty);
-                    cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, intercept);
-                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime);
-                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp);
-                    cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Uuid, newCalibId);
-                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
-                    await cmd.ExecuteNonQueryAsync(ct);
-                }
-                // 仅在达标激活时才回写 bolts.state（未达标只留档不激活，状态不应变已标定）
-                await MarkBoltCalibratedAsync(conn, tx, boltId, ct);
+                    await using (var cmd = new NpgsqlCommand(@"
+                        UPDATE channels SET
+                            k_l = @kl,
+                            k_l_uncertainty = @klu,
+                            k_l_intercept_ns = @intercept,
+                            ref_time_ns = @rt,
+                            ref_temp_c = @rtemp,
+                            active_calibration_id = @cid,
+                            updated_at = now()
+                        WHERE id = @channel_id", conn, tx))
+                    {
+                        cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, slope);
+                        cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, kLUncertainty);
+                        cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, intercept);
+                        cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime);
+                        cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp);
+                        cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Uuid, newCalibId);
+                        cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                        await cmd.ExecuteNonQueryAsync(ct);
+                    }
+                    // 仅在达标激活时才回写 bolts.state（未达标只留档不激活，状态不应变已标定）
+                    await MarkBoltCalibratedAsync(conn, tx, boltId, ct);
                 }
 
                 var afterJson = System.Text.Json.JsonSerializer.Serialize(new

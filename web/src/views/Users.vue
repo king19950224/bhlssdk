@@ -23,10 +23,15 @@ const ROLE_OPTS = [
 const dialog = reactive({ visible: false, mode: 'create' as 'create' | 'reset', saving: false })
 const form = reactive({ username: '', fullName: '', password: '', role: 'operator' })
 
+// 拉取失败要说出来，不能显示成"暂无用户"——那会让管理员以为账号被清空了
+const loadError = ref<string | null>(null)
 async function load() {
   loading.value = true
   try {
     users.value = (await userApi.list()).items
+    loadError.value = null
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : '用户列表加载失败'
   } finally {
     loading.value = false
   }
@@ -87,6 +92,10 @@ function fmt(iso: string | null) {
         <span class="panel-title"><i class="hd-mark" />用户列表</span>
         <span class="hd-sub mono">{{ users.length }} 个</span>
       </div>
+      <div v-if="loadError" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 用户列表加载失败（下方可能是旧数据）：{{ loadError }}
+        <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
       <div class="tbl">
         <div class="tr th"><span>用户名</span><span>姓名</span><span>角色</span><span>状态</span><span>最近登录</span><span>操作</span></div>
         <div v-for="u in users" :key="u.id" class="tr">
@@ -105,7 +114,7 @@ function fmt(iso: string | null) {
             </el-button>
           </span>
         </div>
-        <div v-if="!loading && !users.length" class="tbl-empty">暂无用户</div>
+        <div v-if="!loading && !loadError && !users.length" class="tbl-empty">暂无用户</div>
       </div>
     </div>
 

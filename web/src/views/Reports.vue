@@ -59,10 +59,15 @@ const STATUS: Record<string, { label: string; color: string }> = {
 // 报告对象类型的中文映射（与审计页 targetType 口径一致，未知值回退原值）
 const SUBJECT_LABEL: Record<string, string> = { channel: '通道', monitor_group: '部位', group: '部位', channel_group: '部位', bolt: '螺栓', turbine: '风机' }
 
+// 拉取失败要说出来，不能显示成"暂无报告"——那会让人重复生成已经存在的报告
+const loadError = ref<string | null>(null)
 async function load() {
   loading.value = true
   try {
     items.value = (await reportApi.list(typeFilter.value)).items
+    loadError.value = null
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : '报告列表加载失败'
   } finally {
     loading.value = false
   }
@@ -101,6 +106,10 @@ function fmt(iso: string) {
           </el-select>
         </div>
       </div>
+      <div v-if="loadError" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 报告列表加载失败（下方可能是旧数据）：{{ loadError }}
+        <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
       <div class="tbl">
         <div class="tr th"><span>标题</span><span>类型</span><span>对象</span><span>状态</span><span>生成时间</span><span>操作</span></div>
         <div v-for="r in items" :key="r.id" class="tr">
@@ -115,7 +124,7 @@ function fmt(iso: string) {
             </el-button>
           </span>
         </div>
-        <div v-if="!loading && !items.length" class="tbl-empty">
+        <div v-if="!loading && !loadError && !items.length" class="tbl-empty">
           <el-icon><Document /></el-icon> 暂无报告。完成扭矩阶梯标定等流程后，可生成可追溯报告。
         </div>
       </div>

@@ -444,8 +444,6 @@ function limitOf(a: AlarmItem) {
 .tr.unacked--warn { box-shadow: inset 3px 0 0 var(--warn), inset 0 -1px 0 var(--hairline); }
 .tr.unacked--info { box-shadow: inset 3px 0 0 var(--info), inset 0 -1px 0 var(--hairline); }
 .tr.shv { grid-template-columns: 120px 130px 100px 1fr 168px 100px; }
-.load-error { display: flex; align-items: center; gap: 8px; margin: 4px 16px 8px; padding: 8px 12px; border: 1px solid var(--crit); border-radius: 8px; color: var(--crit); font-size: 12.5px; }
-
 .sev { display: flex; align-items: center; gap: 8px; }
 .msg { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .link { cursor: pointer; color: var(--accent); }

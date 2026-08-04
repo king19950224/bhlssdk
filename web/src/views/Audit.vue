@@ -25,12 +25,18 @@ function qs() {
   p.set('offset', String(offset.value))
   return '?' + p.toString()
 }
+// 查询失败不能显示成"无审计记录"：这一页是出事后追责的入口，
+// 把"查不到"和"没发生过"混为一谈，等于告诉查证的人当时没人动过。
+const loadError = ref<string | null>(null)
 async function load() {
   loading.value = true
   try {
     const d = await auditApi.query(qs())
     items.value = d.items
     hasMore.value = d.hasMore
+    loadError.value = null
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : '审计日志查询失败'
   } finally {
     loading.value = false
   }
@@ -88,6 +94,10 @@ onMounted(async () => {
         <span class="panel-title"><i class="hd-mark" />审计日志</span>
         <span class="hd-sub mono">{{ items.length }} 条</span>
       </div>
+      <div v-if="loadError" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 审计日志查询失败（下方可能是旧数据，不代表这段时间无人操作）：{{ loadError }}
+        <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
       <div class="tbl" v-loading="loading">
         <div class="tr th"><span>时间</span><span>操作人</span><span>动作</span><span>对象</span><span>说明</span></div>
         <div v-for="e in items" :key="e.id" class="tr">
@@ -97,7 +107,7 @@ onMounted(async () => {
           <span class="mono dim">{{ e.targetTypeLabel ? e.targetTypeLabel + '#' + e.targetId : '—' }}</span>
           <span class="note">{{ e.note || '—' }}</span>
         </div>
-        <div v-if="!loading && !items.length" class="tbl-empty">无审计记录</div>
+        <div v-if="!loading && !loadError && !items.length" class="tbl-empty">无审计记录</div>
       </div>
       <div class="pager">
         <el-button size="small" :disabled="offset === 0" @click="prevPage">上一页</el-button>
