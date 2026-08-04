@@ -119,20 +119,24 @@ public static class WiringTableEndpoints
                 deviceProjectId = pid;
             }
 
-            string groupCode = "";
             if (createBolts)
             {
-                await using var cmd = new NpgsqlCommand(
-                    "SELECT code, project_id FROM monitor_groups WHERE id = @gid AND deleted_at IS NULL", conn, tx);
-                cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, req.GroupId!.Value);
-                await using var r = await cmd.ExecuteReaderAsync(ct);
-                if (!await r.ReadAsync(ct))
+                // 先把值读出来、关掉 reader，再判。reader 开着的时候不能在同一连接上发别的命令
+                // （Npgsql 抛"命令正在执行中"），下面两处回滚都得等它关掉——否则这里给出的
+                // 404/400 会变成 500，导入的人只看到"服务器内部错误"，不知道是组填错了还是跨了项目。
+                long? groupProjectId = null;
+                await using (var cmd = new NpgsqlCommand(
+                    "SELECT project_id FROM monitor_groups WHERE id = @gid AND deleted_at IS NULL", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, req.GroupId!.Value);
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    if (await r.ReadAsync(ct)) groupProjectId = r.GetInt64(0);
+                }
+                if (groupProjectId is null)
                 {
                     await tx.RollbackAsync(ct);
                     return Results.NotFound(new { error = "监测组不存在", groupId = req.GroupId });
                 }
-                groupCode = r.GetString(0);
-                var groupProjectId = r.GetInt64(1);
                 if (groupProjectId != deviceProjectId)
                 {
                     await tx.RollbackAsync(ct);
