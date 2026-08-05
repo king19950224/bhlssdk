@@ -442,7 +442,7 @@ CREATE TABLE calibration_session_points (
 
 ---
 
-## 7. P1-D Windows 离线安装包
+## 7. P1-D Windows 离线安装包（部分实施：编排与工程就绪，编译彩排待 Windows）
 
 ### 7.1 前提
 
@@ -511,7 +511,7 @@ CREATE TABLE calibration_session_points (
 | 3 | P1-A 出站通知 | 5 | 已完成（0029 三表 + 发件箱入队 + 派发/webhook + 通知页）；真机联调列入交付验收 |
 | 4 | P1-B 多设备生命周期 | 8–10 | 已完成（两刀提交：supervisor 对账重构 + 设备 CRUD/容量/连带清理，见 §5.9） |
 | 5 | P1-C 载荷标定中心 | 10 | 与 P1-B 无硬依赖，可换序 |
-| 6 | P1-D 离线安装包 | 5 | 放最后，一次打包全部新功能；需 Windows 机 |
+| 6 | P1-D 离线安装包 | 5 | 部分完成：install-all.ps1 一条命令编排 + installer.iss 工程与组包说明已入库；Inno 编译与两轮彩排待 Windows 机（README 有验证清单） |
 
 P0 + P1 合计约 32–35 人天。里程碑建议：
 

@@ -203,6 +203,10 @@ dotnet run --project tools/LicenseSigner -- verify \
 
 服务注册完成后接着跑两件交付硬化：`setup-https.ps1`（§5）与 `register-backup-task.ps1`（§7.1）。
 
+**一条命令替代 §3 + §6 + HTTPS + 备份任务**：程序目录摆好后（app 内容、nssm、公钥），
+`deploy/windows/install-all.ps1` 会按序编排建库、迁移、注册服务、HTTPS、备份任务，
+结尾打印机器码；口令不传参就交互问，应用库口令可自动生成。单步出问题仍可拿对应脚本单独重跑。
+
 ---
 
 ## 7. 数据目录与保留策略
@@ -309,10 +313,10 @@ curl http://localhost:5000/api/health/ready
 
 ## 10. 仍待完成
 
-- **Inno Setup 一键安装包**（`deploy/installer/` 目前为空）：把 PG + TimescaleDB 二进制、.NET 运行时、
-  程序目录、迁移执行、服务注册、证书生成（setup-https.ps1）、备份任务注册打成单个 `.exe`。
-  当前按本手册手工部署可以完成交付，但每台机器的步骤较多、依赖人工不出错。
-  该安装包需要在 Windows 上构建与验证（设计见 product-design.md §7）。
+- **Inno Setup 一键安装包**：工程已建好（`deploy/installer/installer.iss` + 组包说明 README），
+  壳只管摆文件和拉前置，装机逻辑全在 `install-all.ps1`——手工部署与一键安装同一条编排。
+  尚未在 Windows 上编译与彩排，首次出包按 `deploy/installer/README.md` 的验证清单走。
+  在此之前，`install-all.ps1` 已把手工部署压成一条命令（见 §6）。
 - **Windows 实机验证**：本轮新增的 `setup-https.ps1` / `register-backup-task.ps1` 与既有 NSSM
   注册一样，逻辑在 macOS 上只能读查，需在 Windows 上跑通一遍（含恢复演练）。
 - **真机回归**：`资料/工程文档/delivery-master-plan.md` §1/§3 的实测项需在实验室或现场真机各走一轮。
