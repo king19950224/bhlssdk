@@ -18,7 +18,6 @@ const routes: RouteRecordRaw[] = [
       { path: 'assets', name: 'assets', component: () => import('../views/AssetMonitor.vue') },
       { path: 'bolts/:boltId', name: 'boltDetail', component: () => import('../views/BoltDetail.vue') },
       { path: 'alarms', name: 'alarms', component: () => import('../views/Alarms.vue') },
-      // M3：路由按角色守卫（meta.roles 与后端授权对齐；后端仍有 403 兜底，这里是纵深防御 + UX）
       { path: 'calibration', name: 'calibration', component: () => import('../views/Calibration.vue'), meta: { roles: ['reviewer', 'admin'] } },
       { path: 'config-changes', name: 'configChanges', component: () => import('../views/ConfigChanges.vue') },
       { path: 'audit', name: 'audit', component: () => import('../views/Audit.vue'), meta: { roles: ['reviewer', 'admin'] } },
@@ -40,7 +39,7 @@ router.beforeEach((to) => {
   const auth = useAuth()
   if (!to.meta.public && !auth.isAuthed) return { name: 'login', query: { r: to.fullPath } }
   if (to.name === 'login' && auth.isAuthed) return { name: auth.homeName }
-  // M3：角色守卫——meta.roles 指定允许角色；当前角色不满足则回各自首页（后端仍有 403 兜底，这里做纵深防御 + UX）
+  // 角色守卫：meta.roles 指定允许角色，不满足则回各自首页。后端每个端点仍有 403 兜底，这里只是别让人点进白屏页。
   const roles = to.meta.roles as string[] | undefined
   if (roles && (!auth.role || !roles.includes(auth.role))) {
     // 不再静默弹回首页：告知无权限,避免"点了没反应"的困惑

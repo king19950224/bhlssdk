@@ -275,9 +275,9 @@ const unitLabel = computed(() => (unit.value === 'kN' ? 'kN' : '%'))
 function chipDelta(c: LiveChan): number | null {
   const s = c.series
   if (s.length < 2) return null
-  const now = s[s.length - 1]
-  const past = [...s].reverse().find((p) => now.t - p.t >= 12000) ?? s[0]
-  return now.v - past.v
+  const last = s[s.length - 1]
+  const past = [...s].reverse().find((p) => last.t - p.t >= 12000) ?? s[0]
+  return last.v - past.v
 }
 // 卡片当前值用平滑后的读数，避免 ±量化抖动让大数字乱跳
 function curOf(c: LiveChan): number | null {

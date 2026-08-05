@@ -173,8 +173,11 @@ function isPending(it: ChannelLive) {
 function needsSpec(it: ChannelLive) {
   return it.boltId != null && it.targetPreloadN == null
 }
+// 信号强度条满格 = 峰峰值 1500：probe-scan 的合格线是 600（PeakToPeakMin），
+// 现场接好的探头一般在 600~1500 之间，1500 以上就按满格显示
+const SIG_FULL_P2P = 1500
 function sigPct(p2p: number | null) {
-  return Math.min(100, Math.round(((p2p ?? 0) / 1500) * 100))
+  return Math.min(100, Math.round(((p2p ?? 0) / SIG_FULL_P2P) * 100))
 }
 function isLive(ch: number) {
   return nowTick.value - (liveAt[ch] ?? 0) < 2500

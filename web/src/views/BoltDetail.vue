@@ -224,6 +224,7 @@ function toggleLive() {
 }
 
 // 松紧状态：当前回波声时相对基线(RefTime)的偏移。回波偏晚(ΔTOF+)=偏紧(预紧↑),偏早(ΔTOF−)=偏松(松动方向)
+const TIGHTNESS_DEADBAND_NS = 8
 const tightness = computed(() => {
   const refNs = chCfg.value?.refTimeNs != null ? Number(chCfg.value.refTimeNs) : null
   const echo = liveEchoNs.value
@@ -234,8 +235,10 @@ const tightness = computed(() => {
   let band: 'tight' | 'loose' | 'base'
   let label: string
   let color: string
-  if (dt >= 8) { band = 'tight'; label = '偏紧'; color = '#10b981' }
-  else if (dt <= -8) { band = 'loose'; label = '偏松'; color = '#f43f5e' }
+  // ±8ns 死区：健康探头的回波抖动合格线是 5ns（probe-scan EchoStdGoodNs），
+  // 留出余量取 8，噪声抖动不至于让"偏紧/偏松"标签来回跳
+  if (dt >= TIGHTNESS_DEADBAND_NS) { band = 'tight'; label = '偏紧'; color = '#10b981' }
+  else if (dt <= -TIGHTNESS_DEADBAND_NS) { band = 'loose'; label = '偏松'; color = '#f43f5e' }
   else { band = 'base'; label = '基线附近'; color = '#61748f' }
   return { dt, dF, band, label, color }
 })

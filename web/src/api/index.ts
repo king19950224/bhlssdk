@@ -351,9 +351,6 @@ export const deviceApi = {
     return http.post<{ triggered: boolean; deviceId: number; mode: string }>(
       `/api/devices/${deviceId}/diagnostic/set-mode/${mode}${q ? `?${q}` : ''}`)
   },
-  // 通道目录现状（channel_count / 活跃通道 / 目录缺失通道号）
-  channelCatalog: (deviceId: number) =>
-    http.get<ChannelCatalog>(`/api/devices/${deviceId}/channel-catalog/`),
   // 重建通道目录（reviewer+）：更新 channel_count、复活被删通道、补插缺失行，运行时即时生效
   rebuildChannelCatalog: (deviceId: number, channelCount: number, note?: string) =>
     http.post<ChannelCatalogRebuildResult>(`/api/devices/${deviceId}/channel-catalog/`, { channelCount, note }),
@@ -372,10 +369,6 @@ export interface DeviceSettings {
 export interface DeviceSettingsPatchResult {
   deviceId: number; defaultGroupId: number | null; defaultGroupCode: string | null
   enrolledBolts: { channelNo: number; boltId: number; code: string }[]
-}
-export interface ChannelCatalog {
-  deviceId: number; channelCount: number; activeChannels: number
-  missingChannels: number[]; extraActiveChannels: number; maxChannelCount: number
 }
 export interface ChannelCatalogRebuildResult {
   deviceId: number; channelCount: number; previousChannelCount: number
@@ -406,8 +399,6 @@ export const channelApi = {
     return http.get<{ count: number; items: ChannelRow[] }>(`/api/channels${q ? `?${q}` : ''}`)
   },
   unboundSummary: () => http.get<{ items: UnboundSummaryRow[] }>('/api/channels/unbound/summary'),
-  bind: (channelId: number, body: { boltId: number; calibrationAction?: string; backfillUnbound?: boolean; note?: string }) =>
-    http.post<{ bound?: boolean; moved?: boolean }>(`/api/channels/${channelId}/bind-bolt`, body),
   unbind: (channelId: number, note?: string) =>
     http.post<{ unbound: boolean; channelId: number; boltId: number }>(`/api/channels/${channelId}/unbind-bolt`, { note }),
 }
@@ -620,7 +611,6 @@ export const probeScanApi = {
     http.post<{ scanRunId: number; deviceId: number; status: string; estimatedSeconds: number; warning: string }>(
       `/api/devices/${deviceId}/channels/probe-scan/`, body),
   latest: (deviceId: number) => http.get<ProbeScanView>(`/api/devices/${deviceId}/channels/probe-scan/latest`),
-  get: (deviceId: number, scanRunId: number) => http.get<ProbeScanView>(`/api/devices/${deviceId}/channels/probe-scan/${scanRunId}`),
   abort: (deviceId: number, scanRunId: number) =>
     http.post<{ aborted: boolean; scanRunId: number }>(`/api/devices/${deviceId}/channels/probe-scan/${scanRunId}/abort`),
 }

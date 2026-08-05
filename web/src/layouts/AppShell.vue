@@ -48,8 +48,7 @@ const navGroups = [
   },
 ]
 
-// 菜单可见性与路由 meta.roles 对齐：admin-only 仅管理员、reviewer-only 复核员+管理员可见。
-// 纵深防御 + 一致体验（后端仍有 403 兜底）。
+// 菜单可见性与路由 meta.roles 对齐，免得点进去被守卫弹回来。
 function visibleItems(items: { name: string; label: string; icon: string; adminOnly?: boolean; reviewerOnly?: boolean }[]) {
   return items.filter((i) => (!i.adminOnly || auth.isAdmin) && (!i.reviewerOnly || auth.isReviewer))
 }

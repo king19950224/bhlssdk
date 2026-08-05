@@ -24,6 +24,7 @@ const posOf = (v: number | null) =>
   v == null ? null : Math.max(0, Math.min(100, ((v - range.value.lo) / range.value.span) * 100))
 
 const dangerEnd = computed(() => posOf(props.min) ?? 0)
+// 黄区上界 min×1.1 = preload.ts 的“接近下限”档（同一个 1.1，改要一起改）
 const warnEnd = computed(() => (props.min != null ? posOf(props.min * 1.1) ?? dangerEnd.value : dangerEnd.value))
 const curPos = computed(() => posOf(props.current))
 const minPos = computed(() => posOf(props.min))

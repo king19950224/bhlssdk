@@ -4,7 +4,7 @@
 
 export type PreloadStatus = 'normal' | 'warn' | 'loose' | 'high' | 'uncalibrated' | 'nodata'
 
-// 螺栓状态元数据（颜色/文案/LED 类）。AssetMonitor / FlangeRadar / HealthBar 等一律引用此表，
+// 螺栓状态元数据（颜色/文案/LED 类）。AssetMonitor / FlangeLayout / HealthBar 等一律引用此表，
 // 不再各自复制（历史上三处各写一份、颜色文案还不一致）。
 // high(偏高/超张力)：保持率 > 110%，用紫色——与总览"超张力"配色一致，且和 warn 的琥珀(偏低预警)区分开。
 // 只有 BigScreen.vue 例外，它自己留了一份：值班室墙上那块屏是隔着距离看的，

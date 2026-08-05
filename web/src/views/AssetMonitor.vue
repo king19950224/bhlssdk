@@ -1,10 +1,10 @@
 <script setup lang="ts">
-// 资产监测：按项目 → 风机 → 监测组一层层往下钻，法兰画成雷达图，组里的螺栓铺成网格卡。
+// 资产监测：按项目 → 风机 → 监测组一层层往下钻，法兰画成螺栓布置图，组里的螺栓铺成网格卡。
 import { onMounted, onUnmounted, ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import HealthBar from '../components/HealthBar.vue'
-import FlangeRadar from '../components/FlangeRadar.vue'
+import FlangeLayout from '../components/FlangeLayout.vue'
 import GroupTrend from '../components/GroupTrend.vue'
 import PreloadScale from '../components/PreloadScale.vue'
 import BoltCreateDialog from '../components/BoltCreateDialog.vue'
@@ -415,7 +415,7 @@ function onProjectChange() {
           <span class="hd-sub mono">{{ sel.group?.name }} · 监测 {{ bolts.length }} 颗（孔位 {{ sel.group?.expectedBoltCount ?? '—' }}）</span>
         </div>
         <div class="ring-body">
-          <FlangeRadar
+          <FlangeLayout
             v-if="bolts.length"
             :bolts="bolts"
             :total-holes="sel.group?.expectedBoltCount ?? null"
