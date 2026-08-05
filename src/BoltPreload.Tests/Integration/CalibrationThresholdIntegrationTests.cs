@@ -85,7 +85,6 @@ public sealed class CalibrationThresholdIntegrationTests
         (await _fx.ScalarAsync<bool>("SELECT passed FROM calibration_records WHERE id = @arg", warnId))
             .Should().BeFalse("留档记录本身要如实标记不合格");
 
-        // 这一条是本测试的要害：劣质拟合绝不能顶替在产的好标定
         (await _fx.ActiveCalibrationAsync(s.ChannelId)).Should().Be(goodId,
             "未达合格线的拟合只留档不激活，通道必须仍指向原来那份好标定");
         (await _fx.ScalarAsync<long>(

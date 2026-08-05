@@ -64,8 +64,7 @@ public sealed class RealJwtAuthIntegrationTests
         (await admin.PostAsync($"/api/auth/users/{victimId}/toggle", null))
             .StatusCode.Should().Be(HttpStatusCode.OK);
 
-        // 要害：令牌本身仍然签名有效、也没过期，必须靠这次复核当场拒掉。
-        // 这一步失败意味着被撤权的人还能继续写数据，直到令牌自然过期。
+        // 令牌本身仍然签名有效、也没过期，只能靠 token_version 复核当场拒掉
         (await victim.GetAsync("/api/auth/me")).StatusCode.Should().Be(HttpStatusCode.Unauthorized,
             "停用后旧令牌必须立即失效，而不是等它 8 小时后过期");
     }

@@ -10,7 +10,7 @@ using Xunit;
 namespace BoltPreload.Tests.Integration;
 
 /// <summary>
-/// HTTP 层端点集成测试（WebApplicationFactory；无 DB 时自动 Skip）。锁定本会话修复：
+/// HTTP 层端点集成测试（WebApplicationFactory；无 DB 时自动 Skip）。锁定两处行为：
 /// 1) 管理员免审批：admin 提交 configure-channel 直接落 approved；reviewer 仍 requested；
 /// 2) 入参校验：preload-trend 非法 bucket → 400。
 /// 测试替身（认证/license/去后台服务）见共享 harness <see cref="TestApi"/>。

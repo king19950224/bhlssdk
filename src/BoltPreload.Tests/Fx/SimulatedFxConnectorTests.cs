@@ -41,7 +41,6 @@ public class SimulatedFxConnectorTests
         // 至少收到一些数据（100Hz × 3 通道 × 2 秒 = 600 条，取 30 没问题）
         results.Should().HaveCountGreaterThan(10);
 
-        // 全部是 ChannelResult 类型
         results.Should().AllSatisfy(env =>
         {
             env.ResultType.Should().Be(FxResultType.ChannelResult);
@@ -53,11 +52,9 @@ public class SimulatedFxConnectorTests
             env.ChannelResult.Channel.Should().BeInRange((ushort)1, (ushort)3);
         });
 
-        // 3 个通道都有数据
         var channels = results.Select(r => r.ChannelResult!.Channel).Distinct().ToList();
         channels.Should().Contain(new ushort[] { 1, 2, 3 });
 
-        // 设备 ID 正确
         results.Should().AllSatisfy(env => env.DeviceId.Should().Be(42));
     }
 

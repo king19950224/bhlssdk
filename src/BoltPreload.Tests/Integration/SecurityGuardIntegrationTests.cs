@@ -9,7 +9,7 @@ using Xunit;
 namespace BoltPreload.Tests.Integration;
 
 /// <summary>
-/// 安全守卫端点集成测试（本轮审查修复的回归锁定）：
+/// 安全守卫端点集成测试：
 /// 1) 告警抑制：boltId 必填（禁止全局静默）、reason trim、shelve/cancel 写审计；
 /// 2) 用户管理：不能把最后一名 enabled admin 降权 / 停用；
 /// 3) 解绑通道：reviewer+（operator 403）；

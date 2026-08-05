@@ -50,7 +50,7 @@ public sealed class LoadCalibrationCountersignIntegrationTests
             "SELECT reviewer_user_id IS NULL FROM calibration_records WHERE id = @arg", calibId))
             .Should().BeTrue("尚未会签，不该有复核人");
 
-        // 本用例的要害：一个人单独提交，绝不能有任何东西进入生产
+        // 一个人单独提交，不能有任何东西进入生产
         (await _fx.ActiveCalibrationAsync(s.ChannelId)).Should().BeNull("提交只是入队待审，不生效");
         (await _fx.ScalarAsync<bool>("SELECT k_l IS NULL FROM channels WHERE id = @arg", s.ChannelId))
             .Should().BeTrue("未会签前不得把 K_L 写进通道");

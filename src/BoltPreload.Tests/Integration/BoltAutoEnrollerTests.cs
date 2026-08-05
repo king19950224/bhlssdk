@@ -166,7 +166,7 @@ public sealed class BoltAutoEnrollerTests
         return new BoltAutoEnroller(_fx.DataSource, resolver, NullLogger<BoltAutoEnroller>.Instance);
     }
 
-    private sealed record Seed(long GroupId, string GroupCode, long DeviceId, long ChannelId, ushort ChannelNo);
+    private sealed record Seed(long GroupId, long DeviceId, long ChannelId, ushort ChannelNo);
 
     private async Task<Seed> SeedAsync(
         int unboundRows = 0,
@@ -244,7 +244,7 @@ public sealed class BoltAutoEnrollerTests
             await cmd.ExecuteNonQueryAsync();
         }
 
-        return new Seed(groupId, groupCode, deviceId, channelId, (ushort)channelNo);
+        return new Seed(groupId, deviceId, channelId, (ushort)channelNo);
     }
 
     private async Task ExecAsync(string sql, long p0)

@@ -7,7 +7,7 @@ namespace BoltPreload.Tests.Integration;
 
 /// <summary>
 /// 沉降期窗口起点选取（预测/即将到限的 cal CTE）对真库的集成测试（无 DB 时自动 Skip）。
-/// 锁定本会话修复：cal 只取“当前生效”标定（superseded_by IS NULL 且 review_state IN ('approved','self_signed')），
+/// 锁定窗口起点的选取：cal 只取“当前生效”标定（superseded_by IS NULL 且 review_state IN ('approved','self_signed')），
 /// 否则被顶替/待复核的记录会把 max(created_at) 错误前移、饿死回归历史。
 /// </summary>
 [Collection("postgres")]

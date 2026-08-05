@@ -42,8 +42,6 @@ public class LocalFileLicenseServiceTests
     [Fact]
     public void MissingLicense_Production_WithFlag_IsInvalid()
     {
-        // 关键安全用例：即使配置文件里 AllowMissingLicenseInDevelopment=true，
-        // 非 Development 环境也必须无效，绝不能让生产裸奔。
         var status = NewService(allowMissing: true, isDevelopment: false).GetStatus();
         status.Valid.Should().BeFalse("非 Development 环境必须忽略该开关，按无效授权处理");
     }

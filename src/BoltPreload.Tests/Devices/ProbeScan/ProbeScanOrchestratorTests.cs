@@ -106,7 +106,6 @@ public class ProbeScanOrchestratorTests
 
         repo.GetStatus(view.ScanRunId).Should().Be("aborted");
 
-        // 关键不变量：abort 后 MultiMeas 必须被恢复
         connector.WorkModeCalls.Last().Mode.Should().Be(FxWorkMode.MultiMeas);
         state.IsRunning(1).Should().BeFalse();
     }
@@ -152,10 +151,7 @@ public class ProbeScanOrchestratorTests
         connector.McrConfigCalls.Should().Contain(call => call.SequenceEqual(new ushort[] { 3 }));
         connector.McrConfigCalls.Should().Contain(call => call.SequenceEqual(new ushort[] { 5 }));
 
-        // 关键：最后一次 MCR 必须是原始的 1-40 全集
         connector.McrConfigCalls.Last().Should().BeEquivalentTo(Enumerable.Range(1, 40).Select(i => (ushort)i));
-
-        // 工作模式最后必须是 MultiMeas
         connector.WorkModeCalls.Last().Mode.Should().Be(FxWorkMode.MultiMeas);
     }
 

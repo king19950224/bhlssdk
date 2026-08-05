@@ -220,7 +220,7 @@ public sealed class BoltProvisioningIntegrationTests
     // ===================== seed =====================
 
     private sealed record Seed(
-        long GroupId, string GroupCode, long DeviceId,
+        long GroupId, long DeviceId,
         long ChannelId, short ChannelNo, long ExtraChannelId);
 
     /// <summary>
@@ -277,7 +277,7 @@ public sealed class BoltProvisioningIntegrationTests
             await cmd.ExecuteNonQueryAsync();
         }
 
-        return new Seed(group.Id, group.Code, device.Id, channel.Id, channelNo, extra?.Id ?? 0);
+        return new Seed(group.Id, device.Id, channel.Id, channelNo, extra?.Id ?? 0);
     }
 
     private static Channel NewChannel(long deviceId, short channelNo, DateTimeOffset now) => new()
