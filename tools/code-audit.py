@@ -54,6 +54,7 @@ G3_LIVING_DOCS = [
     "资料/工程文档/torque-step-test-protocol.md",
     "资料/工程文档/commercialization-roadmap.md",
     "资料/工程文档/phase2-backlog.md",
+    "资料/工程文档/product-design.md",
 ]
 # 豁免的历史记录文档(带日期/阶段快照,保留当时原貌,不随重构改写):
 #   资料/工程文档/plan.md                               原始方案快照(K_L 口径等以 sdk-api-facts.md §12 为准)
