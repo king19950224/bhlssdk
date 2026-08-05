@@ -9,19 +9,27 @@ namespace BoltPreload.Application.Ingestion;
 
 /// <summary>
 /// 从 IFxConnector 消费数据，写入数据库。
-/// 一个 IFxConnector 对应一个设备，对应一个 IngestionService 任务。
+/// 一个 IFxConnector 对应一个设备，对应一条消费任务。
 /// </summary>
 /// <remarks>
-/// 每个设备运行时一条独立消费循环并发运行（单设备异常退避重启，不拖垮其它设备）；
+/// supervisor 对账模式：不再启动时取一次运行时数组，而是每 2 秒与
+/// <see cref="IDeviceConnectorManager.Runtimes"/> 对账——manager 有而任务表没有的起任务，
+/// 任务表有而 manager 没有的取消、等退出、释放连接器。设备热增删的接缝在 manager 写侧，
+/// 本服务只认对账结果。启动首轮对账起出的任务集与旧的"取一次数组"实现完全相同。
+/// 每设备一条独立消费循环并发运行（单设备异常退避重启，不拖垮其它设备）；
 /// 入库失败与背压溢出走 WAL 兜底，由 <c>WalReplayService</c> 重放补写。
 /// </remarks>
 public sealed class IngestionService : BackgroundService
 {
+    private static readonly TimeSpan ReconcileInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan StopGrace = TimeSpan.FromSeconds(15);
+
     private readonly IDeviceConnectorManager _deviceManager;
     private readonly IMeasurementSink _sink;
     private readonly IMeasurementPublisher _publisher;
     private readonly IMeasurementWal _wal;
     private readonly ChannelPresenceTracker _presence;
+    private readonly IngestionTaskRegistry _registry;
     private readonly ILogger<IngestionService> _logger;
 
     public IngestionService(
@@ -30,6 +38,7 @@ public sealed class IngestionService : BackgroundService
         IMeasurementPublisher publisher,
         IMeasurementWal wal,
         ChannelPresenceTracker presence,
+        IngestionTaskRegistry registry,
         ILogger<IngestionService> logger)
     {
         _deviceManager = deviceManager;
@@ -37,16 +46,104 @@ public sealed class IngestionService : BackgroundService
         _publisher = publisher;
         _wal = wal;
         _presence = presence;
+        _registry = registry;
         _logger = logger;
     }
 
+    private sealed record RunningRuntime(DeviceRuntimeContext Runtime, CancellationTokenSource Cts, Task Task);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var runtimes = _deviceManager.Runtimes.ToArray();
-        _logger.LogInformation("IngestionService 启动 runtimes={Count}", runtimes.Length);
+        var running = new Dictionary<long, RunningRuntime>();
+        _logger.LogInformation("IngestionService 启动（supervisor 对账模式）runtimes={Count}", _deviceManager.Runtimes.Count);
 
-        var tasks = runtimes.Select(runtime => RunRuntimeAsync(runtime, stoppingToken)).ToArray();
-        await Task.WhenAll(tasks);
+        try
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                StartMissing(running, stoppingToken);
+                await StopOrphanedAsync(running);
+                try
+                {
+                    await Task.Delay(ReconcileInterval, stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            // 停机：取消全部任务并等它们走完 finally（DisconnectAsync 收尾）。
+            // 连接器的释放不在这里做——字典里的运行时由 DeviceConnectorManager.DisposeAsync 统一释放，
+            // 与重构前一致；本服务只释放"被摘出字典的孤儿"（见 StopOrphanedAsync）。
+            foreach (var r in running.Values) r.Cts.Cancel();
+            // RunRuntimeAsync 吞掉一切非取消异常（兜底重启循环），取消路径正常 return，这里不会抛
+            await Task.WhenAll(running.Values.Select(r => r.Task));
+            foreach (var r in running.Values) r.Cts.Dispose();
+            _logger.LogInformation("IngestionService 停机，{Count} 条消费任务已退出", running.Count);
+        }
+    }
+
+    /// <summary>manager 有而任务表没有的设备：起消费任务（启动首轮 = 全量起动，此后 = 热加的设备）。</summary>
+    private void StartMissing(Dictionary<long, RunningRuntime> running, CancellationToken stoppingToken)
+    {
+        foreach (var runtime in _deviceManager.Runtimes)
+        {
+            if (running.ContainsKey(runtime.DeviceId))
+                continue;
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            var task = RunRuntimeAsync(runtime, cts.Token);
+            running[runtime.DeviceId] = new RunningRuntime(runtime, cts, task);
+            _registry.MarkStarted(runtime.DeviceId);
+        }
+    }
+
+    /// <summary>
+    /// 任务表有而 manager 没有的设备（被禁用/删除/重启连接）：取消任务、等退出、释放连接器。
+    /// 连接器必须在这里释放——它已不在 manager 字典里，停机路径不会再碰它，
+    /// 不释放就是半开 TCP 会话挂到进程退出（设备端可能拒绝下一次连接）。
+    /// </summary>
+    private async Task StopOrphanedAsync(Dictionary<long, RunningRuntime> running)
+    {
+        List<long>? orphaned = null;
+        var current = new HashSet<long>(_deviceManager.Runtimes.Select(r => r.DeviceId));
+        foreach (var id in running.Keys)
+        {
+            if (!current.Contains(id))
+                (orphaned ??= []).Add(id);
+        }
+        if (orphaned is null)
+            return;
+
+        foreach (var id in orphaned)
+        {
+            var r = running[id];
+            r.Cts.Cancel();
+            try
+            {
+                await r.Task.WaitAsync(StopGrace);
+            }
+            catch (TimeoutException)
+            {
+                // 任务卡死也照常继续释放：多半卡在 DB 写入或 SDK 调用上，
+                // 释放连接器会让阻塞的 IO 抛错收场，比无限等强
+                _logger.LogWarning("设备 {DeviceId} 的消费任务 {Grace}s 内未退出，强制释放连接器", id, StopGrace.TotalSeconds);
+            }
+            try
+            {
+                await r.Runtime.Connector.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "释放被摘除设备的连接器失败 device={DeviceId}", id);
+            }
+            r.Cts.Dispose();
+            running.Remove(id);
+            _registry.MarkStopped(id);
+            _logger.LogInformation("设备 {DeviceId} 已摘出采集（任务退出、连接器释放）", id);
+        }
     }
 
     private async Task RunRuntimeAsync(DeviceRuntimeContext runtime, CancellationToken stoppingToken)

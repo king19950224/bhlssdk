@@ -203,7 +203,8 @@ builder.Services.AddSingleton<IChannelPresencePublisher, SignalRChannelPresenceP
 builder.Services.AddSingleton<BoltPreload.Api.Runtime.BoltAutoEnroller>();
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.ChannelPresenceService>();
 
-// IngestionService 作为 BackgroundService 跑
+// IngestionService 作为 BackgroundService 跑（supervisor 对账模式；登记表给设备管理端点等停用信号）
+builder.Services.AddSingleton<IngestionTaskRegistry>();
 builder.Services.AddHostedService<IngestionService>();
 builder.Services.Configure<IngestionWatchdogOptions>(builder.Configuration.GetSection("Ingestion:Watchdog"));
 builder.Services.AddHostedService<IngestionWatchdogService>();

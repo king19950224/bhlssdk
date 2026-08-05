@@ -125,6 +125,7 @@ public sealed class IngestionServiceTests
             new FakeDeviceManager(connector),
             sink, publisher, wal,
             presence ?? new ChannelPresenceTracker(Options.Create(new ChannelPresenceOptions())),
+            new IngestionTaskRegistry(),
             NullLogger<IngestionService>.Instance);
         await svc.StartAsync(CancellationToken.None);
         return new RunningService(svc);
