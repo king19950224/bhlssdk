@@ -336,7 +336,7 @@ public sealed class AlarmPipelineIntegrationTests
         var cache = new MemoryCache(new MemoryCacheOptions { SizeLimit = 10_000 });
         var resolver = new CachedChannelResolver(_fx.DataSource, cache, NullLogger<CachedChannelResolver>.Instance);
         var evaluator = new StaticThresholdAlarmEvaluator(
-            Options.Create(new StaticThresholdAlarmOptions()), NullLogger<StaticThresholdAlarmEvaluator>.Instance);
+            new Tests.Alarm.FixedAlarmRuleProvider(), NullLogger<StaticThresholdAlarmEvaluator>.Instance);
         var alarmSink = new PostgresAlarmSink(_fx.DataSource, NullLogger<PostgresAlarmSink>.Instance);
         return new PostgresMeasurementSink(
             _fx.DataSource, resolver, NullLogger<PostgresMeasurementSink>.Instance,

@@ -30,9 +30,9 @@ var isDevelopment = builder.Environment.IsDevelopment();
 
 // ============================================================================
 // 仿真模式的生产防线，放在最前面，比任何配置校验都早
-// 模拟器只给开发和测试用。它吐出来的假预紧力物理上自洽、在界面上跟真数据一模一样，
-// 真跑到现场就是拿仿真数据当监测结果看——螺栓松了照样显示正常。宁可起不来也不能这么跑。
-// 没配 Fx:Mode 时按 Real 算（跟 DeviceConnectorManager 一个口径），绝不能一声不吭滑进仿真。
+// 模拟器只给开发和测试用。它出来的假预紧力物理上自洽、在界面上跟真数据一模一样，
+// 到现场就是拿仿真数据当监测结果看——螺栓松了照样显示正常。
+// 没配 Fx:Mode 时按 Real 算（跟 DeviceConnectorManager 一个口径）
 // ============================================================================
 var fxSimulated = string.Equals(builder.Configuration["Fx:Mode"] ?? "Real", "Simulated", StringComparison.OrdinalIgnoreCase);
 if (fxSimulated && builder.Environment.IsProduction())
@@ -147,8 +147,11 @@ builder.Services.AddSignalR(opts =>
 builder.Services.AddSingleton<IMeasurementPublisher, SignalRMeasurementPublisher>();
 builder.Services.AddSingleton<IAlarmPublisher, SignalRAlarmPublisher>();
 
-// 告警评估 + 持久化
+// 告警评估 + 持久化。appsettings 的 Alarm:StaticThreshold 是出厂兜底；
+// 库内 alarm_rules 按 bolt > group > global 覆盖，快照由 AlarmRuleRefreshService 定期刷新
 builder.Services.Configure<StaticThresholdAlarmOptions>(builder.Configuration.GetSection("Alarm:StaticThreshold"));
+builder.Services.AddSingleton<IAlarmRuleProvider, PostgresAlarmRuleProvider>();
+builder.Services.AddHostedService<AlarmRuleRefreshService>();
 builder.Services.AddSingleton<IAlarmEvaluator, StaticThresholdAlarmEvaluator>();
 builder.Services.AddSingleton<IAlarmSink, PostgresAlarmSink>();
 builder.Services.AddSingleton<IChannelConfigService, PostgresChannelConfigService>();
@@ -395,6 +398,7 @@ app.MapWiringTableEndpoints();
 app.MapCalibrationEndpoints();
 app.MapBoltEndpoints();
 app.MapAlarmEndpoints();
+app.MapAlarmRuleEndpoints();
 app.MapReportEndpoints();
 app.MapLicenseEndpoints();
 

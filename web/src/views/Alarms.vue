@@ -6,6 +6,7 @@ import { alarmApi, type AlarmItem, type AlarmSummaryRow, type AlarmShelving } fr
 import { onRealtime } from '../api/realtime'
 import { useNow } from '../utils/useNow'
 import { alarmTypeLabel } from '../utils/labels'
+import AlarmRulesPanel from '../components/AlarmRulesPanel.vue'
 
 // 告警中心（工业告警管理口径，参照 ISA-18.2 生命周期）：
 // 触发(未确认) → 确认(已知悉,仍开启) → 闭合(恢复/处置完成)。
@@ -18,6 +19,8 @@ const loading = ref(false)
 let timer: number | undefined
 let unsub: (() => void) | undefined
 
+// 页级切换：告警处置（默认） / 阈值规则（进库后的管理面，reviewer 才能改）
+const pageTab = ref<'dispose' | 'rules'>('dispose')
 // 状态段选：未闭合(默认) / 未确认 / 已闭合 / 全部
 const view = ref<'open' | 'unacked' | 'cleared' | 'all'>('open')
 const filterSeverity = ref('')
@@ -280,6 +283,12 @@ function limitOf(a: AlarmItem) {
 
 <template>
   <div class="alarms rise">
+    <div class="seg page-seg">
+      <span class="seg-tab" :class="{ active: pageTab === 'dispose' }" @click="pageTab = 'dispose'">告警处置</span>
+      <span class="seg-tab" :class="{ active: pageTab === 'rules' }" @click="pageTab = 'rules'">阈值规则</span>
+    </div>
+    <AlarmRulesPanel v-if="pageTab === 'rules'" />
+    <template v-else>
     <!-- 摘要：未确认是处置焦点（ISA-18.2），单列突出 -->
     <div class="sum-row">
       <div class="stat panel" :class="{ 'stat--crit': openUnacked > 0 }">
@@ -426,6 +435,7 @@ function limitOf(a: AlarmItem) {
         <el-button type="primary" :loading="shelve.saving" @click="confirmShelve">确认抑制</el-button>
       </template>
     </el-dialog>
+    </template>
   </div>
 </template>
 
@@ -445,6 +455,7 @@ function limitOf(a: AlarmItem) {
 
 .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .seg { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 9px; padding: 3px; }
+.page-seg { align-self: flex-start; }
 .seg-tab { font-size: 12.5px; padding: 5px 14px; border-radius: 6px; cursor: pointer; color: var(--text-3); }
 .seg-tab:hover { color: var(--text-1); }
 .seg-tab.active { color: var(--accent); background: rgba(34, 211, 238, 0.1); font-weight: 600; }

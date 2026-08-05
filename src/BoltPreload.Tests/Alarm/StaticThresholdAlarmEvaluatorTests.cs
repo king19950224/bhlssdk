@@ -1,7 +1,6 @@
 using BoltPreload.Application.Alarm;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace BoltPreload.Tests.Alarm;
@@ -13,8 +12,7 @@ namespace BoltPreload.Tests.Alarm;
 public class StaticThresholdAlarmEvaluatorTests
 {
     private static StaticThresholdAlarmEvaluator NewEvaluator(StaticThresholdAlarmOptions? opt = null) =>
-        new(Options.Create(opt ?? new StaticThresholdAlarmOptions()),
-            NullLogger<StaticThresholdAlarmEvaluator>.Instance);
+        new(new FixedAlarmRuleProvider(opt), NullLogger<StaticThresholdAlarmEvaluator>.Instance);
 
     private static AlarmInput Input(decimal ratio, long boltId = 1) =>
         new(BoltId: boltId, ChannelId: 1, Ts: DateTimeOffset.UtcNow,

@@ -19,7 +19,8 @@ public class DisplayLabelsTests
     // 删词条会让这里挂掉——老审计记录也要能翻译，不能因为代码不再产生就删。
     private static readonly string[] ActionsInUse =
     [
-        "alarm_ack", "alarm_clear", "alarm_shelve", "alarm_shelve_cancel",
+        "alarm_ack", "alarm_clear", "alarm_rule_approve", "alarm_rule_propose", "alarm_rule_reject",
+        "alarm_shelve", "alarm_shelve_cancel",
         "apply_torque_fit", "bolt_move_channel", "calibration_renew",
         "channel_accept", "channel_bind", "channel_commission", "channel_recalibrate",
         "channel_rename", "channel_unbind", "config_change_approve", "config_change_execute",
@@ -33,7 +34,7 @@ public class DisplayLabelsTests
     ];
 
     private static readonly string[] TargetTypesInUse =
-        ["alarm", "alarm_shelving", "bolt", "calibration", "channel", "device", "monitor_group", "report", "user"];
+        ["alarm", "alarm_rule", "alarm_shelving", "bolt", "calibration", "channel", "device", "monitor_group", "report", "user"];
 
     private static readonly string[] HardwareStatesInUse =
         ["healthy", "noisy", "suspect", "no_data", "no_probe", "unknown"];

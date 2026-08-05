@@ -11,7 +11,7 @@ import { alarmTypeLabel, calibrationMethodLabel } from '../utils/labels'
 import { useNow } from '../utils/useNow'
 import { analyzeAscan } from '../utils/ascan'
 import { downloadFile } from '../utils/download'
-import { boltApi, alarmApi, auditApi, waveApi, configChangeApi, deviceApi, calibrationApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction } from '../api'
+import { boltApi, alarmApi, alarmRuleApi, auditApi, waveApi, configChangeApi, deviceApi, calibrationApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction, type EffectiveAlarmRule } from '../api'
 import { ApiError } from '../api/client'
 import { onRealtime } from '../api/realtime'
 import { useAuth } from '../stores/auth'
@@ -58,6 +58,9 @@ const wave = ref<WaveFile | null>(null)
 const waveFeat = ref<WaveFeature | null>(null)
 
 const chCfg = ref<BoltChannelConfig | null>(null)
+// 生效的告警阈值及来源级别（bolt/group/global/default），来自 alarm_rules 三级解析
+const effRule = ref<EffectiveAlarmRule | null>(null)
+const EFF_SOURCE: Record<string, string> = { bolt: '螺栓级规则', group: '部位级规则', global: '全站规则', default: '出厂默认' }
 const adjust = reactive({ visible: false, saving: false })
 const adjForm = reactive({ gain: null as number | null, probeFreqMhz: null as number | null, echoWinNs: null as number | null })
 
@@ -333,6 +336,7 @@ const loadErr = ref<string | null>(null)
 async function init() {
   loading.value = true
   loadErr.value = null
+  effRule.value = null
   try {
     try {
       bolt.value = await boltApi.get(boltId)
@@ -340,6 +344,9 @@ async function init() {
       bolt.value = null
       if (!(e instanceof ApiError && e.status === 404))
         loadErr.value = (e as Error)?.message || '加载失败'
+    }
+    if (bolt.value) {
+      try { effRule.value = await alarmRuleApi.effective(boltId) } catch { /* 阈值展示缺席不阻断本页 */ }
     }
     await loadTrend()
     try { pred.value = await boltApi.prediction(boltId) } catch { /* 预测不可用 */ }
@@ -726,6 +733,9 @@ async function exportTrendCsv() {
       <div class="stat panel">
         <div class="stat-hd"><span class="stat-label">目标 / 下限</span><el-icon class="stat-ic"><Aim /></el-icon></div>
         <div class="stat-val metric stat-val--sm">{{ fmtN(bolt.targetPreloadN) }} / {{ fmtN(bolt.minPreloadN) }}</div>
+        <div v-if="effRule" class="stat-foot" :title="effRule.reason ?? ''">
+          告警限 &lt;{{ (effRule.triggerLowRatio * 100).toFixed(0) }}% / &gt;{{ (effRule.triggerHighRatio * 100).toFixed(0) }}% · {{ EFF_SOURCE[effRule.source] }}
+        </div>
       </div>
       <div class="stat panel">
         <div class="stat-hd"><span class="stat-label">温度</span><el-icon class="stat-ic"><Sunny /></el-icon></div>

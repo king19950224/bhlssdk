@@ -36,6 +36,11 @@ public static class DisplayLabels
         ["alarm_shelve"] = "告警抑制",
         ["alarm_shelve_cancel"] = "取消抑制",
 
+        // 告警阈值规则（两步异人复核）
+        ["alarm_rule_propose"] = "提案告警阈值",
+        ["alarm_rule_approve"] = "批准告警阈值",
+        ["alarm_rule_reject"] = "驳回告警阈值",
+
         // 通道与螺栓
         ["sync_channel_config"] = "同步通道配置",
         ["move_bolt_channel"] = "螺栓换通道",
@@ -71,6 +76,7 @@ public static class DisplayLabels
         ["bolt"] = "螺栓",
         ["alarm"] = "告警",
         ["alarm_shelving"] = "告警抑制",
+        ["alarm_rule"] = "告警阈值规则",
         ["calibration"] = "标定",
         ["report"] = "报告",
         ["user"] = "用户",

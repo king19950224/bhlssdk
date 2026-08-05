@@ -1,10 +1,12 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 namespace BoltPreload.Application.Alarm;
 
-/// <summary>静态阈值告警配置（appsettings 的 Alarm:StaticThreshold 节），触发/恢复双阈值防抖。</summary>
+/// <summary>
+/// 静态阈值告警参数，触发/恢复双阈值防抖。appsettings 的 Alarm:StaticThreshold 节是出厂兜底；
+/// 库内 alarm_rules 可按 global/group/bolt 三级覆盖，经 <see cref="IAlarmRuleProvider"/> 解析。
+/// </summary>
 public sealed class StaticThresholdAlarmOptions
 {
     /// <summary>触发下限（preload_ratio）。低于此值连续 N 次 → preload_low 告警。</summary>
@@ -43,19 +45,22 @@ public sealed class StaticThresholdAlarmOptions
 /// </para>
 /// <para>
 /// 每个 bolt 一个状态机。线程安全：用 lock 保证状态机原子性。
+/// 阈值每次评估时按 boltId 向 <see cref="IAlarmRuleProvider"/> 取（bolt &gt; group &gt; global &gt; 兜底）；
+/// 规则切换不重置状态机——streak 计数保留、按新阈值继续判，语义等价于运行中调整阈值，
+/// 回差带保证边界不抖。
 /// 告警抑制/搁置由告警中心接口（AlarmEndpoints）在管理层实现，本评估器保持纯阈值判定；
 /// 趋势类判据（CUSUM/EWMA）为后续增强方向。
 /// </para>
 /// </summary>
 public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
 {
-    private readonly StaticThresholdAlarmOptions _opt;
+    private readonly IAlarmRuleProvider _rules;
     private readonly ILogger<StaticThresholdAlarmEvaluator> _logger;
     private readonly ConcurrentDictionary<long, BoltAlarmState> _states = new();
 
-    public StaticThresholdAlarmEvaluator(IOptions<StaticThresholdAlarmOptions> opt, ILogger<StaticThresholdAlarmEvaluator> logger)
+    public StaticThresholdAlarmEvaluator(IAlarmRuleProvider rules, ILogger<StaticThresholdAlarmEvaluator> logger)
     {
-        _opt = opt.Value;
+        _rules = rules;
         _logger = logger;
     }
 
@@ -65,6 +70,7 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             return Array.Empty<AlarmEvent>();
 
         var ratio = input.PreloadRatio.Value;
+        var opt = _rules.Resolve(input.BoltId);
         var state = _states.GetOrAdd(input.BoltId, _ => new BoltAlarmState());
 
         lock (state)
@@ -73,14 +79,14 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
 
             // === 预紧力脱落（critical，不走 on-delay；这是危及安全的状态，宁可误报 5 条也不能漏）===
             // 注意：旧版本曾把 ratio==0 当"无效数据"跳过，那其实是"螺栓松脱"的最严重情况，必须报警。
-            if (ratio <= _opt.PreloadLossRatio)
+            if (ratio <= opt.PreloadLossRatio)
             {
                 if (!state.LowActive)
                 {
-                    events.Add(BuildTriggerEvent("preload_loss", "critical", input, 1));
+                    events.Add(BuildTriggerEvent("preload_loss", "critical", input, 1, opt));
                     state.LowActive = true;
                     state.LowAlarmType = "preload_loss";   // 记住 low 槽当前是 loss，恢复时关闭正确的 alarm 行
-                    state.LowTriggerStreak = _opt.TriggerConsecutive;
+                    state.LowTriggerStreak = opt.TriggerConsecutive;
                     state.LowClearStreak = 0;
                 }
                 else if (state.LowAlarmType != "preload_loss")
@@ -88,8 +94,8 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                     // 升级：已开 preload_low，继续跌进脱落区 → 关闭 low 行并升级为 preload_loss critical。
                     // 真实失效多是"渐松→脱落"的渐变过程；若不升级，最危险的"脱落，立即停机"告警会被
                     // 先开的 preload_low 永久压住（loss 触发被 !LowActive 挡掉），导致漏报最严重状态。
-                    events.Add(BuildClearEvent(state.LowAlarmType, input));
-                    events.Add(BuildTriggerEvent("preload_loss", "critical", input, _opt.TriggerConsecutive));
+                    events.Add(BuildClearEvent(state.LowAlarmType, input, opt));
+                    events.Add(BuildTriggerEvent("preload_loss", "critical", input, opt.TriggerConsecutive, opt));
                     state.LowAlarmType = "preload_loss";
                     state.LowClearStreak = 0;
                 }
@@ -99,13 +105,13 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             // === 下限分支 ===
             if (state.LowActive)
             {
-                if (ratio >= _opt.ClearLowRatio)
+                if (ratio >= opt.ClearLowRatio)
                 {
                     state.LowClearStreak++;
-                    if (state.LowClearStreak >= _opt.ClearConsecutive)
+                    if (state.LowClearStreak >= opt.ClearConsecutive)
                     {
                         // 关闭当前 low 槽实际开启的类型（preload_low 或 preload_loss），不要写死 preload_low
-                        events.Add(BuildClearEvent(state.LowAlarmType, input));
+                        events.Add(BuildClearEvent(state.LowAlarmType, input, opt));
                         state.LowActive = false;
                         state.LowAlarmType = "preload_low";
                         state.LowTriggerStreak = 0;
@@ -119,13 +125,13 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             }
             else
             {
-                if (ratio < _opt.TriggerLowRatio)
+                if (ratio < opt.TriggerLowRatio)
                 {
                     state.LowTriggerStreak++;
-                    if (state.LowTriggerStreak >= _opt.TriggerConsecutive)
+                    if (state.LowTriggerStreak >= opt.TriggerConsecutive)
                     {
-                        var sev = ClassifySeverity(ratio);
-                        events.Add(BuildTriggerEvent("preload_low", sev, input, state.LowTriggerStreak));
+                        var sev = ClassifySeverity(ratio, opt);
+                        events.Add(BuildTriggerEvent("preload_low", sev, input, state.LowTriggerStreak, opt));
                         state.LowActive = true;
                         state.LowAlarmType = "preload_low";
                         state.LowClearStreak = 0;
@@ -140,12 +146,12 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             // === 上限分支（与下限对称）===
             if (state.HighActive)
             {
-                if (ratio <= _opt.ClearHighRatio)
+                if (ratio <= opt.ClearHighRatio)
                 {
                     state.HighClearStreak++;
-                    if (state.HighClearStreak >= _opt.ClearConsecutive)
+                    if (state.HighClearStreak >= opt.ClearConsecutive)
                     {
-                        events.Add(BuildClearEvent("preload_high", input));
+                        events.Add(BuildClearEvent("preload_high", input, opt));
                         state.HighActive = false;
                         state.HighTriggerStreak = 0;
                         state.HighClearStreak = 0;
@@ -158,13 +164,13 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             }
             else
             {
-                if (ratio > _opt.TriggerHighRatio)
+                if (ratio > opt.TriggerHighRatio)
                 {
                     state.HighTriggerStreak++;
-                    if (state.HighTriggerStreak >= _opt.TriggerConsecutive)
+                    if (state.HighTriggerStreak >= opt.TriggerConsecutive)
                     {
-                        var sev = ClassifySeverity(ratio);
-                        events.Add(BuildTriggerEvent("preload_high", sev, input, state.HighTriggerStreak));
+                        var sev = ClassifySeverity(ratio, opt);
+                        events.Add(BuildTriggerEvent("preload_high", sev, input, state.HighTriggerStreak, opt));
                         state.HighActive = true;
                         state.HighClearStreak = 0;
                     }
@@ -191,16 +197,17 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             return null;
 
         var ratio = input.PreloadRatio.Value;
+        var opt = _rules.Resolve(input.BoltId);
 
         // 预紧力脱落：最高危，立即 critical（与有状态分支一致，脱落不走 on-delay）
-        if (ratio <= _opt.PreloadLossRatio)
-            return BuildTriggerEvent("preload_loss", "critical", input, 1);
+        if (ratio <= opt.PreloadLossRatio)
+            return BuildTriggerEvent("preload_loss", "critical", input, 1, opt);
 
         // 严重偏低 / 偏高：越过触发阈值且偏差达 critical 档（默认 30%）
-        if (ratio < _opt.TriggerLowRatio && Math.Abs(1m - ratio) >= _opt.CriticalDeviation)
-            return BuildTriggerEvent("preload_low", "critical", input, 1);
-        if (ratio > _opt.TriggerHighRatio && Math.Abs(1m - ratio) >= _opt.CriticalDeviation)
-            return BuildTriggerEvent("preload_high", "critical", input, 1);
+        if (ratio < opt.TriggerLowRatio && Math.Abs(1m - ratio) >= opt.CriticalDeviation)
+            return BuildTriggerEvent("preload_low", "critical", input, 1, opt);
+        if (ratio > opt.TriggerHighRatio && Math.Abs(1m - ratio) >= opt.CriticalDeviation)
+            return BuildTriggerEvent("preload_high", "critical", input, 1, opt);
 
         return null;
     }
@@ -215,6 +222,7 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
         if (!_states.TryGetValue(ev.BoltId, out var state))
             return;
 
+        var opt = _rules.Resolve(ev.BoltId);
         lock (state)
         {
             switch (ev.Action)
@@ -223,13 +231,13 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                 case AlarmAction.Trigger when ev.Type is "preload_low" or "preload_loss":
                     state.LowActive = false;
                     state.LowAlarmType = "preload_low";
-                    state.LowTriggerStreak = Math.Max(0, _opt.TriggerConsecutive - 1);
+                    state.LowTriggerStreak = Math.Max(0, opt.TriggerConsecutive - 1);
                     state.LowClearStreak = 0;
                     break;
 
                 case AlarmAction.Trigger when ev.Type == "preload_high":
                     state.HighActive = false;
-                    state.HighTriggerStreak = Math.Max(0, _opt.TriggerConsecutive - 1);
+                    state.HighTriggerStreak = Math.Max(0, opt.TriggerConsecutive - 1);
                     state.HighClearStreak = 0;
                     break;
 
@@ -237,12 +245,12 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                 case AlarmAction.Clear when ev.Type is "preload_low" or "preload_loss":
                     state.LowActive = true;
                     state.LowAlarmType = ev.Type;
-                    state.LowClearStreak = Math.Max(0, _opt.ClearConsecutive - 1);
+                    state.LowClearStreak = Math.Max(0, opt.ClearConsecutive - 1);
                     break;
 
                 case AlarmAction.Clear when ev.Type == "preload_high":
                     state.HighActive = true;
-                    state.HighClearStreak = Math.Max(0, _opt.ClearConsecutive - 1);
+                    state.HighClearStreak = Math.Max(0, opt.ClearConsecutive - 1);
                     break;
             }
         }
@@ -252,10 +260,10 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
     /// 根据偏离目标的程度分级（GB/T 41261 三级警告：info / warn / critical）。
     /// |1 - ratio| ≥ CriticalDeviation 即 critical（默认 30% 偏离）。
     /// </summary>
-    private string ClassifySeverity(decimal ratio)
+    private static string ClassifySeverity(decimal ratio, StaticThresholdAlarmOptions opt)
     {
         var deviation = Math.Abs(1m - ratio);
-        return deviation >= _opt.CriticalDeviation ? "critical" : "warn";
+        return deviation >= opt.CriticalDeviation ? "critical" : "warn";
     }
 
     /// <summary>
@@ -284,7 +292,8 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
         _logger.LogInformation("从 DB 恢复 {Count} 条开启告警的内存状态", openAlarms.Count());
     }
 
-    private AlarmEvent BuildTriggerEvent(string type, string severity, AlarmInput input, int streak) =>
+    // 事件里快照的是本次评估实际用的阈值（可能来自 bolt/group/global 任一级），落到 alarms 行可追溯
+    private static AlarmEvent BuildTriggerEvent(string type, string severity, AlarmInput input, int streak, StaticThresholdAlarmOptions opt) =>
         new(
             Action: AlarmAction.Trigger,
             BoltId: input.BoltId,
@@ -295,12 +304,12 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             PreloadN: input.PreloadN,
             PreloadRatio: input.PreloadRatio,
             TargetPreloadN: input.TargetPreloadN,
-            ThresholdLowRatio: _opt.TriggerLowRatio,
-            ThresholdHighRatio: _opt.TriggerHighRatio,
+            ThresholdLowRatio: opt.TriggerLowRatio,
+            ThresholdHighRatio: opt.TriggerHighRatio,
             ConsecutiveCount: streak,
             Message: BuildMessage(type, input));
 
-    private AlarmEvent BuildClearEvent(string type, AlarmInput input) =>
+    private static AlarmEvent BuildClearEvent(string type, AlarmInput input, StaticThresholdAlarmOptions opt) =>
         new(
             Action: AlarmAction.Clear,
             BoltId: input.BoltId,
@@ -311,8 +320,8 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             PreloadN: input.PreloadN,
             PreloadRatio: input.PreloadRatio,
             TargetPreloadN: input.TargetPreloadN,
-            ThresholdLowRatio: _opt.TriggerLowRatio,
-            ThresholdHighRatio: _opt.TriggerHighRatio,
+            ThresholdLowRatio: opt.TriggerLowRatio,
+            ThresholdHighRatio: opt.TriggerHighRatio,
             ConsecutiveCount: 0,
             Message: $"{TypeLabel(type)}已恢复（当前为目标的 {(input.PreloadRatio != null ? (input.PreloadRatio.Value * 100m).ToString("F1") + "%" : "—")}）");
 

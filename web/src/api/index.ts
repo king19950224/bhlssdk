@@ -112,6 +112,73 @@ export const alarmApi = {
   cancelShelve: (id: number) => http.post(`/api/alarms/shelve/${id}/cancel`),
 }
 
+// ---- 告警阈值规则（三级 scope + 两步异人复核，出厂兜底在 appsettings） ----
+export interface AlarmRule {
+  id: number
+  scope: 'global' | 'group' | 'bolt'
+  groupId: number | null
+  groupCode: string | null
+  boltId: number | null
+  boltCode: string | null
+  triggerLowRatio: number
+  clearLowRatio: number
+  triggerHighRatio: number
+  clearHighRatio: number
+  triggerConsecutive: number
+  clearConsecutive: number
+  criticalDeviation: number
+  preloadLossRatio: number
+  reason: string
+  reviewState: 'pending' | 'active' | 'rejected' | 'superseded'
+  createdBy: number
+  createdByName: string | null
+  createdAt: string
+  reviewedByName: string | null
+  reviewedAt: string | null
+}
+export interface AlarmRuleProposeBody {
+  scope: 'global' | 'group' | 'bolt'
+  groupId?: number | null
+  boltId?: number | null
+  triggerLowRatio: number
+  clearLowRatio: number
+  triggerHighRatio: number
+  clearHighRatio: number
+  triggerConsecutive: number
+  clearConsecutive: number
+  criticalDeviation: number
+  preloadLossRatio: number
+  reason: string
+}
+// 某颗螺栓生效的阈值及来源级别；source=default 表示库里没有可用规则、走 appsettings 出厂值
+export interface EffectiveAlarmRule {
+  boltId: number
+  source: 'bolt' | 'group' | 'global' | 'default'
+  ruleId: number | null
+  triggerLowRatio: number
+  clearLowRatio: number
+  triggerHighRatio: number
+  clearHighRatio: number
+  triggerConsecutive: number
+  clearConsecutive: number
+  criticalDeviation: number
+  preloadLossRatio: number
+  reason: string | null
+  approvedAt: string | null
+}
+export interface AlarmRuleTargets {
+  groups: { id: number; code: string; name: string }[]
+  bolts: { id: number; code: string; groupCode: string }[]
+}
+export const alarmRuleApi = {
+  list: () => http.get<{ count: number; items: AlarmRule[] }>('/api/alarm-rules/'),
+  targets: () => http.get<AlarmRuleTargets>('/api/alarm-rules/targets'),
+  propose: (body: AlarmRuleProposeBody) => http.post<{ id: number; reviewState: string }>('/api/alarm-rules/', body),
+  approve: (id: number) => http.post<{ id: number; reviewState: string }>(`/api/alarm-rules/${id}/approve`),
+  reject: (id: number, note?: string) => http.post<{ id: number; reviewState: string }>(`/api/alarm-rules/${id}/reject`, { note }),
+  effective: (boltId: number) => http.get<EffectiveAlarmRule>(`/api/bolts/${boltId}/effective-alarm-rule`),
+}
+
 // ---- 参数变更审批 ----
 export interface ConfigChange {
   id: number
