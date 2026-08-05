@@ -1,6 +1,6 @@
 # 商业化工业软件路线图
 
-本文件是 `commercial_roadmap` 的落地执行版，用于指导后续开发，不替代总体方案。
+用于指导后续开发，不替代总体方案（plan.md）。
 
 ## 当前产品级别
 
@@ -13,15 +13,15 @@
 - Watchdog 自动恢复。
 - Vue Dashboard。
 - 基础告警。
+- 参数变更复核流程（requested → approved → executed → verified，双人复核，见 0016 迁移与 ConfigChanges 页）。
+- License 授权（RSA-SHA256 验签 + tools/LicenseSigner 签发，容量限额与写操作拦截）。
 
 仍不具备：
 
 - 多设备运行时完整管理。
-- 参数变更复核流程。
 - 正式载荷标定中心。
 - 波形诊断中心完整 UI。
 - Windows 离线安装包。
-- License 授权。
 
 ## 已经落地的商业化底座
 
@@ -58,17 +58,15 @@
    - 授权状态接口 `/api/license/status`。
    - 离线 `license.json` 模板。
    - runtime 接口暴露当前设备数/通道数与授权上限。
-   - Phase 1 只做格式和机器码校验，Phase 2 换 RSA/ECDSA 签名校验。
+   - RSA-SHA256 签名校验已落地（LocalFileLicenseService 验签 + tools/LicenseSigner 签发）。
 
 ## 下一轮建议
 
-优先级：
+优先级（参数审批与 License 签名已交付，从清单销掉）：
 
 1. 多设备动态加载：从 `devices` 表加载多个 runtime。
-2. 参数变更审批：requested → approved → executed → verified。
-3. 波形诊断 UI：A-Scan、阈值、零交叉、SNR。
-4. 标定中心 UI：标定点、拟合线、报告导出。
-5. License：机器码、通道数、到期时间。
+2. 波形诊断 UI：A-Scan、阈值、零交叉、SNR。
+3. 标定中心 UI：标定点、拟合线、报告导出。
 
 ## 商业风险提醒
 

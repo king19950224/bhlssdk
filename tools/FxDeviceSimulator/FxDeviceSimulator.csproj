@@ -6,12 +6,7 @@
     <OutputType>Exe</OutputType>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
-    <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
-    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
-  </ItemGroup>
-
-  <!-- 模拟器独立于 SDK 实现，按厂家协议帧自己构造数据，避免对 SDK 的耦合（§9.16 SDK 供应商风险） -->
+  <!-- 模拟器独立于 SDK 实现，按厂家协议帧自己构造数据，避免对 SDK 的耦合（§9.16 SDK 供应商风险）。
+       当前是 Phase 1 占位（纯 Console），不带依赖；Phase 2 动工时再按需加包。 -->
 
 </Project>

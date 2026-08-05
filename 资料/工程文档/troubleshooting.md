@@ -232,9 +232,8 @@ docker compose -f deploy/docker-compose.yml exec postgres \
   psql -U boltpreload -d boltpreload -c "SELECT id, channel_id, code FROM bolts;"
 ```
 
-应该看到 3 颗螺栓 M16-001/002/003。
-
-如果空，跑 `bash setup.sh reset` 重新初始化。
+种子不预插螺栓：模拟器跑起来约 30 秒后，自动建档会按在位通道生成螺栓（code 形如 通道位号）。
+一直是空的话先确认 API 在跑、`Fx:Mode=Simulated` 已设；设备行都没有就跑 `bash setup.sh reset` 重新初始化。
 
 ### API 启动报 "PartitioningStrategy not supported"
 
@@ -249,8 +248,10 @@ docker compose -f deploy/docker-compose.yml exec postgres \
 **排查 1**：模拟器在跑吗？看 API 日志，应该有：
 
 ```
-模拟器开始连接 device=1, channels=3, rate=5Hz
+模拟器开始连接 device=1, channels=12, rate=5Hz
 ```
+
+（通道数跟 `Fx:Simulator:ChannelCount` 配置走，当前默认 12。）
 
 如果没有，IFxConnector 的注册有问题。
 

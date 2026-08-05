@@ -63,7 +63,7 @@ B/S 架构，几处关键设计：
 |---|---|
 | 数据库 | PostgreSQL 16 + TimescaleDB 2.17（时序扩展） |
 | 开发环境 | Docker 容器运行（deploy/docker-compose.yml），仅供开发 |
-| 生产环境 | Windows 工控机原生安装（Inno Setup 打包），不使用 Docker|
+| 生产环境 | Windows 工控机原生安装，不使用 Docker（步骤见 deployment-guide；Inno Setup 打包待做） |
 | 结构变更 | SQL 迁移脚本 deploy/sql/0001~00NN_*.sql，按文件名序号顺序执行，不使用 EF 迁移 |
 
 ### 2.4 开发工具要求
@@ -414,7 +414,7 @@ curl http://localhost:5085/api/measurements/latest | jq
 |---|---|
 | 修改后端 | 修改后 `./dev.sh restart`，或在 IDE 中直接 Debug 运行 BoltPreload.Api |
 | 修改前端 | Vite 热更新，保存即生效 |
-| 修改表结构 | `deploy/sql/` 新增序号脚本 + `deploy/docker-compose.yml` 挂载列表加一行，执行 `bash setup.sh reset` 重建（会清空数据） |
+| 修改表结构 | `deploy/sql/` 新增序号脚本（compose 挂载整个目录，不用改 compose），执行 `bash setup.sh reset` 重建（会清空数据） |
 | 运行测试 | `dotnet test BoltPreload.sln` |
 
 ### 6.7 接入真实设备
@@ -463,12 +463,12 @@ bhlssdk/
 │   ├── BoltPreload.Api/             # ASP.NET Core 入口：Endpoints、Hubs、Auth
 │   └── BoltPreload.Tests/           # 单元测试 + 集成测试
 ├── web/                             # Vue 3 前端，页面位于 src/views/
-├── external/FxSDK/                  # 厂家 SDK 源码拷贝（禁止修改 .cs）
+├── external/FxSDK/                  # 厂家 SDK 源码拷贝（我方改动逐条记录在 sdk-changelog.md）
 ├── deploy/
 │   ├── docker-compose.yml           # 开发数据库
 │   ├── sql/                         # 数据库迁移脚本，按序号执行
-│   └── windows/ installer/          # 工控机部署、Inno Setup
-├── tools/FxDeviceSimulator/         # 独立 TCP 层设备模拟器
+│   └── windows/                     # 工控机部署脚本（installer/ 为 Inno Setup 预留，现为空）
+├── tools/FxDeviceSimulator/         # 独立 TCP 层设备模拟器（Phase 2 占位，现只有空跑）
 └── 资料/
     ├── 工程文档/                    # 全部工程/运维文档（本文件所在目录，不随客户交付）
     └── …                            # 厂家原始包、软著/会议材料等（不进 git）
@@ -478,7 +478,7 @@ bhlssdk/
 
 1. 算法、阈值、报警规则的修改必须可追溯至国家标准、SDK 源码或现场标定数据，不接受无依据的经验值；
 2. SDK 字段、状态码、常量问题以 `资料/工程文档/sdk-api-facts.md` 为准，不以 Java 1.0 文档为依据；
-3. 禁止修改 `external/FxSDK/` 下的 `.cs` 文件；需要扩展行为时在 `BoltPreload.Fx` 适配层实现；
+3. `external/FxSDK/` 是厂家源码拷贝，业务扩展一律放 `BoltPreload.Fx` 适配层；确需修改 SDK 本体（如解码韧性、心跳）时，逐条记录进 `sdk-changelog.md` 并配回归测试，方便厂家升级时对差异；
 4. K_L 量纲约定：全系统 `K_L = Δt/F`，单位 ns/N，量级约 1e-4。标定证书上 1/N 量纲（约 1e-11）的数值不可直接录入，接口已设量级护栏，详见 sdk-api-facts.md §12；
 5. 工程开启编译警告即错误（TreatWarningsAsErrors），提交前须保证 `dotnet build` 无警告、`dotnet test` 全部通过；
 6. 连接串、JWT 密钥、license 公钥等敏感配置不得提交仓库。开发环境置于 `appsettings.Development.json`（已 gitignore），生产环境通过环境变量（如 `ConnectionStrings__Postgres`）或 user-secrets 注入；

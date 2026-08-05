@@ -294,7 +294,7 @@ CREATE TABLE measurement_anomalies (
 SELECT create_hypertable('measurement_anomalies', 'ts', chunk_time_interval => INTERVAL '7 days');
 
 -- ============================================================================
--- 注：开发种子数据已抽到 deploy/sql/dev/0001_dev_seed.sql，
--- 默认 initdb 不挂载该目录。docker-compose.yml dev profile 才挂。
--- 生产 Inno Setup 安装包只跑 deploy/sql/ 下的 0001~00NN，不跑 dev/。
+-- 注：开发种子数据已抽到 deploy/sql/dev/0001_dev_seed.sql。
+-- 开发环境 compose 挂载整个 deploy/sql/，docker-initdb.sh 会顺带跑 dev/；
+-- 生产用 deploy/windows/apply-migrations.ps1，只跑 0001~00NN，不碰 dev/。
 -- ============================================================================

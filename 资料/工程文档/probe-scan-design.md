@@ -1,6 +1,6 @@
 # 通道自动检测（Probe Scan）设计
 
-> 状态：**已实现并真机验证**（2026-05-27）。代码见 `src/BoltPreload.Application/Devices/ProbeScan/`、`src/BoltPreload.Infrastructure/Devices/ProbeScan/`、`src/BoltPreload.Api/Endpoints/ProbeScanEndpoints.cs`、`src/BoltPreload.Api/wwwroot/probe-scan.html`。  
+> 状态：**已实现并真机验证**（2026-05-27）。代码见 `src/BoltPreload.Application/Devices/ProbeScan/`、`src/BoltPreload.Infrastructure/Devices/ProbeScan/`、`src/BoltPreload.Api/Endpoints/ProbeScanEndpoints.cs`；页面入口在 `web/src/views/Devices.vue`（当年的 wwwroot 演示页已随 UI 并入 Vue 后删除）。  
 > 目的：在现场不知道探头插在哪几个物理通道的情况下，由系统自动识别“哪些通道接了探头、信号质量如何”，输出供运维人工绑定的清单。**不自动绑定 bolt**。
 
 ---
@@ -340,8 +340,8 @@ src/BoltPreload.Api/Endpoints/
 └── DiagnosticEndpoints.cs            # configure-multichannel-polling / set-mode / recalibrate
                                        # 三处都加了 ProbeScanState.IsRunning 检查，409 拒绝并发
 
-src/BoltPreload.Api/wwwroot/
-└── probe-scan.html                   # 浏览器演示页：登录 / 启动扫描 / 进度 / 表格 / 点格改名
+web/src/views/
+└── Devices.vue                       # 扫描入口页（早期 wwwroot/probe-scan.html 演示页已删，功能并入此页）
 
 deploy/sql/
 ├── 0013_channel_probe_scan.sql       # 两张表
@@ -576,5 +576,5 @@ stateDiagram-v2
 ## 13. 后续追查项
 
 - **3 号通道异常**：scanRunId=7 显示已绑定 M16-003 但 `not_reporting`。可能那次扫描时探头连接松了、或被前一次扫描的 SetWorkMode 残留状态影响。单独 `POST /probe-scan {"channels":[3]}` 复测确认。
-- **dashboard.html 集成**：当前 probe-scan 入口在独立页面，建议主 dashboard 顶部加一个 "扫描通道" 快捷按钮 + 最近扫描状态徽章。
+- ~~dashboard 集成~~ 已随 UI 并入 Vue：扫描入口在 Devices 页，独立演示页已删。
 - **`bolts.position_label` vs `channels.name` 关系**：现有 `bolts` 表已有 `position_label`（"塔筒-北 #3"），新加的 `channels.name` 也是位置标签。两者语义有重叠 — 建议长期 `channels.name = 物理插口的固定标签`、`bolts.position_label = 螺栓本身的逻辑位置`（同一插口换装不同螺栓时 position_label 可变）。当前没有强一致约束，靠人工。

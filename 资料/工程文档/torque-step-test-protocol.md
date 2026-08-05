@@ -9,7 +9,7 @@
 - 探头/通道：device 1 / channel 9
 - 扭力扳手：最大 200 N·m
 - 临时扭矩系数：K = 0.20
-- 当前系统：真实 EchoTime 接受率 100%，Watchdog 已启用
+- 开始前先确认系统状态（EchoTime 接受率、Watchdog）：查 `real-health` 接口（见下文第三节）
 
 ## 二、建议扭矩点
 
@@ -22,12 +22,7 @@
 | 3 | 150 N·m | 60 秒 | 同上 |
 | 4 | 200 N·m | 60 秒 | 同上 |
 
-已经采集：
-
-- 200 N·m 点：`torque_test_points.id = 1`
-- 样本：581 条
-- 平均 EchoTime：32287.0387 ns
-- 温补 Δt：121.1693 ns
+（历次实测结果不记在操作单里，见 lab-torque-step-report-*.md 系列报告。）
 
 ## 三、每个扭矩点的操作
 

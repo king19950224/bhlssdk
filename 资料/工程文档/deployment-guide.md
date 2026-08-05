@@ -66,6 +66,8 @@ psql -U postgres -c "CREATE DATABASE boltpreload OWNER boltpreload;"
 
 要点：
 
+- psql 非交互执行要先设 `$env:PGPASSWORD` 或配好 `%APPDATA%\postgresql\pgpass.conf`，
+  否则脚本会卡在密码提示上（备份脚本 backup-postgres.ps1 同理）。
 - **只跑 `deploy/sql/0*.sql`，不要跑 `deploy/sql/dev/`** —— 那是开发种子数据，会往生产库塞演示风场和螺栓
   （`apply-migrations.ps1` 只认顶层 `0*.sql`，不会碰 `dev/`）。
 - 脚本用 `schema_migrations` 账本记录已执行的迁移：每个文件整体一个事务，执行与记账同一事务提交，

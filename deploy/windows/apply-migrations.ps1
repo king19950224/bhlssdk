@@ -15,7 +15,7 @@
     显式声明"这台机器装机时执行到了哪个迁移"；≤Baseline 的文件只记账不执行。
     不带 -Baseline 时脚本会拒绝执行并给出提示，避免对存量库从 0001 重放。
 
-    认证方式与手册 §3 一致：环境变量 PGPASSWORD 或 %APPDATA%\postgresql\pgpass.conf。
+    认证：psql 非交互执行需要先设环境变量 PGPASSWORD，或配好 %APPDATA%\postgresql\pgpass.conf。
 
 .EXAMPLE
     # 全新空库 / 已有账本的库：直接跑

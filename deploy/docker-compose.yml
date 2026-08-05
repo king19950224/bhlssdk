@@ -50,4 +50,4 @@ services:
       - "log_statement=mod"
 
 # 注：docker-compose 是开发用。
-# 工控机部署的 PG 走 Windows 原生安装（Inno Setup 打包），见 deploy/installer/。
+# 工控机部署的 PG 走 Windows 原生安装，步骤见 资料/工程文档/deployment-guide.md（Inno Setup 打包未做）。

@@ -1,3 +1,5 @@
+# 非交互跑必须先设 PGPASSWORD 或配好 %APPDATA%\postgresql\pgpass.conf，否则卡在密码提示。
+# -F c 出自定义格式：恢复走 pg_restore，可以只挑部分表，比纯 SQL dump 灵活。
 param(
     [string]$PgDump = "C:\Program Files\PostgreSQL\16\bin\pg_dump.exe",
     [string]$Database = "boltpreload",

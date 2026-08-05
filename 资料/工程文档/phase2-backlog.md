@@ -48,7 +48,8 @@
 - 严格多点最小二乘标定工作站（含 R²/不确定度/双签）（`CalibrationEndpoints` 注释所述）。
 
 ### 平台 / 运维
-- License 正式签名校验（RSA/ECDSA）+ 授权生成工具（`ILicenseService`）。
+- ~~License 正式签名校验 + 授权生成工具~~ 已交付：RSA-SHA256 验签（`LocalFileLicenseService`）+ `tools/LicenseSigner`，含回归测试。
+- `tools/FxDeviceSimulator` 完整实现（独立 TCP 层设备模拟器，当前仅 Phase 1 占位空跑）。
 - 查询走 MediatR + Application 层 Query Handler（`MeasurementEndpoints`）。
 - 上线前关闭 SDK 协议帧调试日志（`NLog.config` / `Program.cs`，Phase 3）。
 - `bolt_status` 每螺栓 LATERAL 最新测量是资产页/总览/大屏共用的最热查询模式，规模上千后需物化视图或缓存

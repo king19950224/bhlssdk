@@ -1,6 +1,7 @@
 -- ============================================================================
 -- 开发种子数据。仅本地 docker-compose 用，**不要在生产部署**。
--- docker-compose.yml 把 deploy/sql/dev 单独挂进 initdb 才会生效（默认不挂）。
+-- compose 挂载整个 deploy/sql/，docker-initdb.sh 建库时自动执行本目录；
+-- 生产走 apply-migrations.ps1，不会碰 dev/。
 --
 -- 检测即螺栓：种子只建项目 / 监测组 / 设备 / 通道目录，不预插螺栓档案。
 -- 螺栓由探头在位自动建档产生（设备 default_group_id 指向 TEST_GROUP_01）。

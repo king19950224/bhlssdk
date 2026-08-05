@@ -37,7 +37,7 @@
 - `EchoTime2` 在 Java SDK 1.0 没有，C# SDK 1.4 才有
 - `EchoTime` **不是设备直接给的最终值**。在 `MultiChIotProtocolHandler.ProcessResult()` 中，SDK 会拿上行波形按 `ChannelConfig` 计算 `EchoTime`。如果 `SessionContext` 里没有对应 `(address, channel)` 的 `ChannelConfig`，或者 `ProbeFreq <= 0`，SDK 不会进入计算分支，`EchoTime` 会一直是 `null`，但 `StatusCode` 仍可能是默认 `0`。
 
-## 1.1 EchoTime 计算前置条件（非常关键）
+## 1.1 EchoTime 计算前置条件
 
 文件：
 

@@ -21,7 +21,7 @@ bash setup.sh
 
 - `.docker-data/postgres/`：本地 PG 数据
 - `src/**/bin`, `src/**/obj`：编译产物
-- 数据库 `boltpreload` 已创建，schema 已执行，种子数据已插入（项目 / 监测组 / 设备 / 3 颗螺栓）
+- 数据库 `boltpreload` 已创建，schema 已执行，种子数据已插入（项目 / 监测组 / 设备 / 48 通道目录；不预插螺栓，螺栓由探头在位自动建档产生）
 
 ## 启动 API
 
@@ -48,8 +48,8 @@ curl http://localhost:5000/api/measurements/count
 # 看最新 20 条
 curl http://localhost:5000/api/measurements/latest | jq
 
-# 按螺栓查（M16-001 的 ID=1）
-curl http://localhost:5000/api/measurements/by-bolt/1/latest?limit=10 | jq
+# 按螺栓查（螺栓是自动建档出来的，boltId 从上一条 latest 的返回里拿）
+curl http://localhost:5000/api/measurements/by-bolt/<boltId>/latest?limit=10 | jq
 ```
 
 直接连数据库看：
@@ -82,8 +82,8 @@ dotnet test BoltPreload.sln  # 直接跑测试
 
 ### "无法解析通道，丢弃数据" 日志
 
-`SimulatedFxConnector` 用的 `DeviceId=1`，需要数据库里有对应的 device + 3 个 channels + 3 个 bolts。
-检查种子数据是否成功插入：
+`SimulatedFxConnector` 用的 `DeviceId=1`，需要数据库里有对应的 device 和通道目录（种子建 48 通道，
+螺栓不预插、由自动建档产生）。检查种子数据是否成功插入：
 
 ```bash
 docker compose -f deploy/docker-compose.yml exec postgres \
