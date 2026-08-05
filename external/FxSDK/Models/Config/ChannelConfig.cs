@@ -25,7 +25,7 @@ public class ChannelConfig
     /// </summary>
     public decimal EchoWin { get; set; }
     /// <summary>
-    /// 回波窗口宽度us(默认15)
+    /// 回波窗口宽度us(SDK 默认 40；业务库 channels.echo_width_us 建档默认 15)
     /// </summary>
     public ushort EchoWidth { get; set; } = 40;
     /// <summary>

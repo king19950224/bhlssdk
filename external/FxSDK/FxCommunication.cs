@@ -16,7 +16,6 @@ partial class FxClient
 {
     #region 会话管理相关
     private readonly ConcurrentDictionary<string, IoSession> _sessions = new();
-    private readonly ConcurrentBag<int> _usedPorts = new();//已经监听的端口
     private readonly Dictionary<int, ushort> _serverModels = new(); // 端口号-设备模型
     private void SubscribeSessionEvents(IoSession session)
     {
@@ -101,7 +100,7 @@ partial class FxClient
         }
         catch (Exception ex)
         {
-            Logger.Error(ex, "OnSessionExceptionCaught 处理过程中发生意外异常 - 会话 {SessionId}", session.SessionId);
+            Logger.Error(ex, "OnDecodedResultReceived 处理过程中发生意外异常 - 会话 {SessionId}", session.SessionId);
         }
     }
     /// <summary>

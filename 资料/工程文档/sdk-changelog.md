@@ -1,6 +1,32 @@
 # 厂家 FxSDK 版本与依赖变更记录
 
-对应项目内拷贝：`external/FxSDK/`（来源见该目录 README）。
+对应项目内拷贝：`external/FxSDK/`（来源见该目录 README）。我方对 SDK 源码本体的修改也记在这里，厂家升级时按此对差异。
+
+## 2026-08-05 之前的源码修改（补记，按提交追溯）
+
+- 2026-07-31（7daeea7）：心跳间隔 20s → 2s——现场串口服务器约 5 秒无流量就掐 TCP，20s 心跳保不住连接；RefTime 存储读取波形命令修复；参数探测。
+- 2026-08-04（d6b0fc6）：两处注释与实现不符修正；断电损坏波形帧不再显示成"暂无波形"。
+
+## 2026-08-05 源码修改：解码链韧性（提交 0cb0d86）
+
+厂家 1.4.0 的解码链一处坏全线停，且外面看不出来（TCP 和心跳还活着）。改动配套单测 `MultiChIotDecodeResyncTests`：
+
+- `MultiChIotProtocolHandler`：CRC 失败帧原地空转 → 改为删 1 字节破坏坏帧头、重新找下一个帧头（不按长度字段整帧跳：长度本身可能就是被打坏的字节）；新增 `OnContextCleared` 复位帧头索引与分段波形缓存；节流记 CRC 失败日志。
+- `IoSession.DecodingLoop`：解码超时/异常从 `break`（解码循环永久退出）改为复位解码状态继续跑。
+- `IoSession.SendMsgAsync` / `TcpSession.SendDataAsync`：不再吞异常静默返回，失败上抛让调用方感知，心跳 missed 计数从此真正生效。
+- `FxProtocolHandler`：加 `ResetDecodeState()` 复位入口。
+
+## 2026-08-05 源码修改：死代码与调试残留清理（交接前整备）
+
+只动我们运行路径（model=3 MultiChIot / TCP / FxClient），行为等价或纯日志补强；GeneralProtocolHandler、IotR24、串口等纯厂家分支不动：
+
+- `MultiChIotProtocolHandler`：删注释掉的 Standby switch 分支与"时间解码(暂时不用)"块注释；三处 catch 空吞（`//Console.WriteLine(ex)`）补 `Logger.Warn`；EncodeDevice 异常文案补齐 LoraConfig/NetCheckConfig。
+- `IoSession`：删永不置位的 `_disposed` 字段及其死分支。
+- `TcpSession`：删注释掉的旧同步收发实现两行。
+- `FxClient`：Logger 名从抄错的 `TcpSession` 改为 `FxClient`（日志归因）。
+- `FxCommunication`：删只清不加的 `_usedPorts` 半成品；错误日志里不存在的方法名 `OnSessionExceptionCaught` 改为实际的 `OnDecodedResultReceived`。
+- `ByteUtility`：删 CRC 逐字节循环里构造后即丢弃的 `BitArray`（热路径无谓分配）。
+- `ChannelConfig`：`EchoWidth` 注释的默认值 15 与代码 40 对齐（业务库建档默认才是 15）。
 
 ## 2026-07-08 依赖升级（SDK 源码版本不变：C# 1.4.0）
 

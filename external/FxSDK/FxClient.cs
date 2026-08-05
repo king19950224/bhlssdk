@@ -9,7 +9,8 @@ namespace FxSDK;
 
 public partial class FxClient
 {
-    private static readonly ILogger Logger = LogManager.GetLogger(nameof(TcpSession));
+    // 原来抄成 nameof(TcpSession)，FxClient 的日志全挂在 TcpSession 名下，排查时归因错误
+    private static readonly ILogger Logger = LogManager.GetLogger(nameof(FxClient));
     #region 公共事件 
     /// <summary>
     /// 会话连接成功事件
@@ -465,8 +466,6 @@ public partial class FxClient
             }
             _serverSockets.Clear();
         }
-        // 清除已使用的端口记录
-        _usedPorts.Clear();
         _serverModels.Clear();
         // 关闭所有会话
         foreach (var session in _sessions.Values.ToList())

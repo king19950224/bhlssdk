@@ -101,7 +101,6 @@ public class TcpSession : IoSession
                 try
                 {
                     var bytesRead = await _socket.ReceiveAsync(buffer, SocketFlags.None, SessionToken).ConfigureAwait(false);
-                    //var bytesRead = _socket.Receive(buffer, 0, buffer.Length, SocketFlags.None);
 
                     if (bytesRead == 0)
                     {
@@ -172,7 +171,6 @@ public class TcpSession : IoSession
                                     break;
                                 
                                 await _socket.SendAsync(segment, SocketFlags.None, SessionToken).ConfigureAwait(false);
-                                //_socket.Send(segment.Span);
                                 
                                 if (FxUtility.DeveloperMode)
                                 {
@@ -303,7 +301,6 @@ public class TcpSession : IoSession
         {
             try
             {
-                // 10 秒足够让任务响应取消
                 await Task.WhenAll(_backgroundTasks).WaitAsync(TaskExitGrace).ConfigureAwait(false);
                 Logger.Debug($"Session {SessionId} all tasks completed successfully");
             }

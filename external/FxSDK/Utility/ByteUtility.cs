@@ -232,7 +232,6 @@ namespace FxSDK.Utility
             var crc = InitialValue;
             foreach (var t in data)
             {
-                new BitArray(t).Reverse();
                 var index = (byte)(Reflect(t, 8) ^ (crc >> 8));
                 crc = (ushort)(Table[index] ^ (crc << 8));
             }

@@ -140,7 +140,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             else
             {
                 throw new ArgumentException(
-                    "Invalid property name provided. Supported property names for configuration include: 'Address', 'MCRConfig', 'MeasConfig', and 'BaudRate'."
+                    "Invalid property name provided. Supported property names for configuration include: 'Address', 'MCRConfig', 'MeasConfig', 'BaudRate', 'LoraConfig', and 'NetCheckConfig'."
                 );
             }
         }
@@ -661,10 +661,6 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             default://保留时 解析数据帧并触发结果
                 decodedResults.AddRange(DecodeResults(session, token,false));
                 break;
-            // case WorkMode.Standby:
-            // default:
-            //     ClearContext();//待机或者未知状态不处理数据
-            //     break;
         }
         return decodedResults;
     }
@@ -781,6 +777,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                             }
                             catch (Exception ex)
                             {
+                                Logger.Warn(ex, "解码指令帧失败（按坏帧丢弃重同步）");
                                 isComplete = false;
                             }
                             if (!isComplete) //收到错误数据帧
@@ -893,18 +890,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             var waveStartIdx = payloadIdx + 2 + 4 + 2 + 2 + 2;
             if (decodedFrame.Count > waveStartIdx)
             {
-                var decodedTime = DateTime.Now;//使用上位机时间
-                #region 时间解码(暂时不用)
-                /*var secBytes = decodedFrame.GetRange(payloadIdx + 2, 4).ToArray();
-                var msBytes = decodedFrame.GetRange(payloadIdx + 6, 2).ToArray();
-                var recSec = (int) BitConverter.ToUInt32(secBytes) % 60; //获取秒 
-                var recMilSec = (int) BitConverter.ToUInt16(msBytes); //获取毫秒 
-                if (recSec is >= 0 and <= 60 && recMilSec is >= 0 and <= 999)
-                {
-                    decodedTime = new DateTime(decodedTime.Year, decodedTime.Month, decodedTime.Day,
-                        decodedTime.Hour, decodedTime.Minute, recSec, recMilSec);
-                }*/
-                #endregion
+                var decodedTime = DateTime.Now;//使用上位机时间（帧内秒/毫秒字段不用：设备时钟不可靠）
                 var ptsCount = (decodedFrame.Count - 2 - waveStartIdx) / 2;
                 var waveData = new List<short>();
                 for (var i = 0; i < ptsCount; i++)
@@ -1069,7 +1055,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
         }
         catch (Exception ex)
         {
-            //Console.WriteLine(ex);
+            Logger.Warn(ex, "解码设备参数帧失败（isComplete=false，按坏帧丢弃重同步）");
         }
         return paramList;
     }
@@ -1104,7 +1090,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
         }
         catch (Exception ex)
         {
-            //Console.WriteLine(ex);
+            Logger.Warn(ex, "解码设备状态帧失败（isComplete=false，按坏帧丢弃重同步）");
         }
         return paramList;
     }

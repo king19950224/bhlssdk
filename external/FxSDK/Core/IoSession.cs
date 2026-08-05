@@ -16,7 +16,6 @@ public abstract class IoSession
     public event EventHandler<SessionDisconnectedEventArgs>? SessionDisconnected;
     public event EventHandler<DecodedResultsReceivedEventArgs>? SessionDecResultsReceived;
     internal readonly FxProtocolHandler ProtocolHandler;
-    private bool _disposed = false; // 添加一个标志
     protected IoSession(FxProtocolHandler protocolHandler)
     {
         ProtocolHandler = protocolHandler ?? throw new ArgumentNullException(nameof(protocolHandler));
@@ -132,7 +131,6 @@ public abstract class IoSession
         {
             foreach (var msg in msgList)
             {
-                if (_disposed) return; // 检查是否已释放
                 if (msg.Equals(FxUtility.Delay500Ms))
                     await Task.Delay(500, SessionToken);
                 else if (msg.Equals(FxUtility.Delay100Ms))
