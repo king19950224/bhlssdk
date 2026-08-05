@@ -10,8 +10,10 @@ using BoltPreload.Application.Devices.Acceptance;
 using BoltPreload.Application.Devices.ProbeScan;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Application.Licensing;
+using BoltPreload.Application.Notifications;
 using BoltPreload.Application.Realtime;
 using BoltPreload.Infrastructure.Alarm;
+using BoltPreload.Infrastructure.Notifications;
 using BoltPreload.Fx;
 using BoltPreload.Fx.Simulator;
 using BoltPreload.Infrastructure.Devices;
@@ -154,6 +156,14 @@ builder.Services.AddSingleton<IAlarmRuleProvider, PostgresAlarmRuleProvider>();
 builder.Services.AddHostedService<AlarmRuleRefreshService>();
 builder.Services.AddSingleton<IAlarmEvaluator, StaticThresholdAlarmEvaluator>();
 builder.Services.AddSingleton<IAlarmSink, PostgresAlarmSink>();
+
+// 出站通知：告警落库时按路由快照同事务写发件箱，派发服务轮询发送（webhook 适配器，失败退避）
+builder.Services.AddSingleton<INotificationRouter, PostgresNotificationRouter>();
+builder.Services.AddSingleton<INotificationTransport, WebhookNotificationTransport>();
+builder.Services.AddSingleton<NotificationDispatcher>();
+builder.Services.AddHostedService<NotificationDispatcherService>();
+builder.Services.AddHttpClient(WebhookNotificationTransport.HttpClientName,
+    c => c.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.AddSingleton<IChannelConfigService, PostgresChannelConfigService>();
 
 // 通道自动检测（Probe Scan）
@@ -399,6 +409,7 @@ app.MapCalibrationEndpoints();
 app.MapBoltEndpoints();
 app.MapAlarmEndpoints();
 app.MapAlarmRuleEndpoints();
+app.MapNotificationEndpoints();
 app.MapReportEndpoints();
 app.MapLicenseEndpoints();
 

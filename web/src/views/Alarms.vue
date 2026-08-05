@@ -7,6 +7,8 @@ import { onRealtime } from '../api/realtime'
 import { useNow } from '../utils/useNow'
 import { alarmTypeLabel } from '../utils/labels'
 import AlarmRulesPanel from '../components/AlarmRulesPanel.vue'
+import NotificationPanel from '../components/NotificationPanel.vue'
+import { useAuth } from '../stores/auth'
 
 // 告警中心（工业告警管理口径，参照 ISA-18.2 生命周期）：
 // 触发(未确认) → 确认(已知悉,仍开启) → 闭合(恢复/处置完成)。
@@ -19,8 +21,9 @@ const loading = ref(false)
 let timer: number | undefined
 let unsub: (() => void) | undefined
 
-// 页级切换：告警处置（默认） / 阈值规则（进库后的管理面，reviewer 才能改）
-const pageTab = ref<'dispose' | 'rules'>('dispose')
+// 页级切换：告警处置（默认） / 阈值规则（reviewer 才能改） / 出站通知（配置 Admin、发送记录 reviewer+）
+const auth = useAuth()
+const pageTab = ref<'dispose' | 'rules' | 'notify'>('dispose')
 // 状态段选：未闭合(默认) / 未确认 / 已闭合 / 全部
 const view = ref<'open' | 'unacked' | 'cleared' | 'all'>('open')
 const filterSeverity = ref('')
@@ -286,8 +289,10 @@ function limitOf(a: AlarmItem) {
     <div class="seg page-seg">
       <span class="seg-tab" :class="{ active: pageTab === 'dispose' }" @click="pageTab = 'dispose'">告警处置</span>
       <span class="seg-tab" :class="{ active: pageTab === 'rules' }" @click="pageTab = 'rules'">阈值规则</span>
+      <span v-if="auth.isReviewer" class="seg-tab" :class="{ active: pageTab === 'notify' }" @click="pageTab = 'notify'">通知</span>
     </div>
     <AlarmRulesPanel v-if="pageTab === 'rules'" />
+    <NotificationPanel v-else-if="pageTab === 'notify'" />
     <template v-else>
     <!-- 摘要：未确认是处置焦点（ISA-18.2），单列突出 -->
     <div class="sum-row">

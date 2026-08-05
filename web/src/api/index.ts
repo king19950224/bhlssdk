@@ -179,6 +179,87 @@ export const alarmRuleApi = {
   effective: (boltId: number) => http.get<EffectiveAlarmRule>(`/api/bolts/${boltId}/effective-alarm-rule`),
 }
 
+// ---- 出站通知（渠道 / 规则 / 发件箱）----
+export interface NotificationChannel {
+  id: number
+  name: string
+  kind: string
+  url: string | null
+  format: string | null
+  hasSecret: boolean // secret 永不回显，只报有无
+  minIntervalSeconds: number
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+  ruleCount: number
+}
+export interface NotificationChannelBody {
+  name: string
+  kind: string
+  url: string
+  format: string
+  // 更新时：undefined/null=保留现有，空串=清除，有值=替换
+  secret?: string | null
+  minIntervalSeconds: number
+  enabled: boolean
+}
+export interface NotificationRule {
+  id: number
+  channelId: number
+  channelName: string
+  minSeverity: string
+  alarmTypes: string[] | null // null = 全部类型
+  groupId: number | null // null = 全站
+  groupCode: string | null
+  notifyOnClear: boolean
+  quietStart: string | null // HH:mm，服务器本地时区；critical 无视静默
+  quietEnd: string | null
+  enabled: boolean
+}
+export interface NotificationRuleBody {
+  channelId: number
+  minSeverity: string
+  alarmTypes?: string[] | null
+  groupId?: number | null
+  notifyOnClear: boolean
+  quietStart?: string | null
+  quietEnd?: string | null
+  enabled: boolean
+}
+export interface NotificationOutboxItem {
+  id: number
+  alarmId: number
+  channelId: number
+  channelName: string
+  eventKind: string // trigger / clear
+  status: string // pending / sent / dead
+  attempts: number
+  nextAttemptAt: string
+  lastError: string | null
+  createdAt: string
+  sentAt: string | null
+  boltCode: string | null
+  message: string | null
+}
+export const notificationApi = {
+  channels: () => http.get<{ count: number; items: NotificationChannel[] }>('/api/notification-channels/'),
+  createChannel: (body: NotificationChannelBody) => http.post<{ id: number }>('/api/notification-channels/', body),
+  updateChannel: (id: number, body: NotificationChannelBody) =>
+    http.patch<{ id: number; updated: boolean }>(`/api/notification-channels/${id}`, body),
+  deleteChannel: (id: number) => http.delete<{ id: number; deleted: boolean }>(`/api/notification-channels/${id}`),
+  // 直发测试消息（不入发件箱），发送失败返回 502 带对端错误
+  testChannel: (id: number) => http.post<{ ok: boolean }>(`/api/notification-channels/${id}/test`),
+  rules: () => http.get<{ count: number; items: NotificationRule[] }>('/api/notification-rules/'),
+  createRule: (body: NotificationRuleBody) => http.post<{ id: number }>('/api/notification-rules/', body),
+  updateRule: (id: number, body: NotificationRuleBody) =>
+    http.patch<{ id: number; updated: boolean }>(`/api/notification-rules/${id}`, body),
+  deleteRule: (id: number) => http.delete<{ id: number; deleted: boolean }>(`/api/notification-rules/${id}`),
+  outbox: (limit = 50, status?: string) =>
+    http.get<{ count: number; items: NotificationOutboxItem[] }>(
+      `/api/notification-outbox/?limit=${limit}${status ? `&status=${status}` : ''}`),
+  retryOutbox: (id: number) => http.post<{ id: number; requeued: boolean }>(`/api/notification-outbox/${id}/retry`),
+}
+
 // ---- 参数变更审批 ----
 export interface ConfigChange {
   id: number

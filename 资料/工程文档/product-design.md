@@ -1,6 +1,6 @@
 # 产品设计：缺失功能补齐（P0–P3）
 
-> 状态：设计稿（2026-08-05）。P0 已实施落地：P0-1 见 §2（0028 迁移 + 规则端点 + 前端规则页），P0-2 见 §3（setup-https / register-backup-task 两脚本 + 手册两节，待 Windows 实机跑通）；P1 起待排。
+> 状态：设计稿（2026-08-05）。已实施落地：P0-1 见 §2（0028 迁移 + 规则端点 + 前端规则页）、P0-2 见 §3（setup-https / register-backup-task 两脚本 + 手册两节，待 Windows 实机跑通）、P1-A 见 §4（0029 三表 + 事务性发件箱 + 派发/webhook + 通知页，真机联调列入交付验收）；P1-B 起待排。
 > 定位：`commercialization-roadmap.md` 盘点了“已具备 / 仍不具备”；本文把“仍不具备”的部分逐项落成可实施的设计——改哪些文件、加什么表、挂哪个接缝、怎么验收。所有设计点写之前都逐条核过源码，引用的文件、表、配置键在当前代码库里真实存在。
 > 相关：`delivery-master-plan.md`（交付验收清单）、`phase2-backlog.md`（技术债台账）、`probe-scan-design.md`（同类设计文档的先例）。
 
@@ -135,7 +135,7 @@ CREATE UNIQUE INDEX ux_alarm_rules_active_bolt   ON alarm_rules(bolt_id)  WHERE 
 
 ---
 
-## 4. P1-A 告警出站通知
+## 4. P1-A 告警出站通知（已实施）
 
 ### 4.1 现状与问题
 
@@ -220,7 +220,7 @@ CREATE INDEX idx_notification_outbox_due ON notification_outbox(next_attempt_at)
 
 `INotificationTransport` 按 `kind` 分发。本轮只实现 webhook：POST JSON，`format` 字段决定报文形状——`raw`（通用 JSON，给客户自有系统对接）、`wecom`（企业微信群机器人 markdown）、`dingtalk`（钉钉机器人）。短信、SMTP 只定义接口不实现，等渠道定了再补（每个适配器预计 0.5–1 人天）。
 
-消息内容用交付件的中文口径（`DisplayLabels.cs` 的告警类型词表）：站点名、组/螺栓、类型、级别、当前值与目标值、触发时间。`config_jsonb` 里的 secret 在 API 返回时抹掉，`collect-diagnostics.ps1` 的脱敏正则同步覆盖新表。
+消息内容用交付件的中文口径：组/螺栓、级别、评估器生成的中文 message（自带类型与数值）、触发时间；级别叫法与前端告警中心一致（严重/预警/提示）。`config_jsonb` 里的 secret 在 API 返回时抹掉（只回 hasSecret 布尔）。实施时核过：`collect-diagnostics.ps1` 只打包配置与日志、不导出数据库，secret 又只存库不进 appsettings，脱敏正则无需扩展——设计稿里"同步覆盖新表"一条实际无事可做。企微/钉钉的一个坑在适配器里处理了：HTTP 200 里带 errcode≠0 也是失败（key 错、被限流），解析响应体判定，否则发丢了记录还显示成功。
 
 ### 4.7 端点与前端
 
@@ -236,7 +236,7 @@ CREATE INDEX idx_notification_outbox_due ON notification_outbox(next_attempt_at)
 - 杀进程重启，pending 不丢、不重复发（发送成功与置 sent 之间的窗口接受“至少一次”语义，写进文档）；
 - 集成测试：入队事务性（告警回滚则发件箱回滚）、规则匹配、退避与 dead。
 
-工作量约 5 人天：发件箱与派发 2.5、端点与前端 1.5、webhook 适配与真机联调 1。
+实施状态：集成测试 9 条全过（入队事务性含"快照过期指向已删渠道→告警行一起回滚"、级别/类型/部位/恢复/静默窗匹配、风暴合并、退避置 dead、渠道限流只顺延不计失败、secret 不回显）；真机 webhook 联调（真实企微/钉钉群收消息、断网补达）需要现场网络环境，列入交付验收清单。
 
 ---
 
@@ -493,7 +493,7 @@ CREATE TABLE calibration_session_points (
 |---|---|---|---|
 | 1 | P0-1 告警阈值进库 | 2–3 | 已完成（0028_alarm_rules + AlarmRuleEndpoints + AlarmRulesPanel） |
 | 2 | P0-2 HTTPS + 备份任务 | 1.5 | 已完成（setup-https / register-backup-task，Windows 实机验证列入手册 §10） |
-| 3 | P1-A 出站通知 | 5 | 可与 P0 并行；见效最快 |
+| 3 | P1-A 出站通知 | 5 | 已完成（0029 三表 + 发件箱入队 + 派发/webhook + 通知页）；真机联调列入交付验收 |
 | 4 | P1-B 多设备生命周期 | 8–10 | supervisor 重构单独提交、单独回归 |
 | 5 | P1-C 载荷标定中心 | 10 | 与 P1-B 无硬依赖，可换序 |
 | 6 | P1-D 离线安装包 | 5 | 放最后，一次打包全部新功能；需 Windows 机 |

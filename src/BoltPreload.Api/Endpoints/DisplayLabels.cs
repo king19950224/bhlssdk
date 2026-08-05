@@ -41,6 +41,16 @@ public static class DisplayLabels
         ["alarm_rule_approve"] = "批准告警阈值",
         ["alarm_rule_reject"] = "驳回告警阈值",
 
+        // 出站通知（渠道/规则配置与发件箱处置）
+        ["notification_channel_create"] = "新建通知渠道",
+        ["notification_channel_update"] = "更新通知渠道",
+        ["notification_channel_delete"] = "删除通知渠道",
+        ["notification_rule_create"] = "新建通知规则",
+        ["notification_rule_update"] = "更新通知规则",
+        ["notification_rule_delete"] = "删除通知规则",
+        ["notification_test_send"] = "通知测试发送",
+        ["notification_retry"] = "通知手工重发",
+
         // 通道与螺栓
         ["sync_channel_config"] = "同步通道配置",
         ["move_bolt_channel"] = "螺栓换通道",
@@ -77,6 +87,9 @@ public static class DisplayLabels
         ["alarm"] = "告警",
         ["alarm_shelving"] = "告警抑制",
         ["alarm_rule"] = "告警阈值规则",
+        ["notification_channel"] = "通知渠道",
+        ["notification_rule"] = "通知规则",
+        ["notification_outbox"] = "通知发件箱",
         ["calibration"] = "标定",
         ["report"] = "报告",
         ["user"] = "用户",

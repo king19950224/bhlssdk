@@ -27,14 +27,22 @@ public class DisplayLabelsTests
         "config_change_reject", "config_change_verify", "create_bolt",
         "device_channel_catalog_update", "device_default_group_update",
         "load_calibrate_countersign", "load_calibrate_reject", "load_calibrate_submit",
-        "move_bolt_channel", "quick_calibrate", "report_sign", "restore_multichannel_loading",
+        "move_bolt_channel",
+        "notification_channel_create", "notification_channel_delete", "notification_channel_update",
+        "notification_retry",
+        "notification_rule_create", "notification_rule_delete", "notification_rule_update",
+        "notification_test_send",
+        "quick_calibrate", "report_sign", "restore_multichannel_loading",
         "sync_channel_config", "torque_calibrate", "torque_point_capture",
         "update_bolt", "update_bolt_spec", "update_group_config", "update_target_preload",
         "user_change_password", "user_create", "user_toggle", "wiring_import",
     ];
 
     private static readonly string[] TargetTypesInUse =
-        ["alarm", "alarm_rule", "alarm_shelving", "bolt", "calibration", "channel", "device", "monitor_group", "report", "user"];
+    [
+        "alarm", "alarm_rule", "alarm_shelving", "bolt", "calibration", "channel", "device", "monitor_group",
+        "notification_channel", "notification_outbox", "notification_rule", "report", "user",
+    ];
 
     private static readonly string[] HardwareStatesInUse =
         ["healthy", "noisy", "suspect", "no_data", "no_probe", "unknown"];
