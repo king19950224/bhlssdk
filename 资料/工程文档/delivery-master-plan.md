@@ -178,7 +178,7 @@
 | 告警引擎（StaticThreshold） | 回差 + on/off-delay + 严重档 | [ ] 阈值配置在 appsettings 显式化，现场按合同调整流程写清 |
 | 授权（License） | 无效不停监测、拦写操作、容量限额 | [ ] 生产 license.json + PublicKeyPem 注入流程演练一次 |
 | 认证授权（JWT + 角色） | operator/reviewer/admin | [ ] 三种角色各建一个账号过一遍菜单可见性 |
-| 数据库迁移（0001~0024） | 编号连续 | [ ] 空库从零跑全量迁移一次（模拟现场首装） |
+| 数据库迁移（0001~0027） | 账本式执行（apply-migrations.ps1，装机/升级共用） | [x] 空库全量 + 存量库（0011 版装机、60 天数据、含压缩 chunk）升级到 0027，2026-08-05 本机 psql 实测通过；[ ] 升级脚本本体在 Windows 现场机上冒烟一次（本机无 PowerShell，psql 调用序列已逐条验证） |
 | 报告生成 | 法兰验收/扭矩阶梯 HTML | [ ] 见 §1.4 |
 
 ---

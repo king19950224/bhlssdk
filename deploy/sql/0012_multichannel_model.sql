@@ -90,6 +90,10 @@ BEGIN
 
     IF compression_was_enabled THEN
         PERFORM remove_compression_policy('measurements', if_exists => true);
+        -- 存在已压缩 chunk 时不能直接关压缩。0001 的压缩策略 30 天起压，
+        -- 装机超过 30 天才升级到本迁移的库会踩中，先逐个解压再关。
+        PERFORM decompress_chunk(c, if_compressed => true)
+           FROM show_chunks('measurements') AS c;
         ALTER TABLE measurements SET (timescaledb.compress = false);
     END IF;
 

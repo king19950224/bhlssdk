@@ -60,19 +60,20 @@ dotnet publish src/BoltPreload.Api/BoltPreload.Api.csproj -c Release -r win-x64 
 psql -U postgres -c "CREATE ROLE boltpreload LOGIN PASSWORD '<强密码>';"
 psql -U postgres -c "CREATE DATABASE boltpreload OWNER boltpreload;"
 
-# 按序号顺序执行全部迁移 —— 必须一个不漏，且 ON_ERROR_STOP
-Get-ChildItem deploy\sql\0*.sql | Sort-Object Name | ForEach-Object {
-    Write-Host "applying $($_.Name)"
-    psql -U boltpreload -d boltpreload -v ON_ERROR_STOP=1 -f $_.FullName
-    if ($LASTEXITCODE -ne 0) { throw "迁移失败：$($_.Name)" }
-}
+# 执行全部迁移（账本式：已应用的自动跳过，装机与升级共用同一脚本）
+.\deploy\windows\apply-migrations.ps1
 ```
 
 要点：
 
-- **只跑 `deploy/sql/0*.sql`，不要跑 `deploy/sql/dev/`** —— 那是开发种子数据，会往生产库塞演示风场和螺栓。
-- 迁移必须按文件名序号顺序，且中途失败就停。已验证：24 个迁移在空库上可干净跑通。
-- 后续版本新增迁移时，用同一段脚本重跑即可（迁移脚本自身幂等或带 `IF NOT EXISTS`）。
+- **只跑 `deploy/sql/0*.sql`，不要跑 `deploy/sql/dev/`** —— 那是开发种子数据，会往生产库塞演示风场和螺栓
+  （`apply-migrations.ps1` 只认顶层 `0*.sql`，不会碰 `dev/`）。
+- 脚本用 `schema_migrations` 账本记录已执行的迁移：每个文件整体一个事务，执行与记账同一事务提交，
+  中途失败自动整体回滚，修复后重跑即从断点续跑。
+- **存量库注意**（本脚本引入之前装的机器，库里有表但没有账本）：第一次跑必须带
+  `-Baseline <序号>` 显式声明装机时执行到了哪个迁移（例：`-Baseline 0024`），
+  脚本会把 ≤ 该序号的文件记账但不执行。不带参数时脚本会拒绝执行——早期迁移并不幂等，
+  对存量库从 0001 重放会直接失败。
 
 ---
 
@@ -238,7 +239,8 @@ curl http://localhost:5000/api/health/ready
 ## 9. 升级与回滚
 
 升级：停服务 → 备份数据库（`deploy/windows/backup-postgres.ps1`）→ 替换程序目录（保留 `license.json`、`data/`、`logs/`）
-→ 按 §3 重跑迁移脚本 → 起服务 → 走 §8 自检。
+→ 重跑 `deploy\windows\apply-migrations.ps1`（账本自动跳过已应用的迁移，只执行新增部分；
+存量库第一次接入账本需带 `-Baseline`，见 §3）→ 起服务 → 走 §8 自检。
 
 回滚：停服务 → 恢复上一版程序目录 → 起服务。
 **注意迁移不提供向下脚本**，若新版本引入了破坏性 schema 变更，回滚需从备份恢复数据库。

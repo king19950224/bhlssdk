@@ -17,9 +17,16 @@ run_sql() {
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -f "$2"
 }
 
+# 0) 迁移账本：与生产升级脚本（deploy/windows/apply-migrations.ps1）同一张表。
+#    开发库虽然每次重建都全量跑，但记了账的库随时可以用升级脚本增量追平，语义一致。
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -q -c \
+    "CREATE TABLE IF NOT EXISTS schema_migrations (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
+
 # 1) schema 迁移：deploy/sql/0*.sql，按文件名序号顺序（与 CI、测试夹具、生产同一套脚本）
 for f in /sql/0*.sql; do
     run_sql "迁移" "$f"
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -q -c \
+        "INSERT INTO schema_migrations(filename) VALUES ('$(basename "$f")') ON CONFLICT DO NOTHING"
 done
 
 # 2) dev 种子：仅本地开发。生产部署不挂载本目录。
