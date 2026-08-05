@@ -81,15 +81,22 @@ public abstract class IoSession
                 var decodeTask = Task.Run(() => ProtocolHandler.TryDecode(this,token), token);
                 results = await decodeTask.ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (!SessionToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (SessionToken.IsCancellationRequested)
             {
-                Logger.Warn("TryDecode timed out — possible infinite loop in DoDecode. Clearing context.");
-                break;
+                break; //会话正常关闭
+            }
+            catch (OperationCanceledException)
+            {
+                // 解码超时（200ms 没返回）：多为坏数据卡住解码状态机。
+                // 旧实现在这里 break，解码循环退出但 TCP 和心跳还在，只能重启进程恢复。
+                // 改为清掉积压、复位解码状态继续跑，代价是丢掉缓冲里这一段数据。
+                Logger.Warn("TryDecode 超时（疑似坏数据卡住解码状态机），复位解码缓冲后继续。");
+                ProtocolHandler.ResetDecodeState();
             }
             catch (Exception e)
             {
-                Logger.Error(e, "TryDecode threw exception");
-                break;
+                Logger.Error(e, "TryDecode 抛出异常，复位解码缓冲后继续。");
+                ProtocolHandler.ResetDecodeState();
             }
 
             if (results is {Count: > 0})
@@ -140,9 +147,17 @@ public abstract class IoSession
                     await SendDataAsync(byteList.ToArray());
             }
         }
+        catch (OperationCanceledException)
+        {
+            // 会话正在关闭，指令没发出去。上抛让调用方感知，否则会白等设备回包到超时。
+            Logger.Warn("SendMsgAsync 取消：会话已关闭，指令未发出。");
+            throw;
+        }
         catch (Exception ex)
         {
+            // 旧实现吞掉异常只记 Warn，调用方以为指令已发出。上抛由上层决定重试或报错。
             Logger.Warn(ex, $"SendMsgAsync failed: {ex.Message}");
+            throw;
         }
         finally
         {

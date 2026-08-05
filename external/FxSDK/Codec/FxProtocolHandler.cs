@@ -71,8 +71,21 @@ public abstract class FxProtocolHandler : IDisposable
         lock (_handlerLock)
         {
             ContextData.Clear();
+            OnContextCleared();
         }
     }
+
+    /// <summary>
+    /// 缓冲被清空时的派生类钩子（锁内调用，勿做耗时操作）：
+    /// 复位跨调用的解码状态（帧头索引、分段波形缓存等），避免用旧流的状态解读新数据。
+    /// </summary>
+    protected virtual void OnContextCleared() { }
+
+    /// <summary>
+    /// 解码故障后的复位入口（供会话层调用）：丢弃当前积压并复位派生类解码状态。
+    /// DecodingLoop 在超时/异常后调用它重来，而不是退出解码循环。
+    /// </summary>
+    internal void ResetDecodeState() => ClearContext();
 
     /// <summary>
     /// 按协议解码从设备读取到的数据（子类实现）

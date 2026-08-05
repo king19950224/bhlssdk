@@ -330,25 +330,31 @@ public class TcpSession : IoSession
 
     protected override async Task SendDataAsync(byte[] data)
     {
-        if (_isClosed == 1 || data.Length == 0 || SessionToken.IsCancellationRequested)
+        if (data.Length == 0)
             return;
-        
+        // 会话已关闭时抛出而不是静默返回：旧实现直接 return，调用方以为发成功了
+        // 白等设备回包；心跳循环的 missed 计数也因此从未加过。
+        if (_isClosed == 1 || SessionToken.IsCancellationRequested)
+            throw new OperationCanceledException($"会话 {SessionId} 已关闭，数据未发送。");
+
         try
         {
             await _pipe.Writer.WriteAsync(data, SessionToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (SessionToken.IsCancellationRequested)
         {
-            // 正常取消，不记录
+            throw; //会话关闭中，调用方需要知道数据没发出去
         }
         catch (Exception ex) when (IsConnectionError(ex))
         {
             Logger.Warn(ex, "SendDataAsync failed due to connection loss");
             _ = CloseAsync(SessionCloseReason.ConnectionLost, ex).ConfigureAwait(false);
+            throw;
         }
         catch (Exception ex)
         {
             Logger.Error(ex, "Unexpected error in SendDataAsync");
+            throw;
         }
     }
 

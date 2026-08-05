@@ -2,11 +2,13 @@ using System.Collections;
 using FxSDK.Core;
 using FxSDK.Models;
 using FxSDK.Utility;
+using NLog;
 
 namespace FxSDK.Codec;
 
 public class MultiChIotProtocolHandler : FxProtocolHandler
 {
+    private static readonly ILogger Logger = LogManager.GetCurrentClassLogger();
     private static readonly byte[] FrameHead = {0xDE, 0xDE, 0xDE, 0xDE};
     private static readonly byte[] FrameTail = {0x00, 0x00, 0x00, 0x00};
     private static readonly byte[] WakeupHead = {0xF0, 0xF0, 0xF0, 0xF0, 0xF0};
@@ -667,6 +669,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
         return decodedResults;
     }
     private int _headBeginIdx = -1; //动态解析头索引
+    private long _crcErrorCount; //CRC 失败帧累计（日志节流用：第 1 帧和之后每 100 帧记一次）
     /// <summary>
     /// 解码结果
     /// </summary>
@@ -786,6 +789,17 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                                 _headBeginIdx = -1;
                             }
                         }
+                        else //CRC 校验失败：链路误码（RS485-TCP 桥上会出现）
+                        {
+                            // 原实现这里什么都不做，缓冲不前进，下轮仍从同一坏帧解起，空转到解码超时。
+                            // 删 1 字节破坏当前帧头，让 IndexOf 同步到下一个帧头；
+                            // 不按 frameSize 整帧跳：长度字段本身可能就是被打坏的字节，跳错会吞掉后面的好帧。
+                            _crcErrorCount++;
+                            if (_crcErrorCount == 1 || _crcErrorCount % 100 == 0)
+                                Logger.Warn($"CRC 校验失败（累计 {_crcErrorCount} 帧），丢弃 1 字节重新同步帧头");
+                            ContextData.RemoveAt(0);
+                            _headBeginIdx = -1;
+                        }
                     }
                     else
                     {
@@ -797,8 +811,9 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                     break; //等待数据帧完整
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Logger.Warn(ex, "解码异常，丢弃 1 字节重新同步帧头");
                 ContextData.RemoveAt(0); //删除最前面的元素 重新检索
                 _headBeginIdx = -1; //重新找头
                 break;
@@ -1158,7 +1173,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
         }
         catch (Exception ex)
         {
-            //Console.WriteLine(ex);
+            Logger.Warn(ex, "解码存储参数帧失败（isComplete=false，按坏帧丢弃重同步）");
         }
         return paramList;
     }
@@ -1166,6 +1181,17 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
     /// 全波列表
     /// </summary>
     private readonly List<ChannelResult> _fullWaveList = new();
+
+    /// <summary>
+    /// 缓冲清空（会话关闭 / 解码故障复位）时复位解码状态：
+    /// 帧头索引不复位，新数据会被按"帧头已在 0 位"错位解读；
+    /// 分段波形缓存里是旧数据流的残片，拼进新全波会得到错误波形。
+    /// </summary>
+    protected override void OnContextCleared()
+    {
+        _headBeginIdx = -1;
+        _fullWaveList.Clear();
+    }
     /// <summary>
     /// 解码全波波形
     /// </summary>
