@@ -152,13 +152,27 @@ dotnet run --project tools/LicenseSigner -- verify \
 - 兜底：`devices` 表为空时回退到 `Fx:Real:CommParams`，其默认值是**实验室地址 `192.168.0.7:23`**，
   现场必须改掉，否则会连到不存在的设备（表现为反复重连、无数据）。
 
-### 关于 HTTPS
+### HTTPS（已定稿：自签证书进受信任根）
 
-当前进程只提供 HTTP，未启用 HTTPS 重定向/HSTS。JWT 以 Bearer 头传输、存在浏览器 localStorage，
-**在局域网上是明文可截获的**。交付时必须二选一并写进验收文档：
+纯局域网拿不到公网 CA 证书，定稿方案是单机一张自签服务器证书直接进受信任根，一条脚本配完：
 
-1. 前置反向代理（IIS / nginx）终结 TLS，工控机上的服务只监听 `127.0.0.1`；
-2. 或明确接受该残余风险，前提是监测网段物理隔离、不与办公网互通。
+```powershell
+# 操作员按 IP 访问页面的话，把该 IP 编进证书 SAN，否则浏览器按名字校验会告警
+.\deploy\windows\setup-https.ps1 -IpAddresses <本机局域网 IP> -OpenFirewall
+```
+
+脚本做四件事：生成带 SAN 的自签证书（默认 5 年）→ pfx 与 .cer 落到 `C:\BoltPreload\certs\` →
+证书进本机"受信任的根证书颁发机构" → 往 `appsettings.Production.json` 写 Kestrel 节并重启服务。
+配完后对外只开 `https://<主机>:8443`，另留一个仅 `127.0.0.1:5000` 的 HTTP 诊断口——
+§8 自检清单和 collect-diagnostics 继续走本机 HTTP 口，不受影响。
+
+- **其它要开页面的工作站**：把 `certs\boltpreload-https.cer` 装进各自的"受信任的根证书颁发机构"
+  （域环境可用组策略统一推），浏览器就不再告警。
+- **客户自有 PKI**：拿他们签的 pfx 替换 `certs\` 下的文件、改 Kestrel 节的 Path/Password，不改代码。
+- Kestrel 节生效后服务环境变量 `ASPNETCORE_URLS` 被覆盖，启动日志的 "Overriding address(es)"
+  提示属预期。SignalR 前端同源自适应，HTTPS 下自动走 wss，无需另配。
+- 监测网段物理隔离、确不需要局域网访问的站点，可以不跑本脚本继续用纯本机 HTTP——
+  但要写进验收文档，别默认。
 
 ---
 
@@ -181,6 +195,8 @@ dotnet run --project tools/LicenseSigner -- verify \
 
 首个管理员建好后，建议重新执行一次不带 `-BootstrapAdminPassword` 的注册，把该变量从服务配置里移除。
 
+服务注册完成后接着跑两件交付硬化：`setup-https.ps1`（§5）与 `register-backup-task.ps1`（§7.1）。
+
 ---
 
 ## 7. 数据目录与保留策略
@@ -195,6 +211,39 @@ dotnet run --project tools/LicenseSigner -- verify \
 
 建议把 `WaveStore:RootPath`、`MeasurementWal:RootPath` 指到独立数据分区，
 避免系统盘写满导致静默丢数（`/api/health/ready` 会报告 `freeDiskGb`，可接入监控告警）。
+
+### 7.1 数据库备份计划任务与恢复演练
+
+`backup-postgres.ps1` 一直能手工跑，交付要求的是"没人管它也每天在跑"：
+
+```powershell
+# 每日 02:00 备份（SYSTEM 账户），保留最近 14 份滚动删除；-RunNow 当场跑一次验证
+.\deploy\windows\register-backup-task.ps1 -PgPassword "<db 口令>" -RunNow
+```
+
+口令两条路：优先给 SYSTEM 账户配 pgpass.conf（路径
+`C:\Windows\System32\config\systemprofile\AppData\Roaming\postgresql\pgpass.conf`，
+内容一行 `127.0.0.1:5432:boltpreload:boltpreload:<口令>`，文件编码 ANSI/UTF-8 无 BOM）；
+配不了就 `-PgPassword` 带参——参数写进任务定义、本机管理员可读，信任边界与服务环境变量相同。
+
+**没演练过的备份不算备份**，交付前至少做一次恢复演练：
+
+```powershell
+# 1) 恢复到临时库。TimescaleDB 的库必须先 pre_restore 再灌数，跳过会报超表元数据错误
+psql -U postgres -c "CREATE DATABASE boltpreload_restore_drill;"
+psql -U postgres -d boltpreload_restore_drill -c "CREATE EXTENSION IF NOT EXISTS timescaledb; SELECT timescaledb_pre_restore();"
+pg_restore -U postgres -d boltpreload_restore_drill --no-owner "C:\BoltPreload\backups\<最新一份>.dump"
+psql -U postgres -d boltpreload_restore_drill -c "SELECT timescaledb_post_restore();"
+
+# 2) 抽查数据对得上：行数量级与生产一致、最新测量时间戳落在备份时刻附近
+psql -U postgres -d boltpreload_restore_drill -c "SELECT count(*) FROM measurements;"
+psql -U postgres -d boltpreload_restore_drill -c "SELECT count(*) FROM bolts; SELECT max(ts) FROM measurements;"
+
+# 3) 演练完删库
+psql -U postgres -c "DROP DATABASE boltpreload_restore_drill;"
+```
+
+注意目标实例的 timescaledb 扩展版本不能低于备份源，跨大版本恢复前先看 Timescale 升级说明。
 
 ---
 
@@ -255,7 +304,9 @@ curl http://localhost:5000/api/health/ready
 ## 10. 仍待完成
 
 - **Inno Setup 一键安装包**（`deploy/installer/` 目前为空）：把 PG + TimescaleDB 二进制、.NET 运行时、
-  程序目录、迁移执行、服务注册、防火墙规则打成单个 `.exe`。当前按本手册手工部署可以完成交付，
-  但每台机器的步骤较多、依赖人工不出错。该安装包需要在 Windows 上构建与验证。
-- **HTTPS 方案定稿**：见 §5 末尾，需按客户网络环境二选一并写入验收文档。
+  程序目录、迁移执行、服务注册、证书生成（setup-https.ps1）、备份任务注册打成单个 `.exe`。
+  当前按本手册手工部署可以完成交付，但每台机器的步骤较多、依赖人工不出错。
+  该安装包需要在 Windows 上构建与验证（设计见 product-design.md §7）。
+- **Windows 实机验证**：本轮新增的 `setup-https.ps1` / `register-backup-task.ps1` 与既有 NSSM
+  注册一样，逻辑在 macOS 上只能读查，需在 Windows 上跑通一遍（含恢复演练）。
 - **真机回归**：`资料/工程文档/delivery-master-plan.md` §1/§3 的实测项需在实验室或现场真机各走一轮。

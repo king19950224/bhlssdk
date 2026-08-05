@@ -140,8 +140,9 @@ if ($BootstrapAdminPassword -ne "") {
 & $NssmPath set $ServiceName AppRotateSeconds 86400 | Out-Null
 & $NssmPath set $ServiceName AppRestartDelay 10000 | Out-Null
 
-# 防火墙：默认不开。只有确实要从局域网访问时才显式 -OpenFirewall，
-# 且请注意当前服务只提供 HTTP，JWT 在网络上是明文（见 资料/工程文档/deployment-guide.md §5）。
+# 防火墙：默认不开。本脚本配出的是 HTTP 明文监听，JWT 在网络上可截获——局域网访问
+# 请接着跑 setup-https.ps1 定稿 HTTPS（Kestrel 配置节会接管监听地址，此后这里的
+# ASPNETCORE_URLS 只剩摆设，启动日志的 Overriding 提示属预期），只给本机用才走 -OpenFirewall 放 HTTP 端口。
 if ($OpenFirewall) {
     New-NetFirewallRule `
         -DisplayName "BoltPreload API $FirewallPort" `
@@ -178,6 +179,7 @@ if (-not $ready) {
 
 Write-Host ""
 Write-Host "接下来请按 资料/工程文档/deployment-guide.md §8 走一遍装完自检（尤其是：浏览器直接打开 /alarms 不应白屏、/api/license/status 应为 valid=true）。"
+Write-Host "交付硬化两件事别漏：HTTPS（.\setup-https.ps1，手册 §5）与每日备份任务（.\register-backup-task.ps1 -RunNow，手册 §7.1）。"
 if ($BootstrapAdminPassword -ne "") {
     Write-Host "提示：首个管理员已创建。建议登录确认后，重跑本脚本且不带 -BootstrapAdminPassword，把该密码从服务配置中移除。"
 }

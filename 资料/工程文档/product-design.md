@@ -1,6 +1,6 @@
 # 产品设计：缺失功能补齐（P0–P3）
 
-> 状态：设计稿（2026-08-05）。P0-1 已实施落地（§2，0028 迁移 + 规则端点 + 前端规则页，实施与设计一致）；其余批次待排。
+> 状态：设计稿（2026-08-05）。P0 已实施落地：P0-1 见 §2（0028 迁移 + 规则端点 + 前端规则页），P0-2 见 §3（setup-https / register-backup-task 两脚本 + 手册两节，待 Windows 实机跑通）；P1 起待排。
 > 定位：`commercialization-roadmap.md` 盘点了“已具备 / 仍不具备”；本文把“仍不具备”的部分逐项落成可实施的设计——改哪些文件、加什么表、挂哪个接缝、怎么验收。所有设计点写之前都逐条核过源码，引用的文件、表、配置键在当前代码库里真实存在。
 > 相关：`delivery-master-plan.md`（交付验收清单）、`phase2-backlog.md`（技术债台账）、`probe-scan-design.md`（同类设计文档的先例）。
 
@@ -114,23 +114,24 @@ CREATE UNIQUE INDEX ux_alarm_rules_active_bolt   ON alarm_rules(bolt_id)  WHERE 
 
 ---
 
-## 3. P0-2 交付硬化小项
+## 3. P0-2 交付硬化小项（已实施）
 
 ### 3.1 HTTPS 定稿
 
-部署形态是集控室/塔基工控机、纯局域网，公网证书拿不到。定稿方案：
+部署形态是集控室/塔基工控机、纯局域网，公网证书拿不到。已按下述方案落地为
+`deploy/windows/setup-https.ps1`（P1-D 安装器届时直接调它，不重写）：
 
-- 安装器生成自签 CA + 服务器证书，导入本机“受信任的根证书颁发机构”，Kestrel 配 pfx 路径与口令（appsettings `Kestrel:Endpoints`）；SignalR 随之走 wss。
+- 自签服务器证书（带 SAN，默认 5 年）导入本机“受信任的根证书颁发机构”，Kestrel 节写进 `appsettings.Production.json`（pfx 路径与口令；口令由 collect-diagnostics 脱敏正则覆盖）；SignalR 随之走 wss。实施取舍：不养“自签 CA + 服务器证书”的小 PKI——单机部署多一层 CA 只多一个可弄丢的私钥，一张服务器证书直接进受信根即可。
 - 客户自有 PKI 的场合直接替换 pfx，不改代码。
 - 保留仅绑定 127.0.0.1 的 HTTP 端点做本机诊断（`curl` 健康检查、诊断脚本用），对外只开 HTTPS 端口。
-- 落点：appsettings 模板 + 安装器证书生成步骤 + `deployment-guide.md` 补一节。约 1 人天。
+- 落点：`setup-https.ps1` + `deployment-guide.md` §5。Windows 实机跑通一遍列在手册 §10。
 
 ### 3.2 备份计划任务
 
-`deploy/windows/backup-postgres.ps1` 已能产出 `-F c` 格式备份，缺的只是没人定时跑：
+`deploy/windows/backup-postgres.ps1` 已能产出 `-F c` 格式备份，缺的只是没人定时跑。已落地：
 
-- 安装器（或 `install-service.ps1`）注册 schtasks：每日 02:00 执行，脚本补“保留最近 14 份、滚动删除”参数；
-- 恢复演练步骤（`pg_restore` 到临时库、抽查行数）写进 `deployment-guide.md`——没演练过的备份不算备份。约 0.5 人天。
+- `register-backup-task.ps1` 注册每日 02:00 计划任务（SYSTEM 账户，`-RunNow` 当场验证一次）；`backup-postgres.ps1` 补了“保留最近 14 份、滚动删除”与“pg_dump 失败清掉半截文件”；
+- 恢复演练步骤（Timescale pre/post_restore + `pg_restore` 到临时库 + 抽查行数）写进 `deployment-guide.md` §7.1——没演练过的备份不算备份。
 
 ---
 
@@ -491,7 +492,7 @@ CREATE TABLE calibration_session_points (
 | 顺序 | 批次 | 人天 | 说明 |
 |---|---|---|---|
 | 1 | P0-1 告警阈值进库 | 2–3 | 已完成（0028_alarm_rules + AlarmRuleEndpoints + AlarmRulesPanel） |
-| 2 | P0-2 HTTPS + 备份任务 | 1.5 | 无前置 |
+| 2 | P0-2 HTTPS + 备份任务 | 1.5 | 已完成（setup-https / register-backup-task，Windows 实机验证列入手册 §10） |
 | 3 | P1-A 出站通知 | 5 | 可与 P0 并行；见效最快 |
 | 4 | P1-B 多设备生命周期 | 8–10 | supervisor 重构单独提交、单独回归 |
 | 5 | P1-C 载荷标定中心 | 10 | 与 P1-B 无硬依赖，可换序 |
