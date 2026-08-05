@@ -25,8 +25,8 @@ namespace BoltPreload.Api.Endpoints;
 /// </summary>
 public static class ChannelCatalogEndpoints
 {
-    /// <summary>SDK 多通道监测协议（model=3）单板最大通道数（MultiChIotProtocolHandler.BoardChannelMax）。</summary>
-    private const int MaxChannelCount = 48;
+    // 通道数上限统一走 DeviceLimits（全项目唯一一份），这里不再自留一份 48
+    private const int MaxChannelCount = DeviceLimits.MaxChannelsPerDevice;
 
     public static IEndpointRouteBuilder MapChannelCatalogEndpoints(this IEndpointRouteBuilder app)
     {

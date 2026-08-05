@@ -4,7 +4,7 @@ namespace BoltPreload.Algorithms.Preload;
 /// GB/T 43232-2023 双波法（详见方案 §8.3）。
 /// <para>公式：<c>σ_b = v_T0 · (t_Lσ · x₀ - t_Tσ) / (2·L_e · (A_L - A_T))</c></para>
 /// <para>精度约 ±3%。需要同时测纵波和横波 TOF。</para>
-/// <para>**仅适用于公称直径 ≥ M12** 的螺栓（GB/T 43232 适用边界）。</para>
+/// <para><b>仅适用于公称直径 ≥ M12</b> 的螺栓（GB/T 43232 适用边界）。</para>
 /// <para>
 /// 当前未实现（<see cref="IsAvailable"/>=false）：完整实现需先给 <see cref="PreloadInput"/> 扩展横波 TOF
 /// （<c>ChannelResult.EchoTime2</c>）。在此之前，<see cref="Calculate"/> 采取【安全降级】而非抛异常——

@@ -16,7 +16,7 @@ public sealed record ProbeScanWindowStats(
     // ChannelName 是后加字段，默认 null 让既有测试与可能的旧调用代码免改
     string? ChannelName = null);
 
-/// <summary>判定结果。</summary>
+/// <summary>单通道扫描判定（五档）。库表和 API 里存 snake_case 名（见 <see cref="ProbeScanVerdictNames"/>），不存枚举数值。</summary>
 public enum ProbeScanVerdict
 {
     /// <summary>样本数不足或异常，无法判定。</summary>
@@ -74,13 +74,11 @@ public static class ProbeScanResultJudge
         if (stats.Samples < t.MinSamples)
             return ProbeScanVerdict.Inconclusive;
 
-        // 至此 samples >= minSamples
-        var echoRate = stats.Samples > 0 ? (double)stats.SamplesWithEcho / stats.Samples : 0.0;
+        var echoRate = (double)stats.SamplesWithEcho / stats.Samples;
 
         if (echoRate < t.EchoRateNoEcho)
             return ProbeScanVerdict.ActiveNoEcho;
 
-        // echoRate >= t.EchoRateNoEcho
         bool good =
             echoRate >= t.EchoRateGood
             && stats.SnrAvgDb is not null && (double)stats.SnrAvgDb.Value >= t.SnrGoodDb

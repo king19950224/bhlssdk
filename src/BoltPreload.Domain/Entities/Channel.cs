@@ -60,6 +60,10 @@ public class Channel
     /// <summary>选用的 TOF 提取算法名（对应 ITofExtractor.Name）</summary>
     public string TofAlgorithm { get; set; } = "ThrSignal";
 
+    /// <summary>
+    /// 建库通用列（users/devices/bolts 都有）。通道这边没有独立行为：
+    /// 采集、轮询、扫描的过滤都只看 <see cref="SamplingEnabled"/>，这个字段只随 CRUD 读写。
+    /// </summary>
     public bool Enabled { get; set; } = true;
 
     /// <summary>是否应加载到 SDK Session / 参与采集诊断。</summary>

@@ -79,8 +79,8 @@ public sealed class IngestionWatchdogService : BackgroundService
         }
 
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(_options.CheckIntervalSeconds));
-        // 顶层 try/catch 保护 — 单次检查异常不能让 BackgroundService 整个挂掉
-        // （默认 BackgroundServiceExceptionBehavior=StopHost 会停整个 app，对 7×24 系统是灾难）
+        // 单次检查异常只记日志、继续下一轮。宿主配的是 Ignore（Program.cs），异常冒出去不停进程，
+        // 但会把本服务停掉——看门狗停了，设备断线就没人重连，只能等 /api/health/ready 心跳失联才被发现。
         while (true)
         {
             try

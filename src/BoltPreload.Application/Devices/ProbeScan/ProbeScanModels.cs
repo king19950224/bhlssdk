@@ -58,7 +58,7 @@ public sealed record ProbeScanResultSlot(
     DateTimeOffset StartedAt,
     DateTimeOffset FinishedAt);
 
-/// <summary>Repository 抽象。</summary>
+/// <summary>扫描运行记录的存取。Npgsql 实现在 Infrastructure；抽出接口是为了单测能用内存假仓库跑 Orchestrator。</summary>
 public interface IProbeScanRepository
 {
     /// <summary>检查该设备是否已有 pending/running 扫描；有则返回 scan_run_id。</summary>

@@ -38,6 +38,6 @@ public interface ICalibrationFitter
     /// </summary>
     /// <param name="points">标定点（至少 2 个，建议 ≥4，见 plan §7 路径 C）</param>
     /// <param name="useWeights">是否加权最小二乘（权重 = 1/σ_F²，仅当点提供了正的 SigmaF 时生效）</param>
-    /// <param name="applyGrubbs">是否做 Grubbs 异常点剔除；**仅在 n≥20 时实际生效**（GB/T 4883-2008，见 plan §8.5.1）</param>
+    /// <param name="applyGrubbs">是否做 Grubbs 异常点剔除；<b>仅在 n≥20 时实际生效</b>（GB/T 4883-2008，见 plan §8.5.1）</param>
     LinearFitResult Fit(IReadOnlyList<CalibrationPoint> points, bool useWeights = false, bool applyGrubbs = true);
 }

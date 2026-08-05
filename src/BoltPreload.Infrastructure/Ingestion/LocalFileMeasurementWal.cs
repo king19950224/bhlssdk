@@ -235,8 +235,6 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
 
     private static FxDecodedEnvelope StripWaves(FxDecodedEnvelope envelope)
     {
-        if (envelope.EchoWave is not null)
-            envelope = envelope with { EchoWave = null };
         if (envelope.ChannelResult?.EchoWave is not null)
             envelope = envelope with { ChannelResult = envelope.ChannelResult with { EchoWave = null } };
         var mc = envelope.MultiChannelResult;

@@ -8,7 +8,7 @@ namespace BoltPreload.Application.Diagnostics;
 /// 为什么需要：宿主配了 <c>BackgroundServiceExceptionBehavior.Ignore</c>（一个后台服务崩不拖停整机，
 /// 对监测系统是对的取舍），但代价是<b>服务死了进程还活着</b> —— 此前 <c>/api/health</c> 依然返回
 /// <c>status=ok</c>，运维探针一路绿灯。最危险的是 SignalHealthService：它一旦停了就不再产生
-/// signal_lost 告警，探头脱落、接头松动会彻底静默，而这正是本系统要防的失效。
+/// signal_lost 告警，探头脱落、接头松动从此无人报。
 /// </para>
 /// <para>
 /// 判定口径：只对<b>已经打过至少一次心跳</b>的服务判超时（按配置关闭、未注册的服务不会被误判为死），

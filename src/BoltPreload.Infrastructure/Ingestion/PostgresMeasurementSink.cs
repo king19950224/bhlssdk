@@ -356,8 +356,6 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         return new(null, null, null, cr.DeltaTofNs ?? 0m, "phase1:raw", null);
     }
 
-    // 通道解析逻辑搬到 IChannelResolver（CachedChannelResolver 带 IMemoryCache）
-
     private async Task WriteMeasurementAsync(ChannelRoute route, FxDecodedEnvelope envelope, FxChannelResultDto cr, bool evaluateAlarms, CancellationToken ct)
     {
         // 1. 算预紧力（hot path 调用 calculator，纯算术，极快）
@@ -590,6 +588,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     {
         var data = wave.WaveData;
         var pointCount = data.Length;
+        // 噪声段取波形开头：回波在采集窗后段，开头这截只有底噪。
+        // 取头部 10%（至少 30 点，RMS 才估得稳；波形不足 30 点就全取）。
         var noiseSamples = Math.Min(Math.Max(30, pointCount / 10), pointCount);
 
         int peakPositive = short.MinValue, peakNegative = short.MaxValue;
@@ -623,6 +623,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             noiseRms = Math.Sqrt(noiseVar);
         }
 
+        // 信号幅值按半峰峰值算；下限压到 1（一个 ADC 码），平坦波形不至于送 0 进 log10 得 -∞
         decimal? snrDb = (noiseRms is null || noiseRms <= 0)
             ? null
             : ToDecimalSafe(20.0 * Math.Log10(Math.Max(1.0, peakToPeak / 2.0) / noiseRms.Value));

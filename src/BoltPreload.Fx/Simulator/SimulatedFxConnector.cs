@@ -10,8 +10,8 @@ namespace BoltPreload.Fx.Simulator;
 /// </summary>
 /// <remarks>
 /// <para>与真机连接器（<c>FxSdkConnector</c>）共用 <see cref="IFxConnector"/> 接口，业务层无感切换。</para>
-/// <para>注意：本模拟器**独立于 SDK 实现**，按方案 §9.16 SDK 供应商风险，
-/// 万一 SDK 失联，我们至少能用模拟器跑回归测试，保证基本可用性。</para>
+/// <para>本模拟器不依赖 SDK 实现（方案 §9.16 SDK 供应商风险）：万一 SDK 失联，
+/// 回归测试还能靠模拟器跑。</para>
 /// </remarks>
 public sealed class SimulatedFxConnector : IFxConnector
 {

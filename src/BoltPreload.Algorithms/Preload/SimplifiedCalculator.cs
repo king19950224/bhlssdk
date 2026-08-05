@@ -6,7 +6,7 @@ namespace BoltPreload.Algorithms.Preload;
 /// 公式：<c>F = E·S·v·Δt / (2·L₀)</c>
 /// </para>
 /// <para>
-/// **重要物理警告**：本模型把"声速 v"当成常数（只算路径变长的效应），**忽略了声弹性效应**
+/// 物理前提要先说清：本模型把声速 v 当常数（只算路径变长的效应），忽略声弹性效应
 /// （应力本身也会改变 v）。直接用碳钢标称声速 v=5890 m/s 时，跟真机标定结果可能差几倍
 /// （比如 80mm M16 在 Δt=195ns 下，本公式算出 ~303 kN，而真机 K_L 标定可能是 ~90 kN）。
 /// </para>
@@ -29,7 +29,7 @@ namespace BoltPreload.Algorithms.Preload;
 /// 生产数据必须走 GbSingleWave 或 GbBiWave。
 /// </para>
 /// <para>
-/// 重要符号约定（§8.3 全方案统一）：<c>Δt</c> 小写 = TOF 时间差；<c>ΔT</c> 大写 = 温度差。
+/// 符号约定（§8.3 全方案统一）：<c>Δt</c> 小写 = TOF 时间差；<c>ΔT</c> 大写 = 温度差。
 /// 代码里对应 <c>DeltaTofNs</c> 和 <c>DeltaTempC</c>。
 /// </para>
 /// </summary>

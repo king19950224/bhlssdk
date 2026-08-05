@@ -2,7 +2,8 @@ namespace BoltPreload.Fx.Models;
 
 /// <summary>
 /// SDK 解码结果的内部封装，把 SDK 类型转成业务用的 record。
-/// 一个 envelope 装一个解码结果（ChannelResult / DeviceParameter / EchoWave / MultiChannelResult 之一）。
+/// 一个 envelope 装一个解码结果（ChannelResult / MultiChannelResult / DeviceParameter 之一）。
+/// 波形不单独成包：设备总是随测量结果带波形，放在 ChannelResult.EchoWave 里。
 /// </summary>
 /// <param name="DeviceId">业务层逻辑设备 ID</param>
 /// <param name="ReceiveTime">设备打的事件时间</param>
@@ -15,7 +16,6 @@ public sealed record FxDecodedEnvelope(
     FxResultType ResultType,
     FxChannelResultDto? ChannelResult = null,
     FxDeviceParameterDto? DeviceParameter = null,
-    FxEchoWaveDto? EchoWave = null,
     FxMultiChannelResultDto? MultiChannelResult = null);
 
 /// <summary>信封承载的解码结果类型，决定 <see cref="FxDecodedEnvelope"/> 上哪个载荷字段非空。</summary>
@@ -23,9 +23,7 @@ public enum FxResultType
 {
     ChannelResult,
     MultiChannelResult,
-    DeviceParameter,
-    EchoWave,
-    Unknown
+    DeviceParameter
 }
 
 /// <summary>

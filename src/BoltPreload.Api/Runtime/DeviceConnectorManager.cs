@@ -150,7 +150,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         ILoggerFactory loggerFactory,
         bool isPrimary)
     {
-        var logger = loggerFactory.GetRequiredLogger<FxSdkConnector>();
+        var logger = loggerFactory.CreateLogger<FxSdkConnector>();
         var spec = new FxRealDeviceSpec(
             DeviceId: row.Id,
             Model: (ushort)row.Model,
@@ -185,7 +185,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         NpgsqlDataSource dataSource,
         ILoggerFactory loggerFactory)
     {
-        var logger = loggerFactory.GetRequiredLogger<FxSdkConnector>();
+        var logger = loggerFactory.CreateLogger<FxSdkConnector>();
         var deviceId = configuration.GetValue<long>("Fx:Real:DeviceId", 1);
         // 配置优先，缺了才读库：GetValue(key, default) 的默认值是先求值再传进去的，
         // 写成默认参数会让配置已给出通道数时也白查一次库，还可能打出一条与实际取值无关的回退警告
@@ -300,7 +300,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         ILoggerFactory loggerFactory,
         ILogger log)
     {
-        var logger = loggerFactory.GetRequiredLogger<SimulatedFxConnector>();
+        var logger = loggerFactory.CreateLogger<SimulatedFxConnector>();
         var baseDeviceId = configuration.GetValue<long>("Fx:Simulator:DeviceId", 1);
         var address = configuration.GetValue<ushort>("Fx:Simulator:Address", 1);
         var channelCount = configuration.GetValue<ushort>("Fx:Simulator:ChannelCount", 3);
@@ -347,10 +347,4 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         short Address,
         short TransferMode,
         short ChannelCount);
-}
-
-internal static class LoggerFactoryExtensions
-{
-    public static ILogger<T> GetRequiredLogger<T>(this ILoggerFactory loggerFactory)
-        => loggerFactory.CreateLogger<T>();
 }

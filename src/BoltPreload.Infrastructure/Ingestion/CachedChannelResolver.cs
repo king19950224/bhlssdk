@@ -162,6 +162,8 @@ public sealed class CachedChannelResolver : IChannelResolver
                         KL: reader.GetDecimal(2),
                         KLUncertainty: reader.IsDBNull(3) ? 0m : reader.GetDecimal(3),
                         RefTimeNs: reader.GetDecimal(4),
+                        // ref_temp_c 缺省 20℃：GB/T 通用标准实验室温度，与标定台账的缺省一致。
+                        // 温补按 (T - RefTempC) 算增量，标定确实在 20℃ 做的话缺省无损。
                         RefTempC: reader.IsDBNull(5) ? 20m : reader.GetDecimal(5),
                         InterceptNs: reader.IsDBNull(7) ? null : reader.GetDecimal(7),
                         ExpiresAt: reader.IsDBNull(17) ? null : reader.GetDateTime(17),

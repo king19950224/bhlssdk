@@ -10,9 +10,9 @@ namespace BoltPreload.Algorithms.Preload;
 /// <item>否则（无标定 / 标定过期 / &lt; M5）→ 简化模型 A（仅看趋势，不作正式监测值）</item>
 /// </list>
 /// <para>
-/// 注：双波法（≥M12、精度更高）尚未实现。<see cref="Pick"/> 已就位 ≥M12 路由，但加了
-/// <see cref="GbBiWaveCalculator.IsAvailable"/> 守卫：bi-wave 实现可用前自动回退单波法，
-/// 确保 ≥M12 螺栓不会因双波法未实现而丢失预紧力计算（也绝不会路由到会抛异常的未实现分支）。
+/// 双波法（≥M12、精度更高）尚未实现。<see cref="Pick"/> 里 ≥M12 的路由已就位，
+/// 由 <see cref="GbBiWaveCalculator.IsAvailable"/> 守着：实现可用前 ≥M12 自动落到单波法，
+/// 不会路由到没实现的分支上去。
 /// </para>
 /// </remarks>
 public interface IPreloadCalculatorFactory
@@ -45,8 +45,7 @@ public sealed class PreloadCalculatorFactory : IPreloadCalculatorFactory
         // 标定过期 → 降级到简化模型，UI 上提示重新标定
         if (calibration.IsExpired(now)) return _simplified;
 
-        // M12 以上 → 双波法（精度更高，未实现）。bi-wave 未实现可用（IsAvailable=false）时
-        // 自动 fallthrough 到单波法，确保 ≥M12 螺栓不丢失预紧力计算，也不会调到未实现的双波法。
+        // M12 以上走双波法，但 IsAvailable=false（未实现）时落到下面的单波分支
         if (bolt.NominalDiamMm >= 12m && _biWave.IsAvailable) return _biWave;
 
         // M5 以上 + 标定齐全 → 单波法

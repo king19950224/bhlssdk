@@ -42,9 +42,9 @@ public sealed class StaticThresholdAlarmOptions
 /// </code>
 /// </para>
 /// <para>
-    /// 每个 bolt 一个状态机。线程安全：用 lock 保证状态机原子性。
-    /// 告警抑制/搁置由告警中心接口（AlarmEndpoints）在管理层实现，本评估器保持纯阈值判定；
-    /// 趋势类判据（CUSUM/EWMA）为后续增强方向。
+/// 每个 bolt 一个状态机。线程安全：用 lock 保证状态机原子性。
+/// 告警抑制/搁置由告警中心接口（AlarmEndpoints）在管理层实现，本评估器保持纯阈值判定；
+/// 趋势类判据（CUSUM/EWMA）为后续增强方向。
 /// </para>
 /// </summary>
 public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
@@ -260,7 +260,8 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
 
     /// <summary>
     /// 进程启动时从 DB 恢复内存状态（避免重启后重新累积 on-delay）。
-    /// 当前开启告警 → 直接置 active；触发条数从最近 N 条 measurements 推断（简化：直接置 TriggerConsecutive）。
+    /// 当前开启告警 → 直接置 active。连击计数不恢复：触发侧 active 态用不到，
+    /// 恢复侧从 0 重数只是自动闭合稍慢一拍。
     /// </summary>
     public void Restore(IEnumerable<(long BoltId, string Type)> openAlarms)
     {
