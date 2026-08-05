@@ -136,6 +136,32 @@ public sealed class ChannelPollingConvergenceTests
     }
 
     [PostgresFact]
+    public async Task Converge_AfterReconnect_TreatsThePollingSetAsUnknownAndResends()
+    {
+        _fx.EnsureAvailable();
+        var connector = new FakeConnector(deviceId: 1);
+        var svc = NewService(connector, channelCount: 48);
+
+        await svc.EnsureFullChannelPollingAsync(default);
+        connector.McrConfigCalls.Should().HaveCount(1);
+
+        // 断线。设备可能是断电重启，轮询集丢没丢不知道
+        connector.State = FxConnectorState.Disconnected;
+        await svc.EnsureFullChannelPollingAsync(default);
+        connector.McrConfigCalls.Should().HaveCount(1, "没有会话，下发不了");
+
+        // 重连成功：连接器在新会话 provisioning 时把 MCR 视图清成未知（FxSdkConnector.OnSdkConnectedAsync）
+        connector.State = FxConnectorState.Connected;
+        connector.SessionMcr = [];
+        await svc.EnsureFullChannelPollingAsync(default);
+
+        connector.McrConfigCalls.Should().HaveCount(2,
+            "重连后设备端轮询集是未知数（断电重启可能丢），要重新下发；" +
+            "按'已下发过'跳过的话，丢了集的设备只剩默认几路在测，其余通道全黑且无人补救");
+        connector.McrConfigCalls.Last().Should().BeEquivalentTo(FullSet(48));
+    }
+
+    [PostgresFact]
     public async Task Converge_AfterTheChannelCountGrows_SendsTheWiderSet()
     {
         _fx.EnsureAvailable();

@@ -26,7 +26,10 @@ namespace BoltPreload.Tests.Integration;
 /// 2) 生效的维护抑制(shelve)吞掉触发；已过期的抑制不生效；
 /// 3) signal_lost 触发也走抑制判定（此前 SignalHealthService 绕过 shelve）；
 /// 4) 手动闭合复位评估器状态机：条件仍越限时下一条样本立即重新触发；
-/// 5) 闭合原因放宽为 text（>64 字不再 500），API 层限 500 字。
+/// 5) 闭合原因放宽为 text（>64 字不再 500），API 层限 500 字；
+/// 6) GB 范围外照常告警：入库 preload_n 仍为 NULL（定量不可信），告警评估拿原始值——
+///    应力跌破 30% Rp0.2 报 preload_loss，超 90% 报 preload_high；
+/// 7) WAL 有积压时 signal_lost 判定暂停：入库时间落后于设备实况，此时按 max(ts) 判静默全是误报。
 /// 标定基线设计：KL=0.001 ns/N、RefTime=30000ns、echo=30100ns（温度=参考温度→温补中性）
 /// → deltaTof=100 → preloadN=100000N；螺栓 target=172000/min=120000 → ratio≈0.58(&lt;0.70 触发 preload_low)，
 /// 应力=408MPa ∈ [30%,90%]×940 → 落在 GB 适用范围内（保证真出 preload_n / ratio）。
@@ -135,20 +138,59 @@ public sealed class AlarmPipelineIntegrationTests
         await sink.WriteAsync(LowMeasurement(devA, 25, t0), evaluateAlarms: true);
         await sink.WriteAsync(LowMeasurement(devB, 26, t0), evaluateAlarms: true);
 
-        var svc = new SignalHealthService(
-            _fx.DataSource,
-            new PostgresAlarmSink(_fx.DataSource, NullLogger<PostgresAlarmSink>.Instance),
-            new NoopAlarmPublisher(),
-            new ProbeScanState(),
-            new BackgroundServiceHealth(),
-            Options.Create(new SignalHealthOptions()),   // 默认 120s 无回波判丢失，10 分钟静默必命中
-            NullLogger<SignalHealthService>.Instance);
+        var svc = NewSignalHealth();
         await svc.CheckAsync(default);
 
         (await OpenAlarmCountAsync(boltA, "signal_lost"))
             .Should().Be(0, "整颗抑制生效期间 signal_lost 不得触发（此前 SignalHealthService 绕过 shelve）");
         (await OpenAlarmCountAsync(boltB, "signal_lost"))
             .Should().Be(1, "未抑制的静默螺栓应正常触发 signal_lost");
+    }
+
+    [PostgresFact]
+    public async Task SignalLost_WhileWalBacklogged_SkipsRound_ResumesAfterDrain()
+    {
+        _fx.EnsureAvailable();
+
+        // 螺栓最后一条测量在 10 分钟前——但这是因为入库链路刚故障过（WAL 有积压），
+        // 不是设备静默。此时 max(ts) 落后于设备实况，按它判"无回波"就是误报。
+        var (deviceId, _, boltId, _) = await SeedCalibratedChannelAsync(channelNo: 32);
+        var sink = NewSinkWithAlarms();
+        await sink.WriteAsync(LowMeasurement(deviceId, 32, DateTimeOffset.UtcNow.AddMinutes(-10)), evaluateAlarms: true);
+
+        var wal = new StubWal { PendingCount = 5 };
+        var svc = NewSignalHealth(wal);
+
+        await svc.CheckAsync(default);
+        (await OpenAlarmCountAsync(boltId, "signal_lost"))
+            .Should().Be(0, "WAL 有积压时入库时间不可信，不得按它报 signal_lost");
+
+        // 重放清零后恢复判定：此时 max(ts) 反映的才是设备实况，静默是真静默
+        wal.PendingCount = 0;
+        await svc.CheckAsync(default);
+        (await OpenAlarmCountAsync(boltId, "signal_lost"))
+            .Should().Be(1, "积压清零后照常判定，真静默要报出来");
+    }
+
+    private SignalHealthService NewSignalHealth(IMeasurementWal? wal = null) =>
+        new(_fx.DataSource,
+            new PostgresAlarmSink(_fx.DataSource, NullLogger<PostgresAlarmSink>.Instance),
+            new NoopAlarmPublisher(),
+            new ProbeScanState(),
+            wal ?? NoopMeasurementWal.Instance,
+            new BackgroundServiceHealth(),
+            Options.Create(new SignalHealthOptions()),   // 默认 120s 无回波判丢失，10 分钟静默必命中
+            NullLogger<SignalHealthService>.Instance);
+
+    /// <summary>可拨积压数的假 WAL：只为 SignalHealth 的跳过判定服务。</summary>
+    private sealed class StubWal : IMeasurementWal
+    {
+        public bool Enabled => true;
+        public long PendingCount { get; set; }
+        public ValueTask AppendAsync(FxDecodedEnvelope envelope, CancellationToken cancellationToken = default)
+            => ValueTask.CompletedTask;
+        public Task<int> ReplayAsync(Func<FxDecodedEnvelope, CancellationToken, Task> writeAsync, CancellationToken cancellationToken = default)
+            => Task.FromResult(0);
     }
 
     // ===================== 手动闭合复位状态机（重臂） =====================
@@ -216,6 +258,54 @@ public sealed class AlarmPipelineIntegrationTests
         var a2 = await InsertOpenAlarmAsync(boltId, channelId);
         var bad = await client.PostAsJsonAsync($"/api/alarms/{a2}/clear", new { reason = new string('长', 501) });
         bad.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+    }
+
+    // ===================== GB 范围外照常告警 =====================
+
+    [PostgresFact]
+    public async Task OutOfGbRangeLow_LooseBolt_TriggersPreloadLoss_ButStoresNullPreload()
+    {
+        _fx.EnsureAvailable();
+
+        var (deviceId, channelId, boltId, _) = await SeedCalibratedChannelAsync(channelNo: 30);
+        var sink = NewSinkWithAlarms();
+
+        // preload = 3440N：ratio 0.02 ≤ 0.05(PreloadLossRatio)，应力 14MPa < 30%×940，
+        // 松脱且超出 GB 定量适用范围。旧实现把 preload 置 NULL 后评估器直接跳过、不报警；
+        // 现在应报 preload_loss（critical，不走 on-delay，1 条触发）。
+        var ts = DateTimeOffset.UtcNow.AddMinutes(-10);
+        await sink.WriteAsync(MeasurementAt(deviceId, 30, ts, echoNs: 30003.44m), evaluateAlarms: true);
+
+        (await OpenAlarmCountAsync(boltId, "preload_loss"))
+            .Should().Be(1, "松脱到 GB 范围外也要报 preload_loss");
+
+        // 存储语义不变：范围外的数不入库（定量不可信），algo_version 记录原因
+        await using var q = _fx.DataSource.CreateCommand(
+            "SELECT preload_n IS NULL AND preload_ratio IS NULL, algo_version FROM measurements WHERE channel_id=@c AND ts=@t");
+        q.Parameters.AddWithValue("c", NpgsqlDbType.Bigint, channelId);
+        q.Parameters.AddWithValue("t", NpgsqlDbType.TimestampTz, ts);
+        await using var rd = await q.ExecuteReaderAsync();
+        (await rd.ReadAsync()).Should().BeTrue();
+        rd.GetBoolean(0).Should().BeTrue("GB 范围外的 preload_n/ratio 不得入库");
+        rd.GetString(1).Should().EndWith("out_of_gb_range");
+    }
+
+    [PostgresFact]
+    public async Task OutOfGbRangeHigh_OverTension_TriggersPreloadHigh()
+    {
+        _fx.EnsureAvailable();
+
+        var (deviceId, _, boltId, _) = await SeedCalibratedChannelAsync(channelNo: 31);
+        var sink = NewSinkWithAlarms();
+
+        // preload = 250kN：应力 1020MPa > 90%×940（超 GB 上限），ratio 1.45 > 1.10。
+        // preload_high 走 on-delay，连续 5 条触发（偏差 45% ≥ 30% → critical）。
+        var t0 = DateTimeOffset.UtcNow.AddMinutes(-10);
+        for (var i = 0; i < 5; i++)
+            await sink.WriteAsync(MeasurementAt(deviceId, 31, t0.AddSeconds(i), echoNs: 30250m), evaluateAlarms: true);
+
+        (await OpenAlarmCountAsync(boltId, "preload_high"))
+            .Should().Be(1, "过张到 GB 范围外也要报 preload_high");
     }
 
     // ===================== shelve alarmType 白名单 =====================
@@ -381,10 +471,13 @@ public sealed class AlarmPipelineIntegrationTests
     }
 
     private static FxDecodedEnvelope LowMeasurement(long deviceId, ushort channel, DateTimeOffset ts)
+        => MeasurementAt(deviceId, channel, ts, LowEchoNs);
+
+    private static FxDecodedEnvelope MeasurementAt(long deviceId, ushort channel, DateTimeOffset ts, decimal echoNs)
     {
         var cr = new FxChannelResultDto(
             Address: 1, Channel: channel, StatusCode: 0,
-            EchoTimeNs: LowEchoNs, EchoTime2Ns: null, SpTempC: RefTempC, DeltaTofNs: null,
+            EchoTimeNs: echoNs, EchoTime2Ns: null, SpTempC: RefTempC, DeltaTofNs: null,
             Gain: 16f, EchoWave: null, LowAi: null, HighAi: null, Angle: null, MidResults: null);
         return new FxDecodedEnvelope(deviceId, ts, ts, FxResultType.ChannelResult, ChannelResult: cr);
     }

@@ -199,18 +199,49 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     }
 
     /// <summary>
-    /// 路由命中已绑定通道时，尝试算 preload_n / preload_ratio。
-    /// 算不出（缺标定 / 缺规格 / EchoTime 空 / 超出 GB 适用范围 / 算出负值）就 NULL，
-    /// 由 AlgoVersion 字段记录原因，方便后续审计回放。
+    /// 预紧力计算结果：入库值与告警评估值分开。
+    /// <para>
+    /// 入库值（<see cref="PreloadN"/>/<see cref="PreloadRatio"/>）：超出 GB 适用范围时为 null。
+    /// 定量精度（±5%）只在 30%~90% Rp0.2 窗口内有保证，范围外的数不当正式监测值存。
+    /// </para>
+    /// <para>
+    /// 告警评估值（<see cref="AlarmPreloadN"/>/<see cref="AlarmRatio"/>）：范围外回退到原始计算值
+    /// （<see cref="RawPreloadN"/>/<see cref="RawRatio"/>）。范围界定的是定量精度，不影响定性判断：
+    /// 应力跌破 30% Rp0.2 就是松脱形态，超 90% 就是过张。此前实现把范围外一律置 NULL，
+    /// 评估器对 null 直接跳过，这两种状态反而不报警。
+    /// </para>
     /// </summary>
-    private (decimal? PreloadN, decimal? PreloadRatio, decimal? UncertaintyN, decimal DeltaTofNs, string AlgoVersion, Guid? CalibrationId)
-        TryComputePreload(ChannelRoute route, FxChannelResultDto cr)
+    private sealed record PreloadComputation(
+        decimal? PreloadN,
+        decimal? PreloadRatio,
+        decimal? UncertaintyN,
+        decimal DeltaTofNs,
+        string AlgoVersion,
+        Guid? CalibrationId,
+        decimal? RawPreloadN = null,
+        decimal? RawRatio = null)
+    {
+        /// <summary>告警评估用预紧力：入库值优先，范围外回退原始值。</summary>
+        public decimal? AlarmPreloadN => PreloadN ?? RawPreloadN;
+
+        /// <summary>告警评估用比值：入库值优先，范围外回退原始值。</summary>
+        public decimal? AlarmRatio => PreloadRatio ?? RawRatio;
+    }
+
+    /// <summary>
+    /// 路由命中已绑定通道时，尝试算 preload_n / preload_ratio。
+    /// 算不出（缺标定 / 缺规格 / EchoTime 空 / 算出负值）就 NULL，
+    /// 由 AlgoVersion 字段记录原因，方便后续审计回放。
+    /// 超出 GB 适用范围时入库值为 NULL，原始值仍随 RawPreloadN/RawRatio 带给告警评估
+    /// （见 <see cref="PreloadComputation"/>）。
+    /// </summary>
+    private PreloadComputation TryComputePreload(ChannelRoute route, FxChannelResultDto cr)
     {
         if (cr.EchoTimeNs is null || cr.SpTempC is null)
-            return (null, null, null, 0m, "phase1:raw", null);
+            return new(null, null, null, 0m, "phase1:raw", null);
 
         if (route.BoltSpec is null)
-            return (null, null, null, 0m, "phase1:raw", null);
+            return new(null, null, null, 0m, "phase1:raw", null);
 
         // 温度系数：优先用螺栓自带的（按材料标准值），缺则退化到 SDK 默认。
         var tempCoeff = route.BoltSpec.TempCoefficientPerC ?? BoltPhysicsDefaults.SdkTempCoefficientPerC;
@@ -230,13 +261,13 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             // 仍保留原始 echo/温度入库，但 preload_n/ratio 置空、algo_version 标记 calibration_expired，
             // 供审计回放与前端灰显；preload 为空 → 不会据此触发预紧力告警。
             if (route.Calibration.IsExpiredAsOf(DateTime.UtcNow))
-                return (null, null, null, cr.DeltaTofNs ?? 0m,
+                return new(null, null, null, cr.DeltaTofNs ?? 0m,
                     $"phase1:calibration_expired:{route.Calibration.CalibrationId}", route.Calibration.CalibrationId);
 
             // 标定未达合格线（passed=false，例如 torque_fit R² 落在 [0.95,0.98) 临时可用层）：
             // 与过期一样不得当"正式"预紧力监测值；保留原始 echo/温度，preload 置空 + 专门 algo_version 供审计/灰显。
             if (!route.Calibration.Passed)
-                return (null, null, null, cr.DeltaTofNs ?? 0m,
+                return new(null, null, null, cr.DeltaTofNs ?? 0m,
                     $"phase1:calibration_not_passed:{route.Calibration.CalibrationId}", route.Calibration.CalibrationId);
 
             // 多点拟合（如 torque_fit）会带截距 b：Δt = K_L * F + b。
@@ -246,7 +277,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 var deltaTempC = cr.SpTempC.Value - route.Calibration.RefTempC;
                 var tempFactor = 1m + tempCoeff * deltaTempC;
                 if (tempFactor <= 0m || route.Calibration.KL <= 0m)
-                    return (null, null, null, 0m, "phase1:torque_fit:invalid", route.Calibration.CalibrationId);
+                    return new(null, null, null, 0m, "phase1:torque_fit:invalid", route.Calibration.CalibrationId);
 
                 var normalizedTofNs = cr.EchoTimeNs.Value / tempFactor;
                 var deltaTofNs = normalizedTofNs - route.Calibration.RefTimeNs;
@@ -254,24 +285,26 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
 
                 // torque_fit 算出负值 = 标定方向反或基线漂；不要 Abs 抹平
                 if (preloadN < 0m)
-                    return (null, null, null, deltaTofNs,
+                    return new(null, null, null, deltaTofNs,
                         "phase1:TorqueFitSingleWave:1.0.0:negative_preload", route.Calibration.CalibrationId);
 
-                // 适用范围（同 GbSingleWave）：30~90% Rp0.2；超范围不出 preload_n（防"算出假预紧力被当真"）
-                if (boltSpec.CrossSectionMm2 > 0m)
-                {
-                    var stressMpa = preloadN / boltSpec.CrossSectionMm2;
-                    if (stressMpa < boltSpec.Rp02Mpa * 0.30m || stressMpa > boltSpec.Rp02Mpa * 0.90m)
-                        return (null, null, null, deltaTofNs,
-                            "phase1:TorqueFitSingleWave:1.0.0:out_of_gb_range", route.Calibration.CalibrationId);
-                }
-
-                var uncertaintyN = preloadN * 0.30m; // 扭矩拟合仍按临时工程估算处理
                 decimal? torqueFitRatio = null;
                 if (route.TargetPreloadN is > 0)
                     torqueFitRatio = preloadN / route.TargetPreloadN.Value;
 
-                return (preloadN, torqueFitRatio, uncertaintyN, deltaTofNs,
+                // 适用范围（同 GbSingleWave）：30~90% Rp0.2；超范围不入库（防"算出假预紧力被当真"），
+                // 原始值仍带给告警评估：跌破下限是松脱形态，要能报 preload_loss。
+                if (boltSpec.CrossSectionMm2 > 0m)
+                {
+                    var stressMpa = preloadN / boltSpec.CrossSectionMm2;
+                    if (stressMpa < boltSpec.Rp02Mpa * 0.30m || stressMpa > boltSpec.Rp02Mpa * 0.90m)
+                        return new(null, null, null, deltaTofNs,
+                            "phase1:TorqueFitSingleWave:1.0.0:out_of_gb_range", route.Calibration.CalibrationId,
+                            RawPreloadN: preloadN, RawRatio: torqueFitRatio);
+                }
+
+                var uncertaintyN = preloadN * 0.30m; // 扭矩拟合仍按临时工程估算处理
+                return new(preloadN, torqueFitRatio, uncertaintyN, deltaTofNs,
                     "phase1:TorqueFitSingleWave:1.0.0", route.Calibration.CalibrationId);
             }
 
@@ -300,25 +333,27 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             var calc = _calculatorFactory.Pick(boltSpec, input.Calibration, DateTimeOffset.UtcNow);
             var result = calc.Calculate(input);
 
-            // GB 范围外不出 preload_n —— calculator 标 WithinGbRange=false 但仍返回 preload_n，
-            // 这里在写库前再过滤一遍，避免下游业务把超范围预紧力当真。
-            if (result.PreloadN.HasValue && !result.WithinGbRange)
-            {
-                return (null, null, null, result.DeltaTofNs,
-                    $"phase1:{result.ModelUsed}:out_of_gb_range", result.CalibrationId);
-            }
-
             decimal? ratio = null;
             if (result.PreloadN.HasValue && route.TargetPreloadN is > 0)
                 ratio = result.PreloadN.Value / route.TargetPreloadN.Value;
 
-            return (result.PreloadN, ratio, result.UncertaintyN, result.DeltaTofNs,
+            // GB 范围外不入库 —— calculator 标 WithinGbRange=false 但仍返回 preload_n，
+            // 这里在写库前过滤，避免下游业务把超范围预紧力当真。
+            // 原始值仍带给告警评估：跌破 GB 下限是松脱形态（见 PreloadComputation）。
+            if (result.PreloadN.HasValue && !result.WithinGbRange)
+            {
+                return new(null, null, null, result.DeltaTofNs,
+                    $"phase1:{result.ModelUsed}:out_of_gb_range", result.CalibrationId,
+                    RawPreloadN: result.PreloadN, RawRatio: ratio);
+            }
+
+            return new(result.PreloadN, ratio, result.UncertaintyN, result.DeltaTofNs,
                 $"phase1:{result.ModelUsed}:{calc.Version}", result.CalibrationId);
         }
 
         // 未标定通道不计算 preload_n，避免把 "0N" 当成真实预紧力。
         // SDK 如果有 ChannelConfig.RefTime/RefTemp，会给 DeltaTofNs；这里保留它。
-        return (null, null, null, cr.DeltaTofNs ?? 0m, "phase1:raw", null);
+        return new(null, null, null, cr.DeltaTofNs ?? 0m, "phase1:raw", null);
     }
 
     // 通道解析逻辑搬到 IChannelResolver（CachedChannelResolver 带 IMemoryCache）
@@ -610,17 +645,19 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
 
     private async Task EvaluateAndDispatchAlarmsAsync(
         ChannelRoute route, FxDecodedEnvelope envelope, FxChannelResultDto cr,
-        (decimal? PreloadN, decimal? PreloadRatio, decimal? UncertaintyN, decimal DeltaTofNs, string AlgoVersion, Guid? CalibrationId) pre,
+        PreloadComputation pre,
         CancellationToken ct)
     {
         if (_alarmEvaluator is null) return;
 
+        // 用 AlarmPreloadN/AlarmRatio 而非入库值：GB 范围外入库为 NULL，
+        // 告警评估要拿原始计算值（见 PreloadComputation）。
         var input = new AlarmInput(
             BoltId: route.BoltId,
             ChannelId: route.ChannelId,
             Ts: envelope.ReceiveTime,
-            PreloadN: pre.PreloadN,
-            PreloadRatio: pre.PreloadRatio,
+            PreloadN: pre.AlarmPreloadN,
+            PreloadRatio: pre.AlarmRatio,
             TargetPreloadN: route.TargetPreloadN,
             SdkStatusCode: cr.StatusCode);
 
@@ -721,17 +758,18 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     /// </summary>
     private async Task EvaluateReplayCriticalSafetyNetAsync(
         ChannelRoute route, FxDecodedEnvelope envelope, FxChannelResultDto cr,
-        (decimal? PreloadN, decimal? PreloadRatio, decimal? UncertaintyN, decimal DeltaTofNs, string AlgoVersion, Guid? CalibrationId) pre,
+        PreloadComputation pre,
         CancellationToken ct)
     {
         if (_alarmEvaluator is null || _alarmSink is null) return;
 
+        // 与在线评估一致用告警评估值：故障窗口内发生的松脱即使超出 GB 范围，重放也要补出 critical。
         var input = new AlarmInput(
             BoltId: route.BoltId,
             ChannelId: route.ChannelId,
             Ts: envelope.ReceiveTime,
-            PreloadN: pre.PreloadN,
-            PreloadRatio: pre.PreloadRatio,
+            PreloadN: pre.AlarmPreloadN,
+            PreloadRatio: pre.AlarmRatio,
             TargetPreloadN: route.TargetPreloadN,
             SdkStatusCode: cr.StatusCode);
 

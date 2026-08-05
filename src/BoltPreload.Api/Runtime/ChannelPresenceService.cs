@@ -117,11 +117,19 @@ public sealed class ChannelPresenceService : BackgroundService
                 _mcrConfigured.Remove(rt.DeviceId);
                 continue;
             }
+            if (rt.Connector.State != FxConnectorState.Connected)
+            {
+                // 断开期间清"已下发"标记（必须在下面的标记短路判断之前，否则已确认的设备走不到这里）：
+                // 重连是新会话，设备断电重启可能丢轮询集。连接器侧在新会话 provisioning 时会把
+                // 会话 MCR 视图一并清空（FxSdkConnector.OnSdkConnectedAsync），两边都清，
+                // 恢复 Connected 后才会真正重新校验下发，而不是拿旧快照判"一致"跳过。
+                _mcrConfigured.Remove(rt.DeviceId);
+                continue;
+            }
             var channelCount = rt.Options.ChannelCount;
             // 已确认且目标通道数没变才跳过；通道目录扩容（40→48）会改变目标，需重新收敛
             if (_mcrConfigured.TryGetValue(rt.DeviceId, out var configuredCount) && configuredCount == channelCount)
                 continue;
-            if (rt.Connector.State != FxConnectorState.Connected) continue;
 
             if (rt.Options.Model != 3)
             {

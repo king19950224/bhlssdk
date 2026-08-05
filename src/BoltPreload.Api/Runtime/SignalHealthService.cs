@@ -1,6 +1,7 @@
 using BoltPreload.Application.Alarm;
 using BoltPreload.Application.Devices.ProbeScan;
 using BoltPreload.Application.Diagnostics;
+using BoltPreload.Application.Ingestion;
 using BoltPreload.Application.Realtime;
 using Microsoft.Extensions.Options;
 using Npgsql;
@@ -34,19 +35,22 @@ public sealed class SignalHealthService : BackgroundService
     private readonly IAlarmSink _sink;
     private readonly IAlarmPublisher _publisher;
     private readonly ProbeScanState _probeScan;
+    private readonly IMeasurementWal _wal;
     private readonly SignalHealthOptions _opt;
     private readonly BackgroundServiceHealth _health;
     private readonly ILogger<SignalHealthService> _logger;
+    private long _walSkipRounds;
 
     public SignalHealthService(
         NpgsqlDataSource ds, IAlarmSink sink, IAlarmPublisher publisher,
-        ProbeScanState probeScan, BackgroundServiceHealth health,
+        ProbeScanState probeScan, IMeasurementWal wal, BackgroundServiceHealth health,
         IOptions<SignalHealthOptions> opt, ILogger<SignalHealthService> logger)
     {
         _ds = ds;
         _sink = sink;
         _publisher = publisher;
         _probeScan = probeScan;
+        _wal = wal;
         _health = health;
         _opt = opt.Value;
         _logger = logger;
@@ -77,6 +81,19 @@ public sealed class SignalHealthService : BackgroundService
     // internal 供集成测试直调单轮检查（BoltPreload.Tests，见 csproj InternalsVisibleTo）
     internal async Task CheckAsync(CancellationToken ct)
     {
+        // WAL 有积压 = 入库链路刚故障过或正在恢复：measurements 的 max(ts) 落后于设备实况，
+        // 按它判"无回波"会把一批在线设备误报成 signal_lost。跳过本轮，重放清零后恢复判定。
+        // 代价是积压期间真实的信号丢失也延后报——此时系统本身已在降级状态，日志里全是入库失败。
+        if (_wal.Enabled && _wal.PendingCount > 0)
+        {
+            _walSkipRounds++;
+            if (_walSkipRounds == 1 || _walSkipRounds % 15 == 0) // 20s 一轮，约 5 分钟提示一次
+                _logger.LogWarning("SignalHealth 跳过检查：WAL 尚有 {Pending} 条待重放，入库时间落后于设备实况（已连续 {Rounds} 轮）",
+                    _wal.PendingCount, _walSkipRounds);
+            return;
+        }
+        _walSkipRounds = 0;
+
         // 1) 当前已开启的 signal_lost 告警（按 bolt 去重）
         var open = new HashSet<long>();
         await using (var cmd = _ds.CreateCommand("SELECT DISTINCT bolt_id FROM alarms WHERE type='signal_lost' AND cleared_at IS NULL"))

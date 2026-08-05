@@ -23,7 +23,8 @@ internal sealed class FakeConnector : IFxConnector
     /// <summary>收到的 <see cref="ReadChannelParamAsync"/> 调用，按发生顺序。</summary>
     public ConcurrentQueue<(string Property, ushort Channel)> ChannelParamReads { get; } = new();
 
-    public FxConnectorState State => FxConnectorState.Connected;
+    /// <summary>可设：断线/重连场景的用例直接拨这个状态。</summary>
+    public FxConnectorState State { get; set; } = FxConnectorState.Connected;
     public long DeviceId { get; }
     public ChannelReader<FxDecodedEnvelope> Results => _channel.Reader;
 

@@ -387,6 +387,12 @@ public sealed class FxSdkConnector : IFxConnector
             _sessionId = session;
             _logger.LogInformation("FxSdk 已连接 device={DeviceId}, session={Session}", _deviceId, session);
 
+            // 新会话的设备端轮询集是未知数：上一会话下发的 MCRConfig 在设备断电重启后未必还在。
+            // 把内存视图清掉，让 ChannelPresenceService 的收敛循环按未知状态重新校验下发；
+            // 不清的话它拿旧会话的快照对比目标集，永远判"一致"，丢了轮询集的设备只剩默认几路在测。
+            if (_config.MCRConfig is { } mcr)
+                mcr.EnabledChannels = null;
+
             // 必须把 DeviceConfig 存到 SessionContext，否则后续 ReadDeviceParam / ReadChannelParam
             // 走 SDK EncodeReadDeviceParameter 时 GetDeviceConfig 返回 null 导致空指令发不出去
             // 用 sendCommand=false 表示只更新会话状态，不下发指令到设备
