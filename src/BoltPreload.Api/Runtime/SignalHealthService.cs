@@ -100,15 +100,19 @@ public sealed class SignalHealthService : BackgroundService
         await using (var r = await cmd.ExecuteReaderAsync(ct))
             while (await r.ReadAsync(ct)) open.Add(r.GetInt64(0));
 
-        // 2) 监测中的螺栓（近 MonitoredWindow 有过测量）+ 距最近一条测量的秒数
+        // 2) 监测中的螺栓（近 MonitoredWindow 有过测量）+ 距最近一条测量的秒数。
+        //    设备被禁用/软删的螺栓不纳入：设备是人主动停的，数据停摆是预期而不是"信号丢失"，
+        //    不滤的话禁用 120 秒后名下螺栓逐颗误报、滑出监测窗后告警永久挂开
         await using var q = _ds.CreateCommand(@"
             SELECT b.id, b.channel_id, b.code,
                    EXTRACT(EPOCH FROM (now() - mx.last_ts))::double precision AS idle_secs,
                    c.device_id
             FROM bolts b
             LEFT JOIN channels c ON c.id = b.channel_id
+            LEFT JOIN devices d ON d.id = c.device_id
             JOIN LATERAL (SELECT max(ts) AS last_ts FROM measurements m WHERE m.bolt_id = b.id) mx ON true
             WHERE b.deleted_at IS NULL AND b.enabled
+              AND (d.id IS NULL OR (d.enabled AND d.deleted_at IS NULL))
               AND mx.last_ts IS NOT NULL
               AND mx.last_ts > now() - (@win * interval '1 minute')");
         q.Parameters.AddWithValue("win", NpgsqlDbType.Integer, _opt.MonitoredWindowMinutes);

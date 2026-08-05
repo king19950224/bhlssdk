@@ -395,6 +395,7 @@ app.MapAuthEndpoints();
 // 业务 endpoints — 每个内部的 MapGroup 自己已经挂 RequireAuthorization(...)
 app.MapMeasurementEndpoints();
 app.MapBoltBindingEndpoints();
+app.MapDeviceEndpoints();
 app.MapDiagnosticEndpoints();
 app.MapChannelConfigChangeEndpoints();
 app.MapAuditLogEndpoints();

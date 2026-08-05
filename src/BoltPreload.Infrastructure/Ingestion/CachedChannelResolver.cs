@@ -106,6 +106,20 @@ public sealed class CachedChannelResolver : IChannelResolver
         Interlocked.Increment(ref _invalidations);
     }
 
+    public void InvalidateDevice(long deviceId)
+    {
+        var prefix = $"chan:{deviceId}:";
+        foreach (var key in _knownKeys.Keys)
+        {
+            if (!key.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+            _cache.Remove(key);
+            _knownKeys.TryRemove(key, out _);
+        }
+        Interlocked.Increment(ref _invalidations);
+        _logger.LogInformation("通道路由缓存按设备失效 device={DeviceId}", deviceId);
+    }
+
     /// <summary>
     /// 只失效本 resolver 写入过的 key。早期实现是 mc.Compact(1.0) 整个进程缓存清空，
     /// 多个 caller 共享 IMemoryCache 时会误伤 — 改成显式遍历 _knownKeys。

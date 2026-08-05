@@ -21,20 +21,30 @@ namespace BoltPreload.Api.Runtime;
 /// </summary>
 public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisposable
 {
-    // TryUpdateChannelCount 会整体替换字典里的 record（Options 是不可变 record），
+    // TryUpdateChannelCount / 热增删 会整体替换或增删字典条目（Options 是不可变 record），
     // 与后台服务的 Runtimes/Find 读取并发，用 _gate 串行化字典读写。
     private readonly object _gate = new();
     private readonly Dictionary<long, DeviceRuntimeContext> _runtimes;
-    private readonly long _primaryId;
+    private long _primaryId;
+    private readonly bool _isSimulated;
+    private readonly IConfiguration _configuration;
+    private readonly NpgsqlDataSource _dataSource;
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly IngestionTaskRegistry _registry;
     private readonly ILogger<DeviceConnectorManager> _log;
 
     public DeviceConnectorManager(
         IConfiguration configuration,
         NpgsqlDataSource dataSource,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        IngestionTaskRegistry registry)
     {
         var log = loggerFactory.CreateLogger<DeviceConnectorManager>();
         _log = log;
+        _configuration = configuration;
+        _dataSource = dataSource;
+        _loggerFactory = loggerFactory;
+        _registry = registry;
 
         // 缺 Fx:Mode 时按 Real 兜底，不是 Simulated：模拟器会产出物理上自洽、看起来完全正常的预紧力，
         // 现场若因配置丢失而静默跑成仿真，值班人员盯着的是假数据 —— 对安全监测系统这是最坏的失效方向。
@@ -46,9 +56,10 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             log.LogWarning("未配置 Fx:Mode，按 Real（真机）兜底。若本机是开发/演示环境需显式设置 Fx:Mode=Simulated。");
         }
 
-        var runtimes = string.Equals(fxMode, "Real", StringComparison.OrdinalIgnoreCase)
-            ? BuildRealRuntimes(configuration, dataSource, loggerFactory, log)
-            : BuildSimulatorRuntimes(configuration, loggerFactory, log);
+        _isSimulated = !string.Equals(fxMode, "Real", StringComparison.OrdinalIgnoreCase);
+        var runtimes = _isSimulated
+            ? BuildSimulatorRuntimes(configuration, loggerFactory, log)
+            : BuildRealRuntimes(configuration, dataSource, loggerFactory, log);
 
         if (runtimes.Count == 0)
             throw new InvalidOperationException("未构造出任何设备运行时：检查 devices 表或 Fx 配置。");
@@ -73,7 +84,17 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
 
     public DeviceRuntimeContext Primary
     {
-        get { lock (_gate) return _runtimes[_primaryId]; }
+        get
+        {
+            lock (_gate)
+            {
+                // RestartAsync 的摘除-重建窗口里 _primaryId 可能短暂不在字典（重建后恢复标记），
+                // 退回任一在跑设备，别让并发的诊断请求在这个窗口 500
+                if (_runtimes.TryGetValue(_primaryId, out var p)) return p;
+                return _runtimes.Values.FirstOrDefault()
+                    ?? throw new InvalidOperationException("设备运行时为空（热重启窗口），稍后重试");
+            }
+        }
     }
 
     public DeviceRuntimeContext? Find(long deviceId)
@@ -92,6 +113,131 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         }
         _log.LogInformation("运行时通道数已更新 device={DeviceId} channelCount={Count}", deviceId, clamped);
         return true;
+    }
+
+    // ===================== 热增删（IngestionService 对账拉起/收尾） =====================
+
+    public async Task<bool> AddAsync(long deviceId, CancellationToken ct = default)
+    {
+        if (_isSimulated)
+            throw new NotSupportedException("Simulated 模式不支持热增删设备：模拟设备数量由 Fx:Simulator:DeviceCount 决定");
+
+        lock (_gate)
+        {
+            if (_runtimes.ContainsKey(deviceId))
+                return true;
+        }
+
+        var row = await LoadDeviceRowAsync(deviceId, ct);
+        if (row is null)
+        {
+            _log.LogWarning("热加设备失败：devices 表无 id={DeviceId} 的启用设备", deviceId);
+            return false;
+        }
+
+        // 只建不连：连接、下发工作模式由 IngestionService 对账（2 秒内）拉起，与启动路径同一分工
+        var runtime = BuildRealRuntimeFromDb(row, _configuration, _dataSource, _loggerFactory, isPrimary: false);
+        lock (_gate)
+        {
+            if (!_runtimes.TryAdd(deviceId, runtime))
+                return true;   // 并发加同一台：先到的赢，本次构建的运行时没连接过，丢弃无残留
+        }
+        _log.LogInformation("热加设备运行时 device={DeviceId} name={Name} comm={Comm}", deviceId, runtime.Name, row.CommParams);
+        return true;
+    }
+
+    public Task<bool> RemoveAndStopAsync(long deviceId, TimeSpan stopTimeout, CancellationToken ct = default)
+        => RemoveAndStopCoreAsync(deviceId, stopTimeout, allowPrimary: false, ct);
+
+    public async Task<bool> RestartAsync(long deviceId, TimeSpan stopTimeout, CancellationToken ct = default)
+    {
+        bool wasPrimary;
+        lock (_gate)
+        {
+            if (!_runtimes.TryGetValue(deviceId, out var rt)) return false;
+            wasPrimary = rt.IsPrimary;
+        }
+        if (!await RemoveAndStopCoreAsync(deviceId, stopTimeout, allowPrimary: true, ct))
+            return false;
+        if (!await AddAsync(deviceId, ct))
+            return false;   // 行在摘除后被禁用/删除：按新事实办，不复活
+        if (wasPrimary)
+            TransferPrimary(deviceId);
+        _log.LogInformation("设备已热重启 device={DeviceId}", deviceId);
+        return true;
+    }
+
+    public bool TransferPrimary(long deviceId)
+    {
+        lock (_gate)
+        {
+            if (!_runtimes.TryGetValue(deviceId, out var target)) return false;
+            if (_runtimes.TryGetValue(_primaryId, out var old) && old.DeviceId != deviceId)
+                _runtimes[old.DeviceId] = old with { IsPrimary = false };
+            _runtimes[deviceId] = target with { IsPrimary = true };
+            _primaryId = deviceId;
+        }
+        _log.LogInformation("主设备已转移 primary={DeviceId}", deviceId);
+        return true;
+    }
+
+    private async Task<bool> RemoveAndStopCoreAsync(long deviceId, TimeSpan stopTimeout, bool allowPrimary, CancellationToken ct)
+    {
+        bool wasRunning;
+        DeviceRuntimeContext? removed;
+        lock (_gate)
+        {
+            if (!_runtimes.TryGetValue(deviceId, out removed))
+                return false;
+            if (removed.IsPrimary && !allowPrimary)
+                throw new InvalidOperationException("primary 设备不许摘除：先把主设备转移给另一台启用设备");
+            wasRunning = _registry.IsRunning(deviceId);
+            _runtimes.Remove(deviceId);
+        }
+
+        if (wasRunning)
+        {
+            // 消费任务在跑：supervisor 对账发现孤儿后取消任务、走 finally 清理、释放连接器并登记停止。
+            // 超时不视为失败——supervisor 到点会强制释放，这里没必要吊死调用方。
+            if (!await _registry.WaitStoppedAsync(deviceId, stopTimeout, ct))
+                _log.LogWarning("设备 {DeviceId} 的消费任务未在 {Timeout}s 内确认停止（supervisor 会强制释放连接器）",
+                    deviceId, stopTimeout.TotalSeconds);
+        }
+        else
+        {
+            // 采集服务根本没在跑（对账没登记过它）：没人会来释放这个连接器，得自己收
+            try
+            {
+                await removed.Connector.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "释放未在采集中的设备连接器失败 device={DeviceId}", deviceId);
+            }
+        }
+        _log.LogInformation("设备已摘出运行时 device={DeviceId}（任务此前在跑：{WasRunning}）", deviceId, wasRunning);
+        return true;
+    }
+
+    private async Task<DeviceRow?> LoadDeviceRowAsync(long deviceId, CancellationToken ct)
+    {
+        await using var cmd = _dataSource.CreateCommand(@"
+            SELECT id, code, model, comm_type, comm_params, address, transfer_mode, channel_count
+            FROM devices
+            WHERE id = @id AND enabled = true AND deleted_at IS NULL");
+        cmd.Parameters.AddWithValue("id", NpgsqlTypes.NpgsqlDbType.Bigint, deviceId);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return null;
+        return new DeviceRow(
+            Id: reader.GetInt64(0),
+            Code: reader.GetString(1),
+            Model: reader.GetInt16(2),
+            CommType: reader.GetInt16(3),
+            CommParams: reader.GetString(4),
+            Address: reader.GetInt16(5),
+            TransferMode: reader.GetInt16(6),
+            ChannelCount: reader.GetInt16(7));
     }
 
     /// <summary>

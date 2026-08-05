@@ -13,12 +13,15 @@ import { useAuth } from '../stores/auth'
 import EmptyState from '../components/EmptyState.vue'
 import BoltCreateDialog from '../components/BoltCreateDialog.vue'
 import CalibrationWizard from '../components/CalibrationWizard.vue'
+import DeviceManagePanel from '../components/DeviceManagePanel.vue'
 
 const router = useRouter()
 const auth = useAuth()
 
 const devices = ref<RuntimeDevice[]>([])
 const selected = ref<RuntimeDevice | null>(null)
+// 设备生命周期管理面板（Admin）：新增/启停/改参/转主/删除，关闭后刷新运行时卡片
+const manageOpen = ref(false)
 const tab = ref<'health' | 'scan' | 'bind'>('health')
 const loading = ref(false)
 let timer: number | undefined
@@ -383,6 +386,11 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
         </div>
       </div>
       <EmptyState v-if="!devices.length" :loading="!devicesLoaded" :empty="devicesLoaded" empty-text="暂无设备运行时" />
+      <div v-if="auth.isAdmin" class="dc panel dc-manage" @click="manageOpen = true">
+        <span class="dc-manage-plus">+</span>
+        <span class="dc-manage-label">设备管理</span>
+        <span class="dc-manage-sub">新增 / 启停 / 改参 / 删除</span>
+      </div>
     </div>
 
     <div class="panel panel--glow" v-if="selected">
@@ -527,6 +535,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
       :bolt-code="wizardSel?.code ?? ''"
       @done="loadBinding(); loadHealth()"
     />
+    <DeviceManagePanel v-model="manageOpen" @changed="loadDevices" />
   </div>
 </template>
 
@@ -540,6 +549,11 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
 .dc-name { font-weight: 600; font-size: 14px; flex: 1; }
 .ptag { background: rgba(34, 211, 238, 0.16) !important; border-color: var(--panel-border-strong) !important; color: var(--accent) !important; }
 .dc-state { font-size: 11px; color: var(--text-3); margin: 4px 0 14px; letter-spacing: 0.08em; }
+.dc-manage { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; border-style: dashed; color: var(--text-3); }
+.dc-manage:hover { color: var(--accent); }
+.dc-manage-plus { font-size: 22px; line-height: 1; }
+.dc-manage-label { font-size: 13px; font-weight: 600; }
+.dc-manage-sub { font-size: 10.5px; }
 .dc-metrics { display: flex; justify-content: space-between; }
 .dc-metrics > div { display: flex; flex-direction: column; gap: 3px; }
 .dc-metrics b { font-size: 17px; }

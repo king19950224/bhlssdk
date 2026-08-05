@@ -82,7 +82,14 @@ internal sealed class FakeConnector : IFxConnector
 
     public IReadOnlyList<FxSessionChannelConfigSnapshot> GetSessionChannelConfigs() => [];
 
-    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    /// <summary>是否已被释放（supervisor 摘除设备后必须释放连接器，热增删用例据此断言）。</summary>
+    public bool Disposed { get; private set; }
+
+    public ValueTask DisposeAsync()
+    {
+        Disposed = true;
+        return ValueTask.CompletedTask;
+    }
 }
 
 /// <summary>只装一台设备的运行时管理器。</summary>

@@ -480,6 +480,44 @@ export interface ChannelHealth {
   measurement: { total: number; withEcho: number; echoRatePct: number; avgEchoNs: number | null; avgTempC: number | null; lastTs: string | null; healthy: boolean }
   latestWave: { snrDb: number | null; peakToPeak: number | null; noiseRms: number | null }
 }
+// ---- 设备生命周期管理（Admin；表视角 + 运行时叠加）----
+export interface AdminDevice {
+  id: number
+  code: string
+  model: number
+  commType: number
+  commParams: string
+  address: number
+  transferMode: number
+  channelCount: number
+  enabled: boolean
+  state: string
+  deletedAt: string | null
+  createdAt: string
+  projectCode: string
+  activeChannels: number
+  inRuntime: boolean
+  isPrimary: boolean
+  connectorState: string | null
+  isIngesting: boolean
+}
+export const deviceMgmtApi = {
+  list: (includeDeleted = false) =>
+    http.get<{ count: number; items: AdminDevice[] }>(`/api/devices/?includeDeleted=${includeDeleted}`),
+  // 新增：插行 + 建全通道目录 + 热加运行时（Simulated 模式只落库），前置授权容量预检（超限 409）
+  create: (body: { code: string; commParams: string; channelCount: number; model?: number; commType?: number; address?: number; transferMode?: number; projectId?: number; note?: string }) =>
+    http.post<{ id: number; channelsCreated: number; runtimeAttached: boolean; note: string | null }>('/api/devices/', body),
+  // 试连走临时连接器（5 秒超时用完即弃）；正在采集的设备会被抢占连接位，响应里带 warning
+  testConnection: (id: number) =>
+    http.post<{ id: number; ok: boolean; state: string; error: string | null; warning: string | null }>(`/api/devices/${id}/test-connection`),
+  update: (id: number, body: { commParams?: string; address?: number; transferMode?: number; makePrimary?: boolean }) =>
+    http.patch<{ id: number; updated: boolean; connChanged: boolean; restarted: boolean; primaryTransferred: boolean; note: string | null }>(`/api/devices/${id}`, body),
+  enable: (id: number) => http.post<{ id: number; enabled: boolean; runtimeAttached?: boolean; note?: string | null }>(`/api/devices/${id}/enable`),
+  disable: (id: number) =>
+    http.post<{ id: number; disabled: boolean; closedSignalLost?: number; taskStopped?: boolean; note?: string | null }>(`/api/devices/${id}/disable`),
+  remove: (id: number) => http.delete<{ id: number; deleted: boolean }>(`/api/devices/${id}`),
+}
+
 export const deviceApi = {
   channelHealth: (deviceId: number, minutes = 5) =>
     http.get<{ deviceId: number; connectorState: string; count: number; items: ChannelHealth[] }>(

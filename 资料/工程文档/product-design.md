@@ -1,6 +1,6 @@
 # 产品设计：缺失功能补齐（P0–P3）
 
-> 状态：设计稿（2026-08-05）。已实施落地：P0-1 见 §2（0028 迁移 + 规则端点 + 前端规则页）、P0-2 见 §3（setup-https / register-backup-task 两脚本 + 手册两节，待 Windows 实机跑通）、P1-A 见 §4（0029 三表 + 事务性发件箱 + 派发/webhook + 通知页，真机联调列入交付验收）；P1-B 起待排。
+> 状态：设计稿（2026-08-05）。已实施落地：P0-1 见 §2（0028 迁移 + 规则端点 + 前端规则页）、P0-2 见 §3（setup-https / register-backup-task 两脚本 + 手册两节，待 Windows 实机跑通）、P1-A 见 §4（0029 三表 + 事务性发件箱 + 派发/webhook + 通知页，真机联调列入交付验收）、P1-B 见 §5（supervisor 对账 + 设备 CRUD/容量热重估/连带清理，偏差记录在 §5.9）；P1-C 起待排。
 > 定位：`commercialization-roadmap.md` 盘点了“已具备 / 仍不具备”；本文把“仍不具备”的部分逐项落成可实施的设计——改哪些文件、加什么表、挂哪个接缝、怎么验收。所有设计点写之前都逐条核过源码，引用的文件、表、配置键在当前代码库里真实存在。
 > 相关：`delivery-master-plan.md`（交付验收清单）、`phase2-backlog.md`（技术债台账）、`probe-scan-design.md`（同类设计文档的先例）。
 
@@ -240,7 +240,7 @@ CREATE INDEX idx_notification_outbox_due ON notification_outbox(next_attempt_at)
 
 ---
 
-## 5. P1-B 多设备生命周期管理
+## 5. P1-B 多设备生命周期管理（已实施）
 
 ### 5.1 设计前提（逐条核过源码）
 
@@ -320,6 +320,21 @@ preload 类告警有意不动：螺栓还在法兰上，只是数据停了，预
 - 集成测试：对账循环增删、容量预检 409、连带清理（告警闭合 + 缓存失效 + 残项清零）。
 
 工作量 8–10 人天：supervisor 重构 3、CRUD 与容量 2.5、连带清理 1、前端 2、回归联调 1.5。
+
+### 5.9 实施状态与设计偏差
+
+按两刀提交：第一刀只做 supervisor 对账重构（行为等价，单独全量回归 + 双模拟器冒烟：两台同时采集、
+热插拔与 MCR 双双收敛），第二刀开写侧与端点。集成测试盖住对账热增删（含连接器释放）、真机模式
+manager 写侧（primary 摘除守卫/转移/热重启）、端点全流程（建档目录、重名 409、禁用连带闭合
+signal_lost、先禁用再删）、SignalHealth 禁用过滤、容量预检纯函数。实施与设计的偏差，都是干到那儿发现更省事的：
+
+- 没做 `Version` 计数器：supervisor 直接按成员差异对账（几十台规模的字典每 2 秒 diff 一次成本可忽略），少维护一个要同步的计数；
+- 摘除等停靠新增的 `IngestionTaskRegistry`（任务登记表）传信号，端点能确定性等到"任务真停、连接器真释放"，manager 与采集服务不互相引用；
+- 试连是对已建档行（临时连接器 5 秒超时用完即弃），流程为"建档 → 试连 → 不通改参或删除"——建档前裸参数试连需要另一个无主体端点，不值；
+- primary 转移是运行时动作不落库（devices 表无 is_primary 列），进程重启后按 `Fx:Real:DeviceId` 配置或 id 最小行重选，端点响应与手册都写明；
+- `cleared_reason='device_disabled'` 不进词表：全系统 cleared_reason 本就无词表（manual_reset/auto_recovered 同样直显原码），单给一个登记反而两套口径。
+
+真机验收（真实设备热增删、断电重启自愈）列入交付验收清单，与 P1-A 的 webhook 联调同批做。
 
 ---
 
@@ -494,7 +509,7 @@ CREATE TABLE calibration_session_points (
 | 1 | P0-1 告警阈值进库 | 2–3 | 已完成（0028_alarm_rules + AlarmRuleEndpoints + AlarmRulesPanel） |
 | 2 | P0-2 HTTPS + 备份任务 | 1.5 | 已完成（setup-https / register-backup-task，Windows 实机验证列入手册 §10） |
 | 3 | P1-A 出站通知 | 5 | 已完成（0029 三表 + 发件箱入队 + 派发/webhook + 通知页）；真机联调列入交付验收 |
-| 4 | P1-B 多设备生命周期 | 8–10 | supervisor 重构单独提交、单独回归 |
+| 4 | P1-B 多设备生命周期 | 8–10 | 已完成（两刀提交：supervisor 对账重构 + 设备 CRUD/容量/连带清理，见 §5.9） |
 | 5 | P1-C 载荷标定中心 | 10 | 与 P1-B 无硬依赖，可换序 |
 | 6 | P1-D 离线安装包 | 5 | 放最后，一次打包全部新功能；需 Windows 机 |
 

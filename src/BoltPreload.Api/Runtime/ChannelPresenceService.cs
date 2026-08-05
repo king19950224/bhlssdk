@@ -49,6 +49,7 @@ public sealed class ChannelPresenceService : BackgroundService
     // 已确认下发过全通道 MCR 的设备 → 当时的目标通道数（本进程内幂等；设备端 MCR 是持久配置，
     // 重启进程会话快照为空时会再下发一次收敛）。记录通道数是为了在通道目录扩容
     //（TryUpdateChannelCount，如 40→48）后检测到目标变化并重新收敛，而不是永久跳过。
+    // 已摘出运行时的设备（热禁用/删除）每轮末尾清掉，重新启用时按新会话重新收敛。
     private readonly Dictionary<long, ushort> _mcrConfigured = [];
 
     public ChannelPresenceService(
@@ -170,6 +171,12 @@ public sealed class ChannelPresenceService : BackgroundService
                 _logger.LogWarning(ex, "全通道轮询下发失败 device={DeviceId}，下轮重试", rt.DeviceId);
             }
         }
+
+        // 已摘出运行时的设备（热禁用/删除）清掉确认标记：重新启用是新连接器新会话，必须重新收敛，
+        // 残留的旧标记会让"目标通道数没变"的短路判断直接跳过下发
+        var alive = new HashSet<long>(_deviceManager.Runtimes.Select(r => r.DeviceId));
+        foreach (var staleId in _mcrConfigured.Keys.Where(id => !alive.Contains(id)).ToList())
+            _mcrConfigured.Remove(staleId);
     }
 
     // ===================== 静默扫描 =====================

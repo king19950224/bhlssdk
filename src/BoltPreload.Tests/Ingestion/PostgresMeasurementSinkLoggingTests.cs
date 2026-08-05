@@ -75,6 +75,7 @@ public class PostgresMeasurementSinkLoggingTests
         public Task<ChannelRoute> ResolveAsync(long deviceId, ushort channelNo, DateTimeOffset firstSeenAt, CancellationToken ct = default)
             => Task.FromResult(new ChannelRoute(ChannelId: 0, BoltId: 0));
         public void Invalidate(long deviceId, ushort channelNo) { }
+        public void InvalidateDevice(long deviceId) { }
         public void InvalidateAll() { }
     }
 }

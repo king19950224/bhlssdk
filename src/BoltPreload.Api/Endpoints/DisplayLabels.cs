@@ -70,6 +70,11 @@ public static class DisplayLabels
         // 设备与点位
         ["device_default_group_update"] = "设置默认监测部位",
         ["device_channel_catalog_update"] = "重建通道目录",
+        ["device_create"] = "新建设备",
+        ["device_update"] = "更新设备参数",
+        ["device_enable"] = "启用设备",
+        ["device_disable"] = "禁用设备",
+        ["device_delete"] = "删除设备",
         ["restore_multichannel_loading"] = "恢复多通道轮询",
         ["wiring_import"] = "导入点位表",
 

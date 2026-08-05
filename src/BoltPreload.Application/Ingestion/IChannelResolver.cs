@@ -21,6 +21,9 @@ public interface IChannelResolver
     /// <summary>失效特定 (device, channel) 的缓存条目（写操作后调用）。</summary>
     void Invalidate(long deviceId, ushort channelNo);
 
+    /// <summary>失效某设备的全部通道条目（设备禁用/删除时调用，别用全量失效误伤其它设备）。</summary>
+    void InvalidateDevice(long deviceId);
+
     /// <summary>失效所有缓存（重大配置变更后调用，慎用）。</summary>
     void InvalidateAll();
 }

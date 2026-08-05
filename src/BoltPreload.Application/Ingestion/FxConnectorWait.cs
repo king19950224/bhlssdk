@@ -12,7 +12,7 @@ namespace BoltPreload.Application.Ingestion;
 /// 用轮询而不是 Task.Delay 硬等一秒：硬等对慢机器不够、对快机器纯浪费。
 /// </para>
 /// </summary>
-internal static class FxConnectorWait
+public static class FxConnectorWait
 {
     private const int TimeoutMs = 5000;
     private const int PollIntervalMs = 50;

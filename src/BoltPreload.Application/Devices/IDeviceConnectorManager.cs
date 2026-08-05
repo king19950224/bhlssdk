@@ -25,6 +25,33 @@ public interface IDeviceConnectorManager
     /// 返回 false 表示设备不在运行时中。
     /// </summary>
     bool TryUpdateChannelCount(long deviceId, ushort channelCount);
+
+    /// <summary>
+    /// 热加设备：从 devices 表读该行建运行时（只建不连——连接与下发工作模式由 IngestionService
+    /// 对账拉起，职责分工与启动路径相同）。已在运行时中返回 true（幂等）；
+    /// 行不存在/未启用/已软删返回 false。Simulated 模式抛 <see cref="NotSupportedException"/>。
+    /// </summary>
+    Task<bool> AddAsync(long deviceId, CancellationToken ct = default) =>
+        throw new NotSupportedException("该实现不支持热增删设备");
+
+    /// <summary>
+    /// 热摘设备：摘出字典（数据路由立即断，IngestionService 对账下一拍取消消费任务并释放连接器），
+    /// 并等任务真停。primary 不许摘（先 <see cref="TransferPrimary"/>）；返回 false = 设备不在运行时中。
+    /// 任务未在 stopTimeout 内退出也返回 true——supervisor 会强制释放连接器，不值得让调用方一直吊着。
+    /// </summary>
+    Task<bool> RemoveAndStopAsync(long deviceId, TimeSpan stopTimeout, CancellationToken ct = default) =>
+        throw new NotSupportedException("该实现不支持热增删设备");
+
+    /// <summary>热重启 = 摘除等停 + 重建（改连接参数后用）。primary 重启后自动恢复 primary 标记。</summary>
+    Task<bool> RestartAsync(long deviceId, TimeSpan stopTimeout, CancellationToken ct = default) =>
+        throw new NotSupportedException("该实现不支持热增删设备");
+
+    /// <summary>
+    /// 转移主设备（不带 deviceId 的旧端点的默认路由）。运行时概念不落库：
+    /// 进程重启后按 Fx:Real:DeviceId 配置或 id 最小行重选。返回 false = 目标不在运行时中。
+    /// </summary>
+    bool TransferPrimary(long deviceId) =>
+        throw new NotSupportedException("该实现不支持热增删设备");
 }
 
 /// <summary>授权容量核算用的运行时口径。</summary>
