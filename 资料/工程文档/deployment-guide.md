@@ -60,7 +60,13 @@ dotnet publish src/BoltPreload.Api/BoltPreload.Api.csproj -c Release -r win-x64 
 psql -U postgres -c "CREATE ROLE boltpreload LOGIN PASSWORD '<强密码>';"
 psql -U postgres -c "CREATE DATABASE boltpreload OWNER boltpreload;"
 
+# TimescaleDB 扩展必须先用超级用户建：0001 里的 CREATE EXTENSION 需要超级用户权限，
+# 而迁移脚本是用 boltpreload 普通用户跑的，漏这一步迁移会在第一个文件就报 permission denied
+#（Docker 环境没这问题——容器初始化用户本身就是超级用户，原生安装必须补这一步）
+psql -U postgres -d boltpreload -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+
 # 执行全部迁移（账本式：已应用的自动跳过，装机与升级共用同一脚本）
+$env:PGPASSWORD = '<boltpreload 的密码>'
 .\deploy\windows\apply-migrations.ps1
 ```
 
