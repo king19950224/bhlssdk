@@ -24,10 +24,10 @@
 
 B/S 架构，几处关键设计：
 
-- 后端基于 .NET 8 构建，厂家 SDK 以源码方式编入工程，便于调试与维护；
-- 设备接入层与业务层解耦，通过统一接口（IFxConnector）屏蔽 SDK 细节。进程内模拟器（`Fx:Mode=Simulated`）只服务于无真机的开发与自动化测试：Production 环境配 Simulated 会拒绝启动（见 Program.cs 开头的防线），独立模拟器工具 `tools/FxDeviceSimulator` 也不随交付包发布；
-- 测量数据采用时序数据库存储（PostgreSQL + TimescaleDB），支持高频写入与历史查询；
-- 前端通过 REST API 与 SignalR（WebSocket）获取数据，实现实时刷新。
+- 后端 .NET 8，厂家 SDK 直接以源码编进工程——出问题能下断点单步，不用隔着 dll 猜；
+- 业务代码不直接碰 SDK，设备接入收在 IFxConnector 一个接口后面。进程内模拟器（`Fx:Mode=Simulated`）只给无真机的开发和自动化测试用：Production 环境配 Simulated 会拒绝启动（见 Program.cs 开头的防线），独立模拟器工具 `tools/FxDeviceSimulator` 也不随交付包发布；
+- 测量数据落 PostgreSQL + TimescaleDB。写入频次高、按时间段查得多，所以走原生 Npgsql；业务表才用 EF Core；
+- 前端 REST API 拿数据、SignalR 推实时，页面不做轮询。
 
 本系统属于商用关键基础设施监测系统，算法、阈值、报警规则的设计与修改均须可追溯至国家标准（GB/T 43232-2023、GB/T 41261-2022 等）、SDK 源码或现场标定数据，详见 plan.md §0 商用底线原则。
 
