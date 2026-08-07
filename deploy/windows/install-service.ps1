@@ -138,7 +138,27 @@ if ($BootstrapAdminPassword -ne "") {
 & $NssmPath set $ServiceName AppRotateFiles 1 | Out-Null
 & $NssmPath set $ServiceName AppRotateOnline 1 | Out-Null
 & $NssmPath set $ServiceName AppRotateSeconds 86400 | Out-Null
+
+# 崩溃自动重启：AppRestartDelay 只定间隔，不配 AppExit 的话非零退出码 NSSM 默认就是重启，
+# 但显式写死不留歧义——监测服务停了没人拉起来，等于全站停采
+& $NssmPath set $ServiceName AppExit Default Restart | Out-Null
 & $NssmPath set $ServiceName AppRestartDelay 10000 | Out-Null
+# 节流：短时间内反复崩（配置坏了/端口被占）不许无限快速重启刷爆日志盘
+& $NssmPath set $ServiceName AppThrottle 5000 | Out-Null
+
+# SCM 层双保险：NSSM 自己被杀/异常退出时由服务控制管理器再拉（86400s 后计数复位）
+sc.exe failure $ServiceName reset= 86400 actions= restart/10000/restart/30000/restart/60000 | Out-Null
+
+# 本机 PostgreSQL 服务依赖：工控机重启时 SCM 会先等 PG 起来再起本服务，避免开机竞速期
+# 一连串写库失败假警报。连远端库（ConnectionString 指向别机）时探不到本机 PG 服务，跳过即可——
+# 应用自身的重试与 WAL 兜底本来就扛得住库晚到。
+$pgService = Get-Service -Name "postgresql*" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($pgService) {
+    & $NssmPath set $ServiceName DependOnService $pgService.Name | Out-Null
+    Write-Host "已声明服务依赖：$($pgService.Name)（开机先等 PG 就绪）"
+} else {
+    Write-Host "本机未发现 PostgreSQL 服务（远端库场景），不设服务依赖"
+}
 
 # 防火墙：默认不开。本脚本配出的是 HTTP 明文监听，JWT 在网络上可截获——局域网访问
 # 请接着跑 setup-https.ps1 定稿 HTTPS（Kestrel 配置节会接管监听地址，此后这里的
