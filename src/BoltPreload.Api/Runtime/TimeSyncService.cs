@@ -237,13 +237,17 @@ public sealed class TimeSyncService : BackgroundService
         await PersistAsync(MakeEvent(AlarmAction.Trigger, boltId, channelId, message), ct);
     }
 
-    private async Task<(long BoltId, long ChannelId)?> FindAnchorBoltAsync(long deviceId, CancellationToken ct)
+    // internal 供集成测试直调锚定查询（BoltPreload.Tests，见 csproj InternalsVisibleTo）
+    internal async Task<(long BoltId, long ChannelId)?> FindAnchorBoltAsync(long deviceId, CancellationToken ct)
     {
+        // 绑定方向是 bolts.channel_id -> channels.id，channels 表没有 bolt_id 列
+        // （总览页同病灶 2026-08-07 修过一处，这里当时漏了——写反时 42703 直接抛，
+        // clock_drift 告警的落靠与清除整条不工作）
         await using var cmd = _ds.CreateCommand(@"
             SELECT b.id, c.id
             FROM channels c
-            JOIN bolts b ON b.id = c.bolt_id AND b.deleted_at IS NULL
-            WHERE c.device_id = @d AND c.deleted_at IS NULL AND c.bolt_id IS NOT NULL
+            JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+            WHERE c.device_id = @d AND c.deleted_at IS NULL
             ORDER BY c.channel_no
             LIMIT 1");
         cmd.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
