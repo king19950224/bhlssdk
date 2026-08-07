@@ -99,9 +99,11 @@ public static class DashboardEndpoints
                     count(*) FILTER (WHERE cr.expires_at >= (now() AT TIME ZONE 'UTC')::date
                                       AND cr.expires_at <= (now() AT TIME ZONE 'UTC')::date + 30) AS within_30
                 FROM channels c
-                JOIN bolts b ON b.id = c.bolt_id AND b.deleted_at IS NULL
+                -- 绑定方向是 bolts.channel_id → channels.id（channels 上没有 bolt_id 列）
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 JOIN calibration_records cr ON cr.id = c.active_calibration_id
-                WHERE cr.expires_at IS NOT NULL
+                WHERE c.deleted_at IS NULL
+                  AND cr.expires_at IS NOT NULL
                   AND cr.expires_at <= (now() AT TIME ZONE 'UTC')::date + 30;
 
                 SELECT b.id, b.code,
@@ -110,11 +112,12 @@ public static class DashboardEndpoints
                        cr.expires_at,
                        (cr.expires_at - (now() AT TIME ZONE 'UTC')::date)::int AS days_left
                 FROM channels c
-                JOIN bolts b ON b.id = c.bolt_id AND b.deleted_at IS NULL
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 JOIN calibration_records cr ON cr.id = c.active_calibration_id
                 LEFT JOIN monitor_groups mg ON mg.id = b.group_id AND mg.deleted_at IS NULL
                 LEFT JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
-                WHERE cr.expires_at IS NOT NULL
+                WHERE c.deleted_at IS NULL
+                  AND cr.expires_at IS NOT NULL
                   AND cr.expires_at <= (now() AT TIME ZONE 'UTC')::date + 30
                 ORDER BY cr.expires_at ASC, b.code
                 LIMIT 20;

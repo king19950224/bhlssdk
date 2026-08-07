@@ -75,6 +75,25 @@ public sealed class EndpointIntegrationTests
         resp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
     }
 
+    [PostgresFact]
+    public async Task DashboardPreloadHealth_Returns200WithAllSections()
+    {
+        _fx.EnsureAvailable();
+
+        var userId = await SeedUserAsync("operator");
+        using var factory = CreateFactory();
+        using var client = AuthedClient(factory, userId, "operator");
+
+        // 总览聚合是七段批量 SQL，列名/JOIN 方向写错只有真库能暴露——
+        // 真机彩排就撞过一次：标定到期查询写成 c.bolt_id（列不存在），页面直接 500。钉住 200 + 各段都在。
+        var resp = await client.GetAsync("/api/dashboard/preload-health");
+        resp.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        foreach (var key in new[] { "global", "byGroup", "topLoose", "openAlarms", "alarmsBySeverity",
+                     "residualDist", "approachingLimit", "calibrationExpiry", "noTargetPreload" })
+            body.TryGetProperty(key, out _).Should().BeTrue($"preload-health 响应缺 {key} 段");
+    }
+
     // ===================== harness =====================
 
     private WebApplicationFactory<Program> CreateFactory() => TestApi.CreateFactory(_fx);
