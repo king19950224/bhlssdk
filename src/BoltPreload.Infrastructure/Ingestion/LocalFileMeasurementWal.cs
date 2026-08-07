@@ -86,7 +86,14 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
             var finalPath = Path.Combine(_root, name);
             var tmpPath = finalPath + TmpSuffix;
 
-            await File.WriteAllBytesAsync(tmpPath, bytes, cancellationToken);
+            // 写后 fsync：tmp→rename 只能保证原子可见，断电时 OS 页缓存未落盘仍会丢 WAL 条目。
+            await using (var fs = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                             bufferSize: 64 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                await fs.WriteAsync(bytes, cancellationToken);
+                await fs.FlushAsync(cancellationToken);
+                fs.Flush(flushToDisk: true);
+            }
             File.Move(tmpPath, finalPath, overwrite: false);
             Interlocked.Increment(ref _pending);
         }

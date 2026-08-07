@@ -64,7 +64,9 @@ COMMENT ON COLUMN bolts.temp_coefficient_per_c IS
 DROP INDEX IF EXISTS idx_meas_status;
 
 -- ----------------------------------------------------------------------------
--- H13 续：measurement_anomalies 补压缩 + retention（与 measurements 对齐，避免无限增长）
+-- H13 续：measurement_anomalies 补压缩 + retention（避免无限增长）。
+-- 注：anomalies 保留 2 年；measurements 本体为 5 年（见 0001_initial_schema）。
+-- 异常样本体积更大、合规追溯价值低于正式测量，故有意缩短，并非笔误。
 -- ----------------------------------------------------------------------------
 DO $$
 BEGIN

@@ -31,6 +31,9 @@ public class Device
 
     public bool Enabled { get; set; } = true;
 
+    /// <summary>探头在位自动建档归属监测组（0026_device_default_group）。</summary>
+    public long? DefaultGroupId { get; set; }
+
     // 计量溯源（§9.3）
     public string? CalibCertNo { get; set; }
     public DateOnly? CalibDate { get; set; }

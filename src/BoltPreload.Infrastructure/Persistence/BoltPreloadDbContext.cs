@@ -48,6 +48,7 @@ public sealed class BoltPreloadDbContext : DbContext
             e.HasKey(x => x.Id);
             MapTimestamps(e);
             e.Property(x => x.ProjectId).HasColumnName("project_id");
+            e.Property(x => x.TurbineId).HasColumnName("turbine_id");
             e.Property(x => x.Code).HasColumnName("code").IsRequired().HasMaxLength(64);
             e.Property(x => x.Name).HasColumnName("name").IsRequired().HasMaxLength(128);
             e.Property(x => x.StructureType).HasColumnName("structure_type").HasMaxLength(32);
@@ -72,6 +73,7 @@ public sealed class BoltPreloadDbContext : DbContext
             e.Property(x => x.TransferMode).HasColumnName("transfer_mode");
             e.Property(x => x.ChannelCount).HasColumnName("channel_count");
             e.Property(x => x.Enabled).HasColumnName("enabled");
+            e.Property(x => x.DefaultGroupId).HasColumnName("default_group_id");
             e.Property(x => x.CalibCertNo).HasColumnName("calib_cert_no").HasMaxLength(64);
             e.Property(x => x.CalibDate).HasColumnName("calib_date");
             e.Property(x => x.NextCalibDate).HasColumnName("next_calib_date");

@@ -9,6 +9,9 @@ public class MonitorGroup
 
     public long ProjectId { get; set; }
 
+    /// <summary>所属风机（0018_turbines）；存量数据回填到默认机组。</summary>
+    public long? TurbineId { get; set; }
+
     public string Code { get; set; } = string.Empty;
 
     public string Name { get; set; } = string.Empty;
