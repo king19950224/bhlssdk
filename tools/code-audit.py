@@ -48,12 +48,9 @@ G3_LIVING_DOCS = [
     "资料/工程文档/concurrency-model.md",
     "资料/工程文档/sdk-api-facts.md",
     "资料/工程文档/calibration-field-guide.md",
-    "资料/工程文档/delivery-master-plan.md",
     "资料/工程文档/troubleshooting.md",
     "资料/工程文档/probe-scan-design.md",
     "资料/工程文档/torque-step-test-protocol.md",
-    "资料/工程文档/commercialization-roadmap.md",
-    "资料/工程文档/phase2-backlog.md",
     "资料/工程文档/product-design.md",
 ]
 # 豁免的历史记录文档(带日期/阶段快照,保留当时原貌,不随重构改写):

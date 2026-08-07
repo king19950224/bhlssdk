@@ -338,4 +338,4 @@ curl http://localhost:5000/api/health/ready
   在此之前，`install-all.ps1` 已把手工部署压成一条命令（见 §6）。
 - **Windows 实机验证**：本轮新增的 `setup-https.ps1` / `register-backup-task.ps1` 与既有 NSSM
   注册一样，逻辑在 macOS 上只能读查，需在 Windows 上跑通一遍（含恢复演练）。
-- **真机回归**：`资料/工程文档/delivery-master-plan.md` §1/§3 的实测项需在实验室或现场真机各走一轮。
+- **真机回归**：设备连接、校时、采集入库、验收拦截、告警链路等实测项需在实验室或现场真机各走一轮。
