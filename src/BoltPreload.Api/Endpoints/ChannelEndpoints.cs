@@ -115,10 +115,10 @@ public static class ChannelEndpoints
 
             var user = UserContext.Require(http);
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
                 VALUES (@uid, 'channel_rename', 'channel', @cid,
                         jsonb_build_object('name', @old::text), jsonb_build_object('name', @new::text),
-                        @note, now())", conn, tx))
+                        @note, now(), @ip)", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, updatedId);
@@ -126,6 +126,7 @@ public static class ChannelEndpoints
                 audit.Parameters.AddWithValue("new", NpgsqlDbType.Text, (object?)newName ?? DBNull.Value);
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                     $"通道改名 device={deviceId} CH{channelNo}：'{oldName ?? "(空)"}' → '{newName ?? "(空)"}'");
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
             await tx.CommitAsync(ct);

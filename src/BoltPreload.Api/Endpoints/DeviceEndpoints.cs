@@ -211,7 +211,9 @@ public static class DeviceEndpoints
             }
             catch (Exception ex)
             {
-                error = ex.Message;
+                // 试连失败可能含 Socket/DNS 细节，不回传给前端
+                error = "连接失败，详情见系统日志";
+                lf.CreateLogger("Device").LogWarning(ex, "设备试连失败 id={Id}", id);
             }
             finally
             {
@@ -536,12 +538,13 @@ public static class DeviceEndpoints
         long userId, string action, long deviceId, string note, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@user_id, @action, 'device', @target_id, NULL, NULL, @note, now())", conn, tx);
+            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+            VALUES (@user_id, @action, 'device', @target_id, NULL, NULL, @note, now(), @ip)", conn, tx);
         cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, deviceId);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        AuditClientIp.Bind(cmd.Parameters);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 }

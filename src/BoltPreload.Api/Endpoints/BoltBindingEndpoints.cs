@@ -180,14 +180,15 @@ public static class BoltBindingEndpoints
             // audit_log 同事务补录：binding_history 是绑定专用轨迹，审计日志页只查 audit_log，
             // 缺这条会让"解绑"在统一审计视图里隐身
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'channel_unbind', 'bolt', @bid, @before::jsonb, NULL, @note, now())", conn, tx))
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                VALUES (@uid, 'channel_unbind', 'bolt', @bid, @before::jsonb, NULL, @note, now(), @ip)", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("bid", NpgsqlDbType.Bigint, boltId.Value);
                 audit.Parameters.AddWithValue("before", NpgsqlDbType.Jsonb, (object?)beforeJson ?? DBNull.Value);
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                     $"解绑通道 CH{channelNo}（设备 {deviceId}）螺栓 #{boltId}，原因：{req?.Note ?? "（未填）"}");
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
 
@@ -419,8 +420,8 @@ public static class BoltBindingEndpoints
 
             // audit_log 同事务补录（统一审计视图只查 audit_log，见解绑处说明）
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                SELECT @uid, @action, 'bolt', @bid, @before::jsonb, to_jsonb(b), @note
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                SELECT @uid, @action, 'bolt', @bid, @before::jsonb, to_jsonb(b), @note, now(), @ip
                 FROM bolts b WHERE b.id = @bid", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
@@ -432,6 +433,7 @@ public static class BoltBindingEndpoints
                         ? $"迁移螺栓 #{boltId} 通道 {bolt.ChannelId} → {toChannelId}（标定策略 {normalizedAction}，回填 {backfilled} 条）"
                         : $"绑定螺栓 #{boltId} 到通道 {toChannelId}（回填 {backfilled} 条）")
                     + (string.IsNullOrWhiteSpace(note) ? "" : $"，备注：{note}"));
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
 

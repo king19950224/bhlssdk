@@ -347,14 +347,15 @@ public static class DiagnosticEndpoints
                 }
 
                 await using (var audit = new NpgsqlCommand(@"
-                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                    VALUES (@user_id, 'sync_channel_config', 'channel', @channel_id, @before::jsonb, @after::jsonb, @note, now())", conn, tx))
+                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                    VALUES (@user_id, 'sync_channel_config', 'channel', @channel_id, @before::jsonb, @after::jsonb, @note, now(), @ip)", conn, tx))
                 {
                     audit.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
                     audit.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
                     audit.Parameters.AddWithValue("before", NpgsqlDbType.Jsonb, beforeJson);
                     audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, afterJson);
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, "按设备参数历史里最新的读回值同步通道配置");
+                    AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
                 }
 
@@ -481,13 +482,14 @@ public static class DiagnosticEndpoints
                 {
                     // 责任链：管理员免审批也要留痕（谁、何时、批了哪条）
                     await using var audit = new NpgsqlCommand(@"
-                        INSERT INTO audit_log (user_id, action, target_type, target_id, after_jsonb, note, at)
-                        VALUES (@uid, 'config_change_approve', 'channel', @cid, @after::jsonb, @note, now())", conn, tx);
+                        INSERT INTO audit_log (user_id, action, target_type, target_id, after_jsonb, note, at, ip_addr)
+                        VALUES (@uid, 'config_change_approve', 'channel', @cid, @after::jsonb, @note, now(), @ip)", conn, tx);
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
                     audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                     audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb,
                         System.Text.Json.JsonSerializer.Serialize(new { requestId, autoApproved = true, by = userId, role = actor.Role }));
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"管理员免审批：变更 #{requestId} 提交即自动批准");
+                    AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
                 }
 
@@ -604,13 +606,14 @@ public static class DiagnosticEndpoints
                 }
 
                 await using (var audit = new NpgsqlCommand(@"
-                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                    VALUES (@uid, 'channel_commission', 'channel', @cid, NULL, @after::jsonb, @note, now())", conn, tx))
+                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                    VALUES (@uid, 'channel_commission', 'channel', @cid, NULL, @after::jsonb, @note, now(), @ip)", conn, tx))
                 {
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
                     audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                     audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(updates));
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"调试直发通道参数 device={deviceId} ch={channel}（未标定）");
+                    AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
                 }
                 await tx.CommitAsync(ct);
@@ -1048,12 +1051,13 @@ public static class DiagnosticEndpoints
                 {
                     var uid = UserContext.Require(http).UserId;
                     await using var audit = new NpgsqlCommand(@"
-                        INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                        VALUES (@uid, 'channel_recalibrate', 'channel', @cid, NULL, @after::jsonb, @note, now())", conn, tx);
+                        INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                        VALUES (@uid, 'channel_recalibrate', 'channel', @cid, NULL, @after::jsonb, @note, now(), @ip)", conn, tx);
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, uid);
                     audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                     audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new { result.NewRefTimeNs, result.NewRefTempC, explicit_ = body?.RefTimeNs != null }));
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"重标定基线 device={deviceId} ch={channel} → RefTime={result.NewRefTimeNs}ns");
+                    AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
                 }
                 await tx.CommitAsync(ct);
@@ -1080,7 +1084,7 @@ public static class DiagnosticEndpoints
             catch (TimeoutException ex)
             {
                 logger.LogError(ex, "重标定超时 device={DeviceId} ch={Ch}", deviceId, channel);
-                return Results.Json(new { error = ex.Message }, statusCode: 504);
+                return Results.Json(new { error = "重标定超时，详情见系统日志" }, statusCode: 504);
             }
         })
         .WithName("RecalibrateChannel")

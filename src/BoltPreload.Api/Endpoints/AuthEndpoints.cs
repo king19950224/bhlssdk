@@ -17,11 +17,17 @@ public static class AuthEndpoints
 
         // 登录：用户名 + 密码 → JWT。匿名可访问。
         grp.MapPost("/login", async (
-            LoginRequest req, NpgsqlDataSource ds,
+            LoginRequest req, HttpContext http, NpgsqlDataSource ds,
             IPasswordHasher<UserAccount> hasher, IJwtIssuer issuer,
-            ILoggerFactory loggerFactory, CancellationToken ct) =>
+            LoginIpRateLimiter ipLimiter, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var logger = loggerFactory.CreateLogger("Auth.Login");
+            var clientIp = http.Connection.RemoteIpAddress;
+            if (ipLimiter.IsLimited(clientIp))
+            {
+                logger.LogWarning("登录 IP 限速命中 ip={Ip}", clientIp);
+                return Results.StatusCode(StatusCodes.Status429TooManyRequests);
+            }
             if (string.IsNullOrWhiteSpace(req.Username) || string.IsNullOrWhiteSpace(req.Password))
                 return Results.BadRequest(new { error = "username 与 password 必填" });
 
@@ -36,6 +42,7 @@ public static class AuthEndpoints
             if (!await r.ReadAsync(ct))
             {
                 await Task.Delay(120, ct);
+                ipLimiter.RecordFailure(clientIp);
                 logger.LogInformation("登录失败 username={U}（用户不存在）", req.Username);
                 return Results.Unauthorized();
             }
@@ -73,6 +80,7 @@ public static class AuthEndpoints
             if (verifyResult == PasswordVerificationResult.Failed)
             {
                 var attempts = await BumpFailureAsync(ds, id, ct);
+                ipLimiter.RecordFailure(clientIp);
                 logger.LogInformation("登录失败 username={U}（密码错误，连续失败={N}）", username, attempts);
                 return Results.Unauthorized();
             }
@@ -95,6 +103,7 @@ public static class AuthEndpoints
                 await clear.ExecuteNonQueryAsync(ct);
             }
 
+            ipLimiter.RecordSuccess(clientIp);
             var token = issuer.Issue(id, username, role, tokenVersion);
             return Results.Ok(new LoginResponse(token, id, username, role));
         })
@@ -374,12 +383,13 @@ public static class AuthEndpoints
         long actorId, string action, long targetUserId, string note, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@uid, @action, 'user', @tid, NULL, NULL, @note, now())", conn, tx);
+            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+            VALUES (@uid, @action, 'user', @tid, NULL, NULL, @note, now(), @ip)", conn, tx);
         cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, actorId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("tid", NpgsqlDbType.Bigint, targetUserId);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        AuditClientIp.Bind(cmd.Parameters);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 

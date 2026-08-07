@@ -14,7 +14,7 @@ public sealed class JwtOptions
     public string Issuer { get; set; } = "BoltPreload";
     public string Audience { get; set; } = "BoltPreload.Api";
     public string SigningKey { get; set; } = "";
-    public int AccessTokenLifetimeMinutes { get; set; } = 480;
+    public int AccessTokenLifetimeMinutes { get; set; } = 120;
 }
 
 /// <summary>

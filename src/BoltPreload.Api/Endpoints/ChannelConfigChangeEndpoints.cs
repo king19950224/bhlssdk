@@ -220,15 +220,17 @@ public static class ChannelConfigChangeEndpoints
             }
             catch (Exception ex)
             {
+                // failure_reason 供运营查看，只存异常类型；完整堆栈在日志
+                var reason = $"下发失败（{ex.GetType().Name}），详情见系统日志";
                 await using var cmd = ds.CreateCommand(@"
                     UPDATE channel_config_change_requests
                     SET status='failed', failure_reason=@reason
                     WHERE id=@id AND status='approved'");
-                cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, ex.Message);
+                cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, reason);
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
                 await cmd.ExecuteNonQueryAsync(ct);
                 logger.LogError(ex, "参数变更执行失败 #{Id} device={Dev} ch={Ch}", id, row.DeviceId, row.ChannelNo);
-                return Results.BadRequest(new { error = ex.Message, id, status = "failed" });
+                return Results.BadRequest(new { error = reason, id, status = "failed" });
             }
         })
         .RequireAuthorization(AuthPolicies.WriteAccess)
@@ -461,8 +463,8 @@ public static class ChannelConfigChangeEndpoints
     }
 
     private const string AuditSql = @"
-        INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-        VALUES (@user_id, @action, 'channel', @target_id, NULL, @after::jsonb, @note, now())";
+        INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+        VALUES (@user_id, @action, 'channel', @target_id, NULL, @after::jsonb, @note, now(), @ip)";
 
     private static void FillAuditParams(NpgsqlCommand cmd, long userId, string action, long channelId, string afterJson, string note)
     {
@@ -471,6 +473,7 @@ public static class ChannelConfigChangeEndpoints
         cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, channelId);
         cmd.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, afterJson);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        AuditClientIp.Bind(cmd.Parameters);
     }
 
     /// <summary>驳回配置变更。原因可不填，但填了申请人才知道该改什么再报。</summary>

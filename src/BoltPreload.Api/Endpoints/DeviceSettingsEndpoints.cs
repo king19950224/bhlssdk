@@ -114,8 +114,8 @@ public static class DeviceSettingsEndpoints
                 }
 
                 await using (var audit = new NpgsqlCommand(@"
-                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                    VALUES (@uid, 'device_default_group_update', 'device', @did, @before::jsonb, @after::jsonb, @note, now())", conn, tx))
+                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                    VALUES (@uid, 'device_default_group_update', 'device', @did, @before::jsonb, @after::jsonb, @note, now(), @ip)", conn, tx))
                 {
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                     audit.Parameters.AddWithValue("did", NpgsqlDbType.Bigint, deviceId);
@@ -125,6 +125,7 @@ public static class DeviceSettingsEndpoints
                         System.Text.Json.JsonSerializer.Serialize(new { defaultGroupId = req.DefaultGroupId, code = newGroupCode }));
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                         $"设备默认监测组：{oldGroupId?.ToString() ?? "未设置"} → {(req.DefaultGroupId is null ? "未设置" : $"{req.DefaultGroupId}({newGroupCode})")}（自动建档归属组）");
+                    AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
                 }
 

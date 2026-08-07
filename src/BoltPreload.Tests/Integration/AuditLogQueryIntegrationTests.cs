@@ -223,8 +223,8 @@ public sealed class AuditLogQueryIntegrationTests
         long? targetId = null, long? userId = null, string? note = null, DateTimeOffset? at = null)
     {
         await using var cmd = _fx.DataSource.CreateCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, note, at)
-            VALUES (@uid, @action, @tt, @tid, @note, coalesce(@at, now()))");
+            INSERT INTO audit_log (user_id, action, target_type, target_id, note, at, ip_addr)
+            VALUES (@uid, @action, @tt, @tid, @note, coalesce(@at, now()), NULL)");
         cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, (object?)userId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("tt", NpgsqlDbType.Varchar, targetType);

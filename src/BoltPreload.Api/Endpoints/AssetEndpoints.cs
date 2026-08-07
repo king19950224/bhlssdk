@@ -41,7 +41,9 @@ public static class AssetEndpoints
             FROM bolts b
             JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
             JOIN monitor_groups mg ON mg.id = b.group_id AND mg.deleted_at IS NULL
-            JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
+            -- LEFT JOIN 机组：monitor_groups.turbine_id 可空；INNER JOIN 会让未挂机组的整批螺栓从资产聚合消失，
+            -- 页面显示无告警/无螺栓 = 假安全（商用交付安全静默失效项）。
+            LEFT JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
             LEFT JOIN calibration_records acr ON acr.id = c.active_calibration_id
             LEFT JOIN LATERAL (
                 SELECT preload_n, preload_ratio, ts FROM measurements m
@@ -454,14 +456,15 @@ public static class AssetEndpoints
             }
 
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                SELECT @uid, 'create_bolt', 'bolt', @id, NULL, to_jsonb(b), @note, now()
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                SELECT @uid, 'create_bolt', 'bolt', @id, NULL, to_jsonb(b), @note, now(), @ip
                 FROM bolts b WHERE b.id = @id", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                     $"新建螺栓 {code} 并绑定 CH{channelNo}（设备 {deviceId}，回填 {backfilled} 条暂存数据）");
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
 
@@ -525,17 +528,18 @@ public static class AssetEndpoints
             }
 
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
                 VALUES (@uid, 'update_group_config', 'monitor_group', @gid,
                         jsonb_build_object('expectedBoltCount', @old::int),
                         jsonb_build_object('expectedBoltCount', @new::int),
-                        @note, now())", conn, tx))
+                        @note, now(), @ip)", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
                 audit.Parameters.AddWithValue("old", NpgsqlDbType.Integer, (object?)(int?)oldCount ?? DBNull.Value);
                 audit.Parameters.AddWithValue("new", NpgsqlDbType.Integer, n);
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"修改监测组 {groupCode} 孔位数 {oldCount?.ToString() ?? "—"} → {n}");
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
 

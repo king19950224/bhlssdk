@@ -179,8 +179,8 @@ public static class ChannelCatalogEndpoints
 
                 // §0 责任链：状态变更与审计同事务
                 await using (var audit = new NpgsqlCommand(@"
-                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                    VALUES (@uid, 'device_channel_catalog_update', 'device', @did, @before::jsonb, @after::jsonb, @note, now())", conn, tx))
+                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                    VALUES (@uid, 'device_channel_catalog_update', 'device', @did, @before::jsonb, @after::jsonb, @note, now(), @ip)", conn, tx))
                 {
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                     audit.Parameters.AddWithValue("did", NpgsqlDbType.Bigint, deviceId);
@@ -190,6 +190,7 @@ public static class ChannelCatalogEndpoints
                         System.Text.Json.JsonSerializer.Serialize(new { channelCount = n, resurrected, created }));
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                         $"通道目录重建：channel_count {oldCount}→{n}，复活 {resurrected.Count} 个，新建 {created.Count} 个。{req.Note ?? ""}".Trim());
+                    AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
                 }
 

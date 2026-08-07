@@ -340,14 +340,15 @@ public static class WiringTableEndpoints
                 }
 
                 await using (var audit = new NpgsqlCommand(@"
-                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                    SELECT @uid, 'create_bolt', 'bolt', @id, NULL, to_jsonb(b), @note, now()
+                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                    SELECT @uid, 'create_bolt', 'bolt', @id, NULL, to_jsonb(b), @note, now(), @ip
                     FROM bolts b WHERE b.id = @id", conn, tx))
                 {
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                     audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, newBoltId);
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                         $"点位表导入：新建螺栓 {code} 绑定 CH{row.ChannelNo}（设备 {deviceId}）");
+                    AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
                 }
 
@@ -357,8 +358,8 @@ public static class WiringTableEndpoints
 
             // 汇总审计（§0 责任链：与数据变更同事务）
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'wiring_import', 'device', @did, NULL, @after::jsonb, @note, now())", conn, tx))
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                VALUES (@uid, 'wiring_import', 'device', @did, NULL, @after::jsonb, @note, now(), @ip)", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("did", NpgsqlDbType.Bigint, deviceId);
@@ -368,6 +369,7 @@ public static class WiringTableEndpoints
                 }));
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                     $"点位表导入 device={deviceId}：{rows.Count} 行，更新位置 {updatedPositions}，建档 {created.Count}，跳过已绑定 {skippedBound.Count}。{req.Note ?? ""}".Trim());
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
 

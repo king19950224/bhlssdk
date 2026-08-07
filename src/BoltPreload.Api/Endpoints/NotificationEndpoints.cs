@@ -202,7 +202,7 @@ public static class NotificationEndpoints
         // 当场发一条测试消息：不进发件箱、不重试，通不通立见分晓
         grp.MapPost("/{id:long}/test", async (
             long id, HttpContext http, NpgsqlDataSource ds, IEnumerable<INotificationTransport> transports,
-            CancellationToken ct) =>
+            ILoggerFactory lf, CancellationToken ct) =>
         {
             var u = UserContext.Require(http);
             string? name = null, kind = null, config = null;
@@ -234,7 +234,10 @@ public static class NotificationEndpoints
             }
             catch (Exception ex)
             {
-                return Results.Json(new { ok = false, error = ex.Message }, statusCode: StatusCodes.Status502BadGateway);
+                // 不回传底层异常细节（可能含内网 URL / DNS / TLS），详情见日志
+                lf.CreateLogger("Notification").LogWarning(ex, "通知渠道测试发送失败 channel={Id}", id);
+                return Results.Json(new { ok = false, error = "测试发送失败，详情见系统日志" },
+                    statusCode: StatusCodes.Status502BadGateway);
             }
 
             await WriteStandaloneAuditAsync(ds, u.UserId, "notification_test_send", "notification_channel", id,
@@ -497,10 +500,9 @@ public static class NotificationEndpoints
         // kind 的 smtp/sms 是库里预留的枚举，本轮没有适配器，配了也发不出去，端点直接不放行
         if (req.Kind != "webhook")
             return "本轮只支持 kind=webhook（smtp/sms 预留，适配器未实现）";
-        if (string.IsNullOrWhiteSpace(req.Url)
-            || !(req.Url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-              || req.Url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)))
-            return "Url 必须是 http(s) 地址";
+        // SSRF：不仅校验 scheme，还禁本机/私网（见 WebhookUrlGuard）
+        var urlErr = WebhookUrlGuard.Validate(req.Url);
+        if (urlErr is not null) return urlErr;
         if (req.Format is null || !KnownFormats.Contains(req.Format))
             return $"Format 只能是 {string.Join(" / ", KnownFormats)}";
         if (req.MinIntervalSeconds is < 0 or > 3600)
@@ -583,13 +585,14 @@ public static class NotificationEndpoints
         long userId, string action, string targetType, long targetId, string note, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@user_id, @action, @target_type, @target_id, NULL, NULL, @note, now())", conn, tx);
+            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+            VALUES (@user_id, @action, @target_type, @target_id, NULL, NULL, @note, now(), @ip)", conn, tx);
         cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("target_type", NpgsqlDbType.Varchar, targetType);
         cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, targetId);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        AuditClientIp.Bind(cmd.Parameters);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
@@ -598,13 +601,14 @@ public static class NotificationEndpoints
         NpgsqlDataSource ds, long userId, string action, string targetType, long targetId, string note, CancellationToken ct)
     {
         await using var cmd = ds.CreateCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@user_id, @action, @target_type, @target_id, NULL, NULL, @note, now())");
+            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+            VALUES (@user_id, @action, @target_type, @target_id, NULL, NULL, @note, now(), @ip)");
         cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("target_type", NpgsqlDbType.Varchar, targetType);
         cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, targetId);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        AuditClientIp.Bind(cmd.Parameters);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 }

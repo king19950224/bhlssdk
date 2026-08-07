@@ -87,12 +87,14 @@ public static class AuditLogEndpoints
         .WithSummary("审计动作类型 + 计数（筛选用）");
 
         // CSV 导出（合规归档）。带 UTF-8 BOM 方便 Excel 正确显示中文。
+        // 导出本身也要进审计（§9.5）：谁在何时导出了哪一截历史，必须可追溯。
         grp.MapGet("/export.csv", async (
             long? userId, string? action, string? actionPrefix, string? targetType, long? targetId,
             DateTimeOffset? from, DateTimeOffset? to, int? limit,
-            NpgsqlDataSource ds, CancellationToken ct) =>
+            HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
         {
             var lim = Math.Clamp(limit ?? 5000, 1, 50000);
+            var actor = UserContext.Require(http);
 
             await using var cmd = ds.CreateCommand();
             var sql = new StringBuilder(BaseSelect);
@@ -104,7 +106,8 @@ public static class AuditLogEndpoints
             var csv = new StringBuilder();
             csv.Append('\uFEFF'); // UTF-8 BOM
             // 表头与动作名都用中文：这份文件是打印出来给客户和第三方审查看的
-            csv.AppendLine("序号,时间(UTC),用户编号,用户名,动作,对象类型,对象编号,备注,变更前,变更后");
+            csv.AppendLine("序号,时间(UTC),用户编号,用户名,客户端IP,动作,对象类型,对象编号,备注,变更前,变更后");
+            var exported = 0;
             await using (var r = await cmd.ExecuteReaderAsync(ct))
             {
                 while (await r.ReadAsync(ct))
@@ -113,13 +116,30 @@ public static class AuditLogEndpoints
                        .Append(Csv(r.GetDateTime(10).ToString("o"))).Append(',')
                        .Append(r.IsDBNull(1) ? "" : r.GetInt64(1).ToString()).Append(',')
                        .Append(Csv(r.IsDBNull(2) ? "" : r.GetString(2))).Append(',')
+                       .Append(Csv(r.IsDBNull(3) ? "" : r.GetString(3))).Append(',')
                        .Append(Csv(DisplayLabels.AuditAction(r.GetString(4)))).Append(',')
                        .Append(Csv(r.IsDBNull(5) ? "" : DisplayLabels.AuditTargetType(r.GetString(5)))).Append(',')
                        .Append(r.IsDBNull(6) ? "" : r.GetInt64(6).ToString()).Append(',')
                        .Append(Csv(r.IsDBNull(9) ? "" : r.GetString(9))).Append(',')
                        .Append(Csv(r.IsDBNull(7) ? "" : r.GetString(7))).Append(',')
                        .Append(Csv(r.IsDBNull(8) ? "" : r.GetString(8))).Append('\n');
+                    exported++;
                 }
+            }
+
+            await using (var audit = ds.CreateCommand(@"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                VALUES (@uid, 'audit_export', 'audit_log', NULL, NULL, NULL, @note, now(), @ip)"))
+            {
+                audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, actor.UserId);
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                    $"导出审计 CSV {exported} 行（limit={lim}"
+                    + (action is null ? "" : $", action={action}")
+                    + (from is null ? "" : $", from={from:o}")
+                    + (to is null ? "" : $", to={to:o}")
+                    + "）");
+                AuditClientIp.Bind(audit.Parameters);
+                await audit.ExecuteNonQueryAsync(ct);
             }
 
             var bytes = Encoding.UTF8.GetBytes(csv.ToString());
@@ -127,7 +147,7 @@ public static class AuditLogEndpoints
                 $"审计日志-{DateTime.UtcNow:yyyyMMddHHmmss}.csv");
         })
         .WithName("ExportAuditLogCsv")
-        .WithSummary("导出审计日志 CSV（合规归档）");
+        .WithSummary("导出审计日志 CSV（合规归档，导出动作本身写入审计）");
 
         return app;
     }

@@ -426,12 +426,13 @@ public static class AlarmRuleEndpoints
         long userId, string action, long targetId, string note, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@user_id, @action, 'alarm_rule', @target_id, NULL, NULL, @note, now())", conn, tx);
+            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+            VALUES (@user_id, @action, 'alarm_rule', @target_id, NULL, NULL, @note, now(), @ip)", conn, tx);
         cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, targetId);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        AuditClientIp.Bind(cmd.Parameters);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 }

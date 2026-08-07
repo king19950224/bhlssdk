@@ -112,7 +112,7 @@ public static class AcceptanceEndpoints
                 // 下发失败必须立刻释放占位——否则设备被一个"没生效"的会话锁住，probe-scan 也进不来
                 state.End(deviceId);
                 logger.LogError(ex, "验收会话 MCR 下发失败 device={DeviceId}", deviceId);
-                return Results.Problem($"验收会话轮询下发失败：{ex.Message}", statusCode: 502);
+                return Results.Problem("验收会话轮询下发失败，详情见系统日志", statusCode: 502);
             }
 
             logger.LogInformation("接入验收会话开启 device={DeviceId} channels={Channels} ttl={Ttl}min by user={UserId}",
@@ -300,8 +300,8 @@ public static class AcceptanceEndpoints
             }
 
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'channel_accept', 'channel', @cid, NULL, @after::jsonb, @note, now())", conn, tx))
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                VALUES (@uid, 'channel_accept', 'channel', @cid, NULL, @after::jsonb, @note, now(), @ip)", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
@@ -311,6 +311,7 @@ public static class AcceptanceEndpoints
                 }));
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                     $"通道接入验收 device={deviceId} CH{channelNo} 方式={DisplayLabels.AcceptanceMethod(method)} 电缆={req?.CableLabel ?? "—"} 声时={tof?.ToString("F0") ?? "—"}ns");
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
 

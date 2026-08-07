@@ -34,6 +34,10 @@ public sealed class WebhookNotificationTransport : INotificationTransport
         var url = cfg.TryGetProperty("url", out var u) ? u.GetString() : null;
         if (string.IsNullOrWhiteSpace(url))
             throw new InvalidOperationException($"渠道 '{channel.Name}' 的 config 缺 url");
+        // 发送前再验一轮：历史脏配置 / 手工改库 不能绕过 SSRF 门禁
+        var ssrf = WebhookUrlGuard.Validate(url);
+        if (ssrf is not null)
+            throw new InvalidOperationException($"渠道 '{channel.Name}' URL 被拒绝：{ssrf}");
         var format = cfg.TryGetProperty("format", out var f) ? f.GetString() ?? "raw" : "raw";
         var secret = cfg.TryGetProperty("secret", out var s) ? s.GetString() : null;
 
