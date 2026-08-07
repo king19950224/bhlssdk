@@ -28,6 +28,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     private readonly IAlarmPublisher? _alarmPublisher;
     private readonly IPreloadCalculatorFactory _calculatorFactory;
     private readonly ProbeScanState? _probeScan;
+    private readonly IngestDegradeState? _degrade;
     /// <summary>回波声时下限（与在位状态机同一配置 Fx:HotPlug:MinPlausibleEchoNs，单一"什么算信号"口径）。</summary>
     private readonly int _minPlausibleEchoNs;
 
@@ -76,7 +77,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         IAlarmPublisher? alarmPublisher = null,
         IPreloadCalculatorFactory? calculatorFactory = null,
         ProbeScanState? probeScan = null,
-        Microsoft.Extensions.Options.IOptions<ChannelPresenceOptions>? presenceOptions = null)
+        Microsoft.Extensions.Options.IOptions<ChannelPresenceOptions>? presenceOptions = null,
+        IngestDegradeState? degrade = null)
     {
         _dataSource = dataSource;
         _resolver = resolver;
@@ -86,6 +88,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         _alarmSink = alarmSink;
         _alarmPublisher = alarmPublisher;
         _probeScan = probeScan;
+        _degrade = degrade;
         _minPlausibleEchoNs = presenceOptions?.Value.MinPlausibleEchoNs ?? 0;
         // 未注入工厂时（如单测直接 new）退化为默认工厂，保持原单波法行为
         _calculatorFactory = calculatorFactory ?? new PreloadCalculatorFactory(
@@ -107,6 +110,15 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         => WriteAsync(envelope, evaluateAlarms: true, cancellationToken);
 
     public async Task WriteAsync(FxDecodedEnvelope envelope, bool evaluateAlarms, CancellationToken cancellationToken = default)
+    {
+        await WriteRoutedAsync(envelope, evaluateAlarms, cancellationToken);
+
+        // 走到这里说明本次写库没抛——若刚从降级窗口恢复，把窗口事实补进审计（内部自吞异常）
+        if (_degrade is { HasPendingRecoveredWindow: true })
+            await WriteDegradeRecoveryAuditAsync(cancellationToken);
+    }
+
+    private async Task WriteRoutedAsync(FxDecodedEnvelope envelope, bool evaluateAlarms, CancellationToken cancellationToken)
     {
         var ct = cancellationToken;
 
@@ -130,6 +142,42 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             return;
 
         await WriteChannelResultAsync(envelope, envelope.ChannelResult, evaluateAlarms, ct);
+    }
+
+    /// <summary>
+    /// 降级窗口结束后的审计补写：窗口期间告警评估缺席，这段"监测不可信"的事实必须落到
+    /// 不可改的 audit_log（0030 append-only）里，事后追溯不能只靠会滚动的应用日志。
+    /// 失败只记日志不重排队——窗口事实在 Serilog 已有 Critical 记录，不值得给热路径加重试。
+    /// </summary>
+    private async Task WriteDegradeRecoveryAuditAsync(CancellationToken ct)
+    {
+        if (_degrade is null || !_degrade.TryTakeRecoveredWindow(out var w))
+            return;
+
+        try
+        {
+            const string sql = @"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, after_jsonb, note, at)
+                VALUES (NULL, 'system_degraded', 'system', NULL, @detail::jsonb, @note, now())";
+            await using var cmd = _dataSource.CreateCommand(sql);
+            cmd.Parameters.AddWithValue("detail", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new
+            {
+                from = w.From,
+                to = w.To,
+                dbWriteFailures = w.FailureCount,
+                walDroppedPermanently = w.WalDropped,
+            }, JsonOpts));
+            cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                $"采集入库降级窗口 {w.From:yyyy-MM-dd HH:mm:ss}Z ~ {w.To:yyyy-MM-dd HH:mm:ss}Z：" +
+                $"写库失败 {w.FailureCount} 条、WAL 满永久丢弃 {w.WalDropped} 条；" +
+                "窗口内 warn 级预紧力告警未评估（重放仅补 critical），该时段监测结论不可作为处置依据");
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "system_degraded 审计补写失败 window={From:u}~{To:u}", w.From, w.To);
+        }
     }
 
     private async Task WriteChannelResultAsync(FxDecodedEnvelope envelope, FxChannelResultDto cr, bool evaluateAlarms, CancellationToken ct)

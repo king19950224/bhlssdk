@@ -3,7 +3,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'
-import { dashboardApi, type PreloadHealthCounts, type LooseBolt, type ResidualDist, type ApproachingBolt, type DashboardTrendPoint, type CalibrationExpiry } from '../api'
+import { dashboardApi, type PreloadHealthCounts, type LooseBolt, type ResidualDist, type ApproachingBolt, type DashboardTrendPoint, type CalibrationExpiry, type NoTargetPreload } from '../api'
 import { useRuntime } from '../stores/runtime'
 import { onRealtime } from '../api/realtime'
 import { pctParts } from '../utils/preload'
@@ -17,12 +17,19 @@ const topLoose = ref<LooseBolt[]>([])
 const residualDist = ref<ResidualDist>({ b100: 0, b90: 0, b80: 0, b70: 0, b70d: 0, bhigh: 0 })
 const approaching = ref<ApproachingBolt[]>([])
 const calibrationExpiry = ref<CalibrationExpiry>({ expired: 0, within30Days: 0, items: [] })
+const noTargetPreload = ref<NoTargetPreload>({ count: 0, items: [] })
 const openAlarms = ref(0)
 const alarmsBySeverity = ref<{ severity: string; count: number }[]>([])
 const trend = ref<DashboardTrendPoint[]>([])
 const loaded = ref(false)
 const firstLoad = ref(true)
 const error = ref<string | null>(null)
+// 上次成功刷新的时刻：失败时页面继续显示旧数据，但必须把"旧到什么时候"写在脸上
+const lastOkAt = ref<number | null>(null)
+const lastOkText = computed(() => {
+  if (lastOkAt.value == null) return null
+  return new Date(lastOkAt.value).toLocaleTimeString('zh-CN', { hour12: false })
+})
 // 趋势单独失败态：容错不拖垮整页，但"取不到"不能显示成"没有数据"
 const trendError = ref<string | null>(null)
 
@@ -88,6 +95,9 @@ const verdict = computed<{ level: 'ok' | 'warn' | 'crit' | 'off'; text: string }
         : `${calibrationExpiry.value.within30Days} 颗标定将在 30 天内到期，请安排复检`,
     }
   }
+  // 未配目标预紧力：这些螺栓的预紧力告警一条都不会有，绿灯是残缺的绿——不能压成"一切正常"
+  if (noTargetPreload.value.count > 0)
+    return { level: 'warn', text: `${noTargetPreload.value.count} 颗螺栓未配置目标预紧力，其预紧力告警未生效，请补齐规格` }
   if (measured.value > 0) return { level: 'ok', text: `在测 ${measured.value} 颗预紧力正常` }
   return { level: 'off', text: '暂无在测螺栓，请先完成标定接入' }
 })
@@ -108,6 +118,14 @@ const actionTiles = computed(() => [
     to: 'calibration',
     query: { focus: 'expiring' },
     level: calibrationExpiry.value.expired > 0 ? 'warn' : calibrationExpiry.value.within30Days > 0 ? 'info' : 'muted',
+  },
+  {
+    key: 'notarget',
+    label: '未配目标力',
+    count: noTargetPreload.value.count,
+    sub: noTargetPreload.value.count > 0 ? '预紧力告警未生效' : '规格齐全',
+    to: 'assets',
+    level: noTargetPreload.value.count > 0 ? 'warn' : 'muted',
   },
   { key: 'nodata', label: '无数据', count: health.value.nodata, sub: '无近期回波', to: 'devices', level: 'muted' },
 ])
@@ -132,10 +150,12 @@ async function refresh() {
     residualDist.value = d.residualDist
     approaching.value = d.approachingLimit
     calibrationExpiry.value = d.calibrationExpiry ?? { expired: 0, within30Days: 0, items: [] }
+    noTargetPreload.value = d.noTargetPreload ?? { count: 0, items: [] }
     openAlarms.value = d.openAlarms
     alarmsBySeverity.value = d.alarmsBySeverity ?? []
     if (t) { trend.value = t.points; trendError.value = null }
     error.value = null
+    lastOkAt.value = Date.now()
   } catch (e) {
     if (disposed) return
     error.value = e instanceof Error ? e.message : '加载失败'
@@ -268,10 +288,13 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
 </script>
 
 <template>
-  <div class="dash rise" v-loading="firstLoad" element-loading-text="加载中…">
+  <div class="dash rise" :class="{ 'dash--stale': error && loaded }" v-loading="firstLoad" element-loading-text="加载中…">
     <div v-if="error" class="dash-error">
       <el-icon><WarningFilled /></el-icon>
-      <span class="dash-error-msg">加载失败：{{ error }}</span>
+      <span class="dash-error-msg">
+        加载失败：{{ error }}
+        <template v-if="lastOkText"> · 以下为 {{ lastOkText }} 的旧数据，不代表当前状态</template>
+      </span>
       <el-button size="small" type="danger" plain @click="refresh">重试</el-button>
     </div>
 
@@ -446,6 +469,8 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
 
 <style scoped>
 .dash { display: flex; flex-direction: column; gap: 14px; }
+/* 刷新失败时旧数据降饱和压暗：能看（保留处置上下文）但一眼看得出不是现值；横幅自身不降 */
+.dash--stale > *:not(.dash-error) { filter: grayscale(0.55) brightness(0.8); transition: filter 0.3s; }
 
 .dash-error { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: var(--radius-sm); background: rgba(244, 63, 94, 0.08); border: 1px solid var(--crit); color: var(--text-1); font-size: 13px; }
 .dash-error .el-icon { color: var(--crit); font-size: 18px; }

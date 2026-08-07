@@ -432,6 +432,12 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
       <el-button size="small" text @click="retry">重试</el-button>
     </div>
 
+    <!-- 实时断开横幅：副标题小字不够——值班看波形页时长连接断了必须一眼看见（轮询仍在兜底） -->
+    <div v-if="live && realtimeState === 'disconnected'" class="lp-error">
+      <el-icon><WarningFilled /></el-icon>
+      <span>实时通道已断开，正在自动重连；当前曲线依靠轮询更新，可能滞后数秒</span>
+    </div>
+
     <!-- 当前值卡片：点选要显示的螺栓（默认一颗，可多选）。无数据的通道自动隐藏，恢复上报自动回来 -->
     <div class="chips-wrap" v-if="visible.length">
       <div class="chips-bar">

@@ -70,6 +70,17 @@ export interface ReadyStatus {
   freeDiskGb?: number | null
   memory?: { workingSetMb: number | null; privateMb: number | null; gcHeapMb: number | null }
   wal?: { enabled: boolean; pending: number; sizeMb: number | null }
+  // 采集降级态：db_down / db_write_failing / wal_saturated；空数组 = 无降级理由
+  degradeReasons?: string[]
+  ingest?: {
+    degraded: boolean
+    degradedSince: string | null
+    consecutiveDbWriteFailures: number
+    totalDbWriteFailures: number
+    walDroppedTotal: number
+    walLastDropAt: string | null
+    backpressureDropped: number
+  }
   backgroundServices?: ReadyServiceBeat[]
   deadServices?: string[]
   timestamp?: string
@@ -421,6 +432,11 @@ export interface CalibrationExpiry {
   within30Days: number
   items: CalibrationExpiryItem[]
 }
+/** 未配置目标预紧力的在监螺栓：算不出 ratio → 预紧力告警永不触发（§8.14 降级可见） */
+export interface NoTargetPreload {
+  count: number
+  items: { boltId: number; boltCode: string; turbine: string; group: string }[]
+}
 export const dashboardApi = {
   preloadHealth: () =>
     http.get<{
@@ -432,6 +448,7 @@ export const dashboardApi = {
       residualDist: ResidualDist
       approachingLimit: ApproachingBolt[]
       calibrationExpiry: CalibrationExpiry
+      noTargetPreload: NoTargetPreload
     }>('/api/dashboard/preload-health'),
   trend: (hours = 24) =>
     http.get<{ bucketMinutes: number; hours: number; points: DashboardTrendPoint[] }>(`/api/dashboard/trend?hours=${hours}`),

@@ -47,8 +47,11 @@ const healthPct = computed<Record<string, number>>(() => {
  */
 const STALE_AFTER_MS = 30000
 const lastOkAt = ref(Date.now())
+// 刷新报错立即置位、成功清零：偶发失败横幅只闪一下（5s 轮询下一轮就消），连续失败则与
+// 陈旧计时接力——原先只有 30s 陈旧判定，前 30 秒是一扇"最后一次全绿"的假安全窗
+const failedNow = ref(false)
 const staleMs = computed(() => now.value.getTime() - lastOkAt.value)
-const stale = computed(() => staleMs.value >= STALE_AFTER_MS)
+const stale = computed(() => failedNow.value || staleMs.value >= STALE_AFTER_MS)
 const staleText = computed(() => {
   const s = Math.round(staleMs.value / 1000)
   return s < 120 ? `${s} 秒` : `${Math.floor(s / 60)} 分钟`
@@ -71,7 +74,8 @@ async function refresh() {
     const alarms = (await alarmApi.list('?includeCleared=false&limit=10')).items
     if (!disposed) recentAlarms.value = alarms
     lastOkAt.value = Date.now()
-  } catch { /* 单次失败不打断画面；连续失败由陈旧横幅兜底 */ } finally { inFlight = false }
+    failedNow.value = false
+  } catch { if (!disposed) failedNow.value = true } finally { inFlight = false }
 }
 // 隐藏期间 refresh 直接跳过，不刷新时间戳；重新可见时立刻补一次，
 // 免得刚切回来就先看到一条其实已经不成立的陈旧告警。
@@ -138,7 +142,7 @@ function fmtDate(d: Date) { return d.toLocaleDateString('zh-CN', { year: 'numeri
     <!-- 数据停更横幅：做得比卡片标题还显眼是刻意的，它要在几米外一眼可见 -->
     <div v-if="stale" class="bs-stale">
       <span class="led led--crit" />
-      数据已停止刷新 {{ staleText }} · 以下为最后一次成功获取的画面，不代表当前状态
+      {{ failedNow ? '数据刷新失败' : '数据已停止刷新' }} {{ staleText }} · 以下为最后一次成功获取的画面，不代表当前状态
     </div>
 
     <div class="bs-grid" :class="{ 'bs-grid--stale': stale }">

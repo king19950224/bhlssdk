@@ -21,7 +21,7 @@ public class DisplayLabelsTests
     [
         "alarm_ack", "alarm_clear", "alarm_rule_approve", "alarm_rule_propose", "alarm_rule_reject",
         "alarm_shelve", "alarm_shelve_cancel",
-        "apply_torque_fit", "bolt_move_channel", "calibration_renew",
+        "apply_torque_fit", "audit_export", "bolt_move_channel", "calibration_renew",
         "channel_accept", "channel_bind", "channel_commission", "channel_recalibrate",
         "channel_rename", "channel_unbind", "config_change_approve", "config_change_execute",
         "config_change_reject", "config_change_verify", "create_bolt",
@@ -34,7 +34,7 @@ public class DisplayLabelsTests
         "notification_rule_create", "notification_rule_delete", "notification_rule_update",
         "notification_test_send",
         "quick_calibrate", "report_sign", "restore_multichannel_loading",
-        "sync_channel_config", "torque_calibrate", "torque_point_capture",
+        "sync_channel_config", "system_degraded", "torque_calibrate", "torque_point_capture",
         "update_bolt", "update_bolt_spec", "update_group_config", "update_target_preload",
         "user_change_password", "user_create", "user_toggle", "wiring_import",
     ];
@@ -42,7 +42,7 @@ public class DisplayLabelsTests
     private static readonly string[] TargetTypesInUse =
     [
         "alarm", "alarm_rule", "alarm_shelving", "bolt", "calibration", "channel", "device", "monitor_group",
-        "notification_channel", "notification_outbox", "notification_rule", "report", "user",
+        "notification_channel", "notification_outbox", "notification_rule", "report", "system", "user",
     ];
 
     private static readonly string[] HardwareStatesInUse =

@@ -204,10 +204,10 @@ public static class AcceptanceEndpoints
 
             // 通道行 + 当前绑定 + 近 60s 最新信号快照（绑定走 measurements，未绑定走 unbound_measurements）
             long channelId = 0; long? boltId = null; string? boltCode = null, hwState = null;
-            decimal? tof = null, snr = null; int? p2p = null;
+            decimal? tof = null, snr = null, targetPreloadN = null; int? p2p = null;
             var found = false;
             await using (var cmd = new NpgsqlCommand(@"
-                SELECT c.id, c.hardware_state, b.id, b.code,
+                SELECT c.id, c.hardware_state, b.id, b.code, b.target_preload_n,
                        COALESCE(le.echo_time_ns, ule.echo_time_ns) AS echo_ns,
                        wf.peak_to_peak, wf.snr_db
                 FROM channels c
@@ -237,9 +237,10 @@ public static class AcceptanceEndpoints
                     hwState = r.GetString(1);
                     boltId = r.IsDBNull(2) ? null : r.GetInt64(2);
                     boltCode = r.IsDBNull(3) ? null : r.GetString(3);
-                    tof = r.IsDBNull(4) ? null : r.GetDecimal(4);
-                    p2p = r.IsDBNull(5) ? null : r.GetInt32(5);
-                    snr = r.IsDBNull(6) ? null : r.GetDecimal(6);
+                    targetPreloadN = r.IsDBNull(4) ? null : r.GetDecimal(4);
+                    tof = r.IsDBNull(5) ? null : r.GetDecimal(5);
+                    p2p = r.IsDBNull(6) ? null : r.GetInt32(6);
+                    snr = r.IsDBNull(7) ? null : r.GetDecimal(7);
                 }
             }
             if (!found)
@@ -257,6 +258,19 @@ public static class AcceptanceEndpoints
                 {
                     error = "近 60 秒无回波信号，无法以信号验证方式（顺序接入/拔插确认）通过验收。请确认探头电缆已接好、信号已恢复后重试；无信号的备用通道请用 manual 登记",
                     deviceId, channelNo, hardwareState = hwState
+                });
+            }
+
+            // 验收 = 该点位进入正式监测。没配目标预紧力的螺栓算不出 ratio，预紧力告警一条都不会有——
+            // 这正是"传感器在采、监测其实没生效"的静默失效（§8.14）。在验收这道门上拦住，逼着规格先补齐；
+            // 未绑螺栓的备用通道不受影响（boltId 为空时无从谈告警）。
+            if (boltId is not null && targetPreloadN is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.Conflict(new
+                {
+                    error = $"螺栓 {boltCode} 未配置目标预紧力（target_preload_n），预紧力告警不会生效。请先在螺栓详情补齐目标预紧力再验收",
+                    deviceId, channelNo, boltId, boltCode, reason = "no_target_preload"
                 });
             }
 

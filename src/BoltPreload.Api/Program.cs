@@ -110,6 +110,10 @@ builder.Services.AddSingleton<GbSingleWaveCalculator>();
 builder.Services.AddSingleton<GbBiWaveCalculator>();
 builder.Services.AddSingleton<IPreloadCalculatorFactory, PreloadCalculatorFactory>();
 
+// 采集降级态（进程内存）：DB 故障窗口 warn 告警缺席，/ready 与前端横幅都看这里；
+// 采集循环报成败、WAL 报丢弃、sink 在恢复后补 system_degraded 审计——三方共用同一个单例
+builder.Services.AddSingleton<IngestDegradeState>();
+
 // 时序数据落地
 builder.Services.AddSingleton<IMeasurementSink, PostgresMeasurementSink>();
 
@@ -281,12 +285,14 @@ app.MapGet("/api/health", () => new
 // 就绪检查（readiness）：实际探测关键依赖（DB 连通性）。
 // 区别于上面的 liveness（仅表示进程还在）——运维/负载均衡探针用 /ready 判断"能否真正服务请求"，
 // DB 不通时返回 503，避免"进程在、但后端依赖已断"的静默失效被当成健康。
+string[] DbDownReasons = ["db_down"];
 app.MapGet("/api/health/ready", async (
     NpgsqlDataSource ds,
     IDeviceConnectorManager manager,
     BackgroundServiceHealth svcHealth,
     IMeasurementWal wal,
     IOptions<MeasurementWalOptions> walOpt,
+    IngestDegradeState degrade,
     CancellationToken ct) =>
 {
     // 1) DB 连通性（硬性：down → 503，运维/负载均衡据此摘流）
@@ -300,7 +306,13 @@ app.MapGet("/api/health/ready", async (
         // 匿名探针接口：异常详情只写日志，不外泄（Npgsql 报错可能含主机/库名）
         app.Logger.LogError(ex, "/api/health/ready DB 探测失败");
         return Results.Json(
-            new { status = "degraded", db = "down", timestamp = DateTimeOffset.UtcNow },
+            new
+            {
+                status = "degraded",
+                db = "down",
+                degradeReasons = DbDownReasons,
+                timestamp = DateTimeOffset.UtcNow
+            },
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 
@@ -396,9 +408,31 @@ app.MapGet("/api/health/ready", async (
     //    失联（超过正常间隔 3 倍未心跳）即 503，让运维探针能发现"进程在、监测已停"。
     var services = svcHealth.Snapshot();
     var deadServices = services.Where(s => s.Stale).Select(s => s.Name).ToArray();
+
+    // 8) 采集降级态：DB probe 通了不代表写入健康（磁盘满、权限、锁等照样写不进）。
+    //    降级窗口内 warn 级预紧力告警不评估——此态必须让探针和前端横幅看得见，不能只躺在日志里。
+    //    背压丢弃是连接器侧累计计数（消费跟不上被挤掉的测量），一并暴露。
+    var degradeReasons = new List<string>();
+    if (degrade.DbWriteDegraded) degradeReasons.Add("db_write_failing");
+    if (degrade.WalDroppedRecently) degradeReasons.Add("wal_saturated");
+    long backpressureDropped = 0;
+    foreach (var rt in manager.Runtimes)
+        backpressureDropped += rt.Connector.DroppedCount;
+    var ingest = new
+    {
+        degraded = degrade.DbWriteDegraded,
+        degradedSince = degrade.DegradedSinceUtc,
+        consecutiveDbWriteFailures = degrade.ConsecutiveDbWriteFailures,
+        totalDbWriteFailures = degrade.TotalDbWriteFailures,
+        walDroppedTotal = degrade.WalDroppedTotal,
+        walLastDropAt = degrade.WalLastDropAtUtc,
+        backpressureDropped,
+    };
+
+    var notReady = deadServices.Length > 0 || degradeReasons.Count > 0;
     var payload = new
     {
-        status = deadServices.Length > 0 ? "degraded" : "ready",
+        status = notReady ? "degraded" : "ready",
         db = "up",
         devices = new { total = deviceTotal, connected = deviceConnected },
         maxIdleSeconds = maxIdle,
@@ -406,14 +440,19 @@ app.MapGet("/api/health/ready", async (
         freeDiskGb,
         memory,
         wal = walInfo,
+        ingest,
+        degradeReasons,
         backgroundServices = services,
         deadServices,
         timestamp = now
     };
 
-    if (deadServices.Length > 0)
+    if (notReady)
     {
-        app.Logger.LogError("/api/health/ready 后台服务失联：{Dead}", string.Join(", ", deadServices));
+        if (deadServices.Length > 0)
+            app.Logger.LogError("/api/health/ready 后台服务失联：{Dead}", string.Join(", ", deadServices));
+        if (degradeReasons.Count > 0)
+            app.Logger.LogError("/api/health/ready 采集降级：{Reasons}", string.Join(", ", degradeReasons));
         return Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
     return Results.Ok(payload);

@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuth } from '../stores/auth'
-import { alarmApi, authApi } from '../api'
+import { alarmApi, authApi, healthApi } from '../api'
 import { useRuntime } from '../stores/runtime'
 import { startRealtime, stopRealtime, onRealtime, realtimeState } from '../api/realtime'
 
@@ -77,14 +77,39 @@ const runtimeError = computed(() => runtime.error)
 const walPending = computed(() => runtime.walPending)
 const licenseValid = computed(() => runtime.license?.valid ?? true)
 const openAlarms = ref(0)
+// 角标拿不到就明说未知：保留旧数字会让值班把过期的 0 当成"无告警"——顶栏这一格最不能骗人
+const alarmsUnknown = ref(false)
 let timer: number | undefined
 
 async function refresh() {
   try {
     const sum = await alarmApi.summary()
     openAlarms.value = sum.items.reduce((a, r) => a + r.open, 0)
+    alarmsUnknown.value = false
   } catch {
-    /* 顶栏告警角标尽力刷新 */
+    alarmsUnknown.value = true
+  }
+}
+
+// ---- 全局降级横幅：盯 /api/health/ready（§8.14 降级可见）----
+// DB 故障窗口 warn 级告警不评估、WAL 满在丢数、后台服务失联——这些状态下页面各自的数字
+// 看着都"正常"，必须有一条压在所有页面顶上的横幅把话说破。接口本身挂了同样要说。
+const sysDegraded = ref<string | null>(null)
+let readyTimer: number | undefined
+const DEGRADE_TEXT: Record<string, string> = {
+  db_down: '数据库不可达：测量未入库，此期间监测结论不可信',
+  db_write_failing: '数据入库持续失败（降级）：此窗口内预警级告警不评估，仅严重档补报',
+  wal_saturated: '断网缓存已满，最旧测量正被永久丢弃',
+}
+async function checkReady() {
+  try {
+    const r = await healthApi.ready()
+    if (r.httpStatus === 200) { sysDegraded.value = null; return }
+    const texts = (r.degradeReasons ?? []).map((x) => DEGRADE_TEXT[x] ?? x)
+    if (r.deadServices?.length) texts.push(`后台服务失联：${r.deadServices.join('、')}`)
+    sysDegraded.value = texts.length ? texts.join('；') : '系统自检未通过，详见系统自检页'
+  } catch {
+    sysDegraded.value = '后端服务不可达：页面数据已停止更新，不代表当前状态'
   }
 }
 let unsubAlarm: (() => void) | undefined
@@ -135,7 +160,7 @@ function beep(severity: string) {
   } catch { /* 浏览器未授权音频时静默 */ }
 }
 
-async function showCriticalModal(a: { boltCode?: string; type?: string; message?: string; severity?: string }) {
+async function showCriticalModal(a: { boltCode?: string; type?: string; message?: string | null; severity?: string }) {
   if (criticalModalOpen) return
   criticalModalOpen = true
   try {
@@ -159,8 +184,11 @@ onMounted(() => {
   // 设备状态轮询由 runtime store 统一负责（含可见性暂停与实时刷新）
   runtime.start()
   refresh()
+  checkReady()
   // 告警角标 30s 轮询作为 SignalR 的兜底（实时推送为主，断线时仍能慢刷新）
   timer = window.setInterval(refresh, 30000)
+  // 降级横幅 15s 一查：降级窗口内每一分钟都可能在漏报，检测延迟要压在告警周期以内
+  readyTimer = window.setInterval(() => { if (!document.hidden) checkReady() }, 15000)
   // 实时推送：连上 Hub；收到告警立即刷新顶栏角标，不再纯靠轮询
   startRealtime()
   unsubAlarm = onRealtime('OnAlarm', (a) => {
@@ -184,6 +212,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   if (timer) clearInterval(timer)
+  if (readyTimer) clearInterval(readyTimer)
   unsubAlarm?.()
   runtime.stop()
 })
@@ -260,7 +289,7 @@ function onUserCommand(c: string) {
           >
             <el-icon class="nav-icon"><component :is="n.icon" /></el-icon>
             <span class="nav-label">{{ n.label }}</span>
-            <span v-if="n.name === 'alarms' && openAlarms > 0" class="nav-badge">{{ openAlarms }}</span>
+            <span v-if="n.name === 'alarms' && (openAlarms > 0 || alarmsUnknown)" class="nav-badge">{{ alarmsUnknown ? '?' : openAlarms }}</span>
           </router-link>
         </div>
       </nav>
@@ -278,6 +307,13 @@ function onUserCommand(c: string) {
     </aside>
 
     <div class="main">
+      <!-- 全局降级横幅：压在所有页面之上。降级窗口内各页数字看着都"正常"，这条必须把话说破 -->
+      <div v-if="sysDegraded" class="sys-degrade" role="alert">
+        <span class="led led--crit" />
+        <span class="sys-degrade-msg">{{ sysDegraded }}</span>
+        <router-link :to="{ name: 'systemHealth' }" class="sys-degrade-link">查看系统自检</router-link>
+      </div>
+
       <header class="topbar">
         <div class="topbar-title">
           <h1>{{ pageTitle }}</h1>
@@ -290,10 +326,10 @@ function onUserCommand(c: string) {
             <span class="chip-k">设备在线</span>
             <span class="chip-v mono" :title="runtimeError || ''">{{ runtimeError ? '状态未知' : `${devicesOnline}/${devicesTotal}` }}</span>
           </div>
-          <div class="stat-chip" :class="{ alert: openAlarms > 0 }">
+          <div class="stat-chip" :class="{ alert: openAlarms > 0 || alarmsUnknown }">
             <el-icon><BellFilled /></el-icon>
             <span class="chip-k">未闭合告警</span>
-            <span class="chip-v mono">{{ openAlarms }}</span>
+            <span class="chip-v mono" :title="alarmsUnknown ? '告警计数刷新失败，当前数字不可信' : ''">{{ alarmsUnknown ? '未知' : openAlarms }}</span>
           </div>
         <div class="stat-chip alert" v-if="walPending > 0">
           <span class="chip-k">断网待补传</span>
@@ -417,6 +453,15 @@ function onUserCommand(c: string) {
 .sys-line { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-3); }
 
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+/* 全局降级横幅：红底常亮，不做自动消失——降级没解除它就不该走 */
+.sys-degrade {
+  flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 9px 28px;
+  background: rgba(244, 63, 94, 0.16); border-bottom: 1px solid rgba(244, 63, 94, 0.45);
+  color: #fda4af; font-size: 13px; font-weight: 600;
+}
+.sys-degrade-msg { flex: 1; min-width: 0; }
+.sys-degrade-link { color: #fda4af; text-decoration: underline; white-space: nowrap; }
+.sys-degrade-link:hover { color: #fecdd3; }
 .topbar {
   height: 72px; flex-shrink: 0; display: flex; align-items: center; gap: 20px; padding: 0 28px;
   border-bottom: 1px solid var(--panel-border); background: rgba(8, 11, 20, 0.5); backdrop-filter: blur(10px);

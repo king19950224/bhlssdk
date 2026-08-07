@@ -32,6 +32,7 @@ public sealed class IngestionService : BackgroundService
     private readonly ChannelPresenceTracker _presence;
     private readonly IngestionTaskRegistry _registry;
     private readonly BackgroundServiceHealth _health;
+    private readonly IngestDegradeState _degrade;
     private readonly ILogger<IngestionService> _logger;
 
     public IngestionService(
@@ -42,7 +43,8 @@ public sealed class IngestionService : BackgroundService
         ChannelPresenceTracker presence,
         IngestionTaskRegistry registry,
         BackgroundServiceHealth health,
-        ILogger<IngestionService> logger)
+        ILogger<IngestionService> logger,
+        IngestDegradeState? degrade = null)
     {
         _deviceManager = deviceManager;
         _sink = sink;
@@ -51,6 +53,8 @@ public sealed class IngestionService : BackgroundService
         _presence = presence;
         _registry = registry;
         _health = health;
+        // 单测直接 new 时不必传；DI 里注册的是同一个单例（readiness / sink 共用）
+        _degrade = degrade ?? new IngestDegradeState();
         _logger = logger;
     }
 
@@ -270,6 +274,13 @@ public sealed class IngestionService : BackgroundService
                 {
                     await _sink.WriteAsync(envelope, stoppingToken);
                     persisted = true;
+
+                    // 降级恢复：窗口事实记日志；审计补写由 sink 在后续成功写库路径上完成
+                    if (_degrade.ReportDbWriteSuccess() is { } recovered)
+                        _logger.LogWarning(
+                            "采集入库降级恢复：{From:u} ~ {To:u} 失败 {Failures} 条、WAL 满丢弃 {WalDropped} 条；" +
+                            "窗口内 warn 级预紧力告警未评估（重放仅补 critical），处置判断须结合该窗口",
+                            recovered.From, recovered.To, recovered.FailureCount, recovered.WalDropped);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -278,6 +289,13 @@ public sealed class IngestionService : BackgroundService
                     //（经 /api/runtime/devices 暴露）。测量类信封写失败时落 WAL 兜底，
                     // DB 恢复后由 WalReplayService 重放补写（重放不触发告警）。
                     runtimeStatus.MarkWriteFailure();
+
+                    // 连续失败进降级态：/ready 变 degraded、前端全局横幅。此期间 warn 告警一条不评，
+                    // 值班必须知道"现在看到的绿不是真的绿"。告警表在 DB 里写不进去，只能这样出声。
+                    if (_degrade.ReportDbWriteFailure())
+                        _logger.LogCritical(
+                            "采集入库进入降级态（连续写库失败）：此窗口内 warn 级预紧力告警不评估，仅 WAL 重放补 critical；" +
+                            "/api/health/ready 已置 degraded device={DeviceId}", runtime.DeviceId);
 
                     var isMeasurement = envelope.ResultType
                         is FxResultType.ChannelResult or FxResultType.MultiChannelResult;

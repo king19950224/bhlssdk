@@ -117,6 +117,23 @@ public static class DashboardEndpoints
                 WHERE cr.expires_at IS NOT NULL
                   AND cr.expires_at <= (now() AT TIME ZONE 'UTC')::date + 30
                 ORDER BY cr.expires_at ASC, b.code
+                LIMIT 20;
+
+                -- 未配置目标预紧力的在监螺栓（§8.14 降级可见）：算不出 ratio → 预紧力告警永不触发。
+                -- 在位自动建档的螺栓天生缺规格（待补规格是设计内状态），但不能默默一直缺——总览必须能数清。
+                SELECT count(*) FROM bolts b
+                JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
+                WHERE b.deleted_at IS NULL AND b.enabled AND b.target_preload_n IS NULL;
+
+                SELECT b.id, b.code,
+                       COALESCE(t.name, '—') AS turbine,
+                       COALESCE(mg.name, '—') AS grp
+                FROM bolts b
+                JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
+                LEFT JOIN monitor_groups mg ON mg.id = b.group_id AND mg.deleted_at IS NULL
+                LEFT JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
+                WHERE b.deleted_at IS NULL AND b.enabled AND b.target_preload_n IS NULL
+                ORDER BY b.code
                 LIMIT 20;";
 
             await using var cmd = ds.CreateCommand(sql);
@@ -216,7 +233,26 @@ public static class DashboardEndpoints
                 items = calibrationExpiryItems,
             };
 
-            return Results.Ok(new { global, byGroup, topLoose, openAlarms, alarmsBySeverity, residualDist, approachingLimit, calibrationExpiry });
+            // 未配置目标预紧力：计数 + 前 20 条清单（磁贴点进资产页逐颗补）
+            long noTargetCount = 0;
+            await r.NextResultAsync(ct);
+            if (await r.ReadAsync(ct))
+                noTargetCount = r.GetInt64(0);
+
+            var noTargetItems = new List<object>();
+            await r.NextResultAsync(ct);
+            while (await r.ReadAsync(ct))
+                noTargetItems.Add(new
+                {
+                    boltId = r.GetInt64(0),
+                    boltCode = r.GetString(1),
+                    turbine = r.GetString(2),
+                    group = r.GetString(3),
+                });
+
+            var noTargetPreload = new { count = noTargetCount, items = noTargetItems };
+
+            return Results.Ok(new { global, byGroup, topLoose, openAlarms, alarmsBySeverity, residualDist, approachingLimit, calibrationExpiry, noTargetPreload });
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)
         .WithTags("Dashboard")

@@ -86,6 +86,9 @@ public static class DisplayLabels
 
         // 审计自身（导出也要留痕，§9.5）
         ["audit_export"] = "导出审计日志",
+
+        // 系统级事件：采集入库降级窗口结束后由 sink 补写（user_id 为空，见 PostgresMeasurementSink）
+        ["system_degraded"] = "采集降级窗口",
     };
 
     private static readonly Dictionary<string, string> AuditTargetTypes = new(StringComparer.Ordinal)
@@ -104,6 +107,7 @@ public static class DisplayLabels
         ["device"] = "设备",
         ["monitor_group"] = "监测部位",
         ["audit_log"] = "审计日志",
+        ["system"] = "系统",
     };
 
     // 用接线语境的叫法（"在位"而不是"健康"）：点位表是照着现场线缆核对的，

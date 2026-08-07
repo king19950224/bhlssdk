@@ -29,14 +29,19 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
     private readonly string _root;
     private readonly int _maxEntries;
     private readonly ILogger<LocalFileMeasurementWal> _logger;
+    private readonly IngestDegradeState? _degrade;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     private long _pending;
     private long _seq;
     private long _dropped;
 
-    public LocalFileMeasurementWal(IOptions<MeasurementWalOptions> options, ILogger<LocalFileMeasurementWal> logger)
+    public LocalFileMeasurementWal(
+        IOptions<MeasurementWalOptions> options,
+        ILogger<LocalFileMeasurementWal> logger,
+        IngestDegradeState? degrade = null)
     {
+        _degrade = degrade;
         var opt = options.Value;
         _root = Path.GetFullPath(opt.RootPath);
         _maxEntries = Math.Max(1, opt.MaxEntries);
@@ -192,8 +197,11 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
             TryDelete(files[i]);
 
         var total = Interlocked.Add(ref _dropped, dropCount);
-        _logger.LogWarning("WAL 达到上限 {Max}，drop-oldest 丢弃 {Drop} 条最旧测量（累计丢弃 {Total}）—— 排查 DB 不可用时长",
+        // Critical 而非 Warning：被丢的是安全监测数据且永久丢失，重放救不回来。
+        // 告警表在 DB 里（此刻多半不可用）写不进，出声渠道就两条——这条日志 + degrade 态进 /ready。
+        _logger.LogCritical("WAL 达到上限 {Max}，drop-oldest 丢弃 {Drop} 条最旧测量（累计丢弃 {Total}，已永久丢失）—— 排查 DB 不可用时长",
             _maxEntries, dropCount, total);
+        _degrade?.ReportWalDropped(dropCount);
         Interlocked.Exchange(ref _pending, target);
     }
 

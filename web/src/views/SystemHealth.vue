@@ -26,12 +26,22 @@ async function load() {
   }
 }
 
+const DEGRADE_TEXT: Record<string, string> = {
+  db_down: '数据库不可达',
+  db_write_failing: '入库持续失败',
+  wal_saturated: 'WAL 满正在丢数',
+}
 const overall = computed(() => {
   const r = ready.value
   if (!r) return { level: 'off' as const, text: '尚未取得自检结果' }
   if (r.db === 'down') return { level: 'crit' as const, text: '数据库不可用' }
-  if (r.status === 'degraded' || (r.deadServices?.length ?? 0) > 0)
-    return { level: 'crit' as const, text: `监测降级：${(r.deadServices ?? []).join('、') || '后台服务失联'}` }
+  if (r.status === 'degraded' || (r.deadServices?.length ?? 0) > 0) {
+    const parts = [
+      ...(r.degradeReasons ?? []).map((x) => DEGRADE_TEXT[x] ?? x),
+      ...(r.deadServices ?? []),
+    ]
+    return { level: 'crit' as const, text: `监测降级：${parts.join('、') || '后台服务失联'}` }
+  }
   if ((r.wal?.pending ?? 0) > 0) return { level: 'warn' as const, text: `WAL 待补传 ${r.wal!.pending} 条` }
   if (r.freeDiskGb != null && r.freeDiskGb < 2) return { level: 'warn' as const, text: `磁盘余量仅 ${r.freeDiskGb} GB` }
   if (r.ingestLagSeconds != null && r.ingestLagSeconds > 120)
@@ -91,6 +101,13 @@ onBeforeUnmount(() => {
         <div class="c-k">WAL 积压</div>
         <div class="c-v mono">{{ ready.wal?.pending ?? 0 }} <span class="unit">条</span></div>
         <div class="c-sub mono">体积 {{ ready.wal?.sizeMb ?? '—' }} MB · {{ ready.wal?.enabled ? '已启用' : '未启用' }}</div>
+      </div>
+      <div class="c panel" :class="ready.ingest?.degraded ? 'bad' : (ready.ingest?.walDroppedTotal ?? 0) > 0 || (ready.ingest?.backpressureDropped ?? 0) > 0 ? 'warn' : 'ok'">
+        <div class="c-k">入库降级</div>
+        <div class="c-v">{{ ready.ingest?.degraded ? '降级中' : '正常' }}</div>
+        <div class="c-sub mono">
+          写失败 {{ ready.ingest?.totalDbWriteFailures ?? 0 }} · WAL 丢弃 {{ ready.ingest?.walDroppedTotal ?? 0 }} · 背压丢弃 {{ ready.ingest?.backpressureDropped ?? 0 }}
+        </div>
       </div>
       <div class="c panel" :class="ready.freeDiskGb != null && ready.freeDiskGb < 2 ? 'warn' : ''">
         <div class="c-k">磁盘余量</div>
