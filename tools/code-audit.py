@@ -12,7 +12,7 @@
     G4 遗留标记归零   TODO/FIXME/HACK/debugger/console.log 等开发残留必须为零
     G5 未引用导出     web/src 中疑似无人引用的 export(动态引用会误报,故仅报告)
     G6 文风统一       禁表情符号入库(状态用文字写);引号统一中文弯引号;
-                      禁套话与给后果加戏的注释
+                      无依据表达(商用底线原则第 1 条,方案 §0)
 
 所有豁免显式列在下方常量区并附理由,新增豁免必须写明原因。
 """
@@ -69,7 +69,8 @@ G4_CSHARP = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b")
 G4_WEB = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b|@ts-ignore|@ts-nocheck|eslint-disable|\bdebugger\b|console\.log")
 
 # 仓库文件索引要跳过的目录。资料/ 不全跳——只扫 资料/工程文档/（内部工程文档仍进 git）
-INDEX_SKIP = {".git", "node_modules", "bin", "obj", "dist", "logs", "data", ".vs", ".idea"}
+# payload 是安装包组包产物（gitignore 排除，含第三方 TimescaleDB SQL），不受本仓库文风约束
+INDEX_SKIP = {".git", "node_modules", "bin", "obj", "dist", "logs", "data", ".vs", ".idea", "payload"}
 INDEX_资料_ONLY = "工程文档"
 
 
@@ -301,6 +302,12 @@ G6_CLICHE = re.compile(
 G6_DRAMA = re.compile(
     r"一片安静|安安静静|等于告诉|这不是假想|正是最需要|恰是最需要|这是最糟|"
     r"最需要被看见|值得单独留|无迹可查|悄悄地|静静地")
+# 商用底线原则第 1 条(方案 §0):无依据的猜测性表达不进系统。
+# 前面带引号(弯/直)的放行——那是方案和 README 里"禁止这些词"的原则句在引用反面例子。
+# "估计"不进这条:噪声估计/SNR 估计/Bootstrap 估计是统计术语,误伤没完。
+G6_VAGUE = re.compile(
+    r"(?<![“\"'])(我觉得|应该是|应该能|应该没|应该就|应该不会|差不多|大概|好像|貌似|或许|八成)|"
+    r"\b(maybe|probably|perhaps|i think|i guess)\b", re.I)
 G6_SUFFIXES = (".cs", ".ts", ".vue", ".md", ".sql", ".ps1", ".sh", ".py",
                ".yml", ".yaml", ".json", ".html", ".css")
 
@@ -334,6 +341,9 @@ def gate6() -> list[str]:
             m = G6_DRAMA.search(line)
             if m:
                 violations.append(f"{f.relative_to(ROOT)}:{n}: 注释加戏 '{m.group(0)}' -> {line.strip()[:80]}")
+            m = G6_VAGUE.search(line)
+            if m:
+                violations.append(f"{f.relative_to(ROOT)}:{n}: 猜测性表达 '{m.group(0)}' -> {line.strip()[:80]}")
             if f.suffix == ".md":
                 m = G6_HEADING_EN.match(line)
                 if m and m.group(1) not in G6_HEADING_OK:

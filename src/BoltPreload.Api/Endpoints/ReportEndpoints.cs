@@ -315,7 +315,7 @@ public static class ReportEndpoints
             }
 
             // 存盘名是 flange-group-1-2026....html 这种 ASCII，为的是文件系统和 URL 上不出岔子；
-            // 但客户存下来的应该是报告标题。两者分开，别为了下载好看去动落盘的名字。
+            // 但客户存下来的要是报告标题。两者分开，别为了下载好看去动落盘的名字。
             return Results.File(bytes, "text/html; charset=utf-8", DownloadName(title, fullPath));
         })
         .WithName("DownloadReport")

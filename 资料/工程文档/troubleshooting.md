@@ -256,7 +256,7 @@ docker compose -f deploy/docker-compose.yml exec postgres \
 
 **原因**：TimescaleDB 创建 hypertable 时跟某些 EF Core 版本不兼容。
 
-**修复**：我们的方案不用 EF Core 操作时序表，只用业务表。如果 EF Core 启动时去扫描 measurements 表报错，检查 `BoltPreloadDbContext` 里是不是误加了 `DbSet<Measurement>`（应该没有，确认下）。
+**修复**：本方案不用 EF Core 操作时序表，只用业务表。当前 `BoltPreloadDbContext` 里没有 `DbSet<Measurement>`；如果 EF Core 启动时去扫描 measurements 表报错，先检查是不是有人误加了这个 DbSet。
 
 ### API 跑起来了但 `/api/measurements/count` 一直是 0
 

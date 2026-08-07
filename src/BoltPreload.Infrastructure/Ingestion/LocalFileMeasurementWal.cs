@@ -156,7 +156,7 @@ public sealed class LocalFileMeasurementWal : IMeasurementWal, IDisposable
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
-                    // 写入失败：DB 大概率仍不可用，停止本轮，保留这条与后续条目下轮再试
+                    // 写入失败即视为 DB 尚未恢复：停止本轮，保留这条与后续条目下轮再试
                     _logger.LogWarning(ex, "WAL 重放写入失败，暂停本轮（剩余约 {Remaining} 条待下轮）file={File}",
                         files.Count - i, Path.GetFileName(path));
                     break;

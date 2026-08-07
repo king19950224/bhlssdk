@@ -103,7 +103,7 @@ public sealed class TimeSyncService : BackgroundService
             try
             {
                 await CheckHostClockAsync(hostInterval, stoppingToken);
-                await MaybeSyncDevicesAsync(stoppingToken);
+                await SyncDevicesIfDueAsync(stoppingToken);
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex) { _logger.LogError(ex, "TimeSync 一轮异常"); }
@@ -122,7 +122,7 @@ public sealed class TimeSyncService : BackgroundService
             if (jumped && !_hostDriftActive)
             {
                 _logger.LogError(
-                    "主机时钟跳变 detected：期望间隔 {Expected:F0}s，实际 {Actual:F0}s，偏差 {Drift:F0}s（查 NTP/W32Time）",
+                    "检测到主机时钟跳变：期望间隔 {Expected:F0}s，实际 {Actual:F0}s，偏差 {Drift:F0}s（查 NTP/W32Time）",
                     expected.TotalSeconds, actual, drift);
                 await RaiseHostDriftAsync(
                     $"工控机系统时间跳变 {drift:F0} 秒（期望间隔 {expected.TotalSeconds:F0}s，实际 {actual:F0}s）。请检查 NTP/W32Time。",
@@ -139,7 +139,7 @@ public sealed class TimeSyncService : BackgroundService
         _lastHostTick = now;
     }
 
-    private async Task MaybeSyncDevicesAsync(CancellationToken ct)
+    private async Task SyncDevicesIfDueAsync(CancellationToken ct)
     {
         var interval = TimeSpan.FromHours(Math.Max(1, _opt.IntervalHours));
         if (DateTimeOffset.UtcNow - _lastDeviceSyncAt < interval) return;
