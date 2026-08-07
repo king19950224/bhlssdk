@@ -1,18 +1,36 @@
 <script setup lang="ts">
 // 标定管理（复核员以上）：所有标定记录都在这，盯的是可信等级和有效期。正式载荷标定要会签才生效。
-import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { calibrationApi, boltApi, type CalibMethod, type BoltListItem } from '../api'
+import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { calibrationApi, boltApi, dashboardApi, type CalibMethod, type BoltListItem } from '../api'
 import { useAuth } from '../stores/auth'
 import CalibrationDialog from '../components/CalibrationDialog.vue'
 import CalibrationWizard from '../components/CalibrationWizard.vue'
 import { calibrationMethodLabel } from '../utils/labels'
 
 const router = useRouter()
+const route = useRoute()
 const auth = useAuth()
 const methods = ref<CalibMethod[]>([])
 const bolts = ref<BoltListItem[]>([])
 const loading = ref(false)
+
+// Dashboard 标定到期入口带 ?focus=expiring：按生效标定到期日把将到期/已过期排到前面
+// （不能只看 bolts.state——过期后该字段常仍是 calibrated，真实到期日在 active calibration）
+const focusExpiring = computed(() => route.query.focus === 'expiring')
+const expiryDaysByBolt = ref<Map<number, number>>(new Map())
+const displayedBolts = computed(() => {
+  const list = bolts.value.slice()
+  if (!focusExpiring.value) return list
+  const days = expiryDaysByBolt.value
+  return list.sort((a, b) => {
+    const da = days.has(a.id) ? days.get(a.id)! : 9999
+    const db = days.has(b.id) ? days.get(b.id)! : 9999
+    if (da !== db) return da - db
+    const rank = (s: string) => (s === 'expired' || s === 'uncalibrated' ? 0 : 1)
+    return rank(a.state) - rank(b.state) || a.code.localeCompare(b.code)
+  })
+})
 
 // 默认入口是引导向导(现场人员用语);专家模式(载荷标定/手动参数)从向导内进入或按钮直开
 const wizardOpen = ref(false)
@@ -59,8 +77,23 @@ const loadError = ref<string | null>(null)
 async function load() {
   loading.value = true
   try {
-    methods.value = (await calibrationApi.summary()).methods
-    bolts.value = (await boltApi.list()).items
+    const [summary, boltList] = await Promise.all([
+      calibrationApi.summary(),
+      boltApi.list(),
+    ])
+    methods.value = summary.methods
+    bolts.value = boltList.items
+    if (focusExpiring.value) {
+      // 失败不挡主列表：没有到期日时仍按 state 粗排
+      try {
+        const d = await dashboardApi.preloadHealth()
+        const m = new Map<number, number>()
+        for (const it of d.calibrationExpiry?.items ?? []) m.set(it.boltId, it.daysLeft)
+        expiryDaysByBolt.value = m
+      } catch {
+        expiryDaysByBolt.value = new Map()
+      }
+    }
     loadError.value = null
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : '标定列表加载失败'
@@ -80,6 +113,7 @@ onMounted(load)
           <span class="m-name">{{ calibrationMethodLabel(m.method) }}</span>
           <span class="trust" :style="`color:${trustView(m).color};border-color:${trustView(m).color}`">{{ trustView(m).label }}</span>
         </div>
+        <div class="m-precision">标称精度 {{ m.precision }}</div>
         <div class="m-stats">
           <div class="ms"><b class="metric">{{ m.active }}</b><span class="stat-label">生效</span></div>
           <div class="ms"><b class="metric dim">{{ m.total }}</b><span class="stat-label">累计</span></div>
@@ -100,7 +134,10 @@ onMounted(load)
     <div class="panel panel--glow">
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />螺栓标定状态</span>
-        <span class="hd-sub mono">{{ bolts.length }} 颗</span>
+        <span class="hd-sub mono">{{ bolts.length }} 颗<span v-if="focusExpiring"> · 已按到期优先排序</span></span>
+      </div>
+      <div v-if="focusExpiring" class="focus-banner">
+        来自总览标定到期入口：已过期与未标定排在前面。过期标定不产生告警，需在此复检后重新生效。
       </div>
       <div v-if="loadError" class="load-error">
         <el-icon><WarningFilled /></el-icon> 标定列表加载失败（下方可能是旧数据）：{{ loadError }}
@@ -108,7 +145,7 @@ onMounted(load)
       </div>
       <div class="tbl" v-loading="loading">
         <div class="tr th"><span>螺栓</span><span>规格</span><span>状态</span><span>K_L</span><span>参考声时</span><span>参考温度</span><span>操作</span></div>
-        <div v-for="b in bolts" :key="b.id" class="tr" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
+        <div v-for="b in displayedBolts" :key="b.id" class="tr" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
           <span class="mono">{{ b.code }}</span>
           <span>{{ b.nominalDiam }}·{{ b.grade }}</span>
           <span class="bs"><span class="led" :class="BSTATE[b.state]?.cls || 'led--off'" />{{ BSTATE[b.state]?.label || b.state }}</span>
@@ -152,6 +189,8 @@ onMounted(load)
 .m-card:hover { border-color: var(--panel-border-strong); transform: translateY(-1px); }
 .m-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
 .m-name { font-size: 14px; font-weight: 600; color: var(--text-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 标称精度与验收报告同源（后端 DisplayLabels.PrecisionSpec），页面不自己写一份口径 */
+.m-precision { font-size: 11.5px; color: var(--text-2); margin: -8px 0 12px; }
 .trust { font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; padding: 2px 8px; border: 1px solid; border-radius: 999px; flex-shrink: 0; }
 .m-stats { display: flex; justify-content: space-between; gap: 8px; }
 .ms { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
@@ -174,5 +213,6 @@ onMounted(load)
 .bs { display: flex; align-items: center; gap: 8px; }
 .go { color: var(--text-3); }
 .empty, .tbl-empty { padding: 30px; text-align: center; color: var(--text-3); }
+.focus-banner { margin: 0 18px 10px; padding: 10px 12px; border-radius: 8px; font-size: 12.5px; color: var(--text-1); background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.35); }
 .empty { grid-column: 1 / -1; }
 </style>

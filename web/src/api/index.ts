@@ -54,6 +54,40 @@ export const runtimeApi = {
   devices: () => http.get<RuntimeResponse>('/api/runtime/devices'),
 }
 
+// ---- 系统自检 / readiness（匿名；503 也要读 body，故不用统一 http 抛错）----
+export interface ReadyServiceBeat {
+  name: string
+  stale: boolean
+  // 与 BackgroundServiceState.LastBeatSecondsAgo 对齐（ASP.NET camelCase）
+  lastBeatSecondsAgo: number | null
+}
+export interface ReadyStatus {
+  status: string
+  db: string
+  devices?: { total: number; connected: number }
+  maxIdleSeconds?: number | null
+  ingestLagSeconds?: number | null
+  freeDiskGb?: number | null
+  memory?: { workingSetMb: number | null; privateMb: number | null; gcHeapMb: number | null }
+  wal?: { enabled: boolean; pending: number; sizeMb: number | null }
+  backgroundServices?: ReadyServiceBeat[]
+  deadServices?: string[]
+  timestamp?: string
+  httpStatus: number
+}
+export const healthApi = {
+  ready: async (): Promise<ReadyStatus> => {
+    const res = await fetch('/api/health/ready')
+    let body: Omit<ReadyStatus, 'httpStatus'> = { status: 'unknown', db: 'unknown' }
+    try {
+      body = await res.json()
+    } catch {
+      /* 非 JSON */
+    }
+    return { ...body, httpStatus: res.status }
+  },
+}
+
 // ---- 告警 ----
 export interface AlarmItem {
   id: number
@@ -99,9 +133,32 @@ export interface AlarmShelving {
   shelvedBy: number | null
   shelvedByName: string | null
 }
+// GB/T 41261-2022 的四项限值由后端连同实测值一起返回（limit/pass/basis），
+// 前端只负责渲染，不在这里再抄一份限值——两边各存一套迟早对不上。
+export interface AlarmKpiMetric<T> { value: T | null; limit: T; pass: boolean; basis: string }
+export interface AlarmKpiTopRule {
+  boltId: number; boltCode: string; type: string; typeLabel: string; count: number; ratio: number
+}
+export interface AlarmKpi {
+  windowHours: number
+  generatedAt: string
+  totalTriggered: number
+  operatorCount: number
+  metrics: {
+    avgPerHourPerOperator: AlarmKpiMetric<number>
+    peakPer10Min: AlarmKpiMetric<number>
+    overdueCount: AlarmKpiMetric<number>
+    highFrequencyRatio: AlarmKpiMetric<number>
+  }
+  avgAckMinutes: number | null
+  avgClearMinutes: number | null
+  avgPerHour: number
+  topFrequent: AlarmKpiTopRule[]
+}
 export const alarmApi = {
   list: (params = '') => http.get<{ count: number; items: AlarmItem[] }>(`/api/alarms/${params}`),
   summary: () => http.get<{ items: AlarmSummaryRow[] }>('/api/alarms/summary'),
+  kpi: (windowHours = 24) => http.get<AlarmKpi>(`/api/alarms/kpi?windowHours=${windowHours}`),
   ack: (id: number, note?: string) => http.post(`/api/alarms/${id}/ack`, { note }),
   clear: (id: number, reason?: string) => http.post(`/api/alarms/${id}/clear`, { reason }),
   // 维护时段抑制某 bolt+type 的告警（hours 1..168，reason ≥5 字）
@@ -350,6 +407,20 @@ export interface DashboardTrendPoint {
   activeBolts: number
   alarms: number
 }
+/** 生效标定已过期或 30 天内将到期（Dashboard 可见性，不走告警通道） */
+export interface CalibrationExpiryItem {
+  boltId: number
+  boltCode: string
+  turbine: string
+  group: string
+  expiresAt: string
+  daysLeft: number
+}
+export interface CalibrationExpiry {
+  expired: number
+  within30Days: number
+  items: CalibrationExpiryItem[]
+}
 export const dashboardApi = {
   preloadHealth: () =>
     http.get<{
@@ -360,6 +431,7 @@ export const dashboardApi = {
       alarmsBySeverity: { severity: string; count: number }[]
       residualDist: ResidualDist
       approachingLimit: ApproachingBolt[]
+      calibrationExpiry: CalibrationExpiry
     }>('/api/dashboard/preload-health'),
   trend: (hours = 24) =>
     http.get<{ bucketMinutes: number; hours: number; points: DashboardTrendPoint[] }>(`/api/dashboard/trend?hours=${hours}`),
@@ -431,6 +503,8 @@ export interface BoltListItem {
   lastEchoTimeNs: number | null; lastSpTempC: number | null; minPreloadN: number | null
   material: string | null; elasticModulusGpa: number | null; soundVelocityMs: number | null
   effectiveLengthMm: number | null; crossSectionMm2: number | null; installTorqueNm: number | null
+  // 扩展不确定度 U(k=2)，与 lastPreloadN 同一条测量。plan §9.15.4 要求数值带区间展示
+  lastUncertaintyN: number | null
 }
 export interface BoltSettings {
   targetPreloadN?: number | null; minPreloadN?: number | null; material?: string | null
@@ -739,7 +813,8 @@ export const reportApi = {
 
 // ---- 标定中心 ----
 export interface CalibMethod {
-  method: string; trustLevel: string; total: number; active: number; expired: number; avgR2: number | null
+  // precision 是后端 DisplayLabels.PrecisionSpec 给的标称精度文案，与验收报告同源，前端不自算
+  method: string; trustLevel: string; precision: string; total: number; active: number; expired: number; avgR2: number | null
 }
 export interface TorqueTestPoint {
   id: number; torqueNm: number; nutFactor: number; nominalDiameterMm: number; estimatedPreloadN: number

@@ -184,6 +184,7 @@ builder.Services.AddSingleton<LicenseEnforcementState>();
 
 // 鉴权（JWT bearer）+ 授权策略 + 用户密码哈希
 builder.Services.AddBoltPreloadAuth(builder.Configuration, isDevelopment);
+builder.Services.AddSingleton<LoginIpRateLimiter>(); // 登录 IP 滑动窗口限速（与账号锁定互补）
 
 // 后台服务异常行为：单个 HostedService 抛未捕获异常时【不拖停整个进程】。
 // 采集 / 看门狗 / WAL 重放 / 信号健康各自独立，一个崩不应让整机停摆（默认 StopHost 对监测系统太脆）。
@@ -226,6 +227,10 @@ builder.Services.AddHostedService<BoltPreload.Api.Runtime.UnboundRetentionServic
 builder.Services.Configure<BoltPreload.Api.Runtime.WiringGuardOptions>(builder.Configuration.GetSection("Alarm:WiringGuard"));
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.WiringGuardService>();
 
+// 设备校时 + 主机时钟漂移（plan §9.8 / FMEA RPN 70）：连上已在 FxSdkConnector 校一次，这里做日周期与 NTP 跳变监视
+builder.Services.Configure<BoltPreload.Api.Runtime.TimeSyncOptions>(builder.Configuration.GetSection("Alarm:TimeSync"));
+builder.Services.AddHostedService<BoltPreload.Api.Runtime.TimeSyncService>();
+
 // 仿真模式下给模拟器驱动的通道写真标定，让采集链路照常算出预紧力，而不是往库里塞演示数据。
 // 生产环境早在文件开头就拦掉了，走到这里的一定是开发或测试环境。
 if (fxSimulated)
@@ -252,6 +257,12 @@ app.UseStaticFiles();
 // 顺序：Auth → License Gate → 路由
 app.UseAuthentication();
 app.UseAuthorization();
+// plan §9.5：审计行要记客户端 IP。放在鉴权之后，保证后续端点写 audit_log 时 AsyncLocal 已就位。
+app.Use(async (ctx, next) =>
+{
+    AuditClientIp.Capture(ctx);
+    await next();
+});
 app.UseMiddleware<LicenseGateMiddleware>();
 
 // SignalR Hub — 必须登录
@@ -270,7 +281,13 @@ app.MapGet("/api/health", () => new
 // 就绪检查（readiness）：实际探测关键依赖（DB 连通性）。
 // 区别于上面的 liveness（仅表示进程还在）——运维/负载均衡探针用 /ready 判断"能否真正服务请求"，
 // DB 不通时返回 503，避免"进程在、但后端依赖已断"的静默失效被当成健康。
-app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorManager manager, BackgroundServiceHealth svcHealth, CancellationToken ct) =>
+app.MapGet("/api/health/ready", async (
+    NpgsqlDataSource ds,
+    IDeviceConnectorManager manager,
+    BackgroundServiceHealth svcHealth,
+    IMeasurementWal wal,
+    IOptions<MeasurementWalOptions> walOpt,
+    CancellationToken ct) =>
 {
     // 1) DB 连通性（硬性：down → 503，运维/负载均衡据此摘流）
     try
@@ -311,7 +328,69 @@ app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorMana
     }
     catch { /* 探测尽力 */ }
 
-    // 4) 后台服务存活：宿主配了 BackgroundServiceExceptionBehavior.Ignore（一个服务崩不拖停整机），
+    // 4) 进程内存（plan §9.23 BITE）：工控机内存泄漏不会立刻把进程打崩，但会拖慢采集；
+    //    纳入 readiness 让健康度一屏与开机自检能看见，阈值由运维侧告警，这里不武断 503。
+    object memory;
+    try
+    {
+        using var proc = System.Diagnostics.Process.GetCurrentProcess();
+        memory = new
+        {
+            workingSetMb = Math.Round(proc.WorkingSet64 / 1024.0 / 1024, 1),
+            privateMb = Math.Round(proc.PrivateMemorySize64 / 1024.0 / 1024, 1),
+            gcHeapMb = Math.Round(GC.GetTotalMemory(false) / 1024.0 / 1024, 1),
+        };
+    }
+    catch
+    {
+        memory = new { workingSetMb = (double?)null, privateMb = (double?)null, gcHeapMb = (double?)null };
+    }
+
+    // 5) WAL 积压与体积：pending 来自 IMeasurementWal；体积扫本地目录（失败不挡探针）
+    double? walSizeMb = null;
+    try
+    {
+        var root = Path.GetFullPath(walOpt.Value.RootPath);
+        if (Directory.Exists(root))
+        {
+            long bytes = 0;
+            foreach (var f in Directory.EnumerateFiles(root, "*.json"))
+            {
+                try { bytes += new FileInfo(f).Length; }
+                catch { /* 单文件竞态删除 */ }
+            }
+            walSizeMb = Math.Round(bytes / 1024.0 / 1024, 2);
+        }
+        else walSizeMb = 0;
+    }
+    catch { /* 探测尽力 */ }
+
+    var walInfo = new
+    {
+        enabled = wal.Enabled,
+        pending = wal.PendingCount,
+        sizeMb = walSizeMb,
+    };
+
+    // 6) 入库延迟：取近 1 小时 measurements 上 max(ingested_at) 距现在的秒数。
+    //    与 maxIdleSeconds（设备信封空闲）互补——前者看“库里最新一条多久前进了”，后者看“设备多久没说话”。
+    double? ingestLagSeconds = null;
+    try
+    {
+        await using var lagCmd = ds.CreateCommand(@"
+            SELECT EXTRACT(EPOCH FROM (now() - max(ingested_at)))::double precision
+            FROM measurements
+            WHERE ingested_at > now() - interval '1 hour'");
+        var lagObj = await lagCmd.ExecuteScalarAsync(ct);
+        if (lagObj is not null && lagObj != DBNull.Value)
+            ingestLagSeconds = Math.Round(Convert.ToDouble(lagObj), 1);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogDebug(ex, "/api/health/ready 入库延迟探测失败");
+    }
+
+    // 7) 后台服务存活：宿主配了 BackgroundServiceExceptionBehavior.Ignore（一个服务崩不拖停整机），
     //    代价是服务死了进程还活着。此前本接口只看 DB，采集看门狗 / 信号健康停摆时依旧返回 ready ——
     //    最坏情况是 SignalHealthService 死了、探头脱落不再产生 signal_lost，而探针一路绿灯。
     //    失联（超过正常间隔 3 倍未心跳）即 503，让运维探针能发现"进程在、监测已停"。
@@ -323,7 +402,10 @@ app.MapGet("/api/health/ready", async (NpgsqlDataSource ds, IDeviceConnectorMana
         db = "up",
         devices = new { total = deviceTotal, connected = deviceConnected },
         maxIdleSeconds = maxIdle,
+        ingestLagSeconds,
         freeDiskGb,
+        memory,
+        wal = walInfo,
         backgroundServices = services,
         deadServices,
         timestamp = now

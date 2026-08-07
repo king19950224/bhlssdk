@@ -53,6 +53,11 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     private readonly ConcurrentDictionary<long, DateTimeOffset> _lastActiveTouch = new();
     private static readonly TimeSpan LastActiveTouchInterval = TimeSpan.FromSeconds(60);
 
+    // 无 ratio 跳过告警评估的日志节流（按 boltId）：algo_version 已写库是主留痕；
+    // 日志只作值班检索，不能每条测量刷一条（采集热路径可达 Hz 级）。
+    private readonly ConcurrentDictionary<long, DateTimeOffset> _skipAlarmLogTouch = new();
+    private static readonly TimeSpan SkipAlarmLogInterval = TimeSpan.FromMinutes(5);
+
     /// <summary>单设备的未路由通道丢弃聚合状态（每通道累计计数 + 节流时间戳）。</summary>
     private sealed class UnroutedDeviceState
     {
@@ -237,11 +242,14 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
     /// </summary>
     private PreloadComputation TryComputePreload(ChannelRoute route, FxChannelResultDto cr)
     {
+        // 降级原因必须能区分开（plan §8.14“算法降级必须显式标记，绝不能静默退化”）。
+        // 这三种以前共用一个 phase1:raw，事后回放分不出到底是没回波、没规格还是没标定，
+        // 而它们的现场处置完全不同：查探头 / 补螺栓档案 / 去做标定。
         if (cr.EchoTimeNs is null || cr.SpTempC is null)
-            return new(null, null, null, 0m, "phase1:raw", null);
+            return new(null, null, null, 0m, "phase1:raw:no_echo_or_temp", null);
 
         if (route.BoltSpec is null)
-            return new(null, null, null, 0m, "phase1:raw", null);
+            return new(null, null, null, 0m, "phase1:raw:no_bolt_spec", null);
 
         // 温度系数：优先用螺栓自带的（按材料标准值），缺则退化到 SDK 默认。
         var tempCoeff = route.BoltSpec.TempCoefficientPerC ?? BoltPhysicsDefaults.SdkTempCoefficientPerC;
@@ -304,6 +312,11 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
                 }
 
                 var uncertaintyN = preloadN * 0.30m; // 扭矩拟合仍按临时工程估算处理
+                // 与 GB 单波路径一致：有预紧力无目标值必须留痕（评估器会跳过，见 no_target_preload）
+                if (torqueFitRatio is null)
+                    return new(preloadN, null, uncertaintyN, deltaTofNs,
+                        "phase1:TorqueFitSingleWave:1.0.0:no_target_preload", route.Calibration.CalibrationId);
+
                 return new(preloadN, torqueFitRatio, uncertaintyN, deltaTofNs,
                     "phase1:TorqueFitSingleWave:1.0.0", route.Calibration.CalibrationId);
             }
@@ -337,6 +350,15 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             if (result.PreloadN.HasValue && route.TargetPreloadN is > 0)
                 ratio = result.PreloadN.Value / route.TargetPreloadN.Value;
 
+            // 预紧力算出来了、但螺栓没填目标值 → ratio 为 null → 评估器直接跳过，这颗螺栓等于没在被判定。
+            // bolts.target_preload_n 允许为空（自动建档时"目标预紧力空，待现场补全"），
+            // 所以这是现场常见状态而不是异常；但它必须留痕，否则只能靠人挨个翻档案才发现哪些螺栓没进告警。
+            if (result.PreloadN.HasValue && ratio is null)
+            {
+                return new(result.PreloadN, null, result.UncertaintyN, result.DeltaTofNs,
+                    $"phase1:{result.ModelUsed}:no_target_preload", result.CalibrationId);
+            }
+
             // GB 范围外不入库 —— calculator 标 WithinGbRange=false 但仍返回 preload_n，
             // 这里在写库前过滤，避免下游业务把超范围预紧力当真。
             // 原始值仍带给告警评估：跌破 GB 下限是松脱形态（见 PreloadComputation）。
@@ -353,7 +375,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
 
         // 未标定通道不计算 preload_n，避免把 "0N" 当成真实预紧力。
         // SDK 如果有 ChannelConfig.RefTime/RefTemp，会给 DeltaTofNs；这里保留它。
-        return new(null, null, null, cr.DeltaTofNs ?? 0m, "phase1:raw", null);
+        return new(null, null, null, cr.DeltaTofNs ?? 0m, "phase1:raw:uncalibrated", null);
     }
 
     private async Task WriteMeasurementAsync(ChannelRoute route, FxDecodedEnvelope envelope, FxChannelResultDto cr, bool evaluateAlarms, CancellationToken ct)
@@ -440,8 +462,11 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         cmd.Parameters.AddWithValue("algo_version", NpgsqlDbType.Varchar, pre.AlgoVersion);
         cmd.Parameters.AddWithValue("calib_id", NpgsqlDbType.Uuid, (object?)pre.CalibrationId ?? DBNull.Value);
 
-        // 4. 写库（一次往返），随后做告警评估
-        // 注意：先写 measurement 再评估告警，让"告警时对应的 measurement 已经入库可查"
+        // 4. 写库（一次往返），随后做告警评估。
+        // 注意：measurement INSERT 与 alarm Persist 目前分连接、非同事务——告警落库失败时
+        // EvaluateAndDispatchAlarmsAsync 已 RollbackTransition，后续样本可重试（C2）。
+        // 同事务改造需把 IAlarmSink 扩成可注入 DbTransaction，留待下一批次。
+        // 先写 measurement 再评估，保证告警触发时对应 measurement 已可查。
         var rowsAffected = await cmd.ExecuteNonQueryAsync(ct);
         if (rowsAffected == 0)
         {
@@ -660,7 +685,24 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             PreloadN: pre.AlarmPreloadN,
             PreloadRatio: pre.AlarmRatio,
             TargetPreloadN: route.TargetPreloadN,
-            SdkStatusCode: cr.StatusCode);
+            SdkStatusCode: cr.StatusCode,
+            UncertaintyN: pre.UncertaintyN);
+
+        // 无 ratio → 评估器直接空返回是设计内行为（标定过期等不自动告警，见 product-design P2），
+        // 但 §8.14 要求绝不能静默：algo_version 已写库，这里再按螺栓节流落一条可检索日志。
+        if (pre.AlarmRatio is null)
+        {
+            var nowSkip = DateTimeOffset.UtcNow;
+            if (!_skipAlarmLogTouch.TryGetValue(route.BoltId, out var lastSkip)
+                || nowSkip - lastSkip >= SkipAlarmLogInterval)
+            {
+                _skipAlarmLogTouch[route.BoltId] = nowSkip;
+                _logger.LogInformation(
+                    "告警评估跳过（无 preload_ratio）bolt={Bolt} channel={Ch} algo={Algo}",
+                    route.BoltId, route.ChannelId, pre.AlgoVersion);
+            }
+            return;
+        }
 
         // 条件仍命中时刷新开启告警的 last_active_at（节流，与是否产生转移事件无关：
         // 稳定越限期状态机不产生任何事件，而这段时间恰恰需要"仍在命中"的证据）
@@ -772,7 +814,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             PreloadN: pre.AlarmPreloadN,
             PreloadRatio: pre.AlarmRatio,
             TargetPreloadN: route.TargetPreloadN,
-            SdkStatusCode: cr.StatusCode);
+            SdkStatusCode: cr.StatusCode,
+            UncertaintyN: pre.UncertaintyN);
 
         var critical = _alarmEvaluator.EvaluateCriticalStateless(input);
         if (critical is null) return;

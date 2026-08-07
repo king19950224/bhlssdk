@@ -84,8 +84,11 @@ public static class MeasurementEndpoints
         {
             var n = Math.Clamp(limit ?? 100, 1, 1000);
 
+            // 带上扩展不确定度 U(k=2)：plan §9.15.4 要求测量结果必须带不确定度交付，
+            // 界面写"100 ± 5 kN (k=2)"而不是光秃秃一个 100。此前这列只入库、没人读。
             const string sql = @"
-                SELECT ts, echo_time_ns, sp_temp_c, status_code, preload_n, preload_ratio
+                SELECT ts, echo_time_ns, sp_temp_c, status_code, preload_n, preload_ratio,
+                       preload_uncertainty_n
                 FROM measurements
                 WHERE bolt_id = @bolt_id
                 ORDER BY ts DESC
@@ -106,7 +109,8 @@ public static class MeasurementEndpoints
                     spTempC = reader.IsDBNull(2) ? null : (decimal?)reader.GetDecimal(2),
                     statusCode = reader.GetInt16(3),
                     preloadN = reader.IsDBNull(4) ? null : (decimal?)reader.GetDecimal(4),
-                    preloadRatio = reader.IsDBNull(5) ? null : (decimal?)reader.GetDecimal(5)
+                    preloadRatio = reader.IsDBNull(5) ? null : (decimal?)reader.GetDecimal(5),
+                    uncertaintyN = reader.IsDBNull(6) ? null : (decimal?)reader.GetDecimal(6)
                 });
             }
             return Results.Ok(new { boltId, count = items.Count, items });

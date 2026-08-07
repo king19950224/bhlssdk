@@ -20,6 +20,7 @@ const navGroups = [
       { name: 'live', label: '实时波形', icon: 'TrendCharts' },
       { name: 'assets', label: '资产监测', icon: 'Histogram' },
       { name: 'alarms', label: '告警中心', icon: 'BellFilled' },
+      { name: 'alarmKpi', label: '报警 KPI', icon: 'DataLine' },
     ],
   },
   {
@@ -36,6 +37,7 @@ const navGroups = [
       { name: 'devices', label: '采集设备', icon: 'Cpu' },
       { name: 'identify', label: '点位与验收', icon: 'Aim' },
       { name: 'diagnostics', label: '波形诊断', icon: 'TrendCharts', reviewerOnly: true },
+      { name: 'systemHealth', label: '系统自检', icon: 'FirstAidKit' },
     ],
   },
   {
@@ -71,6 +73,7 @@ function isActive(name: string) {
 const runtime = useRuntime()
 const devicesOnline = computed(() => runtime.online)
 const devicesTotal = computed(() => runtime.total)
+const runtimeError = computed(() => runtime.error)
 const walPending = computed(() => runtime.walPending)
 const licenseValid = computed(() => runtime.license?.valid ?? true)
 const openAlarms = ref(0)
@@ -89,35 +92,67 @@ const realtimeLabel = computed(() =>
   realtimeState.value === 'connected' ? '实时已连' : realtimeState.value === 'connecting' ? '实时连接中' : '实时断开',
 )
 
-// ---- 新告警提示音:监控值班场景不能只靠角标变红(可开关,默认开;偏好存本地) ----
+// ---- 新告警提示音 / HMI（plan §9.1 同源合并、§9.24 分级声音与 critical 弹窗）----
 const soundOn = ref(localStorage.getItem('bp_alarm_sound') !== 'off')
 function toggleSound() {
   soundOn.value = !soundOn.value
   localStorage.setItem('bp_alarm_sound', soundOn.value ? 'on' : 'off')
-  if (soundOn.value) beep() // 开启时试听一声
+  if (soundOn.value) beep('warn') // 开启时试听预警档
 }
 let audioCtx: AudioContext | null = null
 let lastBeepAt = 0
-function beep() {
-  // 用 WebAudio 合成"嘟-嘟"双音,不依赖音频资源文件;5s 节流防告警风暴时连环响
+// 同源合并：同一 (boltId,type) 短窗内只响一次，避免法兰 12 颗同时报刷屏
+const mergeWindowMs = 8000
+const recentTriggers = new Map<string, number>()
+let criticalModalOpen = false
+
+function beep(severity: string) {
   const now = Date.now()
-  if (now - lastBeepAt < 5000) return
+  // critical 可打断节流；其余 5s 内最多一声
+  if (severity !== 'critical' && now - lastBeepAt < 5000) return
+  if (severity === 'critical' && now - lastBeepAt < 1500) return
   lastBeepAt = now
+  // §9.24：info 单短音 / warn 双音 / critical 三连急促高音
+  const pattern =
+    severity === 'critical' ? ([[0, 1100], [0.16, 1100], [0.32, 1100]] as const)
+    : severity === 'info' ? ([[0, 720]] as const)
+    : ([[0, 880], [0.22, 660]] as const)
   try {
     audioCtx ??= new AudioContext()
-    for (const [offset, freq] of [[0, 880], [0.22, 660]] as const) {
+    for (const [offset, freq] of pattern) {
       const osc = audioCtx.createOscillator()
       const gain = audioCtx.createGain()
-      osc.type = 'sine'
+      osc.type = severity === 'critical' ? 'square' : 'sine'
       osc.frequency.value = freq
+      const peak = severity === 'critical' ? 0.32 : 0.28
       gain.gain.setValueAtTime(0.0001, audioCtx.currentTime + offset)
-      gain.gain.exponentialRampToValueAtTime(0.28, audioCtx.currentTime + offset + 0.02)
-      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + offset + 0.18)
+      gain.gain.exponentialRampToValueAtTime(peak, audioCtx.currentTime + offset + 0.02)
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + offset + 0.14)
       osc.connect(gain).connect(audioCtx.destination)
       osc.start(audioCtx.currentTime + offset)
-      osc.stop(audioCtx.currentTime + offset + 0.2)
+      osc.stop(audioCtx.currentTime + offset + 0.16)
     }
   } catch { /* 浏览器未授权音频时静默 */ }
+}
+
+async function showCriticalModal(a: { boltCode?: string; type?: string; message?: string; severity?: string }) {
+  if (criticalModalOpen) return
+  criticalModalOpen = true
+  try {
+    await ElMessageBox.alert(
+      (a.message || '预紧力严重异常，请立即处置') + (a.boltCode ? `\n螺栓：${a.boltCode}` : ''),
+      '严重告警',
+      {
+        type: 'error',
+        confirmButtonText: '前往告警中心',
+        closeOnClickModal: false,
+        closeOnPressEscape: false,
+        showClose: false,
+      },
+    )
+    router.push({ name: 'alarms' })
+  } catch { /* 忽略 */ }
+  finally { criticalModalOpen = false }
 }
 
 onMounted(() => {
@@ -130,7 +165,21 @@ onMounted(() => {
   startRealtime()
   unsubAlarm = onRealtime('OnAlarm', (a) => {
     refresh()
-    if (soundOn.value && a.action === 'trigger') beep()
+    // trigger 与 escalate（severity 升级）都要提示；clear 只刷角标
+    if (a.action !== 'trigger' && a.action !== 'escalate') return
+    const key = `${a.boltId ?? ''}:${a.type ?? ''}:${a.action}`
+    const now = Date.now()
+    const prev = recentTriggers.get(key) ?? 0
+    const merged = now - prev < mergeWindowMs
+    recentTriggers.set(key, now)
+    // 清理过期键，避免 Map 无限涨
+    if (recentTriggers.size > 200) {
+      for (const [k, t] of recentTriggers) if (now - t > mergeWindowMs) recentTriggers.delete(k)
+    }
+    if (merged) return
+    const sev = (a.severity || 'warn').toLowerCase()
+    if (soundOn.value) beep(sev)
+    if (sev === 'critical' || sev === 'crit') void showCriticalModal(a)
   })
 })
 onUnmounted(() => {
@@ -237,9 +286,9 @@ function onUserCommand(c: string) {
 
         <div class="topbar-stats">
           <div class="stat-chip">
-            <span class="led" :class="devicesOnline > 0 ? 'led--ok' : 'led--off'" />
+            <span class="led" :class="runtimeError ? 'led--warn' : devicesOnline > 0 ? 'led--ok' : 'led--off'" />
             <span class="chip-k">设备在线</span>
-            <span class="chip-v mono">{{ devicesOnline }}/{{ devicesTotal }}</span>
+            <span class="chip-v mono" :title="runtimeError || ''">{{ runtimeError ? '状态未知' : `${devicesOnline}/${devicesTotal}` }}</span>
           </div>
           <div class="stat-chip" :class="{ alert: openAlarms > 0 }">
             <el-icon><BellFilled /></el-icon>

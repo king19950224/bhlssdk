@@ -112,6 +112,17 @@ public interface IFxConnector : IAsyncDisposable
         => Task.CompletedTask;
 
     /// <summary>
+    /// 向设备下发主机当前时间（plan §9.8 校时）。
+    /// <para>
+    /// 厂家 C# SDK 无 SyncTime API；实际是 <c>GetSyncTimeBase2000</c> 填 <c>MeasConfig</c> 后
+    /// <c>ConfigureDeviceAsync(..., nameof(MeasConfig))</c>。仅 model=3（MultiChIoT）协议会编码对时寄存器；
+    /// MeasConfig 只写不读，无法用协议回读校验设备钟差。模拟器默认空实现。
+    /// </para>
+    /// </summary>
+    Task SyncDeviceTimeAsync(CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    /// <summary>
     /// 当前设备端 MCR 轮询启用的通道集（实时会话状态）。ProbeScan 扫描前据此快照，扫描后恢复业务通道集——
     /// 比读 DB 的 sampling_enabled 标志更可靠（后者可能与设备实际 MCR 不同步）。
     /// 默认返回空（无 MCR 概念的实现，如模拟器 / 测试桩）。

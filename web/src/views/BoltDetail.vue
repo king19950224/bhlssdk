@@ -112,6 +112,15 @@ const effLastTs = computed(() => liveTs.value ?? bolt.value?.lastTs ?? null)
 const displayPreloadN = computed(() => (bolt.value?.calibrated ? livePreloadN.value ?? num(bolt.value?.lastPreloadN) : null))
 const displayRatio = computed(() => (bolt.value?.calibrated ? liveRatio.value ?? num(bolt.value?.lastRatio) : null))
 const displayTempC = computed(() => liveTempC.value ?? num(bolt.value?.lastSpTempC))
+// 不确定度只跟着"加载时的最后已知值"走：SignalR 实时帧不带 U，
+// 实时值刷新后再套旧的 U 会给出一个对不上的区间，那还不如不显示。
+const uncertaintyText = computed(() => {
+  if (livePreloadN.value != null) return ''
+  const u = num(bolt.value?.lastUncertaintyN)
+  const f = num(bolt.value?.lastPreloadN)
+  if (u == null || f == null || !bolt.value?.calibrated) return ''
+  return `± ${fmtN(u)} N（U, k=2, 95% 置信）`
+})
 // 统一的"状态 + 变化程度"模型（与服务端 bolt_status 口径一致）
 const health = computed(() =>
   computePreloadHealth({
@@ -725,6 +734,8 @@ async function exportTrendCsv() {
       <div class="stat panel" :class="status === 'loose' ? 'stat--crit' : status === 'normal' ? 'stat--ok' : ''">
         <div class="stat-hd"><span class="stat-label">{{ liveLabel }}预紧力</span><span class="led" :class="STATUS[status].cls" /></div>
         <div class="stat-val metric" :style="`color:${STATUS[status].color}`">{{ fmtN(displayPreloadN) }}<i>N</i></div>
+        <!-- 测量值必须带不确定度交付（plan §9.15.4）：只给中心值会让业主以为这是精确值 -->
+        <div v-if="uncertaintyText" class="stat-foot">{{ uncertaintyText }}</div>
       </div>
       <div class="stat panel">
         <div class="stat-hd"><span class="stat-label">{{ liveLabel }}比值</span><el-icon class="stat-ic"><Odometer /></el-icon></div>

@@ -28,11 +28,12 @@ public static class BoltEndpoints
                        c.id AS channel_id, c.channel_no, c.k_l, c.ref_time_ns, c.ref_temp_c,
                        last_m.ts AS last_ts, last_m.preload_n, last_m.preload_ratio, last_m.echo_time_ns, last_m.sp_temp_c,
                        b.min_preload_n,
-                       b.material, b.elastic_modulus_gpa, b.sound_velocity_ms, b.effective_length_mm, b.cross_section_mm2, b.install_torque_nm
+                       b.material, b.elastic_modulus_gpa, b.sound_velocity_ms, b.effective_length_mm, b.cross_section_mm2, b.install_torque_nm,
+                       last_m.preload_uncertainty_n
                 FROM bolts b
                 JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
                 LEFT JOIN LATERAL (
-                    SELECT ts, preload_n, preload_ratio, echo_time_ns, sp_temp_c
+                    SELECT ts, preload_n, preload_ratio, echo_time_ns, sp_temp_c, preload_uncertainty_n
                     FROM measurements m
                     WHERE m.bolt_id = b.id
                     ORDER BY ts DESC LIMIT 1
@@ -74,7 +75,9 @@ public static class BoltEndpoints
                     soundVelocityMs = r.IsDBNull(20) ? null : (decimal?)r.GetDecimal(20),
                     effectiveLengthMm = r.IsDBNull(21) ? null : (decimal?)r.GetDecimal(21),
                     crossSectionMm2 = r.IsDBNull(22) ? null : (decimal?)r.GetDecimal(22),
-                    installTorqueNm = r.IsDBNull(23) ? null : (decimal?)r.GetDecimal(23)
+                    installTorqueNm = r.IsDBNull(23) ? null : (decimal?)r.GetDecimal(23),
+                    // 扩展不确定度 U(k=2)，plan §9.15.4 要求测量值带区间交付
+                    lastUncertaintyN = r.IsDBNull(24) ? null : (decimal?)r.GetDecimal(24)
                 });
             }
             return Results.Ok(new { count = items.Count, hasMore = items.Count >= lim, items });
@@ -91,11 +94,12 @@ public static class BoltEndpoints
                        c.id AS channel_id, c.channel_no, c.k_l, c.ref_time_ns, c.ref_temp_c,
                        last_m.ts AS last_ts, last_m.preload_n, last_m.preload_ratio, last_m.echo_time_ns, last_m.sp_temp_c,
                        b.min_preload_n,
-                       b.material, b.elastic_modulus_gpa, b.sound_velocity_ms, b.effective_length_mm, b.cross_section_mm2, b.install_torque_nm
+                       b.material, b.elastic_modulus_gpa, b.sound_velocity_ms, b.effective_length_mm, b.cross_section_mm2, b.install_torque_nm,
+                       last_m.preload_uncertainty_n
                 FROM bolts b
                 JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
                 LEFT JOIN LATERAL (
-                    SELECT ts, preload_n, preload_ratio, echo_time_ns, sp_temp_c
+                    SELECT ts, preload_n, preload_ratio, echo_time_ns, sp_temp_c, preload_uncertainty_n
                     FROM measurements m
                     WHERE m.bolt_id = b.id
                     ORDER BY ts DESC LIMIT 1
@@ -134,7 +138,9 @@ public static class BoltEndpoints
                 soundVelocityMs = r.IsDBNull(20) ? null : (decimal?)r.GetDecimal(20),
                 effectiveLengthMm = r.IsDBNull(21) ? null : (decimal?)r.GetDecimal(21),
                 crossSectionMm2 = r.IsDBNull(22) ? null : (decimal?)r.GetDecimal(22),
-                installTorqueNm = r.IsDBNull(23) ? null : (decimal?)r.GetDecimal(23)
+                installTorqueNm = r.IsDBNull(23) ? null : (decimal?)r.GetDecimal(23),
+                // 扩展不确定度 U(k=2)，plan §9.15.4 要求测量值带区间交付
+                lastUncertaintyN = r.IsDBNull(24) ? null : (decimal?)r.GetDecimal(24)
             });
         })
         .WithName("GetBolt")
@@ -488,13 +494,14 @@ public static class BoltEndpoints
             }
 
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'update_bolt_spec', 'bolt', @id, NULL, @after::jsonb, @note, now())", conn, tx))
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                VALUES (@uid, 'update_bolt_spec', 'bolt', @id, NULL, @after::jsonb, @note, now(), @ip)", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
                 audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(req));
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"更新螺栓 {code} 预紧力设置（目标/下限/规格）");
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
             await tx.CommitAsync(ct);

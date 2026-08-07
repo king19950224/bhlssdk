@@ -2,6 +2,7 @@ using System.Threading.Channels;
 using BoltPreload.Fx.Models;
 using FxSDK;
 using FxSDK.Models;
+using FxSDK.Utility;
 using Microsoft.Extensions.Logging;
 using WorkMode = FxSDK.Models.WorkMode;
 
@@ -235,6 +236,28 @@ public sealed class FxSdkConnector : IFxConnector
         }, cancellationToken);
     }
 
+    /// <inheritdoc />
+    public Task SyncDeviceTimeAsync(CancellationToken cancellationToken = default)
+        => RunUnderSessionLockAsync(SyncMeasConfigAsync, cancellationToken);
+
+    /// <summary>在已持有会话锁的前提下写 MeasConfig 对时寄存器（plan §9.8）。</summary>
+    private Task SyncMeasConfigAsync(string session)
+    {
+        // 用工控机本地时间：设备侧没有时区概念，寄存器是"自 2000-01-01 起的天数 + 当日秒"。
+        // 现场须保证工控机本身已对 NTP（§9.8 上半段）；这里只负责把主机时间灌进设备。
+        var (days, secs) = CalculateExtensions.GetSyncTimeBase2000(DateTime.Now);
+        _config.MeasConfig ??= new MeasConfig();
+        // 保留已有 Frequency/SampleDepth，只改对时字段，避免把测量频率一并改回默认
+        _config.MeasConfig.DaysSince2000 = (ushort)Math.Clamp(days, 0u, ushort.MaxValue);
+        _config.MeasConfig.SecondsToday = secs;
+
+        _logger.LogInformation(
+            "下发设备校时 device={DeviceId} daysSince2000={Days} secondsToday={Secs}",
+            _deviceId, _config.MeasConfig.DaysSince2000, _config.MeasConfig.SecondsToday);
+
+        return _client.ConfigureDeviceAsync(session, _config, nameof(DeviceConfig.MeasConfig), sendCommand: true);
+    }
+
     public IReadOnlyList<FxSessionChannelConfigSnapshot> GetSessionChannelConfigs()
     {
         return _latestChannelConfig.Values
@@ -418,6 +441,13 @@ public sealed class FxSdkConnector : IFxConnector
             {
                 _logger.LogWarning("provisioning 期间设备已断开，放弃置 Connected device={DeviceId}", _deviceId);
                 return;
+            }
+
+            // 连上即校时（plan §9.8）：失败不挡 Connected——校时是辅助，不能因对时寄存器写失败让整条采集停摆。
+            try { await SyncMeasConfigAsync(session); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "连上校时失败（将由 TimeSyncService 周期重试）device={DeviceId}", _deviceId);
             }
 
             // 会话已完整 provision（DeviceConfig + 各 ChannelConfig 均已注入 SessionContext）后，才对外置 Connected。

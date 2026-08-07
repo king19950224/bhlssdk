@@ -83,6 +83,9 @@ public static class DisplayLabels
         ["user_create"] = "创建/重置用户",
         ["user_toggle"] = "启停用户",
         ["user_change_password"] = "修改密码",
+
+        // 审计自身（导出也要留痕，§9.5）
+        ["audit_export"] = "导出审计日志",
     };
 
     private static readonly Dictionary<string, string> AuditTargetTypes = new(StringComparer.Ordinal)
@@ -100,6 +103,7 @@ public static class DisplayLabels
         ["user"] = "用户",
         ["device"] = "设备",
         ["monitor_group"] = "监测部位",
+        ["audit_log"] = "审计日志",
     };
 
     // 用接线语境的叫法（"在位"而不是"健康"）：点位表是照着现场线缆核对的，
@@ -129,8 +133,8 @@ public static class DisplayLabels
     // 用词跟前端告警中心保持一致，同一条告警在页面上和导出表里不该是两个叫法。
     //
     // 产生方各在一处：preload_* 在 StaticThresholdAlarmEvaluator，signal_lost 在 SignalHealthService，
-    // wiring_suspect 在 WiringGuardService。加新告警类型时四处要一起改（本表、前端 labels.ts、
-    // DisplayLabelsTests 的清单、AlarmEndpoints 的可抑制白名单），漏了前两处 G7 门禁会拦。
+    // wiring_suspect 在 WiringGuardService，clock_drift 在 TimeSyncService。
+    // 加新告警类型时四处要一起改（本表、前端 labels.ts、DisplayLabelsTests 的清单、AlarmEndpoints 的可抑制白名单），漏了前两处 G7 门禁会拦。
     //
     // no_data 没有任何评估器会产生，它是 channels.hardware_state 的取值不是告警类型；
     // 保留同样是因为词表只增不删，老库里若存过这个 type 也得翻得出中文。
@@ -141,6 +145,7 @@ public static class DisplayLabels
         ["preload_loss"] = "预紧力脱落",
         ["signal_lost"] = "信号丢失",
         ["wiring_suspect"] = "接线疑似变动",
+        ["clock_drift"] = "时钟漂移",
         ["no_data"] = "数据中断",
     };
 
@@ -171,6 +176,25 @@ public static class DisplayLabels
         "temporary" => "临时",
         "reference" => "参考",
         _ => "未分级",
+    };
+
+    /// <summary>
+    /// 标定方法 → 该方法下预紧力的标称精度，出处为 plan.md §8.3“三种模型的精度对照”。
+    /// <para>
+    /// 单列一处的原因：说明书 V1.03 写的是 ±3%，而 ±3% 对应双波法，本系统在 model=3
+    /// 多通道监测设备上拿不到横波声时（见 <c>GbBiWaveCalculator</c> 类注释的实测结论），
+    /// ≥M12 螺栓实际全部走单波法。口径散在注释里对不上账，交付时会被业主逐条核，
+    /// 所以收敛到这里，由标定中心摘要与验收报告共同引用。
+    /// </para>
+    /// </summary>
+    public static string PrecisionSpec(string? method) => method switch
+    {
+        "gb_bi_wave" => "±3%（双波法，本机型无横波声时，当前不可用）",
+        "load_calibrated" or "gb_single_wave" => "±5%",
+        "torque_fit" => "±10%~20%（扭矩法工程估算）",
+        "quick" or "torque_estimate" => "±15%~25%（临时，仅看趋势）",
+        "sim_baseline" => "不适用（演示基线）",
+        _ => "未标定（±15%~25%，简化模型仅看趋势）",
     };
 
     private static readonly Dictionary<string, string> CalibrationMethods = new(StringComparer.Ordinal)

@@ -69,9 +69,12 @@ export const useRuntime = defineStore('runtime', {
         this.error = null
       } catch (e) {
         this.error = e instanceof Error ? e.message : '设备状态刷新失败'
-        // 拉不到运行时状态就不能继续宣称设备在线——顶栏"1/1 在线"挂着而后端已死是假安全
+        // 拉不到运行时状态就不能继续宣称设备在线——顶栏"1/1 在线"挂着而后端已死是假安全。
+        // total 一并清零：保留旧 total 会显示成 0/N，与"全部离线"视觉相同但语义是"状态未知"。
         this.online = 0
+        this.total = 0
         this.rate = 0
+        this.items = []
       } finally {
         this.loaded = true
         inFlight = false

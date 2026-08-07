@@ -13,7 +13,7 @@ public static class AlarmEndpoints
 {
     /// <summary>可抑制/可闭合的告警类型白名单。拼错的 type 会生成一条永远匹配不上的抑制（操作者误以为已静默），必须挡在入口。</summary>
     private static readonly HashSet<string> KnownAlarmTypes =
-        new(StringComparer.Ordinal) { "preload_low", "preload_high", "preload_loss", "signal_lost", "wiring_suspect" };
+        new(StringComparer.Ordinal) { "preload_low", "preload_high", "preload_loss", "signal_lost", "wiring_suspect", "clock_drift" };
 
     public static IEndpointRouteBuilder MapAlarmEndpoints(this IEndpointRouteBuilder app)
     {
@@ -374,6 +374,152 @@ public static class AlarmEndpoints
         .WithName("AlarmSummary")
         .WithSummary("告警汇总（按 severity × type）");
 
+        // GB/T 41261-2022 报警系统 KPI。方案 §8.7.0 把这几个数写成了国标规定值而非经验值，
+        // 并要求"做进监控页，验收时直接拉数据对照"——所以这里连限值一起返回，
+        // 免得页面和验收单各记一套限值、对不上账。
+        grp.MapGet("/kpi", async (NpgsqlDataSource ds, int? windowHours, CancellationToken ct) =>
+        {
+            // 默认按国标的"每天"口径取 24h；上限 30 天，防止有人拉一年把库扫穿
+            var hours = Math.Clamp(windowHours ?? 24, 1, 720);
+
+            // 一次查完全部标量指标。软删螺栓的告警一律排除，与列表/汇总同一口径。
+            const string scalarSql = @"
+                WITH win AS (
+                    SELECT a.id, a.bolt_id, a.type, a.severity, a.triggered_at,
+                           a.acknowledged_at, a.cleared_at
+                    FROM alarms a
+                    JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
+                    WHERE a.triggered_at >= now() - (@hours * interval '1 hour')
+                ),
+                buckets AS (
+                    SELECT count(*) AS c
+                    FROM win
+                    GROUP BY date_bin('10 minutes', triggered_at, now() - (@hours * interval '1 hour'))
+                ),
+                overdue AS (
+                    -- 超期＝开启且未确认且已过 24 小时。用 alarms 全表而不是 win：
+                    -- 一条 30 天前触发、至今没人处理的告警才是最该被数出来的，按窗口过滤反而会漏掉它。
+                    SELECT count(*) AS c
+                    FROM alarms a
+                    JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
+                    WHERE a.cleared_at IS NULL AND a.acknowledged_at IS NULL
+                      AND a.triggered_at < now() - interval '24 hours'
+                )
+                SELECT
+                    (SELECT count(*) FROM win)                                          AS total_triggered,
+                    COALESCE((SELECT max(c) FROM buckets), 0)                           AS peak_per_10min,
+                    (SELECT c FROM overdue)                                             AS overdue_count,
+                    (SELECT count(*) FROM users WHERE enabled)                          AS operator_count,
+                    (SELECT avg(EXTRACT(EPOCH FROM (acknowledged_at - triggered_at)) / 60.0)
+                       FROM win WHERE acknowledged_at IS NOT NULL)                      AS avg_ack_minutes,
+                    (SELECT avg(EXTRACT(EPOCH FROM (cleared_at - triggered_at)) / 60.0)
+                       FROM win WHERE cleared_at IS NOT NULL)                           AS avg_clear_minutes";
+
+            long totalTriggered, peakPer10Min, overdueCount, operatorCount;
+            double? avgAckMinutes, avgClearMinutes;
+            await using (var cmd = ds.CreateCommand(scalarSql))
+            {
+                cmd.Parameters.AddWithValue("hours", NpgsqlDbType.Integer, hours);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct))
+                    return Results.Problem("KPI 聚合查询没有返回行", statusCode: 500);
+                totalTriggered = r.GetInt64(0);
+                peakPer10Min = r.GetInt64(1);
+                overdueCount = r.GetInt64(2);
+                operatorCount = r.GetInt64(3);
+                avgAckMinutes = r.IsDBNull(4) ? null : (double)r.GetDecimal(4);
+                avgClearMinutes = r.IsDBNull(5) ? null : (double)r.GetDecimal(5);
+            }
+
+            // 高频报警：国标口径是"单条规则触发次数占总报警的比例"。本系统一条规则＝一个 (螺栓, 类型)。
+            const string topSql = @"
+                SELECT a.bolt_id, b.code, a.type, count(*) AS c
+                FROM alarms a
+                JOIN bolts b ON b.id = a.bolt_id AND b.deleted_at IS NULL
+                WHERE a.triggered_at >= now() - (@hours * interval '1 hour')
+                GROUP BY a.bolt_id, b.code, a.type
+                ORDER BY c DESC
+                LIMIT 10";
+
+            var top = new List<object>();
+            long topCount = 0;
+            await using (var cmd = ds.CreateCommand(topSql))
+            {
+                cmd.Parameters.AddWithValue("hours", NpgsqlDbType.Integer, hours);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct))
+                {
+                    var c = r.GetInt64(3);
+                    if (top.Count == 0) topCount = c;   // 已按 c DESC 排序，第一条即最高频
+                    top.Add(new
+                    {
+                        boltId = r.GetInt64(0),
+                        boltCode = r.GetString(1),
+                        type = r.GetString(2),
+                        typeLabel = DisplayLabels.AlarmType(r.GetString(2)),
+                        count = c,
+                        ratio = totalTriggered > 0 ? Math.Round((double)c / totalTriggered, 4) : 0d
+                    });
+                }
+            }
+
+            var avgPerHour = Math.Round((double)totalTriggered / hours, 3);
+            // "每操作员"：没有启用用户时不做除法，返回 null 而不是把总量当人均糊弄过去
+            var avgPerHourPerOperator = operatorCount > 0
+                ? Math.Round(avgPerHour / operatorCount, 3)
+                : (double?)null;
+            var highFrequencyRatio = totalTriggered > 0
+                ? Math.Round((double)topCount / totalTriggered, 4)
+                : 0d;
+
+            return Results.Ok(new
+            {
+                windowHours = hours,
+                generatedAt = DateTimeOffset.UtcNow,
+                totalTriggered,
+                operatorCount,
+                // 每项都带 limit 与 pass，页面直接渲染红绿，验收时按 GB/T 41261-2022 逐条对照
+                metrics = new
+                {
+                    avgPerHourPerOperator = new
+                    {
+                        value = avgPerHourPerOperator,
+                        limit = 10.0,
+                        pass = avgPerHourPerOperator is null || avgPerHourPerOperator <= 10.0,
+                        basis = "GB/T 41261-2022 平均报警率 < 10 报警/小时/操作员"
+                    },
+                    peakPer10Min = new
+                    {
+                        value = peakPer10Min,
+                        limit = 10L,
+                        pass = peakPer10Min <= 10L,
+                        basis = "GB/T 41261-2022 峰值报警率 ≤ 10 报警（10 分钟内）"
+                    },
+                    overdueCount = new
+                    {
+                        value = overdueCount,
+                        limit = 5L,
+                        pass = overdueCount <= 5L,
+                        basis = "GB/T 41261-2022 超期报警 ≤ 5 条（超 24 小时未处理）"
+                    },
+                    highFrequencyRatio = new
+                    {
+                        value = highFrequencyRatio,
+                        limit = 0.05,
+                        pass = highFrequencyRatio < 0.05,
+                        basis = "GB/T 41261-2022 高频报警率 < 5%（单条规则占总报警比例）"
+                    }
+                },
+                // 这两项国标没给限值，是 §9.1 要求跟踪的健康度指标，只报数不判定
+                avgAckMinutes = avgAckMinutes.HasValue ? Math.Round(avgAckMinutes.Value, 1) : (double?)null,
+                avgClearMinutes = avgClearMinutes.HasValue ? Math.Round(avgClearMinutes.Value, 1) : (double?)null,
+                avgPerHour,
+                topFrequent = top
+            });
+        })
+        .WithName("AlarmKpi")
+        .WithSummary("报警系统 KPI（GB/T 41261-2022 四项限值 + 确认/处理时长）");
+
         return app;
     }
 
@@ -387,13 +533,14 @@ public static class AlarmEndpoints
         string targetType = "alarm")
     {
         await using var cmd = new NpgsqlCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            VALUES (@user_id, @action, @target_type, @target_id, NULL, NULL, @note, now())", conn, tx);
+            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+            VALUES (@user_id, @action, @target_type, @target_id, NULL, NULL, @note, now(), @ip)", conn, tx);
         cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("target_type", NpgsqlDbType.Varchar, targetType);
         cmd.Parameters.AddWithValue("target_id", NpgsqlDbType.Bigint, targetId);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        AuditClientIp.Bind(cmd.Parameters);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 }

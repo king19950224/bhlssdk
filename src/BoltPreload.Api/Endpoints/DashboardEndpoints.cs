@@ -89,7 +89,35 @@ public static class DashboardEndpoints
                   AND b.min_preload_n IS NOT NULL AND bs.preload_n > b.min_preload_n
                   AND rc.slope * 86400 < -(COALESCE(b.target_preload_n, bs.preload_n) * 0.001)
                 ORDER BY days_to_limit ASC
-                LIMIT 8;";
+                LIMIT 8;
+
+                -- 标定到期可见性（product-design §6.5 / plan §8.14）：不做自动告警，但总览必须能数清
+                -- 已过期 与 30 天内将到期 的生效标定，并给出可点进螺栓详情的清单。
+                -- LEFT JOIN 机组/部位：未挂机组的监测组也不能从到期清单里消失（见安全静默失效项）。
+                SELECT
+                    count(*) FILTER (WHERE cr.expires_at < (now() AT TIME ZONE 'UTC')::date) AS expired,
+                    count(*) FILTER (WHERE cr.expires_at >= (now() AT TIME ZONE 'UTC')::date
+                                      AND cr.expires_at <= (now() AT TIME ZONE 'UTC')::date + 30) AS within_30
+                FROM channels c
+                JOIN bolts b ON b.id = c.bolt_id AND b.deleted_at IS NULL
+                JOIN calibration_records cr ON cr.id = c.active_calibration_id
+                WHERE cr.expires_at IS NOT NULL
+                  AND cr.expires_at <= (now() AT TIME ZONE 'UTC')::date + 30;
+
+                SELECT b.id, b.code,
+                       COALESCE(t.name, '—') AS turbine,
+                       COALESCE(mg.name, '—') AS grp,
+                       cr.expires_at,
+                       (cr.expires_at - (now() AT TIME ZONE 'UTC')::date)::int AS days_left
+                FROM channels c
+                JOIN bolts b ON b.id = c.bolt_id AND b.deleted_at IS NULL
+                JOIN calibration_records cr ON cr.id = c.active_calibration_id
+                LEFT JOIN monitor_groups mg ON mg.id = b.group_id AND mg.deleted_at IS NULL
+                LEFT JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
+                WHERE cr.expires_at IS NOT NULL
+                  AND cr.expires_at <= (now() AT TIME ZONE 'UTC')::date + 30
+                ORDER BY cr.expires_at ASC, b.code
+                LIMIT 20;";
 
             await using var cmd = ds.CreateCommand(sql);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -159,7 +187,36 @@ public static class DashboardEndpoints
                     r2 = r.IsDBNull(9) ? (double?)null : r.GetDouble(9),
                 });
 
-            return Results.Ok(new { global, byGroup, topLoose, openAlarms, alarmsBySeverity, residualDist, approachingLimit });
+            // 标定到期：计数 + 清单（已过期排前；不新增 alarm type）
+            long expiredCalib = 0, within30Calib = 0;
+            await r.NextResultAsync(ct);
+            if (await r.ReadAsync(ct))
+            {
+                expiredCalib = r.GetInt64(0);
+                within30Calib = r.GetInt64(1);
+            }
+
+            var calibrationExpiryItems = new List<object>();
+            await r.NextResultAsync(ct);
+            while (await r.ReadAsync(ct))
+                calibrationExpiryItems.Add(new
+                {
+                    boltId = r.GetInt64(0),
+                    boltCode = r.GetString(1),
+                    turbine = r.GetString(2),
+                    group = r.GetString(3),
+                    expiresAt = DateOnly.FromDateTime(r.GetDateTime(4)).ToString("yyyy-MM-dd"),
+                    daysLeft = r.GetInt32(5),
+                });
+
+            var calibrationExpiry = new
+            {
+                expired = expiredCalib,
+                within30Days = within30Calib,
+                items = calibrationExpiryItems,
+            };
+
+            return Results.Ok(new { global, byGroup, topLoose, openAlarms, alarmsBySeverity, residualDist, approachingLimit, calibrationExpiry });
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)
         .WithTags("Dashboard")

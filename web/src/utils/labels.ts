@@ -18,6 +18,7 @@ const ALARM_TYPE_LABELS: Record<string, string> = {
   preload_loss: '预紧力脱落',
   signal_lost: '信号丢失',
   wiring_suspect: '接线疑似变动',
+  clock_drift: '时钟漂移',
   no_data: '数据中断',
 }
 

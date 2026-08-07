@@ -1,4 +1,5 @@
 using BoltPreload.Application.Devices;
+using BoltPreload.Application.Diagnostics;
 using BoltPreload.Application.Realtime;
 using BoltPreload.Fx;
 using BoltPreload.Fx.Models;
@@ -30,6 +31,7 @@ public sealed class IngestionService : BackgroundService
     private readonly IMeasurementWal _wal;
     private readonly ChannelPresenceTracker _presence;
     private readonly IngestionTaskRegistry _registry;
+    private readonly BackgroundServiceHealth _health;
     private readonly ILogger<IngestionService> _logger;
 
     public IngestionService(
@@ -39,6 +41,7 @@ public sealed class IngestionService : BackgroundService
         IMeasurementWal wal,
         ChannelPresenceTracker presence,
         IngestionTaskRegistry registry,
+        BackgroundServiceHealth health,
         ILogger<IngestionService> logger)
     {
         _deviceManager = deviceManager;
@@ -47,6 +50,7 @@ public sealed class IngestionService : BackgroundService
         _wal = wal;
         _presence = presence;
         _registry = registry;
+        _health = health;
         _logger = logger;
     }
 
@@ -61,8 +65,28 @@ public sealed class IngestionService : BackgroundService
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                StartMissing(running, stoppingToken);
-                await StopOrphanedAsync(running);
+                // 心跳：本服务停摆 = 全部设备停止采集，属安全相关的静默失效，
+                // 必须能在 /api/health/ready 看出来（宿主的 Ignore 策略让进程照常存活）
+                _health.Beat("ingestion", ReconcileInterval);
+
+                // 单轮对账的异常一律不许冒出循环：冒出去就是 ExecuteAsync 正常返回、
+                // 本服务被宿主按 Ignore 悄悄注销 —— 全站停采而进程看着还活着。
+                // 单设备的异常由 RunRuntimeAsync 的兜底重启循环负责，这里挡的是对账动作本身。
+                try
+                {
+                    StartMissing(running, stoppingToken);
+                    await StopOrphanedAsync(running);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "采集对账轮次异常，{Interval}s 后重试（已在跑的消费任务不受影响）",
+                        ReconcileInterval.TotalSeconds);
+                }
+
                 try
                 {
                     await Task.Delay(ReconcileInterval, stoppingToken);
@@ -130,6 +154,16 @@ public sealed class IngestionService : BackgroundService
                 // 任务卡死也照常继续释放：多半卡在 DB 写入或 SDK 调用上，
                 // 释放连接器会让阻塞的 IO 抛错收场，比无限等强
                 _logger.LogWarning("设备 {DeviceId} 的消费任务 {Grace}s 内未退出，强制释放连接器", id, StopGrace.TotalSeconds);
+            }
+            catch (Exception ex)
+            {
+                // 任务以异常收场时 WaitAsync 会把该异常重抛出来。不接住的话摘除流程从这里断：
+                // 连接器不释放（半开 TCP 会话留到进程退出）、running 里的条目不删，
+                // 于是每 2 秒对账都把它当孤儿重试一遍，异常一路冒到 ExecuteAsync 之外 ——
+                // 配 BackgroundServiceExceptionBehavior.Ignore 就是本服务静默退出、全部设备停采。
+                // RunRuntimeAsync 的兜底循环理论上吞掉一切非取消异常，真漏出来也只是这一条任务的事，
+                // 记下来继续把摘除做完。
+                _logger.LogWarning(ex, "设备 {DeviceId} 的消费任务以异常退出，继续摘除", id);
             }
             try
             {

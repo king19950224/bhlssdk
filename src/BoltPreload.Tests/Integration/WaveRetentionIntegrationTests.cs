@@ -121,6 +121,7 @@ public sealed class WaveRetentionIntegrationTests : IDisposable
     private WaveRetentionService NewService(LocalFileWaveStore store, int retentionDays) => new(
         store, _fx.DataSource,
         Options.Create(new LocalFileWaveStoreOptions { RootPath = _root, RetentionDays = retentionDays }),
+        new BoltPreload.Application.Diagnostics.BackgroundServiceHealth(),
         NullLogger<WaveRetentionService>.Instance);
 
     private string Abs(string relativePath) => Path.Combine(_root, relativePath);

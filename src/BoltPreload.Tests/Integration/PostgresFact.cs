@@ -54,7 +54,7 @@ internal static class PostgresAvailability
 /// 需要真实 PostgreSQL/TimescaleDB 的测试。无可用数据库时报告为 <b>Skipped</b>。
 /// <para>
 /// 这批测试原先写成 <c>if (!_fx.Available) return;</c> —— 提前 return 被 xUnit 记为"已通过"，
-/// 于是在没起库的机器上能跑出"142/142 全绿"，而 32 个 DB 集成测试（EF 与手写 schema 是否漂移、
+/// 于是在没起库的机器上能跑出全绿，而约 171 个 DB 集成测试（EF 与手写 schema 是否漂移、
 /// WAL 重放是否真落库、权限护栏是否真拦）一条断言都没执行。交付前回归最依赖的正是这批测试，
 /// 静默通过比失败更危险，因此改为显式 Skipped：结果里能一眼看出"没跑"。
 /// </para>

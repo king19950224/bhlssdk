@@ -32,6 +32,28 @@ public sealed class StaticThresholdAlarmOptions
 
     /// <summary>预紧力完全脱落的判定阈值。ratio 低于此值即视为 preload_loss critical（不走 on-delay）。</summary>
     public decimal PreloadLossRatio { get; set; } = 0.05m;
+
+    /// <summary>
+    /// 触发判定是否把扩展不确定度 U(k=2) 算进去。取值 <c>off</c> / <c>guardband</c> / <c>sensitive</c>，默认 <c>off</c>。
+    /// <para>
+    /// <b>为什么默认 off，交付前必须由人明确选一个：</b>plan 里这件事有两处互相冲突的规定。
+    /// §9.15.4 写“下限报警当 F + U &lt; F_low 时才触发（保守一侧）……避免不确定度造成的边界震荡”，
+    /// 按这个做，U 相当于一条护带，报警比现在<b>更难触发</b>——以 U≈5%F 计，下限实际从 0.70 后移到约 0.667，
+    /// 松动会晚一步被发现。而 §9.15.3 把整个系统的基调定成“宁可多报，不可漏报”，方向正好相反。
+    /// </para>
+    /// <para>
+    /// 边界震荡这件事，评估器已经用回差（0.70/0.72）+ on-delay（连续 5 条）两道机制在管，
+    /// 不依赖不确定度护带；所以默认保持 <c>off</c>（＝历史行为，现有测试锁的也是这套），
+    /// 不在没人拍板的情况下把一个安全监测系统的报警改钝。
+    /// </para>
+    /// <list type="bullet">
+    /// <item><c>off</c>：用实测 ratio 判定，U 只做展示（当前行为）。</item>
+    /// <item><c>guardband</c>：按 §9.15.4 字面实现，下限用 ratio+u、上限用 ratio−u，更难触发、误报更少、漏报风险更高。</item>
+    /// <item><c>sensitive</c>：反向取边界，下限用 ratio−u、上限用 ratio+u，更早触发，贴合 §9.15.3 的“宁可多报”。</item>
+    /// </list>
+    /// 三档都只作用于<b>触发</b>侧；恢复侧一律用实测 ratio，避免护带把已开启的告警顶住不闭合。
+    /// </summary>
+    public string UncertaintyMode { get; set; } = "off";
 }
 
 /// <summary>
@@ -71,6 +93,8 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
 
         var ratio = input.PreloadRatio.Value;
         var opt = _rules.Resolve(input.BoltId);
+        // 触发侧用的比值可能带不确定度护带（见 UncertaintyMode 注释）；恢复侧一律用实测 ratio
+        var (lowTriggerRatio, highTriggerRatio) = TriggerRatios(ratio, input, opt);
         var state = _states.GetOrAdd(input.BoltId, _ => new BoltAlarmState());
 
         lock (state)
@@ -114,6 +138,7 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                         events.Add(BuildClearEvent(state.LowAlarmType, input, opt));
                         state.LowActive = false;
                         state.LowAlarmType = "preload_low";
+                        state.LowSeverity = "warn";
                         state.LowTriggerStreak = 0;
                         state.LowClearStreak = 0;
                     }
@@ -121,11 +146,21 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                 else
                 {
                     state.LowClearStreak = 0;
+                    // 已开启的告警随恶化升级 severity（否则静默窗豁免 critical 的逻辑永远套不到这条上）
+                    if (state.LowAlarmType == "preload_low")
+                    {
+                        var sev = ClassifySeverity(ratio, opt);
+                        if (SeverityRank(sev) > SeverityRank(state.LowSeverity))
+                        {
+                            events.Add(BuildEscalateEvent(state.LowAlarmType, sev, input, opt));
+                            state.LowSeverity = sev;
+                        }
+                    }
                 }
             }
             else
             {
-                if (ratio < opt.TriggerLowRatio)
+                if (lowTriggerRatio < opt.TriggerLowRatio)
                 {
                     state.LowTriggerStreak++;
                     if (state.LowTriggerStreak >= opt.TriggerConsecutive)
@@ -134,6 +169,7 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                         events.Add(BuildTriggerEvent("preload_low", sev, input, state.LowTriggerStreak, opt));
                         state.LowActive = true;
                         state.LowAlarmType = "preload_low";
+                        state.LowSeverity = sev;
                         state.LowClearStreak = 0;
                     }
                 }
@@ -153,6 +189,7 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                     {
                         events.Add(BuildClearEvent("preload_high", input, opt));
                         state.HighActive = false;
+                        state.HighSeverity = "warn";
                         state.HighTriggerStreak = 0;
                         state.HighClearStreak = 0;
                     }
@@ -160,11 +197,17 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                 else
                 {
                     state.HighClearStreak = 0;
+                    var sev = ClassifySeverity(ratio, opt);
+                    if (SeverityRank(sev) > SeverityRank(state.HighSeverity))
+                    {
+                        events.Add(BuildEscalateEvent("preload_high", sev, input, opt));
+                        state.HighSeverity = sev;
+                    }
                 }
             }
             else
             {
-                if (ratio > opt.TriggerHighRatio)
+                if (highTriggerRatio > opt.TriggerHighRatio)
                 {
                     state.HighTriggerStreak++;
                     if (state.HighTriggerStreak >= opt.TriggerConsecutive)
@@ -172,6 +215,7 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                         var sev = ClassifySeverity(ratio, opt);
                         events.Add(BuildTriggerEvent("preload_high", sev, input, state.HighTriggerStreak, opt));
                         state.HighActive = true;
+                        state.HighSeverity = sev;
                         state.HighClearStreak = 0;
                     }
                 }
@@ -252,8 +296,43 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
                     state.HighActive = true;
                     state.HighClearStreak = Math.Max(0, opt.ClearConsecutive - 1);
                     break;
+
+                // 撤销升级：severity 退回 warn，后续同向样本可再次 Escalate
+                case AlarmAction.Escalate when ev.Type is "preload_low" or "preload_loss":
+                    state.LowSeverity = "warn";
+                    break;
+                case AlarmAction.Escalate when ev.Type == "preload_high":
+                    state.HighSeverity = "warn";
+                    break;
             }
         }
+    }
+
+    /// <summary>
+    /// 算触发侧用的比值。<c>UncertaintyMode=off</c>（默认）时原样返回实测 ratio，
+    /// 否则按 U(k=2) 折算成比值护带后取相应一侧。缺 U 或缺目标预紧力时一律退回实测 ratio ——
+    /// 没有不确定度就当没有护带，不能拿一个猜的 U 去挪安全阈值。
+    /// </summary>
+    private static (decimal Low, decimal High) TriggerRatios(
+        decimal ratio, AlarmInput input, StaticThresholdAlarmOptions opt)
+    {
+        if (string.Equals(opt.UncertaintyMode, "off", StringComparison.OrdinalIgnoreCase))
+            return (ratio, ratio);
+
+        if (input.UncertaintyN is not { } u || u <= 0m
+            || input.TargetPreloadN is not { } target || target <= 0m)
+            return (ratio, ratio);
+
+        var uRatio = u / target;
+        return opt.UncertaintyMode.ToLowerInvariant() switch
+        {
+            // §9.15.4 字面：两侧都取"离阈值更远"的那一端，报警更难触发
+            "guardband" => (ratio + uRatio, ratio - uRatio),
+            // §9.15.3 基调：两侧都取"离阈值更近"的那一端，报警更早触发
+            "sensitive" => (ratio - uRatio, ratio + uRatio),
+            // 配置写错时按 off 处理并保持实测值，不要因为一个拼错的字符串改变安全判定
+            _ => (ratio, ratio),
+        };
     }
 
     /// <summary>
@@ -325,6 +404,30 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
             ConsecutiveCount: 0,
             Message: $"{TypeLabel(type)}已恢复（当前为目标的 {(input.PreloadRatio != null ? (input.PreloadRatio.Value * 100m).ToString("F1") + "%" : "—")}）");
 
+    private static AlarmEvent BuildEscalateEvent(string type, string severity, AlarmInput input, StaticThresholdAlarmOptions opt) =>
+        new(
+            Action: AlarmAction.Escalate,
+            BoltId: input.BoltId,
+            ChannelId: input.ChannelId,
+            Type: type,
+            Severity: severity,
+            Ts: input.Ts,
+            PreloadN: input.PreloadN,
+            PreloadRatio: input.PreloadRatio,
+            TargetPreloadN: input.TargetPreloadN,
+            ThresholdLowRatio: opt.TriggerLowRatio,
+            ThresholdHighRatio: opt.TriggerHighRatio,
+            ConsecutiveCount: 0,
+            Message: $"{TypeLabel(type)}已升级为{severity}：{BuildMessage(type, input)}");
+
+    private static int SeverityRank(string severity) => severity switch
+    {
+        "critical" or "crit" => 3,
+        "warn" or "warning" => 2,
+        "info" => 1,
+        _ => 0,
+    };
+
     private static string TypeLabel(string type) => type switch
     {
         "preload_low" => "预紧力偏低",
@@ -354,9 +457,12 @@ public sealed class StaticThresholdAlarmEvaluator : IAlarmEvaluator
         // low 槽当前开启的告警类型："preload_low" 或 "preload_loss"（两者共用 LowActive）。
         // 用于自动恢复时 Clear 关闭正确的 alarm 行。
         public string LowAlarmType = "preload_low";
+        /// <summary>当前 low 槽 severity 快照，用于检测 warn→critical 升级。</summary>
+        public string LowSeverity = "warn";
         public int LowTriggerStreak;
         public int LowClearStreak;
         public bool HighActive;
+        public string HighSeverity = "warn";
         public int HighTriggerStreak;
         public int HighClearStreak;
     }

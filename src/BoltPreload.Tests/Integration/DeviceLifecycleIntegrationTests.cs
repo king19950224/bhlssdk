@@ -47,7 +47,8 @@ public sealed class DeviceLifecycleIntegrationTests
         var svc = new IngestionService(
             mgr, sink, new NoopPublisher(), new NoopWal(),
             new ChannelPresenceTracker(Microsoft.Extensions.Options.Options.Create(new ChannelPresenceOptions())),
-            registry, NullLogger<IngestionService>.Instance);
+            registry, new BoltPreload.Application.Diagnostics.BackgroundServiceHealth(),
+            NullLogger<IngestionService>.Instance);
         await svc.StartAsync(CancellationToken.None);
         try
         {

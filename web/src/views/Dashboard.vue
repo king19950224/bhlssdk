@@ -3,7 +3,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import EChart from '../components/EChart.vue'
-import { dashboardApi, type PreloadHealthCounts, type LooseBolt, type ResidualDist, type ApproachingBolt, type DashboardTrendPoint } from '../api'
+import { dashboardApi, type PreloadHealthCounts, type LooseBolt, type ResidualDist, type ApproachingBolt, type DashboardTrendPoint, type CalibrationExpiry } from '../api'
 import { useRuntime } from '../stores/runtime'
 import { onRealtime } from '../api/realtime'
 import { pctParts } from '../utils/preload'
@@ -16,6 +16,7 @@ const byGroup = ref<{ turbine: string; group: string; health: PreloadHealthCount
 const topLoose = ref<LooseBolt[]>([])
 const residualDist = ref<ResidualDist>({ b100: 0, b90: 0, b80: 0, b70: 0, b70d: 0, bhigh: 0 })
 const approaching = ref<ApproachingBolt[]>([])
+const calibrationExpiry = ref<CalibrationExpiry>({ expired: 0, within30Days: 0, items: [] })
 const openAlarms = ref(0)
 const alarmsBySeverity = ref<{ severity: string; count: number }[]>([])
 const trend = ref<DashboardTrendPoint[]>([])
@@ -67,6 +68,8 @@ const openBySev = computed(() => {
   return { crit, warn, info }
 })
 const verdict = computed<{ level: 'ok' | 'warn' | 'crit' | 'off'; text: string }>(() => {
+  // 刷新失败时绝不能沿用上次的绿色结论条（假安全）
+  if (error.value) return { level: 'off', text: `总览数据刷新失败：${error.value}` }
   const h = health.value
   if (h.loose > 0) return { level: 'crit', text: `${h.loose} 颗预紧力松动，需立即停机巡检` }
   if (openBySev.value.crit > 0) return { level: 'crit', text: `${openBySev.value.crit} 条严重告警未闭合，需立即处置` }
@@ -75,6 +78,16 @@ const verdict = computed<{ level: 'ok' | 'warn' | 'crit' | 'off'; text: string }
   if (h.warn > 0) return { level: 'warn', text: `${h.warn} 颗预警，预紧力接近下限` }
   if (h.high > 0) return { level: 'warn', text: `${h.high} 颗预紧力偏高（超目标 110%），关注超张力风险` }
   if (approaching.value.length > 0) return { level: 'warn', text: `${approaching.value.length} 颗预紧力持续下降，关注到限` }
+  // 标定到期不走告警通道（P2 延期），但结论条仍要提示——否则值班会当成一切正常
+  const expiring = calibrationExpiry.value.expired + calibrationExpiry.value.within30Days
+  if (expiring > 0) {
+    return {
+      level: 'warn',
+      text: calibrationExpiry.value.expired > 0
+        ? `${calibrationExpiry.value.expired} 颗标定已过期（另有 ${calibrationExpiry.value.within30Days} 颗 30 天内到期），需复检标定`
+        : `${calibrationExpiry.value.within30Days} 颗标定将在 30 天内到期，请安排复检`,
+    }
+  }
   if (measured.value > 0) return { level: 'ok', text: `在测 ${measured.value} 颗预紧力正常` }
   return { level: 'off', text: '暂无在测螺栓，请先完成标定接入' }
 })
@@ -87,9 +100,20 @@ const actionTiles = computed(() => [
   { key: 'loose', label: '松动 / 预警', count: health.value.loose + health.value.warn, sub: `松动 ${health.value.loose} · 预警 ${health.value.warn}`, to: 'assets', level: health.value.loose > 0 ? 'crit' : health.value.warn > 0 ? 'warn' : 'muted' },
   { key: 'appr', label: '即将到限', count: approaching.value.length, sub: '近 7 天下降趋势', to: 'assets', level: approaching.value.some((b) => b.daysToLimit != null && b.daysToLimit < 30) ? 'warn' : 'muted' },
   { key: 'uncal', label: '待标定', count: health.value.uncalibrated, sub: '未标定 / 已过期', to: 'assets', level: health.value.uncalibrated > 0 ? 'info' : 'muted' },
+  {
+    key: 'expiry',
+    label: '标定到期',
+    count: calibrationExpiry.value.expired + calibrationExpiry.value.within30Days,
+    sub: `已过期 ${calibrationExpiry.value.expired} · 30 天内 ${calibrationExpiry.value.within30Days}`,
+    to: 'calibration',
+    query: { focus: 'expiring' },
+    level: calibrationExpiry.value.expired > 0 ? 'warn' : calibrationExpiry.value.within30Days > 0 ? 'info' : 'muted',
+  },
   { key: 'nodata', label: '无数据', count: health.value.nodata, sub: '无近期回波', to: 'devices', level: 'muted' },
 ])
-function goTile(to: string) { router.push({ name: to }) }
+function goTile(to: string, query?: Record<string, string>) {
+  router.push(query ? { name: to, query } : { name: to })
+}
 
 async function refresh() {
   try {
@@ -107,6 +131,7 @@ async function refresh() {
     topLoose.value = d.topLoose
     residualDist.value = d.residualDist
     approaching.value = d.approachingLimit
+    calibrationExpiry.value = d.calibrationExpiry ?? { expired: 0, within30Days: 0, items: [] }
     openAlarms.value = d.openAlarms
     alarmsBySeverity.value = d.alarmsBySeverity ?? []
     if (t) { trend.value = t.points; trendError.value = null }
@@ -277,7 +302,7 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
         v-for="a in actionTiles" :key="a.key"
         class="act panel" :class="[`act--${a.level}`, { 'act--zero': a.count === 0 }]"
         role="button" tabindex="0"
-        @click="goTile(a.to)" @keydown.enter="goTile(a.to)" @keydown.space.prevent="goTile(a.to)"
+        @click="goTile(a.to, a.query)" @keydown.enter="goTile(a.to, a.query)" @keydown.space.prevent="goTile(a.to, a.query)"
       >
         <div class="act-hd"><span class="act-label">{{ a.label }}</span><el-icon class="act-go"><ArrowRightBold /></el-icon></div>
         <div class="act-val metric">{{ a.count }}</div>
@@ -370,6 +395,26 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
               <li v-if="loaded && !approaching.length" class="list-empty"><span class="led led--ok" /> 无下降趋势螺栓</li>
             </ul>
           </div>
+        </div>
+
+        <!-- 标定到期清单：不产生告警，靠总览可见（product-design §6.5） -->
+        <div class="mb-card">
+          <div class="mb-title">
+            标定到期
+            <span class="mb-sub">已过期 {{ calibrationExpiry.expired }} · 30 天内 {{ calibrationExpiry.within30Days }}</span>
+            <router-link :to="{ name: 'calibration', query: { focus: 'expiring' } }" class="hd-link">标定中心 →</router-link>
+          </div>
+          <ul class="data-list">
+            <li v-for="b in calibrationExpiry.items" :key="b.boltId" role="button" tabindex="0" @click="openBolt(b)" @keydown.enter="openBolt(b)" @keydown.space.prevent="openBolt(b)">
+              <span class="led" :class="b.daysLeft < 0 ? 'led--warn' : 'led--off'" />
+              <div class="li-main"><div class="li-code">{{ b.boltCode }}</div><div class="li-loc">{{ b.turbine }} · {{ b.group }}</div></div>
+              <div class="li-right">
+                <span class="li-metric metric" :style="`color:${b.daysLeft < 0 ? 'var(--warn)' : daysColor(b.daysLeft)}`">{{ b.daysLeft < 0 ? '已过期' : fmtDays(b.daysLeft) }}</span>
+                <span class="li-tag mono">{{ b.expiresAt }}</span>
+              </div>
+            </li>
+            <li v-if="loaded && !calibrationExpiry.items.length" class="list-empty"><span class="led led--ok" /> 无 30 天内到期标定</li>
+          </ul>
         </div>
 
         <!-- 按部位健康 -->

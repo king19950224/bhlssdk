@@ -77,6 +77,32 @@ public sealed class PostgresAlarmSink : IAlarmSink
             _logger.LogWarning("告警触发 bolt={Bolt} type={Type} severity={Sev} ratio={Ratio} notify={Channels}",
                 ev.BoltId, ev.Type, ev.Severity, ev.PreloadRatio, match?.ChannelIds.Count ?? 0);
         }
+        else if (ev.Action == AlarmAction.Escalate)
+        {
+            // 只升不降：已开启行的 severity 随恶化更新，让静默窗豁免 critical 等逻辑能看到真实等级
+            const string escalateSql = @"
+                UPDATE alarms
+                   SET severity = @sev,
+                       message = COALESCE(@msg, message),
+                       last_active_at = @ts
+                 WHERE bolt_id = @bolt AND type = @type AND cleared_at IS NULL
+                   AND CASE severity
+                         WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 WHEN 'info' THEN 1 ELSE 0
+                       END
+                     < CASE @sev
+                         WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 WHEN 'info' THEN 1 ELSE 0
+                       END
+                RETURNING id";
+            await using var cmd = _dataSource.CreateCommand(escalateSql);
+            cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, ev.BoltId);
+            cmd.Parameters.AddWithValue("type", NpgsqlDbType.Varchar, ev.Type);
+            cmd.Parameters.AddWithValue("sev", NpgsqlDbType.Varchar, ev.Severity);
+            cmd.Parameters.AddWithValue("msg", NpgsqlDbType.Text, (object?)ev.Message ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("ts", NpgsqlDbType.TimestampTz, ev.Ts);
+            var id = await cmd.ExecuteScalarAsync(ct);
+            _logger.LogWarning("告警升级 bolt={Bolt} type={Type} severity={Sev} alarmId={Id}",
+                ev.BoltId, ev.Type, ev.Severity, id);
+        }
         else // Clear
         {
             // 同 (bolt_id, type) 同时最多一条开启告警（0011 的 partial unique 索引兜着），RETURNING 至多一行

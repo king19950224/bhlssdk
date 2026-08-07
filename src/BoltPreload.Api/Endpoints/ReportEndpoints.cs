@@ -243,12 +243,13 @@ public static class ReportEndpoints
                 }
             }
             await using (var cmd = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'report_sign', 'report', @id, NULL, NULL, @note, now())", conn, tx))
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                VALUES (@uid, 'report_sign', 'report', @id, NULL, NULL, @note, now(), @ip)", conn, tx))
             {
                 cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, reportId);
                 cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"审核签发报告 #{reportId}");
+                AuditClientIp.Bind(cmd.Parameters);
                 await cmd.ExecuteNonQueryAsync(ct);
             }
             await tx.CommitAsync(ct);
@@ -695,9 +696,15 @@ public static class ReportEndpoints
         static string H(string? v) => WebUtility.HtmlEncode(v ?? "");
         static string N(decimal? v) => v.HasValue ? v.Value.ToString("F0") : "—";
         static string R(decimal? v) => v.HasValue ? (v.Value * 100).ToString("F1") + "%" : "—";
+        // 当前值按 plan §9.15.4 带扩展不确定度交付："100 ± 5"，k=2 在表头统一标注。
+        // 算不出预紧力时不显示 ±（那种情况连中心值都没有）；有预紧力但没不确定度时只显示中心值。
+        static string NU(decimal? v, decimal? u) =>
+            !v.HasValue ? "—"
+            : u.HasValue ? $"{v.Value:F0} ± {u.Value:F0}"
+            : v.Value.ToString("F0");
         var rows = string.Join("\n", bolts.Select((b, i) => $"""
             <tr><td>{i + 1}</td><td>{H(b.Code)}</td><td>{H(b.Spec)}</td><td>{H(b.Position)}</td>
-            <td>{N(b.TargetN)}</td><td>{N(b.MinN)}</td><td>{N(b.PreloadN)}</td><td>{R(b.Ratio)}</td>
+            <td>{N(b.TargetN)}</td><td>{N(b.MinN)}</td><td>{NU(b.PreloadN, b.UncertaintyN)}</td><td>{R(b.Ratio)}</td>
             <td>{DisplayLabels.CalibrationMethod(b.CalibMethod)}</td><td>{H(b.Trust)}</td><td>{(b.RSquared.HasValue ? b.RSquared.Value.ToString("F3") : "—")}</td>
             <td>{H(b.Result)}</td></tr>
             """));
@@ -722,6 +729,7 @@ public static class ReportEndpoints
         <body>
           <h1>{{H(title)}}</h1>
           <div class="muted">测量依据：GB/T 43232-2023《紧固件 轴向应力超声测量方法》 · JJF 1059.1-2012《测量不确定度评定与表示》 · 生成时间 {{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}}（当地时间）</div>
+          <div class="muted">测量方法与精度：GB/T 43232 单波法（纵波），标定可靠时 {{H(DisplayLabels.PrecisionSpec("gb_single_wave"))}}。本机型为多通道在线监测设备，不具备横波采集能力，故不适用双波法（±3%）。</div>
           <h2>对象</h2>
           <table>
             <tr><th>风场</th><td>{{H(project)}}</td><th>风机</th><td>{{H(turbine)}}</td></tr>
@@ -731,10 +739,11 @@ public static class ReportEndpoints
           <div class="{{verdictClass}}">总体：{{H(overall)}}；螺栓总数 {{total}}，已标定 {{calibrated}}，合格 {{passed}}，不合格 {{failed}}{{(uncal > 0 ? $"，未标定 {uncal}" : "")}}{{(nodata > 0 ? $"，无数据 {nodata}" : "")}}。</div>
           <h2>逐螺栓结果</h2>
           <table>
-            <thead><tr><th>#</th><th>螺栓</th><th>规格</th><th>位置</th><th>目标 (N)</th><th>下限 (N)</th><th>当前 (N)</th><th>保持率</th><th>标定方法</th><th>可信等级</th><th>R²</th><th>结论</th></tr></thead>
+            <thead><tr><th>#</th><th>螺栓</th><th>规格</th><th>位置</th><th>目标 (N)</th><th>下限 (N)</th><th>当前 (N，± 为 U，k=2)</th><th>保持率</th><th>标定方法</th><th>可信等级</th><th>R²</th><th>结论</th></tr></thead>
             <tbody>{{rows}}</tbody>
           </table>
           <p class="muted">本报告由系统自动生成，数据快照已归档可追溯。“合格*”表示该螺栓预紧力达标但其标定为临时/工程估算等级，不作为正式安全验收依据；正式验收须以载荷标定（正式等级）为准。</p>
+          <p class="muted">各标定方法的标称精度：正式载荷标定 / GB 单波法 {{H(DisplayLabels.PrecisionSpec("load_calibrated"))}}；扭矩阶梯拟合 {{H(DisplayLabels.PrecisionSpec("torque_fit"))}}；快速标定 / 扭矩估算 {{H(DisplayLabels.PrecisionSpec("quick"))}}。精度以标定有效、信号质量满足要求为前提。</p>
           <table style="margin-top:36px">
             <tr><th style="width:20%">编制（签字）</th><td style="width:30%"></td><th style="width:20%">审核（签字）</th><td style="width:30%"></td></tr>
             <tr><th>日期</th><td></td><th>日期</th><td></td></tr>

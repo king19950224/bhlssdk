@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using BoltPreload.Api.Auth;
 using BoltPreload.Api.Endpoints;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Ingestion;
@@ -274,13 +275,14 @@ public sealed class BoltAutoEnroller
             await cmd.ExecuteNonQueryAsync(ct);
         }
         await using (var audit = new NpgsqlCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-            SELECT NULL, 'create_bolt', 'bolt', @id, NULL, to_jsonb(b), @note, now()
+            INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+            SELECT NULL, 'create_bolt', 'bolt', @id, NULL, to_jsonb(b), @note, now(), @ip
             FROM bolts b WHERE b.id = @id", conn, tx))
         {
             audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
             audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                 $"[系统自动建档] 探头在位自动建档：{code} 绑定 CH{channelNo}（设备 {deviceId}，监测组 {groupCode}），缺省规格 M20/8.8，待补位置与目标值");
+            AuditClientIp.Bind(audit.Parameters);
             await audit.ExecuteNonQueryAsync(ct);
         }
 

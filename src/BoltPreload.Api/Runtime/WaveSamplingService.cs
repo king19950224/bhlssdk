@@ -1,5 +1,6 @@
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Devices.ProbeScan;
+using BoltPreload.Application.Diagnostics;
 using BoltPreload.Fx;
 using Microsoft.Extensions.Options;
 using Npgsql;
@@ -40,6 +41,7 @@ public sealed class WaveSamplingService : BackgroundService
     private readonly NpgsqlDataSource _ds;
     private readonly ProbeScanState _probeScan;
     private readonly WaveSamplingOptions _opt;
+    private readonly BackgroundServiceHealth _health;
     private readonly ILogger<WaveSamplingService> _logger;
 
     public WaveSamplingService(
@@ -47,12 +49,14 @@ public sealed class WaveSamplingService : BackgroundService
         NpgsqlDataSource ds,
         ProbeScanState probeScan,
         IOptions<WaveSamplingOptions> opt,
+        BackgroundServiceHealth health,
         ILogger<WaveSamplingService> logger)
     {
         _manager = manager;
         _ds = ds;
         _probeScan = probeScan;
         _opt = opt.Value;
+        _health = health;
         _logger = logger;
     }
 
@@ -77,6 +81,9 @@ public sealed class WaveSamplingService : BackgroundService
         {
             try { if (!await timer.WaitForNextTickAsync(stoppingToken)) return; }
             catch (OperationCanceledException) { return; }
+            // 心跳：本服务停摆则 wave_features 不再补采，波形诊断页的数据源静默断流
+            // （非主监测链路，但同样不该只能靠翻日志发现）。禁用时上面已 return，不会登记成失联。
+            _health.Beat("wave-sampling", TimeSpan.FromSeconds(Math.Max(5, _opt.IntervalSeconds)));
             try { await SampleOnceAsync(stoppingToken); }
             catch (OperationCanceledException) { return; }
             catch (Exception ex) { _logger.LogError(ex, "WaveSampling 一轮采集异常"); }

@@ -1,3 +1,4 @@
+using BoltPreload.Application.Diagnostics;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Infrastructure.Ingestion;
 using Microsoft.Extensions.Options;
@@ -26,17 +27,20 @@ public sealed class WaveRetentionService : BackgroundService
     private readonly IWaveStore _store;
     private readonly NpgsqlDataSource _ds;
     private readonly LocalFileWaveStoreOptions _opt;
+    private readonly BackgroundServiceHealth _health;
     private readonly ILogger<WaveRetentionService> _logger;
 
     public WaveRetentionService(
         IWaveStore store,
         NpgsqlDataSource ds,
         IOptions<LocalFileWaveStoreOptions> opt,
+        BackgroundServiceHealth health,
         ILogger<WaveRetentionService> logger)
     {
         _store = store;
         _ds = ds;
         _opt = opt.Value;
+        _health = health;
         _logger = logger;
     }
 
@@ -50,11 +54,16 @@ public sealed class WaveRetentionService : BackgroundService
         // 启动即跑一轮（清扫 .tmp + 删过期日目录）
         await RunOnceAsync(stoppingToken);
 
-        using var timer = new PeriodicTimer(TimeSpan.FromHours(intervalHours));
+        var interval = TimeSpan.FromHours(intervalHours);
+        _health.Beat("wave-retention", interval);
+
+        using var timer = new PeriodicTimer(interval);
         while (true)
         {
             try { if (!await timer.WaitForNextTickAsync(stoppingToken)) return; }
             catch (OperationCanceledException) { return; }
+            // 心跳：本服务停摆则波形文件只增不删，工控机磁盘会被慢慢填满直到入库一起失败
+            _health.Beat("wave-retention", interval);
             await RunOnceAsync(stoppingToken);
         }
     }

@@ -38,6 +38,15 @@ public interface IAlarmEvaluator
 }
 
 /// <summary>评估器输入</summary>
+/// <param name="BoltId">螺栓 ID</param>
+/// <param name="ChannelId">通道 ID</param>
+/// <param name="Ts">测量时刻</param>
+/// <param name="PreloadN">预紧力（算不出为 null）</param>
+/// <param name="PreloadRatio">预紧力 / 目标值</param>
+/// <param name="TargetPreloadN">目标预紧力</param>
+/// <param name="SdkStatusCode">SDK 状态码</param>
+/// <param name="UncertaintyN">扩展不确定度 U(k=2)。仅在 <c>StaticThresholdAlarmOptions.UncertaintyMode</c>
+/// 非 off 时参与判定，见该属性注释里 §9.15.3 与 §9.15.4 的口径冲突说明。</param>
 public sealed record AlarmInput(
     long BoltId,
     long ChannelId,
@@ -45,7 +54,8 @@ public sealed record AlarmInput(
     decimal? PreloadN,
     decimal? PreloadRatio,
     decimal? TargetPreloadN,
-    short SdkStatusCode);
+    short SdkStatusCode,
+    decimal? UncertaintyN = null);
 
 /// <summary>
 /// 告警事件（评估器产出）。Persistence 层和 publisher 层分别处理。
@@ -79,4 +89,4 @@ public sealed record AlarmEvent(
     string Message);
 
 /// <summary>告警事件动作：Trigger=新触发，Clear=自动恢复。</summary>
-public enum AlarmAction { Trigger, Clear }
+public enum AlarmAction { Trigger, Clear, Escalate }

@@ -18,12 +18,16 @@ const routes: RouteRecordRaw[] = [
       { path: 'assets', name: 'assets', component: () => import('../views/AssetMonitor.vue') },
       { path: 'bolts/:boltId', name: 'boltDetail', component: () => import('../views/BoltDetail.vue') },
       { path: 'alarms', name: 'alarms', component: () => import('../views/Alarms.vue') },
+      // 报警 KPI 单列一页：GB/T 41261 的四项限值验收时要直接拉数对照，混进告警中心的处置视图里不好找
+      { path: 'alarm-kpi', name: 'alarmKpi', component: () => import('../views/AlarmKpi.vue') },
       { path: 'calibration', name: 'calibration', component: () => import('../views/Calibration.vue'), meta: { roles: ['reviewer', 'admin'] } },
       { path: 'config-changes', name: 'configChanges', component: () => import('../views/ConfigChanges.vue') },
       { path: 'audit', name: 'audit', component: () => import('../views/Audit.vue'), meta: { roles: ['reviewer', 'admin'] } },
       { path: 'devices', name: 'devices', component: () => import('../views/Devices.vue') },
       { path: 'identify', name: 'identify', component: () => import('../views/ChannelIdentify.vue') },
       { path: 'diagnostics', name: 'diagnostics', component: () => import('../views/Diagnostics.vue'), meta: { roles: ['reviewer', 'admin'] } },
+      // 系统自检 BITE（plan §9.23）：一屏核对就绪度，与波形诊断分开
+      { path: 'system-health', name: 'systemHealth', component: () => import('../views/SystemHealth.vue') },
       { path: 'reports', name: 'reports', component: () => import('../views/Reports.vue') },
       { path: 'reports/:reportId', name: 'reportDetail', component: () => import('../views/ReportDetail.vue') },
       { path: 'users', name: 'users', component: () => import('../views/Users.vue'), meta: { roles: ['admin'] } },

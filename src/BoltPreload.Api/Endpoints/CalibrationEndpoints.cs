@@ -61,6 +61,8 @@ public static class CalibrationEndpoints
                 {
                     method,
                     trustLevel = DisplayLabels.TrustLevel(method),
+                    // 精度口径与验收报告同源（DisplayLabels.PrecisionSpec），避免页面与导出件各写一套
+                    precision = DisplayLabels.PrecisionSpec(method),
                     total = r.GetInt64(1),
                     active = r.GetInt64(2),
                     expired = r.GetInt64(3),
@@ -665,8 +667,8 @@ public static class CalibrationEndpoints
             // 标定实验数据写入必须可追溯（同文件 quick/torque/load 均有审计，此前唯独采点漏了）。
             // 与采点插入同事务：载荷点是标定曲线的原始证据，多一个来路不明的点就够把拟合带偏。
             await using (var audit = new NpgsqlCommand(@"
-                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
-                VALUES (@uid, 'torque_point_capture', 'channel', @cid, NULL, @after::jsonb, @note, now())", conn, tx))
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                VALUES (@uid, 'torque_point_capture', 'channel', @cid, NULL, @after::jsonb, @note, now(), @ip)", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
                 audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
@@ -677,6 +679,7 @@ public static class CalibrationEndpoints
                 }));
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                     $"采集扭矩阶梯点 #{pointId}：{req.TorqueNm} N·m，估算预紧力 {estimatedPreloadN:0} N（bolt #{boltId}）");
+                AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
             await tx.CommitAsync(ct);
@@ -1562,13 +1565,14 @@ public static class CalibrationEndpoints
         long userId, string action, long channelId, string afterJson, string note, CancellationToken ct)
     {
         await using var cmd = new NpgsqlCommand(@"
-            INSERT INTO audit_log (user_id, action, target_type, target_id, after_jsonb, note, at)
-            VALUES (@uid, @action, 'channel', @cid, @after::jsonb, @note, now())", conn, tx);
+            INSERT INTO audit_log (user_id, action, target_type, target_id, after_jsonb, note, at, ip_addr)
+            VALUES (@uid, @action, 'channel', @cid, @after::jsonb, @note, now(), @ip)", conn, tx);
         cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
         cmd.Parameters.AddWithValue("action", NpgsqlDbType.Varchar, action);
         cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
         cmd.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, afterJson);
         cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+        AuditClientIp.Bind(cmd.Parameters);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 

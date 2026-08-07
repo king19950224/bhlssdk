@@ -56,7 +56,7 @@ public class DisplayLabelsTests
     // 告警类型会拼进审计备注跟着 CSV 导出去,后端这份要和前端告警中心对得上。
     // no_data 不是告警类型(它是 hardware_state),列在这里只为锁住那条历史词条不被删。
     private static readonly string[] AlarmTypesInUse =
-        ["preload_low", "preload_high", "preload_loss", "signal_lost", "wiring_suspect", "no_data"];
+        ["preload_low", "preload_high", "preload_loss", "signal_lost", "wiring_suspect", "clock_drift", "no_data"];
 
     // 连着 3 个以上小写字母就当成漏译的机器码。
     // "GB 单波法"里的 GB 是大写缩写，不会被这条抓到。

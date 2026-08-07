@@ -126,6 +126,7 @@ public sealed class IngestionServiceTests
             sink, publisher, wal,
             presence ?? new ChannelPresenceTracker(Options.Create(new ChannelPresenceOptions())),
             new IngestionTaskRegistry(),
+            new BoltPreload.Application.Diagnostics.BackgroundServiceHealth(),
             NullLogger<IngestionService>.Instance);
         await svc.StartAsync(CancellationToken.None);
         return new RunningService(svc);

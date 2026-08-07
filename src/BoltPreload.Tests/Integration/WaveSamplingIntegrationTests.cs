@@ -83,6 +83,7 @@ public sealed class WaveSamplingIntegrationTests
         _fx.DataSource,
         scan ?? new ProbeScanState(),
         Options.Create(new WaveSamplingOptions { Enabled = true, PerChannelDelayMs = 0 }),
+        new BoltPreload.Application.Diagnostics.BackgroundServiceHealth(),
         NullLogger<WaveSamplingService>.Instance);
 
     private async Task SetSamplingAsync(long channelId, bool enabled)
