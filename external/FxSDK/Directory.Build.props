@@ -11,6 +11,10 @@
     <EnableNETAnalyzers>false</EnableNETAnalyzers>
     <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
     <NoWarn>$(NoWarn);CS8600;CS8601;CS8602;CS8603;CS8604;CS8618;CS8625;CA1822</NoWarn>
+    <!-- macOS AppleDouble（._xxx）排除。根 Directory.Build.props 里有同一条，
+         但本文件截断了向上查找（见下方注释），到不了这里，必须各留一份 —— 改一处时两处要一起改。
+         厂家 SDK 目录下实测有 32 个 ._*.cs 会被当源码编译，报 CS2015。 -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);**/._*</DefaultItemExcludes>
   </PropertyGroup>
 
   <!--

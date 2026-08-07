@@ -72,9 +72,36 @@ jobs:
         run: |
           dotnet test BoltPreload.sln --no-build --configuration Release \
             --logger "console;verbosity=normal" \
+            --logger "trx;LogFileName=results.trx" \
             --collect:"XPlat Code Coverage"
         env:
           ConnectionStrings__Postgres: "Host=localhost;Port=5432;Database=boltpreload;Username=boltpreload;Password=ci_password_only"
+
+      - name: 门禁：跳过的测试必须为 0
+        # dotnet test 连不上库时把 DB 集成测试整批记为 Skipped，退出码仍是 0、末行仍写"已通过"。
+        # 这批恰好是覆盖面最广的（权限守卫、告警管线、入库热路径、EF 与手写 schema 一致性），
+        # 少了它们的绿灯比红灯更危险。README 要求人工确认"已跳过: 0"，这里改成机器拦。
+        run: |
+          python3 - <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+          NS = {'t': 'http://microsoft.com/schemas/VisualStudio/TeamTest/2010'}
+          files = sorted(glob.glob('**/results.trx', recursive=True))
+          if not files:
+              sys.exit('找不到 trx 结果文件，跳过数无法核对')
+          skipped_total = 0
+          for f in files:
+              c = ET.parse(f).getroot().find('t:ResultSummary/t:Counters', NS)
+              # 跳过数只能这么算：xUnit 的 Skip 不进 notExecuted（实测恒为 0），
+              # 而是记在 total 里、不记进 executed。照 notExecuted 判就是一道永远放行的假门禁。
+              total, executed = int(c.get('total', 0)), int(c.get('executed', 0))
+              n = total - executed
+              skipped_total += n
+              print(f'{f}: 总计={total} 已执行={executed} 通过={c.get("passed")} '
+                    f'失败={c.get("failed")} 跳过={n}')
+          if skipped_total:
+              sys.exit(f'有 {skipped_total} 条测试被跳过 —— 多半是 Postgres 没连上导致集成测试整批未执行。')
+          print('跳过数为 0')
+          PY
 
       - name: 上传覆盖率
         uses: actions/upload-artifact@v4
@@ -82,6 +109,36 @@ jobs:
         with:
           name: coverage
           path: '**/coverage.cobertura.xml'
+
+  # 交付目标是 Windows 工控机，CI 却只在 ubuntu 上编译过 —— Windows 侧的编译问题只能等到
+  # 出包那天在现场机器上撞见。实测就撞过一次：开发机是 macOS，仓库拷到 Windows 后每个文件旁
+  # 多出一份 AppleDouble 元数据文件（._xxx，二进制），MSBuild 的 **/*.cs 通配把 39 个 ._*.cs
+  # 当源码编译，报 CS2015 整个解决方案编不过（已在 Directory.Build.props 排除）。
+  # 这个 job 不接数据库、只编译 + 走一遍交付用的 publish，够挡住这一类。
+  windows-build:
+    name: Windows Build
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 编译
+        run: dotnet build BoltPreload.sln --configuration Release
+
+      - name: 交付发布冒烟（与出包同一条命令）
+        run: dotnet publish src/BoltPreload.Api/BoltPreload.Api.csproj --configuration Release -o publish-smoke
+
+      - name: 校验发布产物
+        shell: pwsh
+        run: |
+          if (!(Test-Path publish-smoke/BoltPreload.Api.exe)) {
+            throw "publish 没产出 BoltPreload.Api.exe —— 交付包会缺主程序"
+          }
 
   # 前端此前完全不在 CI 里：9000+ 行、17 个页面的类型错误与依赖漏洞只能靠人工发现，
   # 而 dotnet publish 会把 web/dist 打进 wwwroot —— 前端构建挂了等于交付包里没有界面。

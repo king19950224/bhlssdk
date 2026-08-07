@@ -88,6 +88,12 @@ def iter_files(base: Path, suffixes: tuple[str, ...]) -> list[Path]:
         if Path(dirpath).resolve() == materials:
             dirnames[:] = [d for d in dirnames if d == INDEX_资料_ONLY]
         for name in filenames:
+            # macOS 卷拷到别的文件系统会在每个文件旁留一份同名 ._xxx 资源派生文件(AppleDouble,二进制)。
+            # 后缀跟正文一样,不排掉就会被 read_text(utf-8) 撞成 UnicodeDecodeError:
+            # G1/G2/G4/G7 没接这个异常,整个门禁直接 traceback 退出(只有 G6 接了)。
+            # 与 Directory.Build.props 的 DefaultItemExcludes 同一个根因、同一条排除。
+            if name.startswith("._"):
+                continue
             p = Path(dirpath) / name
             if p.suffix in suffixes:
                 out.append(p)
@@ -467,7 +473,8 @@ def gate7() -> list[str]:
 
     violations = []
     for f in sorted(API_DIR.rglob("*.cs")):
-        if f == LABELS_FILE:
+        # 本门禁不走 iter_files,AppleDouble(._xxx)要在这里单独排掉,理由同 iter_files
+        if f == LABELS_FILE or f.name.startswith("._"):
             continue
         text = f.read_text(encoding="utf-8")
         rel = f.relative_to(ROOT)
