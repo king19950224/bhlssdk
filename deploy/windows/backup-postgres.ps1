@@ -1,4 +1,4 @@
-# 非交互跑必须能拿到口令：设 PGPASSWORD、配好 pgpass.conf，或直接传 -PgPassword。
+﻿# 非交互跑必须能拿到口令：设 PGPASSWORD、配好 pgpass.conf，或直接传 -PgPassword。
 # 计划任务跑在 SYSTEM 账户时 pgpass.conf 的路径见 deployment-guide §7.1；-PgPassword 会出现在
 # 任务定义里（本机管理员可读），信任边界与 NSSM 服务环境变量相同。
 # -F c 出自定义格式：恢复走 pg_restore，可以只挑部分表，比纯 SQL dump 灵活。

@@ -127,18 +127,55 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: 编译
         run: dotnet build BoltPreload.sln --configuration Release
 
-      - name: 交付发布冒烟（与出包同一条命令）
-        run: dotnet publish src/BoltPreload.Api/BoltPreload.Api.csproj --configuration Release -o publish-smoke
+      - name: 前端构建（publish 会把 dist 打进 wwwroot）
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: 自包含发布（免装 .NET，与安装包组包同一条命令）
+        run: dotnet publish src/BoltPreload.Api/BoltPreload.Api.csproj --configuration Release -r win-x64 --self-contained true -o delivery/app
 
       - name: 校验发布产物
         shell: pwsh
         run: |
-          if (!(Test-Path publish-smoke/BoltPreload.Api.exe)) {
+          if (!(Test-Path delivery/app/BoltPreload.Api.exe)) {
             throw "publish 没产出 BoltPreload.Api.exe —— 交付包会缺主程序"
           }
+          if (!(Test-Path delivery/app/wwwroot/index.html)) {
+            throw "publish 没把 web/dist 打进 wwwroot —— 客户打开是空白页"
+          }
+          if (Test-Path delivery/app/appsettings.Development.json) {
+            throw "publish 产物混入 appsettings.Development.json（dev JWT 密钥/admin 自建），不得出厂"
+          }
+
+      - name: 组交付 zip（app/deploy/docs，补 nssm 与授权公钥即可组安装包）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path delivery/deploy/sql, delivery/deploy/windows, delivery/docs | Out-Null
+          Copy-Item deploy/sql/0*.sql delivery/deploy/sql/
+          Copy-Item deploy/windows/*.ps1 delivery/deploy/windows/
+          foreach ($f in @("deployment-guide.md", "troubleshooting.md")) {
+            $p = "资料/工程文档/$f"
+            if (Test-Path $p) { Copy-Item $p delivery/docs/ }
+          }
+          Compress-Archive -Path delivery/* -DestinationPath bhlssdk-delivery.zip
+
+      - name: 上传交付制品
+        uses: actions/upload-artifact@v4
+        with:
+          name: bhlssdk-delivery
+          path: bhlssdk-delivery.zip
+          retention-days: 30
 
   # 前端此前完全不在 CI 里：9000+ 行、17 个页面的类型错误与依赖漏洞只能靠人工发现，
   # 而 dotnet publish 会把 web/dist 打进 wwwroot —— 前端构建挂了等于交付包里没有界面。

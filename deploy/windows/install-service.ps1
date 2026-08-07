@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     把 BoltPreload.Api 注册为 Windows 服务，并一次性把现场配置落好。
 

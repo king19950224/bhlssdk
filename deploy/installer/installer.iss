@@ -27,7 +27,9 @@ SolidCompression=yes
 WizardStyle=modern
 
 [Languages]
-Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 简体中文是非官方翻译，不随 Inno 安装器分发——语言文件收进本目录（kira-96 维护版），
+; 出包不依赖每台机器的 Inno 装了哪些翻译
+Name: "chinese"; MessagesFile: "ChineseSimplified.isl"
 
 [Files]
 ; 应用本体（自包含发布，目标机免装 .NET）

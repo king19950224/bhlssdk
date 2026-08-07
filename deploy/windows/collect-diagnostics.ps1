@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$InstallDir = "C:\BoltPreload",
     [string]$OutputDir = "C:\BoltPreload\diagnostics"
 )

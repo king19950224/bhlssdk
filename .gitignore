@@ -42,6 +42,9 @@ license.json
 publish/
 out/
 artifacts/
+# 安装包组包产物（build-payload.ps1 生成；nssm/公钥/自包含发布均不入库）
+deploy/installer/payload/
+deploy/installer/output/
 
 # Test results
 TestResults/
