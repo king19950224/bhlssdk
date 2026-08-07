@@ -117,12 +117,16 @@ public static class MeasurementEndpoints
         })
         .WithName("GetMeasurementsByBolt");
 
-        // 计数（运维快速验证）
-        group.MapGet("/count", async (NpgsqlDataSource dataSource, CancellationToken ct) =>
+        // 计数（运维快速验证）。默认只数近 24h：无谓词 COUNT(*) 在 hypertable 上是全 chunk 扫描，
+        // 数据到年级后任何登录用户点一下就能把库拖住（DoS 面）。要全量就显式给大 hours，上限一年。
+        group.MapGet("/count", async (NpgsqlDataSource dataSource, int? hours, CancellationToken ct) =>
         {
-            await using var cmd = dataSource.CreateCommand("SELECT COUNT(*) FROM measurements");
+            var h = Math.Clamp(hours ?? 24, 1, 24 * 366);
+            await using var cmd = dataSource.CreateCommand(
+                "SELECT COUNT(*) FROM measurements WHERE ts > now() - make_interval(hours => $1)");
+            cmd.Parameters.AddWithValue(h);
             var count = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
-            return Results.Ok(new { count });
+            return Results.Ok(new { count, hours = h });
         })
         .WithName("GetMeasurementsCount");
 

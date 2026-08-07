@@ -183,41 +183,12 @@ public static class ChannelConfigChangeEndpoints
             }
             if (updates is null) return Results.BadRequest(new { error = "请求参数为空", id });
 
+            // 阶段一：写设备。这一步失败设备没动，落 failed 让人改完重来即可。
             try
             {
                 await runtime.Connector.ConfigureChannelAsync((ushort)row.ChannelNo, updates, runtime.Options.Address, ct);
-
-                await using (var cmd = ds.CreateCommand(@"
-                    UPDATE channel_config_change_requests
-                    SET status='executed', executed_by=@user, executed_at=now(), failure_reason=NULL
-                    WHERE id=@id AND status='approved'"))
-                {
-                    cmd.Parameters.AddWithValue("user", NpgsqlDbType.Bigint, userId);
-                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
-                    if (await cmd.ExecuteNonQueryAsync(ct) == 0)
-                        return Results.Conflict(new { error = "状态已变更，执行未记录（并发？）；设备可能已下发，请核对", id });
-                }
-
-                // 同步 channels 冗余配置 + 失效解析器缓存——否则热路径/前端长期按旧 DB 配置换算，
-                // 设备与库漂移（历史缺口：执行只改设备和审批单，不 sync 库）。
-                await SyncChannelRowAsync(ds, row.ChannelId, updates, ct);
-                resolver.Invalidate(row.DeviceId, (ushort)row.ChannelNo);
-
-                await WriteAuditAsync(ds, userId, "config_change_execute", row.ChannelId,
-                    JsonSerializer.Serialize(new { requestId = id, deviceId = row.DeviceId, channelNo = row.ChannelNo, updates }),
-                    $"执行下发通道参数变更 #{id}", ct);
-                logger.LogWarning("参数变更已执行下发 #{Id} device={Dev} ch={Ch} by user={User}",
-                    id, row.DeviceId, row.ChannelNo, userId);
-
-                // 触发读回，便于随后 verify 闭环（响应经 SDK 事件异步落 device_parameter_history）
-                await TriggerReadbackAsync(runtime.Connector, (ushort)row.ChannelNo, runtime.Options.Address, updates, ct);
-
-                return Results.Ok(new
-                {
-                    id, status = "executed", deviceId = row.DeviceId, channelNo = row.ChannelNo,
-                    note = "已下发设备并同步通道配置。请执行“验证”触发读回比对确认实际生效。"
-                });
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 // failure_reason 供运营查看，只存异常类型；完整堆栈在日志
@@ -232,6 +203,74 @@ public static class ChannelConfigChangeEndpoints
                 logger.LogError(ex, "参数变更执行失败 #{Id} device={Dev} ch={Ch}", id, row.DeviceId, row.ChannelNo);
                 return Results.BadRequest(new { error = reason, id, status = "failed" });
             }
+
+            // 阶段二：库侧三步（审批单状态 / channels 冗余同步 / 审计）合一个事务——设备已经改了，
+            // 库要么全记上要么全不记，不能出现"审批单 executed 而 channels 还是旧值"这种半截账。
+            try
+            {
+                await using var conn = await ds.OpenConnectionAsync(ct);
+                await using var tx = await conn.BeginTransactionAsync(ct);
+
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE channel_config_change_requests
+                    SET status='executed', executed_by=@user, executed_at=now(), failure_reason=NULL
+                    WHERE id=@id AND status='approved'", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("user", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
+                    if (await cmd.ExecuteNonQueryAsync(ct) == 0)
+                    {
+                        await tx.RollbackAsync(ct);
+                        return Results.Conflict(new { error = "状态已变更，执行未记录（并发？）；设备已下发，请核对后重试", id });
+                    }
+                }
+
+                await SyncChannelRowAsync(conn, tx, row.ChannelId, updates, ct);
+                await WriteAuditAsync(conn, tx, userId, "config_change_execute", row.ChannelId,
+                    JsonSerializer.Serialize(new { requestId = id, deviceId = row.DeviceId, channelNo = row.ChannelNo, updates }),
+                    $"执行下发通道参数变更 #{id}", ct);
+                await tx.CommitAsync(ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // 设备已改、库没记上——这是参数漂移的正源头，必须喊出来而不是谎报"下发失败"。
+                // 状态保持 approved：ConfigureChannelAsync 幂等（同值重写），重试执行即可把账补齐。
+                logger.LogCritical(ex,
+                    "参数变更 #{Id} 设备已下发但库侧记录失败（device={Dev} ch={Ch}）——审批单仍为 approved，重试执行可补账；" +
+                    "期间设备与库不一致，verify 读回可核对实际值", id, row.DeviceId, row.ChannelNo);
+                try
+                {
+                    await using var mark = ds.CreateCommand(@"
+                        UPDATE channel_config_change_requests
+                        SET failure_reason='设备已下发但库记录失败，请重试执行补账（下发幂等）'
+                        WHERE id=@id AND status='approved'");
+                    mark.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
+                    await mark.ExecuteNonQueryAsync(ct);
+                }
+                catch (Exception markEx) { logger.LogError(markEx, "补账提示写入也失败 #{Id}（DB 多半整个不可用）", id); }
+                return Results.Json(new
+                {
+                    error = "设备已下发成功，但库侧记录失败——请重试执行补账（下发幂等，不会重复改设备）",
+                    id, status = "approved", deviceWritten = true
+                }, statusCode: StatusCodes.Status502BadGateway);
+            }
+
+            resolver.Invalidate(row.DeviceId, (ushort)row.ChannelNo);
+            logger.LogWarning("参数变更已执行下发 #{Id} device={Dev} ch={Ch} by user={User}",
+                id, row.DeviceId, row.ChannelNo, userId);
+
+            // 触发读回，便于随后 verify 闭环（响应经 SDK 事件异步落 device_parameter_history）；
+            // 读回只是加速核对，失败不影响本次执行的完整性
+            try { await TriggerReadbackAsync(runtime.Connector, (ushort)row.ChannelNo, runtime.Options.Address, updates, ct); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { logger.LogWarning(ex, "执行后读回触发失败 #{Id}（不影响下发结果，verify 可手动再触发）", id); }
+
+            return Results.Ok(new
+            {
+                id, status = "executed", deviceId = row.DeviceId, channelNo = row.ChannelNo,
+                note = "已下发设备并同步通道配置。请执行“验证”触发读回比对确认实际生效。"
+            });
         })
         .RequireAuthorization(AuthPolicies.WriteAccess)
         .WithTags("ConfigChange")
@@ -410,11 +449,12 @@ public static class ChannelConfigChangeEndpoints
     /// <summary>
     /// 执行下发成功后，把请求里的字段同步进 channels 冗余配置（只覆盖请求携带的字段）。
     /// 与 DiagnosticEndpoints 的 sync-channel-config（device_readback）区分 config_source，便于追溯来源。
+    /// 挂在执行事务里跑：设备已改的前提下，channels 同步与审批单状态必须同生共死。
     /// </summary>
     private static async Task SyncChannelRowAsync(
-        NpgsqlDataSource ds, long channelId, ChannelConfigUpdate u, CancellationToken ct)
+        NpgsqlConnection conn, NpgsqlTransaction tx, long channelId, ChannelConfigUpdate u, CancellationToken ct)
     {
-        await using var cmd = ds.CreateCommand(@"
+        await using var cmd = new NpgsqlCommand(@"
             UPDATE channels SET
                 probe_freq_mhz   = COALESCE(@pf, probe_freq_mhz),
                 echo_win_ns      = COALESCE(@ew, echo_win_ns),
@@ -441,6 +481,8 @@ public static class ChannelConfigChangeEndpoints
         cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, (object?)u.RefTimeNs ?? DBNull.Value);
         cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, (object?)u.RefTempC ?? DBNull.Value);
         cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, channelId);
+        cmd.Connection = conn;
+        cmd.Transaction = tx;
         await cmd.ExecuteNonQueryAsync(ct);
     }
 

@@ -31,6 +31,11 @@ public static class DiagnosticEndpoints
         "ProbeFreq", "Gain", "EchoWin", "EchoWidth", "PulseConfig", "RefTime"
     ];
 
+    // 读参端点的白名单（同样以协议编码分支为准，MultiChIotProtocolHandler.EncodeReadDeviceParameter）。
+    // 名字不在册时 SDK 编码返回空列表、什么都不发——此前照样回 200 "triggered"，
+    // 操作员等一个永远不会来的回包。改成 400 把可用名单直接给出来。
+    private static readonly string[] ReadableDeviceParams = ["Address", "NetCheckConfig", "BatVoltage"];
+
     public static IEndpointRouteBuilder MapDiagnosticEndpoints(this IEndpointRouteBuilder app)
     {
         var group = app.MapGroup("/api/devices/{deviceId:long}/diagnostic")
@@ -44,6 +49,12 @@ public static class DiagnosticEndpoints
             long deviceId, string propertyName, ushort? address,
             IDeviceConnectorManager deviceManager, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
+            if (!ReadableDeviceParams.Contains(propertyName, StringComparer.Ordinal))
+                return Results.BadRequest(new
+                {
+                    error = $"设备级可读参数仅限：{string.Join(" / ", ReadableDeviceParams)}（其余名字协议无读命令，发了也不会有回包）",
+                    propertyName
+                });
             var connector = deviceManager.Find(deviceId)?.Connector;
             if (connector is null)
                 return Results.NotFound(new { error = $"设备未加载到运行时：{deviceId}", deviceId });
@@ -70,6 +81,12 @@ public static class DiagnosticEndpoints
             long deviceId, string propertyName, ushort channel, ushort? address,
             IDeviceConnectorManager deviceManager, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
+            if (!DefaultChannelParamNames.Contains(propertyName, StringComparer.Ordinal))
+                return Results.BadRequest(new
+                {
+                    error = $"通道级可读参数仅限：{string.Join(" / ", DefaultChannelParamNames)}（其余名字协议无读命令，发了也不会有回包）",
+                    propertyName
+                });
             var connector = deviceManager.Find(deviceId)?.Connector;
             if (connector is null)
                 return Results.NotFound(new { error = $"设备未加载到运行时：{deviceId}", deviceId });
@@ -581,10 +598,22 @@ public static class DiagnosticEndpoints
             if (runtime is null)
                 return Results.NotFound(new { error = $"设备未加载到运行时：{deviceId}", deviceId });
 
+            // 阶段一：写设备。失败=设备没动，如实报下发失败。
             try
             {
                 await runtime.Connector.ConfigureChannelAsync(channel, updates, runtime.Options.Address, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "调试直发失败 device={Dev} ch={Ch}", deviceId, channel);
+                return Results.BadRequest(new { error = "参数下发失败（设备离线或通信超时），详情见系统日志。", deviceId, channel });
+            }
 
+            // 阶段二：库同步与审计（同事务）。这里失败设备已经改了，不能再报"下发失败"——
+            // 那会诱导人重试或放弃，而真相是设备/库不一致，得喊人核对。
+            try
+            {
                 // DB 同步与审计同事务；echo_width_us 也随下发同步（此前允许下发却不落库，设备与库漂移）
                 await using var conn = await ds.OpenConnectionAsync(ct);
                 await using var tx = await conn.BeginTransactionAsync(ct);
@@ -625,10 +654,17 @@ public static class DiagnosticEndpoints
                     deviceId, channel, updates, userId);
                 return Results.Ok(new { commissioned = true, deviceId, channel, applied = updates, note = "已直发设备（未标定通道，调试期）。观察波形/声时确认锁到真实回波后，请执行重标定设置基线。" });
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                logger.LogError(ex, "调试直发失败 device={Dev} ch={Ch}", deviceId, channel);
-                return Results.BadRequest(new { error = "参数下发失败（设备离线或通信超时），详情见系统日志。", deviceId, channel });
+                logger.LogCritical(ex,
+                    "调试直发：设备已下发但库同步/审计失败 device={Dev} ch={Ch}——设备与库不一致，读参核对后重发同值参数可补账",
+                    deviceId, channel);
+                return Results.Json(new
+                {
+                    error = "设备已下发成功，但库同步/审计失败——设备与库暂不一致，请重发同值参数补账（下发幂等）",
+                    deviceId, channel, deviceWritten = true
+                }, statusCode: StatusCodes.Status502BadGateway);
             }
         })
         .WithName("CommissionChannel")

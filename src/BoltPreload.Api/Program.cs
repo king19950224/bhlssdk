@@ -72,10 +72,18 @@ if (string.IsNullOrWhiteSpace(connectionString))
         "缺少 ConnectionStrings:Postgres。请通过环境变量 ConnectionStrings__Postgres、" +
         "appsettings.Development.json 或 dotnet user-secrets 注入。");
 
-// NpgsqlDataSource（共享连接池，整个进程一个）
+// NpgsqlDataSource（共享连接池，整个进程一个）。
+// 池上限：Npgsql 默认 100，按 48 通道×多设备满载估算（每条测量 1×INSERT + 0~1×波形特征
+// + 0~1×抑制查询 + 0~N×告警持久化，叠加十来个后台服务的周期查询），高峰会把 100 吃满——
+// 池耗尽的表象是入库超时进 WAL，像 DB 故障其实是自己人挤自己人。连接串没显式给就抬到 200；
+// 现场要精调直接在连接串写 Maximum Pool Size，这里不覆盖显式配置。
 builder.Services.AddSingleton(_ =>
 {
-    var dsBuilder = new NpgsqlDataSourceBuilder(connectionString);
+    var csb = new Npgsql.NpgsqlConnectionStringBuilder(connectionString);
+    if (!connectionString.Contains("Maximum Pool Size", StringComparison.OrdinalIgnoreCase)
+        && !connectionString.Contains("Max Pool Size", StringComparison.OrdinalIgnoreCase))
+        csb.MaxPoolSize = 200;
+    var dsBuilder = new NpgsqlDataSourceBuilder(csb.ConnectionString);
     return dsBuilder.Build();
 });
 
