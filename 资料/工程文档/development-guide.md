@@ -274,6 +274,8 @@ IngestionService（BackgroundService 常驻）
 
 匿名（无需登录）的端点仅限：`/api/health`、`POST /api/auth/login`、以及整个 `/api/license/*`（机器码 `GET /api/license/machine-code` 与授权状态）。其余所有接口均要求登录（JWT），敏感写操作另按角色（operator/reviewer/admin）授权。
 
+通道参数变更（`configure-channel`）：非 admin 走两步异人复核；**admin 提交直接落 approved 并写审计**（与变更请求同事务），仍可追溯、不绕过审计。告警阈值以库内 `alarm_rules` 为准，`appsettings` 仅出厂兜底。
+
 SignalR 推送事件：
 
 | 事件名 | 内容 |
@@ -467,7 +469,8 @@ bhlssdk/
 ├── deploy/
 │   ├── docker-compose.yml           # 开发数据库
 │   ├── sql/                         # 数据库迁移脚本，按序号执行
-│   └── windows/                     # 工控机部署脚本（installer/ 为 Inno Setup 预留，现为空）
+│   ├── installer/                   # Windows Inno Setup 脚本（需本机装 Inno 构建）
+│   └── windows/                     # 工控机部署脚本
 ├── tools/FxDeviceSimulator/         # 独立 TCP 层设备模拟器（Phase 2 占位，现只有空跑）
 └── 资料/
     ├── 工程文档/                    # 全部工程/运维文档（本文件所在目录，不随客户交付）

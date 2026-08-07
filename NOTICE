@@ -1,0 +1,38 @@
+BoltPreload — Third-Party Notices
+=================================
+
+本文件列出 BoltPreload 商用交付所依赖的主要开源组件及许可提示。
+完整版本以各项目 `csproj` / `package.json` 锁定版本为准；部署前可用：
+
+  dotnet list BoltPreload.sln package --include-transitive
+  cd web && npm ls --all
+
+.NET / 后端（节选）
+------------------
+- .NET 8 / ASP.NET Core                 MIT（Microsoft .NET Library）
+- Npgsql / EF Core Npgsql               PostgreSQL License
+- Serilog 系列                          Apache-2.0
+- FluentAssertions（仅测试）            Apache-2.0
+- xUnit（仅测试）                       Apache-2.0
+- Microsoft.AspNetCore.Authentication.JwtBearer  MIT
+- 厂家 FxSDK（external/FxSDK）          专有/厂商授权，非开源
+
+前端（节选）
+------------
+- Vue 3 / Vite / TypeScript             MIT
+- Element Plus                          MIT
+- Pinia / Vue Router                    MIT
+- ECharts                               Apache-2.0
+
+数据库
+------
+- PostgreSQL                            PostgreSQL License
+- TimescaleDB
+  本产品默认使用 TimescaleDB 扩展做时序存贮（hypertable / 压缩 / 保留策略）。
+  TimescaleDB 社区版采用 Timescale License（TSL），**不是**纯 Apache-2.0：
+  允许内部使用与交付部署，但对提供与 Timescale 竞争的数据库即服务等场景有限制。
+  商用合同交付时须确认业主部署形态符合 TSL；若需无 TSL 约束，应改用纯 PostgreSQL
+  并关闭 Timescale 特有策略（压缩/保留策略 SQL 已带 if_not_exists 容错）。
+  详见：https://github.com/timescale/timescaledb/blob/main/LICENSE
+
+本仓库自有代码版权与商业授权条款见交付合同；本 NOTICE 不构成额外许可授予。

@@ -259,3 +259,18 @@ public enum WorkMode
   1. §8.3 第 310 行 `P = Δt/(t₀/K_L)`（= `Δt·K_L/t₀`）是 **1/N 约定下的错误反解**，正确应为 `F = Δt/(K_L·t₀)`；
   2. §8.5 第 1213 行 `K_L = a/t₀` 属 1/N 约定。
 - **操作红线**：`quick-calibrate` 入参的 `kL` 必须按 ns/N（~1e-4）填写，**切勿照标定证书的 1e-11（1/N）填**。`CalibrationEndpoints` 的 `ValidateKLMagnitude` 量级护栏覆盖**全部标定写入路径**——`quick-calibrate`（入参 kL）、`torque-calibrate` / `apply-torque-fit` / `load-calibrate`（计算得到的 kL）——用“屈服力下 Δt 不应 ≥ t₀”“目标预紧力下 Δt 应 > 1ns 噪声底”两道物理边界拦截量级异常。
+
+## 13. 横波与双波法：本机型（model=3）采不到
+
+**结论（2026-08 查证）：model=3 多通道监测设备无法采集横波声时，双波法（±3%）在现有硬件上不可实现，对外精度口径按单波法 ±5%。**
+
+查证链条，四条都能在源码里复核：
+
+1. **协议处理器按 model 选，与传输方式无关。** `FxCommunication.cs` 的 `CreateProtocolHandler`：`0 → StandardProtocolHandler`、`1 → ExpertProtocolHandler`、`2 → IotR24ProtocolHandler`、`3 → MultiChIotProtocolHandler`。串口/TCP（`comm_type`）、直连/LoRa（`transfer_mode`）都不参与这个分支，无线接入不改变结论。
+2. **横波能力只做在 `GeneralProtocolHandler`。** 横波参数下发（`ChannelConfig.TEchoConfig` 的横波窗口 `EchoWin` 与横波位置 `MeasWin`）和声时2解码（`EchoTime2 = tof2IntData + tof2DecData`）在整个 SDK 里只出现于 `Codec/GeneralProtocolHandler.cs`，即 model=0 标准版 / model=1 专家版这类单通道手持仪器。`MultiChIotProtocolHandler.cs` 全文没有 `TEchoConfig`、没有 `EchoTime2`。
+3. **model=3 的 EchoTime 是主机算的，设备只传波形。** `MultiChIotProtocolHandler` 里 `EchoTime = EchoWave.EchoStart + zeroIdx * InterpolationInterval`，`zeroIdx` 由 `CalcZeroIndexByThrSignal` 在主机侧跑阈值过零得到。全波模式（`WorkMode.FullWaveRead` + `DecodeFullWaveResults`）能把纵波 A 扫拼长，但设备既不激励横波也不选通横波窗口，拿不到 t_T。
+4. **实测波形佐证。** 抽查真机归档波形 98,113 个，采集窗口一律 600~640 点 × 25 ns（最宽 16 µs），`echoStart` 按通道为 0 / 27,000 / 29,000 ns，最远窗口到 45,000 ns。纵波基线约 32,142 ns，横波按碳钢纵横波声速比（约 1.82）应落在 58,600 ns 附近，不在任何一个采集窗口内。
+
+**要启用双波法，前置条件不是写算法**（`GbBiWaveCalculator` 的公式已按 plan §8.3 写在注释里），而是两件外部事项：厂家在 model=3 固件与 SDK 上补横波支持（属 plan §9.16 SDK 供应商风险与协议接管的范畴），以及现场换装纵横波复合探头。此外数据库还需补 K_T、v_T0、x₀、A_L−A_T 等字段，标定流程也要相应新增一套。
+
+在此之前 `GbBiWaveCalculator.IsAvailable` 必须保持 `false`，工厂会把 ≥M12 螺栓回退到单波法。对外精度文案统一取 `DisplayLabels.PrecisionSpec`，标定中心页面与验收报告都引用它，不要另写一份。

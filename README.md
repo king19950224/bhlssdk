@@ -24,7 +24,7 @@
 部署环境是 Windows 工控机，**不能用 Docker**，PG 走原生安装。开发机用 Docker 只是为了不污染原生 macOS。
 
 现场部署目前按 `资料/工程文档/deployment-guide.md` 手工执行（建库跑迁移 → 注入配置 → 签发授权 → NSSM 注册服务 → 自检）。
-方案附录 H 规划的 Inno Setup 一键安装包尚未实现（`deploy/installer/` 为空），需在 Windows 上构建验证。
+Windows Inno Setup 脚本已入库（`deploy/installer/installer.iss` + README）；本机构建仍需安装 Inno Setup 并做工控机彩排。
 
 ## 快速开始
 
@@ -54,10 +54,10 @@ dotnet run
 dotnet test
 ```
 
-**数据库必须先起来**（见上面的“启动本地依赖”）。连不上库时那 39 个集成测试会自动跳过，
-`dotnet test` 照样报“已通过”，只在末尾一行写“已跳过: 39”—— 很容易被当成全测过了。
+**数据库必须先起来**（见上面的“启动本地依赖”）。连不上库时约 **171** 个 Postgres 集成测试会自动跳过，
+`dotnet test` 照样报“已通过”，只在末尾一行写“已跳过: 171”—— 很容易被当成全测过了。
 跳过的恰好是覆盖面最广的一批：权限守卫、建档绑定、报警管线、入库热路径、EF 模型与
-手写 schema 的一致性。所以合入前请确认那行是“已跳过: 0”。
+手写 schema 的一致性。CI 已对跳过数=0 设门禁。合入前请确认那行是“已跳过: 0”。
 
 ### 关停依赖
 
@@ -85,7 +85,7 @@ BoltPreload/
 │   ├── docker-compose.yml              本地开发用
 │   ├── sql/                            数据库迁移脚本（生产只跑 0*.sql，不含 dev/）
 │   ├── windows/                        工控机部署脚本（NSSM 服务注册、备份、诊断收集）
-│   └── installer/                      Windows Inno Setup（待实现）
+│   └── installer/                      Windows Inno Setup 脚本（需本机装 Inno 构建）
 ├── tools/
 │   ├── FxDeviceSimulator/              设备模拟器
 │   ├── DeviceSmokeTest/                真机连通性烟测

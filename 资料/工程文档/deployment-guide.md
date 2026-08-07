@@ -2,7 +2,7 @@
 
 > 适用版本：v1.2.0。目标环境：风场/桥梁现场 Windows 工控机，**不使用 Docker**，PostgreSQL 走原生安装。
 > 本手册中的每一步都在 macOS + Linux 容器上做过等价演练（空库首装、Production 冷启动、授权签发、鉴权与深链验证）；
-> Windows 特有部分（NSSM 服务注册、防火墙、PG 原生安装）标注了“需在 Windows 上验证”。
+> Windows 特有部分（NSSM 服务注册、防火墙、PG 原生安装）标注了需在 Windows 上验证。
 
 ---
 
@@ -268,12 +268,30 @@ curl http://localhost:5000/api/health
 
 # 2) 依赖与后台服务都正常
 curl http://localhost:5000/api/health/ready
-#    期望：status=ready、db=up、deadServices=[]、backgroundServices 里
-#          ingestion-watchdog / signal-health / channel-presence / wal-replay 的 stale 均为 false
+#    期望：status=ready、db=up、deadServices=[]，且 backgroundServices 里下面各项的 stale 均为 false：
+#          ingestion            采集主干（对账循环；它停摆 = 全部设备停止采集）
+#          ingestion-watchdog   断线看门狗
+#          signal-health        信号丢失告警（它停摆 = 探头脱落不再报警）
+#          alarm-rule-refresh   告警阈值快照刷新（只在刷新成功时打心跳，见下）
+#          channel-presence     探头热插拔在位判定
+#          wiring-guard         接线指纹守卫
+#          time-sync            设备校时 + 主机时钟漂移监视（plan §9.8）
+#          wal-replay           入库失败重放
+#          notification-dispatcher  出站通知派发
+#          unbound-retention    未绑定测量清理
+#          wave-retention       波形保留清理
+#    另检查 payload 中 memory / wal.sizeMb / ingestLagSeconds / freeDiskGb（§9.23 BITE 观测项）。
+#    wave-sampling 默认不出现（Ingestion:WaveSampling:Enabled 出厂为 false）；
+#    上面各项若对应功能被 appsettings 关掉，也不会出现在列表里——按现场实际配置对照。
 #    若返回 503 且 deadServices 非空 → 对应后台服务已停摆，查日志，不要当成"能用"
+#    特别注意 alarm-rule-refresh 变 stale：它代表库内已批准的告警阈值没能装进评估器，
+#    此时用的是 appsettings 出厂兜底阈值（可能比现场核准值更松），必须先查通 DB 再验收
+#    登录页右下角应显示真实自检结果（不只是写死的系统就绪字样）；登录后可打开系统自检页对照
 
 # 3) 界面能打开，且刷新任意页面不白屏
 #    浏览器直接访问 http://<主机>:5000/alarms 和 /board，应正常渲染（不是空白页）
+#    登录页左侧应显示"使用边界"声明（不参与联锁控制 / 不替代人工巡检 / ±5% 精度 / 哪些情况不报警）。
+#    plan §9.15.1 要求合同、用户手册首页、登录页三处口径一致；这里是三处之一，缺了要当阻塞项处理。
 
 # 4) 授权有效
 curl http://localhost:5000/api/license/status
