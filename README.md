@@ -34,7 +34,8 @@ Windows Inno Setup 脚本已入库（`deploy/installer/installer.iss` + README�
 docker compose up -d postgres
 ```
 
-第一次启动会自动创建数据库 + 执行 `deploy/sql/0001_initial_schema.sql`。
+第一次启动会自动创建数据库并按序执行 `deploy/sql/0*.sql` 全部迁移（含 dev 种子），
+同时写 `schema_migrations` 账本——语义与生产升级脚本 `deploy/windows/apply-migrations.ps1` 一致。
 
 ### 跑后端
 

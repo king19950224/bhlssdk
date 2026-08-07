@@ -6,6 +6,23 @@
 
 ---
 
+## 授权过期 / 写操作全部 403
+
+**症状**：页面能看、数据在采，但建档/标定/告警确认等一切写操作报 403；
+侧栏"授权异常"红灯；`GET /api/license/status` 返回 `valid: false`。
+
+**原因**：授权到期、license.json 缺失/被改、或换过网卡导致机器码不匹配。
+这是设计内行为——**监测与读取永不因授权停**（安全数据不作人质），只拦写操作。
+
+**修复**：
+1. `GET /api/license/machine-code`（匿名可访问）取当前机器码；
+2. 把机器码发给供应商，用 `tools/LicenseSigner sign` 签发新 license.json；
+3. 替换安装目录下的 license.json，`Restart-Service BoltPreload.Api`；
+4. `GET /api/license/status` 确认 `valid: true`。
+授权流程详见 deployment-guide §4；到期前 30 天开始联系续签，别等 403 了才动。
+
+---
+
 ## 真实设备问题
 
 ### 有温度和波形，但 `EchoTime` 一直是 NULL

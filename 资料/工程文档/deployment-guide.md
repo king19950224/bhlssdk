@@ -236,22 +236,23 @@ dotnet run --project tools/LicenseSigner -- verify \
 内容一行 `127.0.0.1:5432:boltpreload:boltpreload:<口令>`，文件编码 ANSI/UTF-8 无 BOM）；
 配不了就 `-PgPassword` 带参——参数写进任务定义、本机管理员可读，信任边界与服务环境变量相同。
 
-**没演练过的备份不算备份**，交付前至少做一次恢复演练：
+**没演练过的备份不算备份**，交付前至少做一次恢复演练。整套 pre_restore → pg_restore →
+post_restore → 抽查已收成一条命令（现场压力下逐条敲命令是恢复流程里最容易错的环节）：
 
 ```powershell
-# 1) 恢复到临时库。TimescaleDB 的库必须先 pre_restore 再灌数，跳过会报超表元数据错误
-psql -U postgres -c "CREATE DATABASE boltpreload_restore_drill;"
-psql -U postgres -d boltpreload_restore_drill -c "CREATE EXTENSION IF NOT EXISTS timescaledb; SELECT timescaledb_pre_restore();"
-pg_restore -U postgres -d boltpreload_restore_drill --no-owner "C:\BoltPreload\backups\<最新一份>.dump"
-psql -U postgres -d boltpreload_restore_drill -c "SELECT timescaledb_post_restore();"
+# 恢复演练：默认恢复到 boltpreload_drill 临时库并打印抽查数字，验完 -DropDrillAfterCheck 自清
+.\restore-postgres.ps1 -DumpFile "C:\BoltPreload\backups\<最新一份>.dump" -DropDrillAfterCheck
 
-# 2) 抽查数据对得上：行数量级与生产一致、最新测量时间戳落在备份时刻附近
-psql -U postgres -d boltpreload_restore_drill -c "SELECT count(*) FROM measurements;"
-psql -U postgres -d boltpreload_restore_drill -c "SELECT count(*) FROM bolts; SELECT max(ts) FROM measurements;"
-
-# 3) 演练完删库
-psql -U postgres -c "DROP DATABASE boltpreload_restore_drill;"
+# 真恢复生产库（覆盖！确认备份时间点再动手；脚本会先停 BoltPreload.Api 再灌数再拉起）
+.\restore-postgres.ps1 -DumpFile "..." -TargetDatabase boltpreload -ReplaceExisting
 ```
+
+抽查口径：行数量级与生产一致、最新测量时间戳落在备份时刻附近、schema_migrations 账本条数一致。
+2026-08-07 已对真机联调库演练一轮（20252 条测量、pg_restore 0 错误、时间戳吻合）。
+
+保留策略（backup-postgres.ps1）：日备滚动 30 份 + 每月首份晋级 monthly\ 保留 12 份。
+**异地是业主责任**：本机备份挡不住整机损毁，交接时确定 `C:\BoltPreload\backups` 同步到
+NAS/业主存储的方式（任务计划 robocopy 即可），写进交接单。
 
 注意目标实例的 timescaledb 扩展版本不能低于备份源，跨大版本恢复前先看 Timescale 升级说明。
 

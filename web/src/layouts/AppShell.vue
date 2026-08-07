@@ -273,7 +273,7 @@ function onUserCommand(c: string) {
         </div>
         <div class="brand-text">
           <div class="brand-name">螺栓预紧力在线监测系统</div>
-          <div class="brand-sub">V1.1 在线监测</div>
+          <div class="brand-sub">V1.2.1 在线监测</div>
         </div>
       </div>
 

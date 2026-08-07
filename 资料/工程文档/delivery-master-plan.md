@@ -181,7 +181,7 @@
 | 告警引擎（StaticThreshold） | 回差 + on/off-delay + 严重档 | [ ] 阈值已进库（alarm_rules + 两步复核）；appsettings 仅出厂兜底；现场改阈值走审批流程 |
 | 授权（License） | 无效不停监测、拦写操作、容量限额 | [ ] 生产 license.json + PublicKeyPem 注入流程演练一次 |
 | 认证授权（JWT + 角色） | operator/reviewer/admin | [ ] 三种角色各建一个账号过一遍菜单可见性 |
-| 数据库迁移（0001~0029） | 账本式执行（apply-migrations.ps1，装机/升级共用）；0028 告警规则、0029 通知发件箱均为幂等加表 | [x] 空库全量 + 存量库（0011 版装机、60 天数据、含压缩 chunk）升级，2026-08-05 本机 psql 实测通过（含 0028/0029，测试夹具每轮全量重放）；[ ] 升级脚本本体在 Windows 现场机上冒烟一次（本机无 PowerShell，psql 调用序列已逐条验证） |
+| 数据库迁移（0001~0030） | 账本式执行（apply-migrations.ps1，装机/升级共用）；0028 告警规则、0029 通知发件箱、0030 审计 append-only 触发器均为幂等 | [x] 空库全量 + 存量库（0011 版装机、60 天数据、含压缩 chunk）升级，2026-08-05 本机 psql 实测通过；[x] 2026-08-07 Windows 上空库全量 0001~0030 实测（集成测试夹具 + 真机联调库各过一轮）；全部 *.ps1 已修 UTF-8 BOM（无 BOM 在 PowerShell 5.1 下 7/8 脚本解析失败，见 m4-real-regression-20260807.md） |
 | 报告生成 | 法兰验收/扭矩阶梯 HTML | [ ] 见 §1.4 |
 
 ---
@@ -191,9 +191,10 @@
 > 2026-07-29 复核更新。以下标"已修"的已修复并在本机实测验证（空库首装 → Production 冷启动 → 授权签发 →
 > 鉴权/深链/写操作全链路）；标"待办"的仍是阻塞项。
 
-1. 待办 **Windows 安装包彩排**：`deploy/installer/installer.iss` 与 README 已入库；已补 `资料/工程文档/deployment-guide.md`
-   与增强后的 `deploy/windows/install-service.ps1`（写服务级环境变量、固定 Production、装完自检）。
-   按手册手工部署可以完成交付；本机装 Inno Setup 出包 + 工控机彩排仍待做。
+1. 部分完成 **Windows 安装包**：2026-08-07 已在 Windows 首次编译出包（`BoltPreload-Setup-1.2.0.exe`，37.8 MB，
+   组包脚本 `deploy/installer/build-payload.ps1`，CI 每次产出交付 zip）。同批修复交付级缺陷：全部部署脚本
+   无 BOM 导致 PowerShell 5.1 下 7/8 解析失败（已全部转 UTF-8 BOM 并 Parser 复检归零）。
+   剩余：干净虚机装机彩排（README 清单第 1 条）+ 目标工控机实测。
 2. 已修 **生产配置定稿**：完整必需清单见 `资料/工程文档/deployment-guide.md` §5，含此前<b>文档里完全没有</b>的
    `BoltPreload__BootstrapAdminPassword`。
 3. 已修 **首装无法登录**（本次新发现，原为阻塞）：空库 0 用户、建账号接口要求 admin 鉴权 → 401，
@@ -211,8 +212,10 @@
    已改为 `[PostgresFact]` 发现期探测，无库时显式报 Skipped。
 8. 已修 **调试残留与漏提交**：`NLog.config` 的 TcpSession 已改回 Info（Debug 会按每秒数十帧刷屏淹没业务日志）；
    `IoSession.cs` 心跳 20s→2s 是真修复，需随本次一起提交。
-9. 待办 **真机回归**：热插拔、标定修复、以及本次的心跳 2s 都改了采集主路径，交付前必须在实验室真机
-   完整跑一轮 §1 各页实测项与 §3 后台服务实测。**这是当前最大的剩余风险。**
+9. 部分完成 **真机回归**（2026-08-07，见 `m4-real-regression-20260807.md`）：集成测试 508/508 跳过归零、
+   采集链路/校时/自动建档/验收拦截在 DEV_LAB_001 真机实测通过、DB 故障演练（降级可见 + WAL 全量重放 +
+   system_degraded 审计）闭环、前端六页浏览器走查；当场修掉总览标定到期 JOIN 反向 500。
+   剩余为物理操作项（插拔探头、载荷标定、48 路满载、断网长跑、声音听感），列在回归记录 §7 给现场彩排。
 10. 已修（待 Windows 实机跑通）**HTTPS 方案**：2026-08-05 定稿为自签证书进受信任根，
     `deploy/windows/setup-https.ps1` 一条脚本配完（证书生成/受信根导入/Kestrel 节/防火墙），
     手册 §5 已改写；每日备份计划任务（`register-backup-task.ps1`，保留 14 份 + 恢复演练步骤）同批落地。
