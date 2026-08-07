@@ -240,12 +240,14 @@ public sealed class AlarmNotificationIntegrationTests
         using var factory = TestApi.CreateFactory(_fx);
         using var client = TestApi.AuthedClient(factory, adminId, "admin");
 
+        // TEST-NET-3 字面公网 IP：不走 DNS、离线可测，且能过 WebhookUrlGuard 的 SSRF 校验
+        //（example.invalid 这类不可解析域名会被守卫按"主机名无法解析"正确拒掉，不能再用）
         var name = "值班群-" + Tag();
         var create = await client.PostAsJsonAsync("/api/notification-channels/", new
         {
             name,
             kind = "webhook",
-            url = "https://example.invalid/hook",
+            url = "https://203.0.113.10/hook",
             format = "wecom",
             secret = "top-secret-token",
         });
@@ -261,7 +263,7 @@ public sealed class AlarmNotificationIntegrationTests
         {
             name,
             kind = "webhook",
-            url = "https://example.invalid/hook2",
+            url = "https://203.0.113.10/hook2",
             format = "raw",
         })).StatusCode.Should().Be(HttpStatusCode.Conflict, "渠道重名 409");
 
@@ -269,9 +271,17 @@ public sealed class AlarmNotificationIntegrationTests
         {
             name = name + "-smtp",
             kind = "smtp",
-            url = "https://example.invalid/x",
+            url = "https://203.0.113.10/x",
             format = "raw",
         })).StatusCode.Should().Be(HttpStatusCode.BadRequest, "smtp/sms 是预留枚举，适配器没实现前不放行");
+
+        (await client.PostAsJsonAsync("/api/notification-channels/", new
+        {
+            name = name + "-ssrf",
+            kind = "webhook",
+            url = "http://192.168.0.1/hook",
+            format = "raw",
+        })).StatusCode.Should().Be(HttpStatusCode.BadRequest, "私网地址默认被 SSRF 守卫拦下（AllowPrivateWebhookTargets 未开启）");
     }
 
     // ===================== helpers =====================

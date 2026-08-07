@@ -249,7 +249,9 @@ public sealed class WiringTableIntegrationTests
         var resp = await client.GetAsync($"/api/devices/{seed.DeviceId}/wiring-table/export.csv");
         resp.StatusCode.Should().Be(HttpStatusCode.OK);
         var text = (await resp.Content.ReadAsStringAsync()).TrimStart('\uFEFF');
-        var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        // AppendLine 在 Windows 产出 CRLF、Linux 产出 LF：只按 \n 切会给 Windows 上的每行留个 \r 尾巴
+        var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => l.TrimEnd('\r')).ToArray();
 
         // 这份表要能导出→改→回导。列序变了前端就按错的列取值，把规格读成等级之类。
         // G7 门禁盯的是表头与前端别名表的对应，这里盯的是表头本身没被悄悄改掉。

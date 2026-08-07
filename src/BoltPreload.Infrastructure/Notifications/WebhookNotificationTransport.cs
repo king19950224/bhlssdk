@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using BoltPreload.Application.Notifications;
+using Microsoft.Extensions.Configuration;
 
 namespace BoltPreload.Infrastructure.Notifications;
 
@@ -22,8 +23,14 @@ public sealed class WebhookNotificationTransport : INotificationTransport
     public const string HttpClientName = "notification-webhook";
 
     private readonly IHttpClientFactory _httpFactory;
+    private readonly bool _allowPrivateTargets;
 
-    public WebhookNotificationTransport(IHttpClientFactory httpFactory) => _httpFactory = httpFactory;
+    public WebhookNotificationTransport(IHttpClientFactory httpFactory, IConfiguration? configuration = null)
+    {
+        _httpFactory = httpFactory;
+        // 与 NotificationEndpoints 同一把开关：入库校验放行的内网地址，发送侧不能又拦回去
+        _allowPrivateTargets = configuration?.GetValue("Notifications:AllowPrivateWebhookTargets", false) ?? false;
+    }
 
     public string Kind => "webhook";
 
@@ -35,7 +42,7 @@ public sealed class WebhookNotificationTransport : INotificationTransport
         if (string.IsNullOrWhiteSpace(url))
             throw new InvalidOperationException($"渠道 '{channel.Name}' 的 config 缺 url");
         // 发送前再验一轮：历史脏配置 / 手工改库 不能绕过 SSRF 门禁
-        var ssrf = WebhookUrlGuard.Validate(url);
+        var ssrf = WebhookUrlGuard.Validate(url, _allowPrivateTargets);
         if (ssrf is not null)
             throw new InvalidOperationException($"渠道 '{channel.Name}' URL 被拒绝：{ssrf}");
         var format = cfg.TryGetProperty("format", out var f) ? f.GetString() ?? "raw" : "raw";

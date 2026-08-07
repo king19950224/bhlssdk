@@ -157,7 +157,7 @@ public sealed class AuditLogQueryIntegrationTests
         bytes.Take(bom.Length).Should().Equal(bom, "没有 BOM 的话 Excel 打开是一屏乱码");
         var csv = Encoding.UTF8.GetString(bytes, bom.Length, bytes.Length - bom.Length);
 
-        csv.Should().StartWith("序号,时间(UTC),用户编号,用户名,动作,对象类型,对象编号,备注,变更前,变更后");
+        csv.Should().StartWith("序号,时间(UTC),用户编号,用户名,客户端IP,动作,对象类型,对象编号,备注,变更前,变更后");
         // 动作列必须是中文：这份表是给第三方审查看的，不能带着 alarm_ack 这种机器码出门
         csv.Should().Contain(DisplayLabels.AuditAction("alarm_ack")).And.NotContain("alarm_ack");
 

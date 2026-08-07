@@ -71,10 +71,10 @@ public static class NotificationEndpoints
 
         grp.MapPost("/", async (
             HttpContext http, ChannelSaveRequest req, NpgsqlDataSource ds, INotificationRouter router,
-            ILoggerFactory lf, CancellationToken ct) =>
+            IConfiguration cfg, ILoggerFactory lf, CancellationToken ct) =>
         {
             var u = UserContext.Require(http);
-            var err = ValidateChannel(req);
+            var err = ValidateChannel(req, AllowPrivateTargets(cfg));
             if (err is not null) return Results.BadRequest(new { error = err });
 
             var config = BuildChannelConfig(req.Url!, req.Format!, req.Secret);
@@ -111,10 +111,10 @@ public static class NotificationEndpoints
 
         grp.MapPatch("/{id:long}", async (
             long id, HttpContext http, ChannelSaveRequest req, NpgsqlDataSource ds, INotificationRouter router,
-            ILoggerFactory lf, CancellationToken ct) =>
+            IConfiguration cfg, ILoggerFactory lf, CancellationToken ct) =>
         {
             var u = UserContext.Require(http);
-            var err = ValidateChannel(req);
+            var err = ValidateChannel(req, AllowPrivateTargets(cfg));
             if (err is not null) return Results.BadRequest(new { error = err });
 
             await using var conn = await ds.OpenConnectionAsync(ct);
@@ -493,7 +493,11 @@ public static class NotificationEndpoints
             ? new Dictionary<string, string> { ["url"] = url.Trim(), ["format"] = format }
             : new Dictionary<string, string> { ["url"] = url.Trim(), ["format"] = format, ["secret"] = secret });
 
-    private static string? ValidateChannel(ChannelSaveRequest req)
+    /// <summary>风场内网接收器（SCADA 网内消息桥）确有其事，业主要用时在配置里显式放行并留痕。</summary>
+    private static bool AllowPrivateTargets(IConfiguration cfg) =>
+        cfg.GetValue("Notifications:AllowPrivateWebhookTargets", false);
+
+    private static string? ValidateChannel(ChannelSaveRequest req, bool allowPrivateTargets)
     {
         if (string.IsNullOrWhiteSpace(req.Name) || req.Name.Trim().Length > 64)
             return "Name 必填且不超过 64 字符";
@@ -501,7 +505,7 @@ public static class NotificationEndpoints
         if (req.Kind != "webhook")
             return "本轮只支持 kind=webhook（smtp/sms 预留，适配器未实现）";
         // SSRF：不仅校验 scheme，还禁本机/私网（见 WebhookUrlGuard）
-        var urlErr = WebhookUrlGuard.Validate(req.Url);
+        var urlErr = WebhookUrlGuard.Validate(req.Url, allowPrivateTargets);
         if (urlErr is not null) return urlErr;
         if (req.Format is null || !KnownFormats.Contains(req.Format))
             return $"Format 只能是 {string.Join(" / ", KnownFormats)}";
