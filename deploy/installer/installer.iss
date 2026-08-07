@@ -41,16 +41,20 @@ Source: "payload\nssm.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "payload\license-public.pem"; DestDir: "{app}"; Flags: ignoreversion
 ; 现场手册
 Source: "payload\docs\*"; DestDir: "{app}\docs"; Flags: recursesubdirs ignoreversion
-; 前置安装器（可选放入 payload\prereq\，没放就要求现场已装好）
-Source: "payload\prereq\*"; DestDir: "{tmp}\prereq"; Flags: recursesubdirs ignoreversion skipifsourcedoesntexist
+; 前置安装器（可选放入 payload\prereq\，没放就要求现场已装好）。
+; nocompression：PG 安装器 349MB 本身就是压缩的，LZMA2 再压一遍多花十分钟出包、体积不降
+Source: "payload\prereq\*"; DestDir: "{tmp}\prereq"; Flags: recursesubdirs ignoreversion skipifsourcedoesntexist nocompression
 
 [Run]
 ; PostgreSQL 缺失且包里带了安装器 → 交互式拉起（静默装需要预设超级口令，v1 不做，
 ; 装完 TimescaleDB 安装器同理；两个都装完了本步自动跳过）
+; 注意：PG 缺失与否在 InitializeSetup 时缓存一次（PgWasMissing）。不能在 Run 步现查注册表——
+; 上一行刚把 PG 装上，现查会变"已安装"，TimescaleDB 那步就被跳过，装出来的库建不了扩展。
 Filename: "{tmp}\prereq\postgresql-16-setup.exe"; Description: "安装 PostgreSQL 16（检测到未安装）"; \
-    Flags: waituntilterminated; Check: PgMissing and PgInstallerBundled
-Filename: "{tmp}\prereq\timescaledb-setup.exe"; Description: "安装 TimescaleDB 扩展"; \
-    Flags: waituntilterminated; Check: PgMissing and TsInstallerBundled
+    Flags: waituntilterminated; Check: PgWasMissing and PgInstallerBundled
+; TimescaleDB 官方 zip 是 timescaledb\ 目录带 setup.exe 及依赖 dll，整目录进包、按原布局拉起
+Filename: "{tmp}\prereq\timescaledb\setup.exe"; Description: "安装 TimescaleDB 扩展"; \
+    Flags: waituntilterminated; Check: PgWasMissing and TsInstallerBundled
 ; 主编排：管理员 PowerShell 窗口里跑 install-all.ps1，交互补口令，窗口保留看结果与机器码
 Filename: "powershell.exe"; \
     Parameters: "-ExecutionPolicy Bypass -NoExit -File ""{app}\deploy\windows\install-all.ps1"" -InstallDir ""{app}"""; \
@@ -64,10 +68,20 @@ Filename: "powershell.exe"; \
     Flags: waituntilterminated; RunOnceId: "StopService"
 
 [Code]
-function PgMissing(): Boolean;
+var
+  GPgWasMissing: Boolean;
+
+function InitializeSetup(): Boolean;
 begin
-  // EDB 安装器会写这个键；TimescaleDB 自带 PG 的场合同样能探到
-  Result := not RegKeyExists(HKLM, 'SOFTWARE\PostgreSQL\Installations');
+  // EDB 安装器会写这个键；TimescaleDB 自带 PG 的场合同样能探到。
+  // 结果缓存进全局变量：Run 步的 Check 要用"安装开始时"的状态，不能现查。
+  GPgWasMissing := not RegKeyExists(HKLM, 'SOFTWARE\PostgreSQL\Installations');
+  Result := True;
+end;
+
+function PgWasMissing(): Boolean;
+begin
+  Result := GPgWasMissing;
 end;
 
 function PgInstallerBundled(): Boolean;
@@ -77,5 +91,5 @@ end;
 
 function TsInstallerBundled(): Boolean;
 begin
-  Result := FileExists(ExpandConstant('{tmp}\prereq\timescaledb-setup.exe'));
+  Result := FileExists(ExpandConstant('{tmp}\prereq\timescaledb\setup.exe'));
 end;

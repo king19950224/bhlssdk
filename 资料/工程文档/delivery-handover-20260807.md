@@ -15,17 +15,23 @@
 
 ## 2. 需要你方动手的事（软件侧做不了）
 
-1. **git 远端**：仓库至今无 remote，全部历史只在开发机 + C 盘 bundle（`C:\Users\lenovo\bhlssdk-backup\`）。
-   给一个 Gitee 私有库或内网 Git 地址，`git remote add origin <url> && git push -u origin main --tags` 一条完事。
-2. **正式授权密钥对**：`LicenseSigner keygen` 生成正式钥，私钥离线保管（丢了全部现场授权作废重签）。
-   特别注意：本轮出包用的是**彩排公钥**（`C:\Users\lenovo\bhlssdk-backup\rehearsal-keys\`）——正式出货必须换正式公钥重新组包。
-3. **备份异地**：本机日备 30 份 + 月备 12 份挡不住整机损毁。定一个 NAS/业主存储位置，
+1. **代码与密钥异地备份**：git 远端确认不建（你方口头拍板 2026-08-07）。代码全史在
+   `C:\Users\lenovo\bhlssdk-backup\bhlssdk-v1.2.1-final.bundle`，授权私钥在
+   `C:\Users\lenovo\bhlssdk-RELEASE-KEYS-勿删\`——两样都只在这一台电脑上，**尽快拷 U 盘/加密盘异地存放**。
+   私钥丢了全部现场授权作废重签，泄了谁都能给自己签授权。
+2. **备份异地**：本机日备 30 份 + 月备 12 份挡不住整机损毁。定一个 NAS/业主存储位置，
    任务计划 robocopy 同步 `C:\BoltPreload\backups`（deployment-guide §7.1）。
-4. **干净虚机装机彩排**：`BoltPreload-Setup-1.2.1.exe` 双击装 → 编排跑完 → 打出机器码（installer README 清单）。
-5. **现场物理项回归**（m4 记录 §7）：插拔探头、载荷标定全流程、48 路满载、断网长跑、告警声音听感。
+3. **干净虚机装机彩排**：`BoltPreload-Setup-1.2.1.exe` 双击装 → 前置自动拉起 → 编排跑完 → 打出机器码
+   （installer README 清单）。包已自带 PG 16.14 + TimescaleDB 2.28.3，干净机可从零装到底。
+4. **现场物理项回归**（m4 记录 §7）：插拔探头、载荷标定全流程、48 路满载、断网长跑、告警声音听感。
 
 ## 3. 软件侧已闭环（有据可查）
 
+- 正式授权体系（2026-08-07 下午闭环）：正式密钥对已生成（私钥 `C:\Users\lenovo\bhlssdk-RELEASE-KEYS-勿删\`），
+  安装包已换**正式公钥**重新出包；签发全流程彩排通过（机器码 → sign → verify）；
+  独立签发工具 `LicenseSigner.exe`（自包含单文件，免装 .NET）与私钥同目录，现场任何 Windows 机器可签
+- 安装包自带前置：PG 16.14（EDB 官方，签名校验 Valid）+ TimescaleDB 2.28.3，缺 PG 的干净机自动拉起
+  （拉起条件曾有"装完 PG 即跳过 TimescaleDB"的判序缺陷，2026-08-07 修复）
 - 集成测试 **508/508 通过、跳过 0**（CI 门禁：跳过数必须为 0）
 - 真机链路（DEV_LAB_001 @192.168.0.7）：连接、校时、MultiMeas、自动建档、验收拦截闭环
 - DB 故障演练：降级可见（/ready degraded + 前端全局横幅）→ WAL 全量重放 → system_degraded 审计留痕

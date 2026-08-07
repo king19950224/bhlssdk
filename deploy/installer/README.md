@@ -32,8 +32,9 @@ payload\
   docs\                 ← deployment-guide.md / troubleshooting.md 等现场手册
   nssm.exe              ← nssm.cc 下载 2.24 的 win64 版
   license-public.pem    ← 授权公钥（供应商密钥对的公钥半）
-  prereq\               ← 可选：postgresql-16-setup.exe、timescaledb-setup.exe
-                          （放了就会在目标机缺 PG 时自动拉起；不放则要求现场先装好）
+  prereq\               ← 可选但商用交付建议必放：目标机缺 PG 时自动拉起；不放则要求现场先装好
+    postgresql-16-setup.exe   ← EDB 官方安装器（get.enterprisedb.com，约 360 MB）
+    timescaledb\              ← 官方 PG16 Windows zip 原样解开（setup.exe + 依赖 dll，别只抽 exe）
 ```
 
 交付 zip（bhlssdk-delivery-vX.Y.Z.zip）解开即是 app/deploy/docs/公钥四样，补 nssm 和 prereq 即可。
