@@ -1,0 +1,31 @@
+<Project>
+
+  <!--
+    厂家 SDK 1.6 的防护文件，作用和 external/FxSDK/Directory.Build.props 完全一样：
+    截断根级 Directory.Build.props 的向上查找，让厂家代码不受我方严格设置约束。
+    没有这个文件，根上的 TreatWarningsAsErrors + AnalysisMode=Recommended 会打出 83 个
+    CA 分析器错误（CA1309 序数比较约 40 处等），没有一个是真正的 C# 编译错误——
+    升级评估 §7.1 实测过，这里再实测过一遍。厂家代码不该为我方分析器规则改动。
+
+    与 1.4 那份的两处差异：
+    1. 不再排除 ._*.cs——这份包的 AppleDouble 残留集中在 __MACOSX/ 同级目录，
+       整理入库时已连目录一起删掉，FxSDK/ 内实测没有 ._ 文件；
+    2. CVE 提升先保留——1.6 的 csproj 虽已显式引 FParsec 1.1.1，但 System.Net.Http 4.3.0
+       仍可能经 FSharp.Core 传递进来。net8 下两者都是 facade 包（运行时用内置实现），
+       提升只为消审计告警，无行为影响。升级正式动手时用
+       dotnet list package - -vulnerable 复核一次，确认干净可删（命令里两个减号连写，
+       此处拆开是防呆：XML 注释里不许出现连续减号）。
+  -->
+  <PropertyGroup>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <NoWarn>$(NoWarn);CS8600;CS8601;CS8602;CS8603;CS8604;CS8618;CS8625;CA1822</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Net.Http" Version="4.3.4" />
+    <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />
+  </ItemGroup>
+
+</Project>
