@@ -137,15 +137,22 @@ public interface IFxConnector : IAsyncDisposable
 /// <param name="NewRefTempC">写入设备的新 RefTemp (°C)</param>
 /// <param name="EchoWaveBytes">本次写入的 LEchoWave 数据点数（用于日志/审计）</param>
 /// <param name="Timestamp">操作时间</param>
+/// <param name="NewRefEnvTimeNs">SDK 1.6 自动法包络锚点（ns，绝对时间）。仅 MeasMode=0 且基线取自真实测量帧时非空</param>
+/// <param name="NewRefPeriodNs">SDK 1.6 自动法置零时的稳定载波周期（ns），与 NewRefEnvTimeNs 配对</param>
+/// <param name="RefEchoWave">本次写入设备的参考波形（FxRefWaveCodec 打包），落 channels.ref_echo_wave 供重启回灌</param>
 public sealed record RecalibrateResult(
     ushort Channel,
     ushort Address,
     decimal NewRefTimeNs,
     decimal NewRefTempC,
     int EchoWaveBytes,
-    DateTimeOffset Timestamp);
+    DateTimeOffset Timestamp,
+    decimal? NewRefEnvTimeNs = null,
+    decimal? NewRefPeriodNs = null,
+    byte[]? RefEchoWave = null);
 
-/// <summary>SDK SessionContext 中已注入的通道配置快照（诊断用）</summary>
+/// <summary>SDK SessionContext 中已注入的通道配置快照（诊断用）。
+/// RefEnvTimeNs/RefPeriodNs 是 1.6 自动法锚点——现场验证"重启后锚点是否回灌成功"就看这两个字段。</summary>
 public sealed record FxSessionChannelConfigSnapshot(
     ushort Address,
     ushort Channel,
@@ -156,7 +163,9 @@ public sealed record FxSessionChannelConfigSnapshot(
     decimal? RefTimeNs,
     decimal? RefTempC,
     ushort TcMode,
-    decimal? TempCoefficient);
+    decimal? TempCoefficient,
+    decimal? RefEnvTimeNs = null,
+    decimal? RefPeriodNs = null);
 
 /// <summary>
 /// 通道配置增量更新（null 表示不改）。字段类型严格对齐 SDK ChannelConfig。

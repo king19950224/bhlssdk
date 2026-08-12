@@ -25,9 +25,9 @@ public class ChannelConfig
     /// </summary>
     public decimal EchoWin { get; set; }
     /// <summary>
-    /// 回波窗口宽度us(SDK 默认 40；业务库 channels.echo_width_us 建档默认 15)
+    /// 回波窗口宽度us(默认15)
     /// </summary>
-    public ushort EchoWidth { get; set; } = 40;
+    public ushort EchoWidth { get; set; } = 15;
     /// <summary>
     /// 脉冲设置
     /// </summary>
@@ -78,6 +78,16 @@ public class ChannelConfig
     /// </summary>
     public decimal? RefTime { get; set; }
     /// <summary>
+    /// 自动法置零时的包络粗定位绝对时间(ns)。
+    /// 与 RefTime 配对，用于根据包络位移预测当前上升沿过零点。
+    /// </summary>
+    public decimal? RefEnvTime { get; set; }
+    /// <summary>
+    /// 自动法置零时保存的稳定载波周期(ns)。
+    /// 测量和监测优先使用该周期限定同相上升沿搜索范围。
+    /// </summary>
+    public decimal? RefPeriodNs { get; set; }
+    /// <summary>
     /// 参考温度
     /// </summary>
     public decimal? RefTemp { get; set; }
@@ -90,6 +100,10 @@ public class ChannelConfig
     /// 使用温度通道
     /// </summary>
     public ushort UseTempChannel { get; set; } = 0;
+    /// <summary>
+    /// 温度 Tau 系数，单位秒；为空时使用全局温度 Tau 策略。
+    /// </summary>
+    public decimal? TempTauSeconds { get; set; }
     #endregion
     /// <summary>
     /// 纵波参考回波

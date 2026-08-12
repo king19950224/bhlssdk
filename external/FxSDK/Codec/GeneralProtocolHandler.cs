@@ -10,7 +10,7 @@ namespace FxSDK.Codec;
 /// </summary>
 public class GeneralProtocolHandler : FxProtocolHandler
 {
-    private readonly Pt1000Decoder _pt1000Decoder = new();
+    protected readonly Pt1000Decoder Pt1000Decoder = new();
     private static readonly ILogger Logger = LogManager.GetLogger(nameof(GeneralProtocolHandler));
 
     /// <summary>
@@ -33,16 +33,16 @@ public class GeneralProtocolHandler : FxProtocolHandler
     public const short NoiseBase = 10; //噪声带
     public const short SignalMax = 110;//最大
     public const short SignalAuto = 90;//自动增益幅度
-    public static readonly double[] GainRange = {0, 80};
+    public static readonly double[] GainRange = {0.1, 80};
     public static readonly decimal GainStep = 0.1M;//增益步长
     /// <summary>
     /// 工作模式转换时需要延迟
     /// </summary>
     public const int WorkModeDelay = 100;
-    private const double DiscardMs = 500;//丢弃时间ms
+    protected const double DiscardMs = 500;//丢弃时间ms
     private const int MeasRange = 20000;//测量范围±20us(39,970)
 
-    private DateTime _setWorkModeTime = DateTime.Now;//模式转换时间
+    protected DateTime SetWorkModeTime = DateTime.Now;//模式转换时间
 
     /// <summary>
     /// 纵波波形数据帧头
@@ -62,12 +62,12 @@ public class GeneralProtocolHandler : FxProtocolHandler
     /// <summary>
     /// result frame head
     /// </summary>
-    private static readonly byte[] DecResultFrameHead = {0xDE, 0xDE, 0xDE, 0xDE};
+    protected static readonly byte[] DecResultFrameHead = {0xDE, 0xDE, 0xDE, 0xDE};
 
     /// <summary>
     /// frame tail
     /// </summary>
-    private static readonly byte[] DecFrameTail = {0x00, 0x00, 0x00, 0x00};
+    protected static readonly byte[] DecFrameTail = {0x00, 0x00, 0x00, 0x00};
 
     /// <summary>
     /// DA Range
@@ -228,16 +228,31 @@ public class GeneralProtocolHandler : FxProtocolHandler
         return rfByte;
     }
 
-    private decimal GetMeasWinDelay(ChannelConfig config, bool tWin = false)
+    private uint GetLongitudinalWaveStartDelay(ChannelConfig? config)
     {
-        var delay = config.ProbeFreq switch
+        return 60U;
+    }
+
+    private uint GetTransverseWaveStartDelay(ChannelConfig? config)
+    {
+        return 60U;
+    }
+
+    private decimal GetLongitudinalMeasWinSendDelay(ChannelConfig config)
+    {
+        return config.ProbeFreq switch
         {
-            2 => 200, //200
-            5 => tWin ? 100 : 60, //60
-            10 => 60, //60
-            _ => 0, //default、13、23 延迟0
+            2 => 200M,
+            5 => 60M,
+            10 => 60M,
+            _ => 0M,
         };
-        return delay;
+    }
+
+    private decimal GetTransverseMeasWinSendDelay(ChannelConfig config)
+    {
+        // MeasWin2 is already calculated from the transverse waveform coordinate system.
+        return 0M;
     }
 
     /// <summary>
@@ -287,7 +302,7 @@ public class GeneralProtocolHandler : FxProtocolHandler
         var measModeParams = new byte[3];
         if (config.MeasMode == 1) //最大2^20
         {
-            var winDelay = GetMeasWinDelay(config);
+            var winDelay = GetLongitudinalMeasWinSendDelay(config);
             var measWin = 0M;
             var measMin = config.EchoWin - MeasRange;
             var measMax = config.EchoWin + MeasRange;
@@ -317,15 +332,21 @@ public class GeneralProtocolHandler : FxProtocolHandler
             Array.Copy(echoWin2DivBytes, 1, echoWin2Params, 0, 3); 
         }
         var echoWin2Bytes = EncodeWriteParamCmd(0x0C, echoWin2Params);
-        //编码横波位置
-        var measWin2Params = new byte[3];
-        if (config.TEchoConfig is {MeasWin: > 0})
-        {
-            var win2Delay = GetMeasWinDelay(config, true);
-            var measWin2 = config.TEchoConfig.MeasWin + win2Delay; 
-            var measWin2Div = Convert.ToUInt32(measWin2 / OriginalInterval);
-            var measureWin2Bytes = BitConverter.GetBytes(measWin2Div);
-            Array.Reverse(measureWin2Bytes);
+	        //编码横波位置
+	        var measWin2Params = new byte[3];
+	        if (config.TEchoConfig is {MeasWin: > 0})
+	        {
+		            var win2Delay = GetTransverseMeasWinSendDelay(config);
+	            var measWin2 = 0M;
+	            var measMin2 = config.TEchoConfig.EchoWin - MeasRange;
+	            var measMax2 = config.TEchoConfig.EchoWin + MeasRange;
+	            if (config.TEchoConfig.MeasWin > measMin2 && config.TEchoConfig.MeasWin < measMax2)
+	            {
+	                measWin2 = config.TEchoConfig.MeasWin + win2Delay;
+	            }
+	            var measWin2Div = Convert.ToUInt32(measWin2 / OriginalInterval);
+	            var measureWin2Bytes = BitConverter.GetBytes(measWin2Div);
+	            Array.Reverse(measureWin2Bytes);
             Array.Copy(measureWin2Bytes, 1, measWin2Params, 0, 3);
         }
         var measWin2Bytes = EncodeWriteParamCmd(0x07, measWin2Params);
@@ -348,9 +369,9 @@ public class GeneralProtocolHandler : FxProtocolHandler
         if (config.TempCoefficient.HasValue)
         {
             var scaledTc = Math.Round(config.TempCoefficient.Value * 10000000, 0);
-            var scaledTcBytes = BitConverter.GetBytes(Convert.ToUInt16(scaledTc));
-            tcParams[1] = scaledTcBytes[0];
-            tcParams[2] = scaledTcBytes[1];
+            var scaledTcValue = Convert.ToUInt16(scaledTc);
+            tcParams[1] = (byte) (scaledTcValue >> 8);
+            tcParams[2] = (byte) scaledTcValue;
         }
         var tcBytes = EncodeWriteParamCmd(0x18, tcParams);
         //编码探头频率
@@ -365,35 +386,42 @@ public class GeneralProtocolHandler : FxProtocolHandler
             {
                 encodeMessages.Add(pulseVolBytes);
                 encodeMessages.Add(pulseWidthBytes);
+                encodeMessages.Add(FxUtility.Delay10Ms);
             }
             else if (propertyName.Equals(nameof(config.TEchoConfig)))
             {
                 encodeMessages.Add(echoWin2Bytes);
                 encodeMessages.Add(measWin2Bytes);
                 encodeMessages.Add(tScaleBytes);
+                encodeMessages.Add(FxUtility.Delay10Ms);
             }
             else if (propertyName.Equals(nameof(config.EchoWin)))
             {
                 encodeMessages.Add(echoWinBytes);
+                encodeMessages.Add(FxUtility.Delay10Ms);
             }
             else if (propertyName.Equals(nameof(config.ProbeFreq)))
             {
                 encodeMessages.Add(probeFreqBytes);
+                encodeMessages.Add(FxUtility.Delay10Ms);
             }
             else if (propertyName.Equals(nameof(config.Gain)))
             {
                 encodeMessages.Add(gainBytes);
+                encodeMessages.Add(FxUtility.Delay10Ms);
             }
             else if (propertyName.Equals(nameof(config.MeasMode))
                      || propertyName.Equals(nameof(config.MeasWin)) || propertyName.Equals(nameof(config.Threshold)))
             {
                 encodeMessages.Add(measModeBytes);
+                encodeMessages.Add(FxUtility.Delay10Ms);
             }
             else if (propertyName.Equals(nameof(config.TcMode))
                      || propertyName.Equals(nameof(config.TempProbe)) ||
                      propertyName.Equals(nameof(config.TempCoefficient)))
             {
                 encodeMessages.Add(tcBytes);
+                encodeMessages.Add(FxUtility.Delay10Ms);
             }
         }
         else
@@ -408,6 +436,7 @@ public class GeneralProtocolHandler : FxProtocolHandler
             encodeMessages.Add(echoWinBytes);
             encodeMessages.Add(probeFreqBytes);
             encodeMessages.Add(gainBytes);
+            encodeMessages.Add(FxUtility.Delay10Ms);
             encodeMessages.Add(measModeBytes);
             encodeMessages.Add(tcBytes);
             encodeMessages.Add(FxUtility.Delay10Ms);
@@ -475,15 +504,15 @@ public class GeneralProtocolHandler : FxProtocolHandler
             case WorkMode.Standby:
                 commandParams[0] = 0x02; //待机
                 encodeMessages.Add(EncodeWriteParamCmd(commandCode, commandParams));
-                ClearContext();//待机时清理一下缓存中的信息
                 break;
         }
         
         lock (AcqTimeLock)
         {
             CurrentAcqTime = null;
-            _setWorkModeTime = DateTime.Now;
+            SetWorkModeTime = DateTime.Now;
         }
+        ClearContext();//切换时清理一下缓存
         return encodeMessages;
     }
 
@@ -549,7 +578,7 @@ public class GeneralProtocolHandler : FxProtocolHandler
                 {
                     try
                     {
-                        if (devConfig?.CommunicationType > 0  && rowIndex % 10 == 0)//非串口通讯加入每输出10条加10ms延迟
+                        if (rowIndex % 10 == 0)//非串口通讯加入每输出10条加10ms延迟
                         {
                             encodeMessages.Add(FxUtility.Delay10Ms);
                         }
@@ -564,7 +593,7 @@ public class GeneralProtocolHandler : FxProtocolHandler
                         encodeMessages.Add(EncodeWriteParamCmd(0x0D, calRow3Bytes));
                         rowIndex++;
                     }
-                    catch (Exception ex)
+                    catch (Exception)
                     {
                         //Console.WriteLine(ex);
                     }
@@ -620,7 +649,7 @@ public class GeneralProtocolHandler : FxProtocolHandler
         }
         return decodedResults;
     }
-    private int _headBeginIdx = -1; //动态解析头索引
+    protected int HeadBeginIdx = -1; //动态解析头索引
     /// <summary>
     /// 解码单纵波波形结果
     /// WiFi实际1012个字节
@@ -628,13 +657,11 @@ public class GeneralProtocolHandler : FxProtocolHandler
     private List<ChannelResult> DecodeLWaveResults(IoSession session, CancellationToken token)
     {
         var decodedList = new List<ChannelResult>();
-        var needValidTail = true;
         var echoFrameSize = 3997;
         var devConfig = SessionContext.GetDeviceConfig(session);
-        if (devConfig?.CommunicationType > 0)//非串口通讯使用1000
+        if (devConfig is { CommunicationType: > 0, Model: 0 })//标准版 网络通讯 波形帧长 1000
         {
             echoFrameSize = 1000;
-            needValidTail = false;
         }
         var frameSize = DecLWaveFrameHead.Length + echoFrameSize + DecFrameTail.Length; //定长帧长度
         while (!token.IsCancellationRequested && ContextData.Count >= frameSize)
@@ -642,22 +669,22 @@ public class GeneralProtocolHandler : FxProtocolHandler
             token.ThrowIfCancellationRequested();
             try
             {
-                if (_headBeginIdx < 0)
+                if (HeadBeginIdx < 0)
                 {
-                    _headBeginIdx = ByteUtility.IndexOf(ContextData, DecLWaveFrameHead);
-                    if (_headBeginIdx < 0)
+                    HeadBeginIdx = ByteUtility.IndexOf(ContextData, DecLWaveFrameHead);
+                    if (HeadBeginIdx < 0)
                     {
                         var removeLength = ContextData.Count - DecLWaveFrameHead.Length;
-                        ContextData.RemoveRange(0,removeLength); //保留帧头长度的字节
+                        ConsumeContext(removeLength); //保留帧头长度的字节
                         break;
                     }
                 }
 
                 //找到帧头,则清理帧头前面的无效字节
-                if (_headBeginIdx > 0)
+                if (HeadBeginIdx > 0)
                 {
-                    ContextData.RemoveRange(0,_headBeginIdx);
-                    _headBeginIdx = 0;
+                    ConsumeContext(HeadBeginIdx);
+                    HeadBeginIdx = 0;
                 }
 
                 if (ContextData.Count < frameSize)
@@ -668,13 +695,13 @@ public class GeneralProtocolHandler : FxProtocolHandler
                 //数据长度完整
                 var decodedFrame = ContextData.GetRange(0, frameSize);
                 CurrentAcqTime = DateTime.Now; //波形采集时间采用当前时间
-                //需要判断帧尾但帧尾不对  暂时先不判断帧尾
-                // if (needValidTail && !IsFrameTailValid(decodedFrame, DecFrameTail))
-                // {
-                //     ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                //     _headBeginIdx = -1;
-                // }
-                // else
+                //判断如果有帧头说明有错帧
+                if (ByteUtility.IndexOf(decodedFrame, DecLWaveFrameHead, DecLWaveFrameHead.Length) > 0)
+                {
+                    ContextData.RemoveAt(0);
+                    HeadBeginIdx = -1;//重新找帧头
+                }
+                else
                 {
                     var waveData = new List<short>();
                     var waveStartIndex = DecLWaveFrameHead.Length + 3 + 1;
@@ -700,29 +727,31 @@ public class GeneralProtocolHandler : FxProtocolHandler
                     if (BitConverter.IsLittleEndian)
                         Array.Reverse(echoStartFourBytes);
                     
-                    //赋值到对象
-                    var channelResult = new ChannelResult
-                    {
-                        HexString = ByteUtility.BytesToHexStr(decodedFrame),
-                        EchoWave = new EchoWave
-                        {
-                            EchoStart = BitConverter.ToUInt32(echoStartFourBytes, 0) * (int)OriginalInterval + 60, //延时60ns时间对齐
-                            ClockInt = Convert.ToUInt16(OriginalInterval),
-                            WaveData = waveData,
-                        },
-                        ReceiveTime = CurrentAcqTime.Value,
-                    };
-                    var channelConfig = SessionContext.GetLastChannelConfig(session);
-                    
-                    if (channelConfig != null)
+	                    var channelConfig = SessionContext.GetLastChannelConfig(session);
+	                    var waveStartDelay = GetLongitudinalWaveStartDelay(channelConfig);
+	                    //赋值到对象
+		                    var channelResult = new ChannelResult
+		                    {
+		                        HexString = BuildDiagnosticHexString(decodedFrame),
+		                        EchoWaveKind = EchoWaveKind.Longitudinal,
+		                        EchoWave = new EchoWave
+		                        {
+		                            EchoStart = BitConverter.ToUInt32(echoStartFourBytes, 0) * (int)OriginalInterval + waveStartDelay, //波形起点时间对齐
+	                            ClockInt = Convert.ToUInt16(OriginalInterval),
+	                            WaveData = waveData,
+	                        },
+	                        ReceiveTime = CurrentAcqTime.Value,
+	                    };
+	                    
+	                if (channelConfig != null)
                     {
                         channelResult.Channel = channelConfig.Channel;
-                        decimal[] midResults;
+                        EchoAssist assist;
                         var waveDataDouble = waveData.Select(o => (double) o).ToList();
                         var zeroIdx = 0d;
                         if (channelConfig.MeasMode == 0)//自动波谷法
                         {
-                            zeroIdx = CalculateExtensions.CalcZeroIndexByAutoValley(waveDataDouble, out midResults, NoiseBase);
+                            zeroIdx = CalculateExtensions.CalcZeroIndexByAutoValley(waveDataDouble, out assist, NoiseBase);
                         }
                         else if (channelConfig.MeasMode == 1)//手动位置法
                         {
@@ -731,27 +760,28 @@ public class GeneralProtocolHandler : FxProtocolHandler
                             {
                                 posIndex = 0;
                             }
-                            zeroIdx = CalculateExtensions.CalcZeroIndexByPosition(waveDataDouble, (int)posIndex, out midResults, NoiseBase);
+                            zeroIdx = CalculateExtensions.CalcZeroIndexByPosition(waveDataDouble, (int)posIndex, out assist, NoiseBase);
                         }
                         else//手动阈值法
                         {
-                            zeroIdx = CalculateExtensions.CalcZeroIndexBySimpleThr(waveDataDouble, out midResults, NoiseBase, channelConfig.Threshold);
+                            zeroIdx = CalculateExtensions.CalcZeroIndexBySimpleThr(waveDataDouble, out assist, NoiseBase, channelConfig.Threshold);
                         }
                         if (zeroIdx < 0)
                         {
-                            channelResult.StatusCode = Convert.ToInt16(zeroIdx);
+                            channelResult.StatusCode = MeasStatusCodeExtensions.FromZeroIndex(zeroIdx);
                         }
-                        channelResult.MidResults = midResults;
+                        channelResult.Assist = assist;
                     }
                     decodedList.Add(channelResult);
-                    ContextData.RemoveRange(0,decodedFrame.Count);
-                    _headBeginIdx = -1; //
+                    ConsumeContext(decodedFrame.Count);
+                    HeadBeginIdx = -1; //
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                LogDecodeWarning(session, nameof(DecodeLWaveResults), HeadBeginIdx, ex);
                 ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                _headBeginIdx = -1;
+                HeadBeginIdx = -1;
                 break;
             }
         }
@@ -763,13 +793,11 @@ public class GeneralProtocolHandler : FxProtocolHandler
     private List<ChannelResult> DecodeTWaveResults(IoSession session, CancellationToken token)
     {
         var decodedList = new List<ChannelResult>();
-        var needValidTail = true;
         var echoFrameSize = 3997;
         var devConfig = SessionContext.GetDeviceConfig(session);
         if (devConfig?.CommunicationType > 0)//非串口通讯使用1000
         {
             echoFrameSize = 1000;
-            needValidTail = false;//非串口波形没有帧尾
         }
         var frameSize = DecTWaveFrameHead.Length + echoFrameSize + DecFrameTail.Length; //定长帧长度
         while (!token.IsCancellationRequested && ContextData.Count >= frameSize)
@@ -777,22 +805,22 @@ public class GeneralProtocolHandler : FxProtocolHandler
             token.ThrowIfCancellationRequested();
             try
             {
-                if (_headBeginIdx < 0)
+                if (HeadBeginIdx < 0)
                 {
-                    _headBeginIdx = ByteUtility.IndexOf(ContextData, DecTWaveFrameHead);
-                    if (_headBeginIdx < 0)
+                    HeadBeginIdx = ByteUtility.IndexOf(ContextData, DecTWaveFrameHead);
+                    if (HeadBeginIdx < 0)
                     {
                         var removeLength = ContextData.Count - DecTWaveFrameHead.Length;
-                        ContextData.RemoveRange(0,removeLength); //保留帧头长度的字节
+                        ConsumeContext(removeLength); //保留帧头长度的字节
                         break;
                     }
                 }
 
                 //找到帧头,则清理帧头前面的无线字节
-                if (_headBeginIdx > 0)
+                if (HeadBeginIdx > 0)
                 {
-                    ContextData.RemoveRange(0,_headBeginIdx);
-                    _headBeginIdx = 0;
+                    ConsumeContext(HeadBeginIdx);
+                    HeadBeginIdx = 0;
                 }
 
                 if (ContextData.Count < frameSize)
@@ -803,13 +831,13 @@ public class GeneralProtocolHandler : FxProtocolHandler
                 //数据长度完整
                 var decodedFrame = ContextData.GetRange(0, frameSize);
                 CurrentAcqTime = DateTime.Now; //波形的采集时间使用当前时间
-                //需要判断帧尾但帧尾不对
-                // if (needValidTail && !IsFrameTailValid(decodedFrame, DecFrameTail))
-                // {
-                //     ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                //     _headBeginIdx = -1;
-                // }
-                // else
+                //判断如果有帧头说明有错帧
+                if (ByteUtility.IndexOf(decodedFrame, DecTWaveFrameHead, DecTWaveFrameHead.Length) > 0)
+                {
+                    ContextData.RemoveAt(0);
+                    HeadBeginIdx = -1;//重新找帧头
+                }
+                else
                 {
                     var waveData = new List<short>();
                     var waveStartIndex = DecTWaveFrameHead.Length + 3 + 1;
@@ -835,40 +863,47 @@ public class GeneralProtocolHandler : FxProtocolHandler
                     if (BitConverter.IsLittleEndian)
                         Array.Reverse(echoStartFourBytes);
 
-                    //赋值到对象
-                    var channelResult = new ChannelResult
-                    {
-                        HexString = ByteUtility.BytesToHexStr(decodedFrame),
-                        EchoWave = new EchoWave
-                        {
-                            EchoStart = BitConverter.ToUInt32(echoStartFourBytes, 0) * 10 + 60, //延时60ns时间对齐
-                            ClockInt = Convert.ToUInt16(OriginalInterval),
-                            WaveData = waveData,
-                        },
-                        ReceiveTime = CurrentAcqTime.Value,
-                    };
-                    var waveDataDouble = waveData.Select(o => (double) o).ToList();
-                    var channelConfig = SessionContext.GetLastChannelConfig(session);
-                    if (channelConfig is {TEchoConfig: not null})
-                    {
-                        var posIndex = (channelConfig.TEchoConfig.MeasWin - channelResult.EchoWave.EchoStart) / OriginalInterval;
-                        if (posIndex < 0) posIndex = 0;
-                        var zeroIdx = CalculateExtensions.CalcZeroIndexByPosition(waveDataDouble, (int)posIndex, out var midResults, NoiseBase);
+	                    var channelConfig = SessionContext.GetLastChannelConfig(session);
+	                    var waveStartDelay = GetTransverseWaveStartDelay(channelConfig);
+	                    //赋值到对象
+		                    var channelResult = new ChannelResult
+		                    {
+		                        HexString = BuildDiagnosticHexString(decodedFrame),
+		                        EchoWaveKind = EchoWaveKind.Transverse,
+		                        EchoWave = new EchoWave
+		                        {
+		                            EchoStart = BitConverter.ToUInt32(echoStartFourBytes, 0) * (int)OriginalInterval + waveStartDelay, //波形起点时间对齐
+	                            ClockInt = Convert.ToUInt16(OriginalInterval),
+	                            WaveData = waveData,
+	                        },
+	                        ReceiveTime = CurrentAcqTime.Value,
+		                    };
+		                    var waveDataDouble = waveData.Select(o => (double) o).ToList();
+		                    channelResult.Channel = channelConfig?.Channel ?? 1;
+	                    if (channelConfig is {TEchoConfig: not null})
+	                    {
+	                        var posIndex = (channelConfig.TEchoConfig.MeasWin - channelResult.EchoWave.EchoStart) / OriginalInterval;
+	                        if (posIndex < 0 || posIndex >= waveDataDouble.Count)
+	                        {
+	                            posIndex = 0;
+	                        }
+	                        var zeroIdx = CalculateExtensions.CalcZeroIndexByPosition(waveDataDouble, (int)posIndex, out var assist, NoiseBase);
                         if (zeroIdx < 0)
                         {
-                            channelResult.StatusCode = Convert.ToInt16(zeroIdx);
+                            channelResult.StatusCode = MeasStatusCodeExtensions.FromZeroIndex(zeroIdx);
                         }
-                        channelResult.MidResults = midResults;
+                        channelResult.Assist = assist;
                     }
                     decodedList.Add(channelResult);
-                    ContextData.RemoveRange(0,decodedFrame.Count);
-                    _headBeginIdx = -1; //
+                    ConsumeContext(decodedFrame.Count);
+                    HeadBeginIdx = -1; //
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                LogDecodeWarning(session, nameof(DecodeTWaveResults), HeadBeginIdx, ex);
                 ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                _headBeginIdx = -1;
+                HeadBeginIdx = -1;
                 break;
             }
         }
@@ -880,28 +915,28 @@ public class GeneralProtocolHandler : FxProtocolHandler
     protected List<ChannelResult> DecodeChannelResults(IoSession session, CancellationToken token)
     {
         var decodedList = new List<ChannelResult>();
-        var frameSize = DecResultFrameHead.Length + 27 + DecFrameTail.Length; //定长帧长度
+        var frameSize = SingleChannelResultFrameSize; //定长帧长度
         while (!token.IsCancellationRequested && ContextData.Count >= frameSize)
         {
             token.ThrowIfCancellationRequested();
             try
             {
-                if (_headBeginIdx < 0)
+                if (HeadBeginIdx < 0)
                 {
-                    _headBeginIdx = ByteUtility.IndexOf(ContextData, DecResultFrameHead);
-                    if (_headBeginIdx < 0)
+                    HeadBeginIdx = ByteUtility.IndexOf(ContextData, DecResultFrameHead);
+                    if (HeadBeginIdx < 0)
                     {
                         var removeLength = ContextData.Count - DecResultFrameHead.Length;
-                        ContextData.RemoveRange(0,removeLength); //保留帧头长度的字节
+                        ConsumeContext(removeLength); //保留帧头长度的字节
                         break;
                     }
                 }
 
                 //找到帧头,则清理帧头前面的无效字节
-                if (_headBeginIdx > 0)
+                if (HeadBeginIdx > 0)
                 {
-                    ContextData.RemoveRange(0,_headBeginIdx);
-                    _headBeginIdx = 0;
+                    ConsumeContext(HeadBeginIdx);
+                    HeadBeginIdx = 0;
                 }
 
                 if (ContextData.Count < frameSize)
@@ -917,101 +952,121 @@ public class GeneralProtocolHandler : FxProtocolHandler
                     lock (AcqTimeLock)
                     {
                         CurrentAcqTime = CurrentAcqTime?.AddSeconds((double) devConfig!.SampleInterval) ?? DateTime.Now; //初始化采集时间
-                        if (CurrentAcqTime - _setWorkModeTime < TimeSpan.FromMilliseconds(DiscardMs))
+                        if (CurrentAcqTime - SetWorkModeTime < TimeSpan.FromMilliseconds(DiscardMs))
                         {
-                            ContextData.RemoveRange(0,decodedFrame.Count);
-                            _headBeginIdx = -1; //重新找帧头
+                            ConsumeContext(decodedFrame.Count);
+                            HeadBeginIdx = -1; //重新找帧头
                             continue;
                         }
                     }
-                    var dataIndex = DecResultFrameHead.Length;
-                    var decodedFrameArray = decodedFrame.ToArray();
-                    //声时结果 2,3,4 整数  5,6小数
-                    byte[] tofIntBytes = new byte[4], tofDecBytes = new byte[2];
-                    Array.Copy(decodedFrameArray, dataIndex + 2, tofIntBytes, 1, 3);
-                    Array.Reverse(tofIntBytes); //高-低
-                    Array.Copy(decodedFrameArray, dataIndex + 5, tofDecBytes, 0, 2);
-                    Array.Reverse(tofDecBytes); //高-低
-                    var tofIntData = BitConverter.ToUInt32(tofIntBytes, 0) * OriginalInterval;
-                    var tofDecData = BitConverter.ToUInt16(tofDecBytes, 0) * OriginalInterval / 65536M;
-                    //独立温度探头解析 温度积分值和温度积分参考值 7-11
-                    var tempBytes = new byte[4];
-                    var tempRefBytes = new byte[4];
-                    Array.Copy(decodedFrameArray, dataIndex + 7, tempBytes, 0, 4);
-                    Array.Reverse(tempBytes); //高-低
-                    Array.Copy(decodedFrameArray, dataIndex + 11, tempRefBytes, 0, 4);
-                    Array.Reverse(tempRefBytes); //高-低
-                    var refResIv = BitConverter.ToUInt32(tempRefBytes, 0); //参考电阻积分值
-                    var pt1000Iv = BitConverter.ToUInt32(tempBytes, 0); //pt1000探头积分值
-                    decimal? indTemp = null;
-                    try
+                    if (TryDecodeSingleChannelResultFrame(session, decodedFrame, CurrentAcqTime.Value, out var channelResult)
+                        && channelResult != null)
                     {
-                        indTemp = _pt1000Decoder.GetResult(pt1000Iv, refResIv); //独立探头温度测量值
+                        decodedList.Add(channelResult);
                     }
-                    catch
-                    {
-                        // 忽略
-                    }
-                    //模拟量采集  15-22  高-低 Expert (1-2重复 3-4重复) standard (1-3重复 2-4重复) 解析1和4即可 
-                    var lowAiBytes = new byte[2];
-                    var highAiBytes = new byte[2];
-                    Array.Copy(decodedFrameArray, dataIndex + 15, lowAiBytes, 0, 2);
-                    Array.Reverse(lowAiBytes);
-                    Array.Copy(decodedFrameArray, dataIndex + 21, highAiBytes, 0, 2);
-                    Array.Reverse(highAiBytes);
-                    //角度采集
-                    var angleTempBytes = new byte[4];
-                    Array.Copy(decodedFrameArray, dataIndex + 23, angleTempBytes, 0, 4);
-                    Array.Reverse(angleTempBytes);
-                    //赋值到对象
-                    var channelResult = new ChannelResult
-                    {
-                        HexString = ByteUtility.BytesToHexStr(decodedFrame),
-                        EchoTime = tofIntData + tofDecData, //ns
-                        SpTemp = indTemp,
-                        LowAi = BitConverter.ToUInt16(lowAiBytes, 0),
-                        HighAi = BitConverter.ToUInt16(highAiBytes, 0),
-                        Angle = BitConverter.ToInt16(angleTempBytes, 0),
-                        ReceiveTime = CurrentAcqTime.Value,
-                    };
-                    var lastChannelConfig = SessionContext.GetLastChannelConfig(session, channelResult.Address);
-                    channelResult.Channel = lastChannelConfig?.Channel ?? 1; //默认通道1
-                    //保存温度通道到会话
-                    if (channelResult.SpTemp.HasValue)
-                    {
-                        SessionContext.StoreChannelTemp(session, channelResult.Address, channelResult.Channel, channelResult.SpTemp!.Value);
-                    }
-                    var channelConfig = SessionContext.GetChannelConfig(session, channelResult.Address, channelResult.Channel);
-                    if (channelConfig != null)
-                    {
-                        channelResult.SpTemp = SessionContext.GetChannelTemp(session, channelResult.Address, channelResult.Channel);
-                    }
-
-                    if (channelConfig is {RefTime: not null, RefTemp: not null})
-                    {
-                        var tempCoefficient = channelConfig.TempCoefficient ?? CalculateExtensions.DefaultTempCoeff;
-                        channelResult.DeltaTof = CalculateExtensions.CalcDeltaTof(channelConfig.RefTime.Value, channelConfig.RefTemp.Value,
-                            (decimal) channelResult.EchoTime, channelResult.SpTemp!.Value, channelConfig.TcMode,tempCoefficient);
-                    }
-                    decodedList.Add(channelResult);
-                    ContextData.RemoveRange(0,decodedFrame.Count);
-                    _headBeginIdx = -1; //
+                    ConsumeContext(decodedFrame.Count);
+                    HeadBeginIdx = -1; //
                 }
                 else
                 {
                     ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                    _headBeginIdx = -1;
+                    HeadBeginIdx = -1;
                     break;
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                LogDecodeWarning(session, nameof(DecodeChannelResults), HeadBeginIdx, ex);
                 ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                _headBeginIdx = -1;
+                HeadBeginIdx = -1;
                 break;
             }
         }
         return decodedList;
+    }
+
+    protected virtual int SingleChannelResultFrameSize => DecResultFrameHead.Length + 27 + DecFrameTail.Length;
+
+    private decimal DecodeIntegratedTemperature(IReadOnlyList<byte> frame, int dataIndex)
+    {
+        var highByte = frame[dataIndex + 7];
+        var lowByte = frame[dataIndex + 8];
+        var rawValue = unchecked((short) ((highByte << 8) | lowByte));
+        return Pt1000Decoder.GetAdTemp(rawValue);
+    }
+
+    protected virtual bool TryDecodeSingleChannelResultFrame(IoSession session, List<byte> decodedFrame,
+        DateTime receiveTime, out ChannelResult? channelResult)
+    {
+        var dataIndex = DecResultFrameHead.Length;
+        var decodedFrameArray = decodedFrame.ToArray();
+        //声时结果 2,3,4 整数  5,6小数
+        byte[] tofIntBytes = new byte[4], tofDecBytes = new byte[2];
+        Array.Copy(decodedFrameArray, dataIndex + 2, tofIntBytes, 1, 3);
+        Array.Reverse(tofIntBytes); //高-低
+        Array.Copy(decodedFrameArray, dataIndex + 5, tofDecBytes, 0, 2);
+        Array.Reverse(tofDecBytes); //高-低
+        var tofIntData = BitConverter.ToUInt32(tofIntBytes, 0) * OriginalInterval;
+        var tofDecData = BitConverter.ToUInt16(tofDecBytes, 0) * OriginalInterval / 65536M;
+        //独立温度探头解析 温度积分值和温度积分参考值 7-11
+        var tempBytes = new byte[4];
+        var tempRefBytes = new byte[4];
+        Array.Copy(decodedFrameArray, dataIndex + 7, tempBytes, 0, 4);
+        Array.Reverse(tempBytes); //高-低
+        Array.Copy(decodedFrameArray, dataIndex + 11, tempRefBytes, 0, 4);
+        Array.Reverse(tempRefBytes); //高-低
+        var refResIv = BitConverter.ToUInt32(tempRefBytes, 0); //参考电阻积分值
+        var pt1000Iv = BitConverter.ToUInt32(tempBytes, 0); //pt1000探头积分值
+        decimal? channelTemperature = null;//样件温度
+        try
+        {
+            channelTemperature = Pt1000Decoder.GetResult(pt1000Iv, refResIv); //独立探头温度测量值
+        }
+        catch
+        {
+            // 忽略
+        }
+        //模拟量采集  15-22  高-低 Expert (1-2重复 3-4重复) standard (1-3重复 2-4重复) 解析1和4即可 
+        var lowAiBytes = new byte[2];
+        var highAiBytes = new byte[2];
+        Array.Copy(decodedFrameArray, dataIndex + 15, lowAiBytes, 0, 2);
+        Array.Reverse(lowAiBytes);
+        Array.Copy(decodedFrameArray, dataIndex + 21, highAiBytes, 0, 2);
+        Array.Reverse(highAiBytes);
+        //角度采集
+        var angleTempBytes = new byte[4];
+        Array.Copy(decodedFrameArray, dataIndex + 23, angleTempBytes, 0, 4);
+        Array.Reverse(angleTempBytes);
+        //赋值到对象
+        channelResult = new ChannelResult
+        {
+            HexString = BuildDiagnosticHexString(decodedFrame),
+            EchoTime = tofIntData + tofDecData, //ns
+            LowAi = BitConverter.ToUInt16(lowAiBytes, 0),
+            HighAi = BitConverter.ToUInt16(highAiBytes, 0),
+            Angle = BitConverter.ToInt16(angleTempBytes, 0),
+            ReceiveTime = receiveTime,
+        };
+        channelResult.Channel = ResolveSingleChannelResultChannel(session, decodedFrame, channelResult);
+        var channelConfig = SessionContext.GetChannelConfig(session, channelResult.Address, channelResult.Channel);
+        if (channelConfig is {TempProbe: 1})//一体式温度
+        {
+            channelTemperature = DecodeIntegratedTemperature(decodedFrame, dataIndex);
+        }
+        channelResult.RawTemp = ResolveSourceChannelTemperature(session, channelResult.Address,
+            channelResult.Channel, channelTemperature);
+        ResolveEffectiveChannelTemperature(session, channelResult, channelConfig,
+            sampleTime: channelResult.ReceiveTime);
+        channelResult.DeltaTof = CalculateDeltaTof(channelConfig, (decimal) channelResult.EchoTime,
+            channelResult.SpTemp);
+        return true;
+    }
+
+    protected virtual ushort ResolveSingleChannelResultChannel(IoSession session, List<byte> decodedFrame,
+        ChannelResult result)
+    {
+        var lastChannelConfig = SessionContext.GetLastChannelConfig(session, result.Address);
+        return lastChannelConfig?.Channel ?? 1; //默认通道1
     }
     /// <summary>
     /// 解码单通道双波测量结果
@@ -1025,21 +1080,21 @@ public class GeneralProtocolHandler : FxProtocolHandler
             token.ThrowIfCancellationRequested();
             try
             {
-                if (_headBeginIdx < 0)
+                if (HeadBeginIdx < 0)
                 {
-                    _headBeginIdx = ByteUtility.IndexOf(ContextData, DecResultFrameHead);
-                    if (_headBeginIdx < 0)
+                    HeadBeginIdx = ByteUtility.IndexOf(ContextData, DecResultFrameHead);
+                    if (HeadBeginIdx < 0)
                     {
                         var removeLength = ContextData.Count - DecResultFrameHead.Length;
-                        ContextData.RemoveRange(0,removeLength); //保留帧头长度的字节
+                        ConsumeContext(removeLength); //保留帧头长度的字节
                         break;
                     }
                 }
                 //找到帧头,则清理帧头前面的无线字节
-                if (_headBeginIdx > 0)
+                if (HeadBeginIdx > 0)
                 {
-                    ContextData.RemoveRange(0,_headBeginIdx);
-                    _headBeginIdx = 0;
+                    ConsumeContext(HeadBeginIdx);
+                    HeadBeginIdx = 0;
                 }
 
                 if (ContextData.Count < frameSize)
@@ -1055,10 +1110,10 @@ public class GeneralProtocolHandler : FxProtocolHandler
                     lock (AcqTimeLock)
                     {
                         CurrentAcqTime = CurrentAcqTime?.AddSeconds((double) devConfig!.SampleInterval) ?? DateTime.Now;
-                        if (CurrentAcqTime - _setWorkModeTime < TimeSpan.FromMilliseconds(DiscardMs))
+                        if (CurrentAcqTime - SetWorkModeTime < TimeSpan.FromMilliseconds(DiscardMs))
                         {
-                            ContextData.RemoveRange(0, decodedFrame.Count);
-                            _headBeginIdx = -1; //重新找帧头
+                            ConsumeContext(decodedFrame.Count);
+                            HeadBeginIdx = -1; //重新找帧头
                             continue;
                         }
                     }
@@ -1081,7 +1136,15 @@ public class GeneralProtocolHandler : FxProtocolHandler
                     Array.Reverse(tempRefBytes); //高-低
                     var refResIv = BitConverter.ToUInt32(tempRefBytes, 0); //参考电阻积分值
                     var pt1000Iv = BitConverter.ToUInt32(tempBytes, 0); //pt1000探头积分值
-                    var indTemp = _pt1000Decoder.GetResult(pt1000Iv, refResIv); //独立探头温度测量值
+                    decimal? channelTemperature = null; //样件温度
+                    try
+                    {
+                        channelTemperature = Pt1000Decoder.GetResult(pt1000Iv, refResIv); //独立探头温度测量值
+                    }
+                    catch
+                    {
+                        // 忽略
+                    }
                     //声时2结果 2,3,4 整数  5,6小数
                     byte[] tof2IntBytes = new byte[4], tof2DecBytes = new byte[2];
                     Array.Copy(decodedFrameArray, dataIndex + 15, tof2IntBytes, 1, 3);
@@ -1091,58 +1154,52 @@ public class GeneralProtocolHandler : FxProtocolHandler
                     var tof2IntData = BitConverter.ToUInt32(tof2IntBytes, 0) * OriginalInterval;
                     var tof2DecData = BitConverter.ToUInt16(tof2DecBytes, 0) * OriginalInterval / 65536M;
                     //赋值到对象
-                    var channelResult = new ChannelResult
-                    {
-                        HexString = ByteUtility.BytesToHexStr(decodedFrame),
-                        EchoTime = tofIntData + tofDecData, //ns
-                        EchoTime2 = tof2IntData + tof2DecData,
-                        SpTemp = indTemp,
-                        ReceiveTime = CurrentAcqTime.Value,
-                    };
-                    //保存温度通道到会话
-                    if (channelResult.SpTemp.HasValue)
-                    {
-                        SessionContext.StoreChannelTemp(session, channelResult.Address, channelResult.Channel, channelResult.SpTemp.Value);
-                    }
+	                    var channelResult = new ChannelResult
+	                    {
+	                        HexString = BuildDiagnosticHexString(decodedFrame),
+	                        EchoTime = tofIntData + tofDecData, //ns
+	                        EchoTime2 = tof2IntData + tof2DecData,
+	                        ReceiveTime = CurrentAcqTime.Value,
+	                    };
+	                    var lastChannelConfig = SessionContext.GetLastChannelConfig(session, channelResult.Address);
+	                    channelResult.Channel = lastChannelConfig?.Channel ?? 1;
                     var channelConfig = SessionContext.GetChannelConfig(session, channelResult.Address, channelResult.Channel);
-                    if (channelConfig != null)
+                    if (channelConfig is {TempProbe: 1}) //一体式温度
                     {
-                        channelResult.SpTemp = SessionContext.GetChannelTemp(session, channelResult.Address, channelResult.Channel);
+                        channelTemperature = DecodeIntegratedTemperature(decodedFrame, dataIndex);
                     }
-
-                    if (channelConfig is {RefTime: not null, RefTemp: not null})
-                    {
-                        var tempCoefficient = channelConfig.TempCoefficient ?? CalculateExtensions.DefaultTempCoeff;
-                        channelResult.DeltaTof = CalculateExtensions.CalcDeltaTof(
-                            channelConfig.RefTime.Value, channelConfig.RefTemp.Value,
-                            (decimal) channelResult.EchoTime, channelResult.SpTemp!.Value, channelConfig.TcMode,
-                            tempCoefficient);
-                    }
+                    channelResult.RawTemp = ResolveSourceChannelTemperature(session, channelResult.Address,
+                        channelResult.Channel, channelTemperature);
+                    ResolveEffectiveChannelTemperature(session, channelResult, channelConfig,
+                        sampleTime: channelResult.ReceiveTime);
+                    channelResult.DeltaTof = CalculateDeltaTof(channelConfig, (decimal) channelResult.EchoTime,
+                        channelResult.SpTemp);
                     decodedList.Add(channelResult);
-                    ContextData.RemoveRange(0,decodedFrame.Count);
-                    _headBeginIdx = -1; //
+                    ConsumeContext(decodedFrame.Count);
+                    HeadBeginIdx = -1; //
                 }
                 else
                 {
                     ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                    _headBeginIdx = -1;
+                    HeadBeginIdx = -1;
                     break;
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                LogDecodeWarning(session, nameof(DecodeChannelDualResults), HeadBeginIdx, ex);
                 ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                _headBeginIdx = -1;
+                HeadBeginIdx = -1;
                 break;
             }
         }
         return decodedList;
     }
-    const int MaxFramesPerBatch = 200;//单次最多循环解码的帧数
+    protected const int MaxFramesPerBatch = 200;//单次最多循环解码的帧数
     /// <summary>
     /// 解码多通道结果
     /// </summary>
-    private List<MultiChannelResult> DecodeMultiChannelResults(IoSession session, CancellationToken token)
+    protected virtual List<MultiChannelResult> DecodeMultiChannelResults(IoSession session, CancellationToken token)
     {
         var decodedList = new List<MultiChannelResult>();
         try
@@ -1154,55 +1211,56 @@ public class GeneralProtocolHandler : FxProtocolHandler
                 //通道起始编号(1) + 状态信息(1) + 通道声时(4)*8 + 温度积分(4) + 温度参考(4) + ADH4(2) + ADH3(2) + ADH2(2) +ADH1(2)
                 // + ADL4(2) + ADL3(2) + ADL2(2) + ADL1(2) + 角度4(2) + 角度3(2) + 角度2(2) +角度1(2)
                 var frameSize = DecResultFrameHead.Length + 1 + 1 + 4 * 8 + 4 + 4 + 2 * 4 + 2 * 4 + 2 * 4;
+                var frameSizeWithNextHead = frameSize + 4;//增加下一个字节的4字节帧头
                 var frameCount = 0;
-                while (!token.IsCancellationRequested && ContextData.Count >= frameSize)
+                while (!token.IsCancellationRequested && ContextData.Count >= frameSizeWithNextHead)
                 {
                     token.ThrowIfCancellationRequested();
                     try
                     {
-                        if (_headBeginIdx < 0)
+                        if (HeadBeginIdx < 0)
                         {
-                            _headBeginIdx = ByteUtility.IndexOf(ContextData, DecResultFrameHead);
-                            if (_headBeginIdx < 0)
+                            HeadBeginIdx = ByteUtility.IndexOf(ContextData, DecResultFrameHead);
+                            if (HeadBeginIdx < 0)
                             {
                                 var removeRange = ContextData.Count - DecResultFrameHead.Length;
-                                ContextData.RemoveRange(0,removeRange); //除帧头长度之前的全清除
+                                ConsumeContext(removeRange); //除帧头长度之前的全清除
                                 break;
                             }
                         }
 
                         //找到帧头，清理帧头以前的数据
-                        if (_headBeginIdx > 0)
+                        if (HeadBeginIdx > 0)
                         {
-                            ContextData.RemoveRange( 0,_headBeginIdx);
-                            _headBeginIdx = 0;
+                            ConsumeContext(HeadBeginIdx);
+                            HeadBeginIdx = 0;
                         }
 
-                        if (ContextData.Count < frameSize)
+                        if (ContextData.Count < frameSizeWithNextHead)
                         {
                             break; //数据不全，等待补充完整
                         }
 
                         var devConfig = SessionContext.GetDeviceConfig(session);
-                        var decodedFrame = ContextData.GetRange(0, frameSize);
+                        var decodedFrame = ContextData.GetRange(0, frameSizeWithNextHead);
                         
-                        //乱帧以及帧尾判断
-                        if (ByteUtility.IndexOf(decodedFrame, DecResultFrameHead, DecResultFrameHead.Length) < 0)
-                            //&& IsFrameTailValid(decodedFrame,DecFrameTail))//帧尾判断
+                        //下一帧 帧头判断
+                        var nextFrameHead = decodedFrame.GetRange(decodedFrame.Count - 4, 4);
+                        if (nextFrameHead.SequenceEqual(DecResultFrameHead))
                         {
                             lock (AcqTimeLock)
                             {
                                 CurrentAcqTime = CurrentAcqTime?.AddSeconds((double) devConfig!.SampleInterval) ?? DateTime.Now;
-                                if (CurrentAcqTime - _setWorkModeTime < TimeSpan.FromMilliseconds(DiscardMs))
+                                if (CurrentAcqTime - SetWorkModeTime < TimeSpan.FromMilliseconds(DiscardMs))
                                 {
-                                    ContextData.RemoveRange(0,frameSize);
-                                    _headBeginIdx = -1; //重新找帧头
+                                    ConsumeContext(frameSize);
+                                    HeadBeginIdx = -1; //重新找帧头
                                     continue;
                                 }
                             }
                             var multiChResult = new MultiChannelResult
                             {
-                                HexString = ByteUtility.BytesToHexStr(decodedFrame),
+                                HexString = BuildDiagnosticHexString(decodedFrame),
                                 ReceiveTime = CurrentAcqTime.Value,
                                 Results = new Dictionary<ushort, ChannelResult>(),
                             };
@@ -1280,14 +1338,15 @@ public class GeneralProtocolHandler : FxProtocolHandler
                             //获取温度及计算声时差
                             var tempBytes = decodedFrame.Skip(38).Take(4).ToArray();
                             var tempRefBytes = decodedFrame.Skip(42).Take(4).ToArray();
+                            var frameTemperatures = new Dictionary<ushort, decimal>();
                             if (intTempProbe) //集成温度
                             {
                                 var temp1Ch = tempBytes[0];
-                                var temp1Value = _pt1000Decoder.GetAdTemp(BitConverter.ToInt16(new[] {tempBytes[2], tempBytes[1]}));
+                                var temp1Value = Pt1000Decoder.GetAdTemp(BitConverter.ToInt16(new[] {tempBytes[2], tempBytes[1]}));
                                 var temp2Ch = tempBytes[3];
-                                var temp2Value = _pt1000Decoder.GetAdTemp(BitConverter.ToInt16(new[] {tempRefBytes[1], tempRefBytes[0]}));
-                                SessionContext.StoreChannelTemp(session, device.Address, temp1Ch, temp1Value);
-                                SessionContext.StoreChannelTemp(session, device.Address, temp2Ch, temp2Value);
+                                var temp2Value = Pt1000Decoder.GetAdTemp(BitConverter.ToInt16(new[] {tempRefBytes[1], tempRefBytes[0]}));
+                                frameTemperatures[temp1Ch] = temp1Value;
+                                frameTemperatures[temp2Ch] = temp2Value;
                             }
                             else
                             {
@@ -1295,28 +1354,38 @@ public class GeneralProtocolHandler : FxProtocolHandler
                                 Array.Reverse(tempRefBytes);
                                 var ptRes = BitConverter.ToUInt32(tempBytes, 0);
                                 var refRes = BitConverter.ToUInt32(tempRefBytes, 0);
-                                var aloneTemp = _pt1000Decoder.GetResult(ptRes, refRes);
+                                var aloneTemp = Pt1000Decoder.GetResult(ptRes, refRes);
                                 if (aloneTemp.HasValue)//独立温度 则8个通道都缓存独立温度数值
                                 {
                                     for (var i = 0; i < device.UsChannelCount; i++)
                                     {
                                         var tempChannel = Convert.ToUInt16(i + 1);
-                                        SessionContext.StoreChannelTemp(session, device.Address, tempChannel, aloneTemp.Value);
+                                        frameTemperatures[tempChannel] = aloneTemp.Value;
                                     }
                                 }
                             }
                             
+                            var availableChannelTemps = frameTemperatures.Count > 0
+                                ? frameTemperatures
+                                    .Select(item => (Address: device.Address, Channel: item.Key, Temperature: item.Value))
+                                    .ToList()
+                                : SessionContext.GetChannelTemps(session);
+                            foreach (var kvResult in multiChResult.Results)
+                            {
+                                var chResult = kvResult.Value;
+                                chResult.ReceiveTime = multiChResult.ReceiveTime;
+                                chResult.RawTemp = ResolveSourceChannelTemperature(session, device.Address, kvResult.Key,
+                                    frameTemperatures: frameTemperatures);
+                            }
                             foreach (var kvResult in multiChResult.Results)
                             {
                                 var chConfig = SessionContext.GetChannelConfig(session, device.Address, kvResult.Key);
                                 var chResult = kvResult.Value;
-                                chResult.ReceiveTime = multiChResult.ReceiveTime;
-                                chResult.SpTemp = SessionContext.GetChannelTemp(session, device.Address, kvResult.Key);
                                 //小窗口在线中值滤波
                                 chResult.EchoTime = (decimal) GetMedianValue(session, chResult.Address, chResult.Channel, 
                                     nameof(ChannelResult.EchoTime), (double) chResult.EchoTime!);
-                                chResult.SpTemp = (decimal) GetMedianValue(session, chResult.Address, chResult.Channel,
-                                    nameof(ChannelResult.SpTemp), (double) chResult.SpTemp!, 10);
+                                ResolveEffectiveChannelTemperature(session, chResult, chConfig, availableChannelTemps,
+                                    chResult.ReceiveTime);
                                 if (chResult.HighAi.HasValue)
                                 {
                                     chResult.HighAi = (ushort) GetMedianValue(session, chResult.Address, chResult.Channel, 
@@ -1327,18 +1396,18 @@ public class GeneralProtocolHandler : FxProtocolHandler
                                     chResult.LowAi = (ushort) GetMedianValue(session, chResult.Address, chResult.Channel, 
                                         nameof(ChannelResult.LowAi), (double) chResult.LowAi);
                                 }
-                                chResult.Angle = Convert.ToInt16(GetMedianValue(session, chResult.Address, chResult.Channel, 
-                                    nameof(ChannelResult.Angle), chResult.Angle!.Value));
-                                if (chConfig is {RefTime: not null, RefTemp: not null})//包含参考值则计算声时差
+                                if (chResult.Angle.HasValue)
                                 {
-                                    var tempCoefficient = chConfig.TempCoefficient ?? CalculateExtensions.DefaultTempCoeff;
-                                    chResult.DeltaTof = CalculateExtensions.CalcDeltaTof(chConfig.RefTime.Value, chConfig.RefTemp.Value, (decimal) chResult.EchoTime!,
-                                        chResult.SpTemp!.Value, chConfig.TcMode, tempCoefficient);
+                                    chResult.Angle = Convert.ToInt16(GetMedianValue(session, chResult.Address, chResult.Channel,
+                                        nameof(ChannelResult.Angle), chResult.Angle!.Value));
                                 }
+                               
+                                chResult.DeltaTof = CalculateDeltaTof(chConfig, (decimal) chResult.EchoTime!,
+                                    chResult.SpTemp);
                             }
                             decodedList.Add(multiChResult);
-                            ContextData.RemoveRange(0,decodedFrame.Count);
-                            _headBeginIdx = -1;
+                            ConsumeContext(frameSize);
+                            HeadBeginIdx = -1;
                             
                             frameCount++;
                             if (frameCount > MaxFramesPerBatch)//单次处理超限制时暂时退出解码任务
@@ -1349,14 +1418,15 @@ public class GeneralProtocolHandler : FxProtocolHandler
                         else
                         {
                             ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                            _headBeginIdx = -1;
+                            HeadBeginIdx = -1;
                             break;
                         }
                     }
-                    catch (Exception)
+                    catch (Exception ex)
                     {
+                        LogDecodeWarning(session, nameof(DecodeMultiChannelResults), HeadBeginIdx, ex);
                         ContextData.RemoveAt(0); //删除首个元素，继续往后找
-                        _headBeginIdx = -1;
+                        HeadBeginIdx = -1;
                         break;
                     }
                 }
@@ -1364,9 +1434,9 @@ public class GeneralProtocolHandler : FxProtocolHandler
         }
         catch (Exception e)
         {
-            Logger.Error($"{nameof(DecodeMultiChannelResults)} 异常. 细节:{e.Message}");
+            LogDecodeWarning(session, $"{nameof(DecodeMultiChannelResults)}Outer", HeadBeginIdx, e);
             ContextData.RemoveAt(0); //删除首个元素，继续往后找
-            _headBeginIdx = -1;
+            HeadBeginIdx = -1;
         }
         return decodedList;
     }
@@ -1382,22 +1452,22 @@ public class GeneralProtocolHandler : FxProtocolHandler
             token.ThrowIfCancellationRequested();
             try
             {
-                if (_headBeginIdx < 0) //如果之前还未找到帧头
+                if (HeadBeginIdx < 0) //如果之前还未找到帧头
                 {
-                    _headBeginIdx = ByteUtility.IndexOf(ContextData, DecFullWaveFrameHead);
-                    if (_headBeginIdx < 0)
+                    HeadBeginIdx = ByteUtility.IndexOf(ContextData, DecFullWaveFrameHead);
+                    if (HeadBeginIdx < 0)
                     {
                         var removeLength = ContextData.Count - DecFullWaveFrameHead.Length;
-                        ContextData.RemoveRange(0,removeLength); //保留 4 个字节确保帧头不被清理
+                        ConsumeContext(removeLength); //保留 4 个字节确保帧头不被清理
                         break; //找不到帧头，清理前面的数据 等待新的数据再开始解析
                     }
                 }
 
                 //找到帧头，清理帧头以前的数据
-                if (_headBeginIdx > 0)
+                if (HeadBeginIdx > 0)
                 {
-                    ContextData.RemoveRange(0,_headBeginIdx);
-                    _headBeginIdx = 0;
+                    ConsumeContext(HeadBeginIdx);
+                    HeadBeginIdx = 0;
                 }
 
                 //如果找到了帧头，则继续长度字节的寻找
@@ -1413,7 +1483,7 @@ public class GeneralProtocolHandler : FxProtocolHandler
                     }
                     CurrentAcqTime = DateTime.Now;//全波采集时间采用当前时间
                     
-                    var decodedFrame = ContextData.GetRange(0,endIdx - _headBeginIdx).ToList();
+                    var decodedFrame = ContextData.GetRange(0,endIdx - HeadBeginIdx).ToList();
                     var waveStartIdx = DecFullWaveFrameHead.Length + 3 + 3;
                     var waveData = new List<short>();
                     for (var i = 0; i < dataLen; i++)
@@ -1428,37 +1498,39 @@ public class GeneralProtocolHandler : FxProtocolHandler
                             waveData.Add(dataByte);
                         }
                     }
-                    var channelResult = new ChannelResult
-                    {
-                        ReceiveTime = CurrentAcqTime.Value, 
-                        HexString = ByteUtility.BytesToHexStr(decodedFrame),
-                        EchoWave = new EchoWave
-                        {
+	                    var channelResult = new ChannelResult
+	                    {
+	                        ReceiveTime = CurrentAcqTime.Value, 
+	                        HexString = BuildDiagnosticHexString(decodedFrame),
+	                        EchoWaveKind = EchoWaveKind.LongitudinalFull,
+	                        EchoWave = new EchoWave
+	                        {
                             ClockInt = Convert.ToUInt16(OriginalInterval),
                             EchoStart = 120,
                             WaveData = waveData,
                         },
                     };
                     decodedList.Add(channelResult);
-                    ContextData.RemoveRange(0,decodedFrame.Count);
-                    _headBeginIdx = -1;
+                    ConsumeContext(decodedFrame.Count);
+                    HeadBeginIdx = -1;
                 }
                 else
                 {
                     break;
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                LogDecodeWarning(session, nameof(DecodeFullWaveResults), HeadBeginIdx, ex);
                 ContextData.RemoveAt(0);//删除首个元素 继续找
-                _headBeginIdx = -1;
+                HeadBeginIdx = -1;
                 break;
             }
         }
         return decodedList;
     }
     #endregion
-    private bool IsFrameTailValid(List<byte> frameData, byte[] frameTail)
+    protected static bool IsFrameTailValid(List<byte> frameData, byte[] frameTail)
     {
         // 检查 frameData 的长度是否足够包含帧尾
         if (frameData.Count < frameTail.Length)

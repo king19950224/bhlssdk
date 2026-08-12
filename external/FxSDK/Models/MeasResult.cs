@@ -16,6 +16,24 @@ public class MultiChannelResult : DecodedResult
     }
 }
 /// <summary>
+/// 超声波形类型
+/// </summary>
+public enum EchoWaveKind
+{
+    /// <summary>
+    /// 纵波
+    /// </summary>
+    Longitudinal = 0,
+    /// <summary>
+    /// 横波
+    /// </summary>
+    Transverse = 1,
+    /// <summary>
+    /// 纵波全波
+    /// </summary>
+    LongitudinalFull = 2
+}
+/// <summary>
 /// 单个通道测量结果
 /// </summary>
 public class ChannelResult : DecodedResult
@@ -25,16 +43,9 @@ public class ChannelResult : DecodedResult
     /// </summary>
     public ushort Channel { get; set; } = 1;
     /// <summary>
-    /// 状态码
-    /// 0 正常
-    /// -1 表示信号过小
-    /// -2 阈值异常
-    /// -3 信号溢出
-    /// -4 相似度低
-    /// -5 未知异常
-    /// -6 信噪比低
+    /// 测量状态码
     /// </summary>
-    public short StatusCode { get; set; } = 0;
+    public MeasStatusCode StatusCode { get; set; } = MeasStatusCode.Normal;
     /// <summary>
     /// 回波声时
     /// </summary>
@@ -44,7 +55,11 @@ public class ChannelResult : DecodedResult
     /// </summary>
     public decimal? EchoTime2 { get; set; }
     /// <summary>
-    /// 温度
+    /// 原始温度
+    /// </summary>
+    public decimal? RawTemp { get; set; }
+    /// <summary>
+    /// 保护和 Tau 平滑后的有效温度
     /// </summary>
     public decimal? SpTemp { get; set; }
     /// <summary>
@@ -55,6 +70,10 @@ public class ChannelResult : DecodedResult
     /// 回波模型
     /// </summary>
     public EchoWave? EchoWave { get; set; }
+    /// <summary>
+    /// 回波波形类型
+    /// </summary>
+    public EchoWaveKind EchoWaveKind { get; set; } = EchoWaveKind.Longitudinal;
     /// <summary>
     /// 低电平值
     /// </summary>
@@ -70,11 +89,11 @@ public class ChannelResult : DecodedResult
     /// <summary>
     /// 解码参数数组
     /// </summary>
-    public decimal[] ParamsArray { get; set; }
+    public decimal[] ParamsArray { get; set; } = Array.Empty<decimal>();
     /// <summary>
-    /// 中间结果值
+    /// 回波辅助信息
     /// </summary>
-    public decimal[] MidResults { get; set; }
+    public EchoAssist? Assist { get; set; }
 }
 /// <summary>
 /// 回波数据模型

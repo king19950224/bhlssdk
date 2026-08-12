@@ -8,7 +8,9 @@ namespace FxSDK.Codec;
 
 public class MultiChIotProtocolHandler : FxProtocolHandler
 {
-    private static readonly ILogger Logger = LogManager.GetCurrentClassLogger();
+    private static readonly ILogger Logger = LogManager.GetLogger(nameof(MultiChIotProtocolHandler));
+    private const int LogPreviewByteCount = 32;
+    private static readonly TimeSpan RepeatedFrameLogInterval = TimeSpan.FromSeconds(5);
     private static readonly byte[] FrameHead = {0xDE, 0xDE, 0xDE, 0xDE};
     private static readonly byte[] FrameTail = {0x00, 0x00, 0x00, 0x00};
     private static readonly byte[] WakeupHead = {0xF0, 0xF0, 0xF0, 0xF0, 0xF0};
@@ -20,8 +22,8 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
     private const decimal OriginalInterval = 125M; //原始点间隔
     private const decimal InterpolationInterval = 25M; //插值时间间隔
     public const short NoiseBase = 50;
-    public const short SignalMax = 700;
-    public const short SignalAuto = 600;
+    public const short SignalMax = 600;
+    public const short SignalAuto = 400;
     public static readonly double[] GainRange = {1, 47};
     public static readonly decimal GainStep = 1M;//增益步长
     public const ushort LoraWaitMs = 400;//lora发送等待
@@ -76,7 +78,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             else if (propertyName.Equals(nameof(config.MCRConfig))) //配置轮询参数
             {
                 //构建写参数命令,支持LoraMesh多终端
-                for (ushort i = 1; i <= config.MaxTerminal; i++)
+                foreach (var i in ResolveTerminalAddresses(config))
                 {
                     if (config.TransferMode == 0)
                     {
@@ -91,7 +93,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                     SessionContext.StoreToSession(session,mcrCommand,i);
                     var pendingCount = SessionContext.GetPendingCommands(session,i).Count;
                     var devParameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount), pendingCount){Address = i};
-                    session.FireSessionDecodedResultReceived(new DecodedResult[] {devParameter});
+                    session.EnqueueDecodedResults(new DecodedResult[] {devParameter});
                 }
             }
             else if (propertyName.Equals(nameof(config.MeasConfig))) //配置测量参数
@@ -140,7 +142,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             else
             {
                 throw new ArgumentException(
-                    "Invalid property name provided. Supported property names for configuration include: 'Address', 'MCRConfig', 'MeasConfig', 'BaudRate', 'LoraConfig', and 'NetCheckConfig'."
+                    "Invalid property name provided. Supported property names for configuration include: 'Address', 'MCRConfig', 'MeasConfig', and 'BaudRate'."
                 );
             }
         }
@@ -270,21 +272,24 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                 }
                 else if (propertyName.Equals(nameof(config.RefTime))) //配置初始化信息
                 {
+                    if (config.RefTime == null || config.LEchoWave == null || config.LEchoWave.WaveData == null)
+                        return encodeMessages;
+                    var refTemp = config.RefTemp ?? CalculateExtensions.StandardTemperature;
                     var storageBytes = new List<byte>();
                     //测量方法(1)-阈值/动态特征(2)-参考TOF(4-ns)+参考温度0.01°C(2)+波形起始时间(2)+参考波形(120*2)
                     var measByte = Convert.ToByte(config.MeasMode);
                     var measValBytes = BitConverter.GetBytes(config.Threshold);
-                    var refTofBytes = BitConverter.GetBytes(Convert.ToUInt32(config.RefTime!.Value));
-                    var refTempBytes = BitConverter.GetBytes(Convert.ToInt16(config.RefTemp!.Value * 100));
-                    var echoStartBytes = BitConverter.GetBytes(Convert.ToUInt16(config.LEchoWave!.EchoStart / 1000)); //us
+                    var refTofBytes = BitConverter.GetBytes(Convert.ToUInt32(config.RefTime.Value));
+                    var refTempBytes = BitConverter.GetBytes(Convert.ToInt16(refTemp * 100));
+                    var echoStartBytes = BitConverter.GetBytes(Convert.ToUInt16(config.LEchoWave.EchoStart / 1000)); //us
                     storageBytes.Add(measByte);
                     storageBytes.AddRange(measValBytes);
                     storageBytes.AddRange(refTofBytes);
                     storageBytes.AddRange(refTempBytes);
                     storageBytes.AddRange(echoStartBytes);
                     var refEchoWave = config.LEchoWave;
-                    var savePts = refEchoWave.WaveData!.Select(o => (double)o).ToList();
-                    if (refEchoWave.WaveData!.Count > StorageMaxPts)
+                    var savePts = refEchoWave.WaveData.Select(o => (double)o).ToList();
+                    if (refEchoWave.WaveData.Count > StorageMaxPts)
                     {
                         var waveDataDouble = refEchoWave.WaveData.Select(o => (double) o).ToList();
                         savePts = SignalProcessor.InterpolateAndResample(waveDataDouble, refEchoWave.ClockInt, OriginalInterval);
@@ -329,6 +334,14 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
         var device = SessionContext.GetDeviceConfig(session);
         if (device != null)
         {
+            if (mode != WorkMode.FullWaveRead)
+            {
+                lock (_fullWaveList)
+                {
+                    _fullWaveReadActive = false;
+                    _fullWaveList.Clear();
+                }
+            }
             if (device.TransferMode == 0)
             {
                 encodeMessages.Add(FxUtility.Delay500Ms);//loraMesh 设备加入等待
@@ -339,18 +352,20 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                 case WorkMode.SingleMeas:
                     SessionContext.ClearPendingCommands(session, address);
                     var m1Parameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount),0) {Address = address};
-                    session.FireSessionDecodedResultReceived(new DecodedResult[] {m1Parameter});
+                    session.EnqueueDecodedResults(new DecodedResult[] {m1Parameter});
                     encodeMessages.Add(WrapCommand(device, address, BuildModeCommand(address, 0x02, new[] {(byte) channel})));
                     break;
                 case WorkMode.ReadParam:
                     SessionContext.ClearPendingCommands(session, address);
                     var r1Parameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount),0) {Address = address};
-                    session.FireSessionDecodedResultReceived(new DecodedResult[] {r1Parameter});
+                    session.EnqueueDecodedResults(new DecodedResult[] {r1Parameter});
                     break;
                 case WorkMode.MultiMeas:
                     //监测时需要多终端启动
-                    for (ushort i = 1; i <= device.MaxTerminal; i++)
+                    foreach (var i in ResolveTerminalAddresses(device))
                     {
+                        // 新模式开始前清理旧挂起命令，避免重启/扫波残留命令把设备拉回单通道流。
+                        SessionContext.ClearPendingCommands(session, i);
                         if (device.TransferMode == 0)
                         {
                             encodeMessages.Add(FxUtility.Delay500Ms);//loraMesh 设备加入等待
@@ -361,26 +376,34 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                         SessionContext.StoreToSession(session,multiMeasCommand,i);
                         var pendingCount = SessionContext.GetPendingCommands(session,i).Count;
                         var s2Parameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount), pendingCount){Address = i};
-                        session.FireSessionDecodedResultReceived(new DecodedResult[] {s2Parameter});
+                        session.EnqueueDecodedResults(new DecodedResult[] {s2Parameter});
                     }
                     break;
                 case WorkMode.FullWaveRead:
+                    lock (_fullWaveList)
+                    {
+                        _fullWaveList.Clear();
+                        _fullWaveAddress = address;
+                        _fullWaveChannel = channel;
+                        _fullWaveReadActive = true;
+                    }
                     SessionContext.ClearPendingCommands(session, address);
                     var s3Parameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount),0) {Address = address};
-                    session.FireSessionDecodedResultReceived(new DecodedResult[] {s3Parameter});
+                    session.EnqueueDecodedResults(new DecodedResult[] {s3Parameter});
                     encodeMessages.Add(WrapCommand(device, address,
                         BuildModeCommand(address, 0x04, new[] {(byte) channel})));
                     break;
                 case WorkMode.Reboot:
                     SessionContext.ClearPendingCommands(session, address);
                     var s4Parameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount),0) {Address = address};
-                    session.FireSessionDecodedResultReceived(new DecodedResult[] {s4Parameter});
+                    session.EnqueueDecodedResults(new DecodedResult[] {s4Parameter});
                     encodeMessages.Add(WrapCommand(device, address, BuildModeCommand(address, 0x5A)));
                     break;
                 case WorkMode.Standby:
                 default:
                     if (channel > 0)//通道停止 只涉及当前终端
                     {
+                        SessionContext.ClearPendingCommands(session, address);
                         var stop1CmdBytes = WrapCommand(device, address, BuildModeCommand(address, 0x11));
                         var stop2CmdBytes = WrapCommand(device, address, BuildModeCommand(address, 0x01));
                         if (device.TransferMode == 0)
@@ -398,12 +421,13 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                         SessionContext.StoreToSession(session,stop2CmdBytes,address);
                         var pendingCount = SessionContext.GetPendingCommands(session,address).Count;
                         var s5Parameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount),pendingCount) {Address = address};
-                        session.FireSessionDecodedResultReceived(new DecodedResult[] {s5Parameter});
+                        session.EnqueueDecodedResults(new DecodedResult[] {s5Parameter});
                     }
                     else //监测停止 处理所有终端
                     {
-                        for (ushort i = 1; i <= device.MaxTerminal; i++)
+                        foreach (var i in ResolveTerminalAddresses(device))
                         {
+                            SessionContext.ClearPendingCommands(session, i);
                             if (device.TransferMode == 0)
                             {
                                 encodeMessages.Add(FxUtility.Delay500Ms);//loraMesh 设备加入等待
@@ -420,7 +444,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                             SessionContext.StoreToSession(session,stop2CmdBytes,i);
                             var pendingCount = SessionContext.GetPendingCommands(session,i).Count;
                             var s6Parameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount),pendingCount) {Address = i};
-                            session.FireSessionDecodedResultReceived(new DecodedResult[] {s6Parameter});
+                            session.EnqueueDecodedResults(new DecodedResult[] {s6Parameter});
                         }
                     }
                     break;
@@ -428,6 +452,24 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
         }
         return encodeMessages;
     }
+
+    private static IReadOnlyList<ushort> ResolveTerminalAddresses(DeviceConfig device)
+    {
+        var configuredAddresses = device.TerminalAddresses
+            .Where(address => address > 0)
+            .Distinct()
+            .OrderBy(address => address)
+            .ToArray();
+        if (configuredAddresses.Length > 0)
+        {
+            return configuredAddresses;
+        }
+
+        return Enumerable.Range(1, Math.Max(1, (int)device.MaxTerminal))
+            .Select(value => (ushort)value)
+            .ToArray();
+    }
+
     public override IReadOnlyList<object> EncodeReadDeviceParameter(IoSession session, string propertyName, ushort address = 1)
     {
         var encodeMessages = new List<object>();
@@ -645,15 +687,26 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
     }
     #endregion
     #region 按照协议解码数据
+    private string? _lastCrcMismatchSignature;
+    private DateTime _lastCrcMismatchLogTime = DateTime.MinValue;
+
     protected override List<DecodedResult> DoDecode(IoSession session, CancellationToken token)
     {
         var decodedResults = new List<DecodedResult>();
+        bool fullWaveReadActive;
+        lock (_fullWaveList)
+        {
+            fullWaveReadActive = _fullWaveReadActive;
+        }
+        if (fullWaveReadActive)
+        {
+            decodedResults.AddRange(DecodeFullWaveResults(session, token));
+            return decodedResults;
+        }
+
         var deviceMode = SessionContext.GetDeviceMode(session);
         switch (deviceMode)
         {
-            case WorkMode.FullWaveRead:
-                decodedResults.AddRange(DecodeFullWaveResults(session, token));
-                break;
             case WorkMode.LWaveRead:
             case WorkMode.SingleMeas:
             case WorkMode.MultiMeas:
@@ -661,11 +714,14 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             default://保留时 解析数据帧并触发结果
                 decodedResults.AddRange(DecodeResults(session, token,false));
                 break;
+            // case WorkMode.Standby:
+            // default:
+            //     ClearContext();//待机或者未知状态不处理数据
+            //     break;
         }
         return decodedResults;
     }
     private int _headBeginIdx = -1; //动态解析头索引
-    private long _crcErrorCount; //CRC 失败帧累计（日志节流用：第 1 帧和之后每 100 帧记一次）
     /// <summary>
     /// 解码结果
     /// </summary>
@@ -685,7 +741,10 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                     if (_headBeginIdx < 0)
                     {
                         var removeLength = ContextData.Count - FrameHead.Length; //保留帧头个数字节确保帧头不被清理
-                        ContextData.RemoveRange(0,removeLength);
+                        Logger.Warn(
+                            "Multi-channel protocol discarded bytes without frame head. RemovedBytes={RemovedBytes}, BufferBytes={BufferBytes}, Preview={Preview}",
+                            removeLength, ContextData.Count, FormatHexPreview(ContextData));
+                        ConsumeContext(removeLength);
                         break; //找不到帧头，清理帧头前的无效字节，然后退出循环等待完整帧数据
                     }
                 }
@@ -693,7 +752,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                 //帧头已找到，清理帧头前面的无效字节
                 if (_headBeginIdx > 0)
                 {
-                    ContextData.RemoveRange(0,_headBeginIdx);
+                    ConsumeContext(_headBeginIdx);
                     _headBeginIdx = 0;
                 }
 
@@ -759,43 +818,62 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                                             _ = session.SendMsgAsync(new List<object> { command });
                                             var devParameter = new DeviceParameter(nameof(DeviceConfig.PendingCmdCount),
                                                 pendingCommands.Count) {Address = address};
-                                            session.FireSessionDecodedResultReceived(new DecodedResult[] {devParameter});
+                                            session.EnqueueDecodedResults(new DecodedResult[] {devParameter});
                                             FxUtility.Sleep(50);
                                         }
                                         break;
                                     case 0x81:
-                                    case 0x91: //其他回应先忽略
+                                    case 0x91:
+                                    case 0xA1: //写参数回应先忽略，但必须消费完整帧，避免破坏后续帧头
                                         isComplete = true;
                                         break;
                                 }
 
                                 if (isComplete)
                                 {
-                                    ContextData.RemoveRange(0,decodedFrame.Count);                     
+                                    ConsumeContext(decodedFrame.Count);                     
                                     _headBeginIdx = -1;
                                 }
                             }
-                            catch (Exception ex)
+                            catch (Exception)
                             {
-                                Logger.Warn(ex, "解码指令帧失败（按坏帧丢弃重同步）");
+                                Logger.Warn(
+                                    "Multi-channel protocol frame decode failed. FrameBytes={FrameBytes}, Command=0x{Command:X2}, Address={Address}, Channel={Channel}, Preview={Preview}",
+                                    decodedFrame.Count,
+                                    decodedFrame.Count > 8 ? decodedFrame[8] : 0,
+                                    decodedFrame.Count > 7 ? BitConverter.ToUInt16(new[] {decodedFrame[6], decodedFrame[7]}) : 0,
+                                    decodedFrame.Count > 9 ? decodedFrame[9] : 0,
+                                    FormatHexPreview(decodedFrame));
                                 isComplete = false;
                             }
                             if (!isComplete) //收到错误数据帧
                             {
-                                ContextData.RemoveAt(0);
+                                // CRC 已验证，帧边界可信；丢弃当前完整帧，避免重复解析。
+                                ConsumeContext(decodedFrame.Count);
                                 _headBeginIdx = -1;
+                                continue;
                             }
                         }
-                        else //CRC 校验失败：链路误码（RS485-TCP 桥上会出现）
+                        else
                         {
-                            // 原实现这里什么都不做，缓冲不前进，下轮仍从同一坏帧解起，空转到解码超时。
-                            // 删 1 字节破坏当前帧头，让 IndexOf 同步到下一个帧头；
-                            // 不按 frameSize 整帧跳：长度字段本身可能就是被打坏的字节，跳错会吞掉后面的好帧。
-                            _crcErrorCount++;
-                            if (_crcErrorCount == 1 || _crcErrorCount % 100 == 0)
-                                Logger.Warn($"CRC 校验失败（累计 {_crcErrorCount} 帧），丢弃 1 字节重新同步帧头");
-                            ContextData.RemoveAt(0);
-                            _headBeginIdx = -1;
+                            var expectedCrc = ByteUtility.BytesToHexStr(crcCalcBytes);
+                            var actualCrc = ByteUtility.BytesToHexStr(crcGetBytes.ToArray());
+                            var preview = FormatHexPreview(decodedFrame);
+                            var signature = $"{decodedFrame.Count}|{expectedCrc}|{actualCrc}|{preview}";
+                            if (ShouldLogCrcMismatch(signature))
+                            {
+                                Logger.Warn(
+                                    "Multi-channel protocol CRC mismatch. FrameBytes={FrameBytes}, Command=0x{Command:X2}, Address={Address}, Channel={Channel}, ExpectedCrc={ExpectedCrc}, ActualCrc={ActualCrc}, Preview={Preview}",
+                                    decodedFrame.Count,
+                                    decodedFrame.Count > 8 ? decodedFrame[8] : 0,
+                                    decodedFrame.Count > 7 ? BitConverter.ToUInt16(new[] {decodedFrame[6], decodedFrame[7]}) : 0,
+                                    decodedFrame.Count > 9 ? decodedFrame[9] : 0,
+                                    expectedCrc,
+                                    actualCrc,
+                                    preview);
+                            }
+                            ResynchronizeAfterCorruptFrame();
+                            continue;
                         }
                     }
                     else
@@ -810,13 +888,60 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             }
             catch (Exception ex)
             {
-                Logger.Warn(ex, "解码异常，丢弃 1 字节重新同步帧头");
-                ContextData.RemoveAt(0); //删除最前面的元素 重新检索
-                _headBeginIdx = -1; //重新找头
-                break;
+                Logger.Warn(
+                    ex,
+                    "Multi-channel protocol decode loop failed. Resynchronizing. BufferBytes={BufferBytes}, Preview={Preview}",
+                    ContextData.Count,
+                    FormatHexPreview(ContextData));
+                ResynchronizeAfterCorruptFrame();
+                continue;
             }
         }
         return decodedList;
+    }
+
+    /// <summary>
+    /// 坏帧长度字段也可能不可信，因此从当前帧头之后重新寻找下一帧头。
+    /// 未找到完整帧头时只保留可能跨接收批次的帧头前缀。
+    /// </summary>
+    private void ResynchronizeAfterCorruptFrame()
+    {
+        var nextHeadIndex = ByteUtility.IndexOf(ContextData, FrameHead, 1);
+        if (nextHeadIndex > 0)
+        {
+            ConsumeContext(nextHeadIndex);
+        }
+        else
+        {
+            var retainCount = Math.Min(FrameHead.Length - 1, ContextData.Count);
+            ConsumeContext(ContextData.Count - retainCount);
+        }
+        _headBeginIdx = -1;
+    }
+
+    private bool ShouldLogCrcMismatch(string signature)
+    {
+        var now = DateTime.UtcNow;
+        if (_lastCrcMismatchSignature == signature && now - _lastCrcMismatchLogTime < RepeatedFrameLogInterval)
+        {
+            return false;
+        }
+
+        _lastCrcMismatchSignature = signature;
+        _lastCrcMismatchLogTime = now;
+        return true;
+    }
+
+    private static string FormatHexPreview(IReadOnlyCollection<byte> bytes)
+    {
+        if (bytes.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var preview = bytes.Take(LogPreviewByteCount).ToArray();
+        var suffix = bytes.Count > LogPreviewByteCount ? " ..." : string.Empty;
+        return $"{ByteUtility.BytesToHexStr(preview)}{suffix}";
     }
     /// <summary>
     /// 通过波形计算结果
@@ -824,52 +949,87 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
     private void ProcessResult(IoSession session, ChannelResult chResult, bool rawData = true)
     {
         var channelConfig = SessionContext.GetChannelConfig(session, chResult.Address, chResult.Channel);
-        if (channelConfig != null)
+        chResult.RawTemp = ResolveSourceChannelTemperature(session, chResult.Address, chResult.Channel, chResult.SpTemp);
+        ResolveEffectiveChannelTemperature(session, chResult, channelConfig, sampleTime: chResult.ReceiveTime);
+        // 动态特征法和阈值法仍要求配置有效探头频率后再做带通处理；自动法允许频率为 0，
+        // 此时 BandPassFilter 只去除直流分量，再由主回波的稳定上升沿间距估算实际周期。
+        var canProcessWithoutProbeFrequency = channelConfig?.MeasMode == 0;
+        if (!rawData && channelConfig != null &&
+            (channelConfig.ProbeFreq > 0 || canProcessWithoutProbeFrequency) &&
+            chResult.EchoWave is {WaveData.Count: > 2}) 
         {
-            chResult.SpTemp = GetOrAddTemperature(session, chResult.Address, chResult.Channel, chResult.SpTemp!.Value);
-        }
-        //频率>0, 波形点数>2 需要对数据进行处理
-        if (!rawData && channelConfig is {ProbeFreq: > 0} && chResult.EchoWave is {WaveData.Count: > 2}) 
-        {
-            var waveDataDouble = chResult.EchoWave?.WaveData!.Select(Convert.ToDouble).ToList();
+            var waveDataDouble = chResult.EchoWave?.WaveData!.Select(Convert.ToDouble).ToArray()!;
+            var probeFreq = Convert.ToDouble(channelConfig.ProbeFreq * 1000000);
             //回波波形分析
-            waveDataDouble = SignalProcessor.BandPassFilter(waveDataDouble!, SampleRate,Convert.ToDouble(channelConfig.ProbeFreq * 1000000));
-            var interpolationSignal = SignalProcessor.InterpolateAndResample(waveDataDouble, OriginalInterval, InterpolationInterval);
+            var waveDataList = SignalProcessor.BandPassFilter(waveDataDouble.ToList(), SampleRate, probeFreq);
+            var interpolationSignal = SignalProcessor.InterpolateAndResample(waveDataList, OriginalInterval, InterpolationInterval);
             //计算回波时间
-            var midResults = new decimal[] { };
+            EchoAssist assist;
             var zeroIdx = -1d;
-            if(channelConfig.MeasMode == 0) //自动数峰法
+            // 回波区域检测的最小连续宽度。这里是去除短尖峰的形态学门槛，
+            // 不是“一个载波周期”；真实周期由自动法在主回波内实测或按探头频率解析。
+            var consecutive = 20;
+            EnvelopeTrackingContext? trackingContext = null;
+            var isEnvelopeScan = false;
+            if(channelConfig.MeasMode == 0) //自动法(显著回波法)
             {
-                zeroIdx = CalculateExtensions.CalcZeroIndexAuto(interpolationSignal, InterpolationInterval, out midResults, NoiseBase);
+                trackingContext = SessionContext.GetEnvelopeTrackingContext(session, chResult.Address, chResult.Channel);
+                isEnvelopeScan = SessionContext.GetDeviceMode(session, chResult.Address) == WorkMode.LWaveRead;
+                // 扫波必须重新捕获当前工件的 F0/Z0，不使用旧锚点；正式测量和监测优先使用
+                // 本轮扫波锚点，没有运行期锚点时再使用置零后持久化的 RefEnvTime/RefTime。
+                trackingContext.ReferenceEchoTime = isEnvelopeScan
+                    ? null
+                    : trackingContext.TrackingEchoTime ?? channelConfig.RefTime;
+                trackingContext.ReferenceEnvTime = isEnvelopeScan
+                    ? null
+                    : trackingContext.TrackingEnvTime ?? channelConfig.RefEnvTime;
+                // 扫波阶段每帧独立实测周期并形成中位周期；正式测量/监测优先使用
+                // 本轮扫波的稳定周期，重启后再使用置零持久化的 RefPeriodNs。
+                trackingContext.ReferencePeriodNs = isEnvelopeScan
+                    ? null
+                    : trackingContext.TrackingPeriodNs ?? channelConfig.RefPeriodNs;
+                trackingContext.EchoStart = chResult.EchoWave!.EchoStart;
+                trackingContext.ProbeFreqMhz = channelConfig.ProbeFreq;
+                zeroIdx = CalculateExtensions.CalcZeroIndexByEnvelopeGuidedZero(interpolationSignal,
+                    InterpolationInterval, out assist, consecutive, NoiseBase, trackingContext);
             }
             else if(channelConfig.MeasMode == 1)//动态特征法
             {
-                zeroIdx = CalculateExtensions.CalcZeroIndexByEnv(interpolationSignal, InterpolationInterval, out midResults, NoiseBase);
+                zeroIdx = CalculateExtensions.CalcZeroIndexByEnv(interpolationSignal, InterpolationInterval, out assist,
+                    consecutive, NoiseBase);
             }
             else//阈值法
             {
-                zeroIdx = CalculateExtensions.CalcZeroIndexByThrSignal(interpolationSignal, InterpolationInterval, out midResults, NoiseBase, channelConfig.Threshold);
+                zeroIdx = CalculateExtensions.CalcZeroIndexByThrSignal(interpolationSignal, InterpolationInterval, out assist,
+                    NoiseBase, channelConfig.Threshold);
             }
+            // 即使最终过零点未通过筛选，也保留主回波区域和 F/Fy 等诊断信息，
+            // 配置界面可以明确区分“未找到主回波”和“已找到主回波但未找到合格过零点”。
+            chResult.Assist = assist;
             if (zeroIdx >= 0)
             {
-                chResult.EchoTime = chResult.EchoWave!.EchoStart + (decimal) zeroIdx * InterpolationInterval;
+                var rawEchoTime = chResult.EchoWave!.EchoStart + (decimal) zeroIdx * InterpolationInterval;
+                chResult.EchoTime = rawEchoTime;
+                if (channelConfig.MeasMode == 0 && trackingContext != null && assist.Fx.HasValue)
+                {
+                    var hasPersistentAnchor = channelConfig.RefTime.HasValue && channelConfig.RefEnvTime.HasValue;
+                    if (isEnvelopeScan || (!trackingContext.HasTrackingAnchor && !hasPersistentAnchor))
+                    {
+                        var envelopeTime = chResult.EchoWave.EchoStart + assist.Fx.Value * InterpolationInterval;
+                        SessionContext.StoreEnvelopeTrackingAnchor(session, chResult.Address, chResult.Channel,
+                            envelopeTime, rawEchoTime, assist.PeriodNs);
+                        // 将当前最多 5 帧的中位周期带到 UI，置零保存的是稳定 T0，
+                        // 而不是恰好最后一帧的单次估算值。
+                        assist.PeriodNs = trackingContext.TrackingPeriodNs ?? assist.PeriodNs;
+                    }
+                }
                 //小窗口在线中值滤波
                 chResult.EchoTime = (decimal) GetMedianValue(session, chResult.Address, chResult.Channel, 
                     nameof(ChannelResult.EchoTime), (double) chResult.EchoTime!);
-                chResult.SpTemp = (decimal) GetMedianValue(session, chResult.Address, chResult.Channel,
-                    nameof(ChannelResult.SpTemp), (double) chResult.SpTemp!, 10);
-                
-                chResult.MidResults = midResults;
-                if (channelConfig is {RefTime: not null, RefTemp: not null})
-                {
-                    var tempCoefficient = channelConfig.TempCoefficient ?? CalculateExtensions.DefaultTempCoeff;
-                    chResult.DeltaTof = CalculateExtensions.CalcDeltaTof(
-                        channelConfig.RefTime.Value, channelConfig.RefTemp.Value, (decimal) chResult.EchoTime,
-                        chResult.SpTemp!.Value, channelConfig.TcMode,tempCoefficient);
-                }
+                chResult.DeltaTof = CalculateDeltaTof(channelConfig, (decimal) chResult.EchoTime,
+                    chResult.SpTemp);
             }
-            chResult.StatusCode =
-                zeroIdx >= 0 ? (short) 0 : Convert.ToInt16(zeroIdx);
+            chResult.StatusCode = MeasStatusCodeExtensions.FromZeroIndex(zeroIdx);
             chResult.EchoWave!.WaveData =
                 interpolationSignal.Select(Convert.ToInt16).ToList();
             chResult.EchoWave.ClockInt =
@@ -890,7 +1050,18 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             var waveStartIdx = payloadIdx + 2 + 4 + 2 + 2 + 2;
             if (decodedFrame.Count > waveStartIdx)
             {
-                var decodedTime = DateTime.Now;//使用上位机时间（帧内秒/毫秒字段不用：设备时钟不可靠）
+                var decodedTime = DateTime.Now;//使用上位机时间
+                #region 时间解码(暂时不用)
+                /*var secBytes = decodedFrame.GetRange(payloadIdx + 2, 4).ToArray();
+                var msBytes = decodedFrame.GetRange(payloadIdx + 6, 2).ToArray();
+                var recSec = (int) BitConverter.ToUInt32(secBytes) % 60; //获取秒 
+                var recMilSec = (int) BitConverter.ToUInt16(msBytes); //获取毫秒 
+                if (recSec is >= 0 and <= 60 && recMilSec is >= 0 and <= 999)
+                {
+                    decodedTime = new DateTime(decodedTime.Year, decodedTime.Month, decodedTime.Day,
+                        decodedTime.Hour, decodedTime.Minute, recSec, recMilSec);
+                }*/
+                #endregion
                 var ptsCount = (decodedFrame.Count - 2 - waveStartIdx) / 2;
                 var waveData = new List<short>();
                 for (var i = 0; i < ptsCount; i++)
@@ -915,7 +1086,7 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                 isComplete = true; //匹配到完整数据
                 var channelResult = new ChannelResult
                 {
-                    HexString = ByteUtility.BytesToHexStr(decodedFrame),
+                    HexString = BuildDiagnosticHexString(decodedFrame),
                     SpTemp = spTemp,
                     EchoWave = new EchoWave
                     {
@@ -1053,9 +1224,9 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                 isComplete = true;
             }
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Logger.Warn(ex, "解码设备参数帧失败（isComplete=false，按坏帧丢弃重同步）");
+            //Console.WriteLine(ex);
         }
         return paramList;
     }
@@ -1088,9 +1259,9 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                 isComplete = true;
             }
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Logger.Warn(ex, "解码设备状态帧失败（isComplete=false，按坏帧丢弃重同步）");
+            //Console.WriteLine(ex);
         }
         return paramList;
     }
@@ -1157,9 +1328,9 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                 isComplete = true;
             }
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Logger.Warn(ex, "解码存储参数帧失败（isComplete=false，按坏帧丢弃重同步）");
+            //Console.WriteLine(ex);
         }
         return paramList;
     }
@@ -1167,102 +1338,152 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
     /// 全波列表
     /// </summary>
     private readonly List<ChannelResult> _fullWaveList = new();
-
-    /// <summary>
-    /// 缓冲清空（会话关闭 / 解码故障复位）时复位解码状态：
-    /// 帧头索引不复位，新数据会被按"帧头已在 0 位"错位解读；
-    /// 分段波形缓存里是旧数据流的残片，拼进新全波会得到错误波形。
-    /// </summary>
-    protected override void OnContextCleared()
-    {
-        _headBeginIdx = -1;
-        _fullWaveList.Clear();
-    }
+    private ushort _fullWaveAddress;
+    private ushort _fullWaveChannel;
+    private bool _fullWaveReadActive;
     /// <summary>
     /// 解码全波波形
     /// </summary>
     private List<ChannelResult> DecodeFullWaveResults(IoSession session, CancellationToken token)
     {
         var decodedList = new List<ChannelResult>();
-        var partList = DecodeResults(session, token); //获取原始波形
-        if (partList.Count > 0)
+        // 兼容现有固件：全波模式下 0x82/0x92/0x84 使用相同结果结构，
+        // 再通过目标地址、通道和完整轮次规则排除模式切换时的迟到帧。
+        var partList = DecodeResults(session, token);
+        var wavePartList = partList.OfType<ChannelResult>().ToList();
+        if (wavePartList.Count == 0)
         {
-            var wavePartList = partList.OfType<ChannelResult>().ToList();
-            if (wavePartList.Count > 0)
-            {
-                var lastPart = wavePartList.Last();
-                var config = SessionContext.GetChannelConfig(session, lastPart.Address, lastPart.Channel);
-                foreach (var partResult in wavePartList)
-                {
-                    _fullWaveList.Add(partResult); //加入到全波序列
-                    var maxEchoStart = _fullWaveList.Max(r => r.EchoWave!.EchoStart);
-                    var maxEchoStartResult = _fullWaveList.First(r => r.EchoWave!.EchoStart == maxEchoStart);
-                    var clockInt = partResult.EchoWave!.ClockInt;
-                    var maxEchoWave = maxEchoStartResult.EchoWave;
-                    if (config != null && maxEchoStart >= config.EchoWin) //全波完整
-                    {
-                        uint minEchoStart = 0; //从0位开始显示
-                        var maxLen = Convert.ToInt32(maxEchoStart / clockInt + maxEchoWave!.WaveData!.Count);
-                        var fullWaveArray = new short[maxLen];
-                        foreach (var waveResult in _fullWaveList)
-                        {
-                            var eWave = waveResult.EchoWave;
-                            var offset = Convert.ToInt32((eWave!.EchoStart - minEchoStart) / clockInt);
-                            for (var i = 0; i < eWave.WaveData!.Count; i++)
-                            {
-                                var idx = i + offset;
-                                if (idx >= 0 && idx < maxLen)
-                                {
-                                    fullWaveArray[idx] = eWave.WaveData[i];
-                                }
-                            }
-                        }
+            return decodedList;
+        }
 
-                        _fullWaveList.Clear(); //清理分段波形结果缓存
-                        var fullWaveDouble = fullWaveArray.Select(Convert.ToDouble).ToList();
-                        fullWaveDouble = SignalProcessor.BandPassFilter(fullWaveDouble, SampleRate,
-                            Convert.ToDouble(config.ProbeFreq * 1000000));
-                        var fullWaveSignal = SignalProcessor.InterpolateAndResample(fullWaveDouble, OriginalInterval,
-                            InterpolationInterval);
-                        var fullWave = new EchoWave
-                        {
-                            EchoStart = minEchoStart,
-                            ClockInt = Convert.ToUInt16(InterpolationInterval),
-                            WaveData = fullWaveSignal.Select(Convert.ToInt16).ToList(),
-                            Fc = Convert.ToUInt16(config.ProbeFreq),
-                        };
-                        var fullWaveResult = new ChannelResult
-                        {
-                            Address = lastPart.Address, Channel = lastPart.Channel,
-                            ReceiveTime = lastPart.ReceiveTime, SpTemp = lastPart.SpTemp,
-                            EchoWave = fullWave,
-                        };
-                        decodedList.Add(fullWaveResult);
-                        break;
+        lock (_fullWaveList)
+        {
+            var targetParts = wavePartList
+                .Where(r => r.Address == _fullWaveAddress && r.Channel == _fullWaveChannel)
+                .ToList();
+            foreach (var partResult in targetParts)
+            {
+                var echoStart = partResult.EchoWave!.EchoStart;
+                if (_fullWaveList.Count > 0)
+                {
+                    var currentMaxEchoStart = _fullWaveList.Max(r => r.EchoWave!.EchoStart);
+                    if (echoStart < currentMaxEchoStart)
+                    {
+                        // 起点回退表示新一轮开始。上一轮若未收到终止分段，直接丢弃，
+                        // 不能把两轮数据混合后发布成一条看似完整的波形。
+                        _fullWaveList.Clear();
                     }
+                }
+
+                if (_fullWaveList.Count == 0 && echoStart > QUnit)
+                {
+                    // 模式切换后迟到的中间包或尾包不能作为新一轮起点。
+                    continue;
+                }
+
+                var existingPartIndex = _fullWaveList.FindIndex(r =>
+                    r.EchoWave!.EchoStart == echoStart);
+                if (existingPartIndex >= 0)
+                {
+                    _fullWaveList[existingPartIndex] = partResult;
+                }
+                else
+                {
+                    _fullWaveList.Add(partResult);
+                }
+
+                // 以连续分段实际覆盖到 EchoWin 作为本轮完成条件。
+                // 短窗口可能一个分段就已覆盖完整，不能要求末段起点达到 EchoWin。
+                var completedCurrentResult = TryBuildFullWaveResult(session);
+                if (completedCurrentResult != null)
+                {
+                    decodedList.Add(completedCurrentResult);
+                    _fullWaveList.Clear();
                 }
             }
         }
+
         return decodedList;
     }
-    /// <summary>
-    /// 计算温度，考虑使用其他通道温度的问题
-    /// </summary>
-    private static decimal GetOrAddTemperature(IoSession session, ushort address, ushort channel, decimal chTemp)
+
+    private ChannelResult? TryBuildFullWaveResult(IoSession session)
     {
-       SessionContext.StoreChannelTemp(session,address, channel, chTemp);
-        var temp = chTemp;
-        var channelConfig = SessionContext.GetChannelConfig(session, address, channel);
-        if (channelConfig is {UseTempChannel: > 0})
+        if (_fullWaveList.Count == 0)
         {
-            var useTempChannel = channelConfig.UseTempChannel;
-            var useTempValue = SessionContext.GetChannelTemp(session, address, useTempChannel);
-            if (useTempValue.HasValue)
-            {
-                temp = useTempValue.Value;
-            }
+            return null;
         }
-        return temp;
+
+        var orderedParts = _fullWaveList
+            .OrderBy(r => r.EchoWave!.EchoStart)
+            .ToList();
+        var firstWave = orderedParts[0].EchoWave!;
+        var clockInt = firstWave.ClockInt;
+        if (clockInt == 0)
+        {
+            return null;
+        }
+
+        var lastPart = orderedParts[^1];
+        var config = SessionContext.GetChannelConfig(session, lastPart.Address, lastPart.Channel);
+        if (config is not {EchoWin: > 0, ProbeFreq: > 0})
+        {
+            return null;
+        }
+
+        uint coveredEndNs = 0;
+        foreach (var part in orderedParts)
+        {
+            var wave = part.EchoWave!;
+            if (wave.ClockInt != clockInt || wave.WaveData == null || wave.EchoStart % clockInt != 0)
+            {
+                return null;
+            }
+
+            // EchoStart 由设备按 1us 量化，允许相邻分段边界有一个量化单位内的空隙；
+            // 更大的断档视为缺包，整轮不发布。
+            if (wave.EchoStart > coveredEndNs + QUnit)
+            {
+                return null;
+            }
+
+            var waveDurationNs = checked((uint)wave.WaveData.Count * clockInt);
+            coveredEndNs = Math.Max(coveredEndNs, checked(wave.EchoStart + waveDurationNs));
+        }
+
+        if (coveredEndNs <= config.EchoWin)
+        {
+            return null;
+        }
+
+        var fullWavePointCount = checked((int)Math.Ceiling((double)coveredEndNs / clockInt));
+        var fullWaveArray = new short[fullWavePointCount];
+        foreach (var part in orderedParts)
+        {
+            var wave = part.EchoWave!;
+            var offset = (int)(wave.EchoStart / clockInt);
+            wave.WaveData!.CopyTo(fullWaveArray, offset);
+        }
+
+        var fullWaveDouble = fullWaveArray.Select(Convert.ToDouble).ToList();
+        fullWaveDouble = SignalProcessor.BandPassFilter(fullWaveDouble, SampleRate,
+            Convert.ToDouble(config.ProbeFreq * 1000000));
+        var fullWaveSignal = SignalProcessor.InterpolateAndResample(fullWaveDouble, OriginalInterval,
+            InterpolationInterval);
+        return new ChannelResult
+        {
+            Address = lastPart.Address,
+            Channel = lastPart.Channel,
+            ReceiveTime = lastPart.ReceiveTime,
+            SpTemp = lastPart.SpTemp,
+            EchoWave = new EchoWave
+            {
+                EchoStart = 0,
+                ClockInt = Convert.ToUInt16(InterpolationInterval),
+                WaveData = fullWaveSignal.Select(Convert.ToInt16).ToList(),
+                Fc = Convert.ToUInt16(config.ProbeFreq),
+            },
+            EchoWaveKind = EchoWaveKind.LongitudinalFull,
+        };
     }
     #endregion
 }

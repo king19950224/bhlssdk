@@ -25,7 +25,7 @@ public static class CommExtensions
             } 
             return port;
         }
-        catch (Exception e)
+        catch (Exception)
         {
             throw new ArgumentException("Invalid communication parameter for serial port.", nameof(paramString));
         }
@@ -51,7 +51,7 @@ public static class CommExtensions
             }
             return Tuple.Create(paramArray[0], int.Parse(paramArray[1]));
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             throw new ArgumentException("Invalid communication parameter for IPEndPoint.", nameof(paramString));
         }

@@ -526,8 +526,10 @@ public static class DeviceEndpoints
             return $"ChannelCount 必须在 1..{DeviceLimits.MaxChannelsPerDevice}";
         if (model is < 0 or > 3)
             return "Model 必须在 0..3（SDK 设备型号）";
-        if (commType is < 0 or > 2)
-            return "CommType 必须是 0 串口 / 1 TCPClient / 2 TCPServer";
+        // 2(TCPServer) 从 SDK 1.6 起被移除（连接时抛 NotSupportedException），从入口就拒掉，
+        // 别让运维在设备管理页改出一台永远连不上的设备。设备主动连入需另立 FxServer 方案
+        if (commType is not (0 or 1))
+            return "CommType 必须是 0 串口 / 1 TCPClient（2 TCPServer 已随 SDK 1.6 移除）";
         if (address is < 1 or > 255)
             return "Address 必须在 1..255";
         return null;

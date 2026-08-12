@@ -1,128 +1,302 @@
-using MathNet.Numerics.LinearAlgebra.Double;
+using System;
 
 namespace FxSDK.Utility;
 
 /// <summary>
-/// Savitzky-Golay 滤波器（平滑 + 求导）
-/// 支持边界对称镜像填充，系数可缓存
+/// Savitzky-Golay 平滑滤波器
+/// 原理：局部多项式最小二乘拟合，保留信号特征的同时平滑噪声
 /// </summary>
 public static class SavitzkyGolayFilter
 {
-    // 缓存常见窗口+阶数组合的系数
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, double[]> CoeffCache = new();
     /// <summary>
-    /// 使用 Savitzky-Golay 滤波器平滑信号（输出长度 = 输入长度）
+    /// SG 平滑滤波
     /// </summary>
-    /// <param name="y">输入信号</param>
-    /// <param name="windowSize">窗口大小（必须为正奇数，推荐5~15）</param>
-    /// <param name="order">多项式阶数（建议2~4）</param>
-    /// <returns>平滑后的信号</returns>
-    public static double[] Smooth(double[] y, int windowSize = 9, int order = 3)
-        => Filter(y, windowSize, order, derivativeOrder: 0);
-
-    /// <summary>
-    /// 使用 Savitzky-Golay 滤波器求信号的一阶导数（斜率）
-    /// </summary>
-    /// <param name="y">输入信号</param>
-    /// <param name="windowSize">窗口大小（奇数）</param>
-    /// <param name="order">多项式阶数（order >=1）</param>
-    /// <param name="delta">采样间隔（默认1.0，表示采样点单位；若需物理单位如 ns，传入 1.0/samplingRate）</param>
-    /// <returns>每个点的斜率估计</returns>
-    public static double[] Differentiate(double[] y, int windowSize, int order = 3, double delta = 1.0)
-        => Filter(y, windowSize, order, derivativeOrder: 1, delta: delta);
-
-    private static double[] Filter(double[] y, int windowSize, int order, int derivativeOrder = 0, double delta = 1.0)
+    /// <param name="data">输入数据</param>
+    /// <param name="windowSize">滑动窗口大小 (必须为奇数，>= 3)</param>
+    /// <param name="polynomialOrder">多项式阶数 (必须 < windowSize )</param>
+    /// <returns>平滑后的数据</returns>
+    public static double[] Smooth(double[] data, int windowSize = 5, int polynomialOrder = 2)
     {
-        if (y == null || y.Length == 0)
-            throw new ArgumentException("信号不能为空。", nameof(y));
-        if (windowSize <= 0 || windowSize % 2 == 0)
-            throw new ArgumentException("窗口大小必须为正奇数。", nameof(windowSize));
-        if (order < 0 || order >= windowSize)
-            throw new ArgumentException("多项式阶数必须小于窗口大小且非负。", nameof(order));
-        if (derivativeOrder < 0 || derivativeOrder > order)
-            throw new ArgumentException("导数阶数必须在0到多项式阶数之间。", nameof(derivativeOrder));
-        if (double.IsNaN(delta) || delta <= 0)
-            throw new ArgumentException("采样间隔 delta 必须为正数。", nameof(delta));
-
-        // 自适应窗口：如果信号太短，缩小窗口
-        if (windowSize > y.Length)
-            windowSize = y.Length % 2 == 1 ? y.Length : y.Length - 1;
-
-        // 缓存 key
-        var cacheKey = $"{windowSize}_{order}_{derivativeOrder}";
-
-        if (!CoeffCache.TryGetValue(cacheKey, out var coeffs))
+        if (data == null || data.Length == 0)
+            throw new ArgumentException("输入数据不能为空");
+        
+        if (windowSize < 3)
+            throw new ArgumentException("窗口大小必须 >= 3");
+        
+        if (windowSize % 2 == 0)
+            throw new ArgumentException("窗口大小必须为奇数");
+        
+        if (polynomialOrder < 0 || polynomialOrder >= windowSize)
+            throw new ArgumentException("多项式阶数必须 >= 0 且 < 窗口大小");
+        
+        var n = data.Length;
+        var halfWindow = windowSize / 2;
+        
+        // 计算 SG 系数
+        var coeffs = ComputeCoefficients(windowSize, polynomialOrder);
+        
+        // 应用滤波
+        var result = new double[n];
+        
+        // 中间部分：使用完整窗口
+        for (var i = halfWindow; i < n - halfWindow; i++)
         {
-            coeffs = ComputeSgCoefficients(windowSize, order, derivativeOrder);
-            CoeffCache[cacheKey] = coeffs;
+            double sum = 0;
+            for (var j = -halfWindow; j <= halfWindow; j++)
+                sum += coeffs[j + halfWindow] * data[i + j];
+            result[i] = sum;
         }
-
-        var pad = windowSize / 2;
-        var padded = SymmetricPad(y, pad);
-
-        var result = new double[y.Length];
-        for (var i = 0; i < y.Length; i++)
+        
+        // 边界处理：使用对称延拓
+        for (var i = 0; i < halfWindow; i++)
         {
-            var sum = 0.0;
-            for (var j = 0; j < windowSize; j++)
+            double sum = 0;
+            for (var j = -halfWindow; j <= halfWindow; j++)
             {
-                sum += coeffs[j] * padded[i + j];
+                var idx = i + j;
+                // 对称延拓
+                if (idx < 0) idx = -idx;
+                if (idx >= n) idx = 2 * n - 2 - idx;
+                sum += coeffs[j + halfWindow] * data[idx];
             }
-            result[i] = sum / delta;  // 导数时除以 delta 得到物理斜率
+            result[i] = sum;
         }
-
+        
+        for (var i = n - halfWindow; i < n; i++)
+        {
+            double sum = 0;
+            for (var j = -halfWindow; j <= halfWindow; j++)
+            {
+                var idx = i + j;
+                // 对称延拓
+                if (idx < 0) idx = -idx;
+                if (idx >= n) idx = 2 * n - 2 - idx;
+                sum += coeffs[j + halfWindow] * data[idx];
+            }
+            result[i] = sum;
+        }
+        
         return result;
     }
-
-    // 对称镜像填充（标准 reflection，不重复端点）
-    private static double[] SymmetricPad(double[] signal, int pad)
+    
+    /// <summary>
+    /// 计算 SG 滤波系数
+    /// </summary>
+    private static double[] ComputeCoefficients(int windowSize, int polynomialOrder)
     {
-        var n = signal.Length;
-        var padded = new double[n + 2 * pad];
-
-        // 左填充：signal[pad] ... signal[1]（不含 signal[0] 重复）
-        for (var i = 0; i < pad; i++)
-            padded[i] = signal[pad - 1 - i];  // 优化：pad-1-i 更标准
-
-        // 中心
-        Array.Copy(signal, 0, padded, pad, n);
-
-        // 右填充：signal[n-2] ... signal[n-pad-1]
-        for (var i = 0; i < pad; i++)
-            padded[pad + n + i] = signal[n - 2 - i];
-
-        return padded;
-    }
-
-    // 计算 SG 系数（支持导数）
-    private static double[] ComputeSgCoefficients(int windowSize, int order, int derivativeOrder)
-    {
-        var m = windowSize / 2;
-        var a = new DenseMatrix(windowSize, order + 1);
-
+        var halfWindow = windowSize / 2;
+        var m = polynomialOrder;
+        
+        // 构建 Vandermonde 矩阵 A (windowSize × (m+1))
+        // A[i,j] = i^j, i = -halfWindow ... halfWindow
+        var a = new double[windowSize, m + 1];
         for (var i = 0; i < windowSize; i++)
         {
-            double x = i - m;
-            var xp = 1.0;
-            for (var j = 0; j <= order; j++)
+            var x = i - halfWindow;
+            a[i, 0] = 1;
+            for (var j = 1; j <= m; j++)
+                a[i, j] = a[i, j - 1] * x;
+        }
+        
+        // 计算 (A^T * A)^(-1) * A^T
+        // 使用正规方程：(A^T * A) * c = A^T * y
+        var ata = new double[m + 1, m + 1];
+        for (var i = 0; i <= m; i++)
+            for (var j = 0; j <= m; j++)
+                for (var k = 0; k < windowSize; k++)
+                    ata[i, j] += a[k, i] * a[k, j];
+        
+        // 矩阵求逆 (高斯 - 约旦消元)
+        var ataInv = MatrixInverse(ata, m + 1);
+        
+        // 计算系数：c = (A^T * A)^(-1) * A^T
+        // 对于平滑，我们只需要第 0 行 (常数项)
+        var coeffs = new double[windowSize];
+        for (var i = 0; i < windowSize; i++)
+        {
+            double sum = 0;
+            for (var j = 0; j <= m; j++)
+                sum += ataInv[0, j] * a[i, j];
+            coeffs[i] = sum;
+        }
+        
+        return coeffs;
+    }
+    
+    /// <summary>
+    /// 矩阵求逆 (高斯 - 约旦消元法)
+    /// </summary>
+    private static double[,] MatrixInverse(double[,] matrix, int n)
+    {
+        // 创建增广矩阵 [A|I]
+        var augmented = new double[n, 2 * n];
+        for (var i = 0; i < n; i++)
+        {
+            for (var j = 0; j < n; j++)
+                augmented[i, j] = matrix[i, j];
+            augmented[i, n + i] = 1;
+        }
+        
+        // 高斯 - 约旦消元
+        for (var i = 0; i < n; i++)
+        {
+            // 找主元
+            var maxRow = i;
+            for (int k = i + 1; k < n; k++)
+                if (Math.Abs(augmented[k, i]) > Math.Abs(augmented[maxRow, i]))
+                    maxRow = k;
+            
+            // 交换行
+            if (maxRow != i)
             {
-                a[i, j] = Math.Pow(x, j);  
+                for (var j = 0; j < 2 * n; j++)
+                {
+                    (augmented[i, j], augmented[maxRow, j]) = (augmented[maxRow, j], augmented[i, j]);
+                }
+            }
+            
+            // 缩放主元行
+            var pivot = augmented[i, i];
+            if (Math.Abs(pivot) < 1e-12)
+                throw new InvalidOperationException("矩阵奇异，无法求逆");
+            
+            for (var j = 0; j < 2 * n; j++)
+                augmented[i, j] /= pivot;
+            
+            // 消去其他行
+            for (var k = 0; k < n; k++)
+            {
+                if (k != i)
+                {
+                    var factor = augmented[k, i];
+                    for (var j = 0; j < 2 * n; j++)
+                        augmented[k, j] -= factor * augmented[i, j];
+                }
             }
         }
-
-        var aT = a.Transpose();
-        var aTa = aT * a;
-
-        var e = new DenseVector(order + 1)
+        
+        // 提取逆矩阵
+        var result = new double[n, n];
+        for (var i = 0; i < n; i++)
+            for (var j = 0; j < n; j++)
+                result[i, j] = augmented[i, n + j];
+        
+        return result;
+    }
+    
+    /// <summary>
+    /// SG 平滑并计算导数
+    /// </summary>
+    /// <param name="data">输入数据</param>
+    /// <param name="windowSize">窗口大小(必须是奇数)</param>
+    /// <param name="polynomialOrder">多项式阶数</param>
+    /// <param name="derivative">导数阶数 (0=平滑，1=一阶导，2=二阶导)</param>
+    /// <param name="sampleInterval">采样间隔 (用于导数计算)</param>
+    /// <returns>平滑后的数据或导数</returns>
+    public static double[] SmoothWithDerivative(double[] data, int windowSize = 5, int polynomialOrder = 2, 
+        int derivative = 0, double sampleInterval = 1.0)
+    {
+        if (data == null || data.Length == 0)
+            throw new ArgumentException("输入数据不能为空");
+        
+        if (windowSize < 3 || windowSize % 2 == 0)
+            throw new ArgumentException("窗口大小必须为奇数且 >= 3");
+        
+        if (polynomialOrder < derivative || polynomialOrder >= windowSize)
+            throw new ArgumentException("多项式阶数必须 >= 导数阶数且 < 窗口大小");
+        
+        var n = data.Length;
+        var halfWindow = windowSize / 2;
+        
+        // 计算导数系数
+        var coeffs = ComputeDerivativeCoefficients(windowSize, polynomialOrder, derivative, sampleInterval);
+        
+        var result = new double[n];
+        
+        // 中间部分
+        for (var i = halfWindow; i < n - halfWindow; i++)
         {
-            [derivativeOrder] = 1.0 // 求对应阶的系数
-        };
-
-        var z = aTa.Solve(e);
-        var w = a * z;
-
-        // 对于导数，系数需乘以 factorial(derivativeOrder)，但由于 derivativeOrder=0或1，这里=1
-
-        return w.ToArray();
+            double sum = 0;
+            for (var j = -halfWindow; j <= halfWindow; j++)
+                sum += coeffs[j + halfWindow] * data[i + j];
+            result[i] = sum;
+        }
+        
+        // 边界处理 (对称延拓)
+        for (var i = 0; i < halfWindow; i++)
+        {
+            double sum = 0;
+            for (var j = -halfWindow; j <= halfWindow; j++)
+            {
+                var idx = i + j;
+                if (idx < 0) idx = -idx;
+                if (idx >= n) idx = 2 * n - 2 - idx;
+                sum += coeffs[j + halfWindow] * data[idx];
+            }
+            result[i] = sum;
+        }
+        
+        for (var i = n - halfWindow; i < n; i++)
+        {
+            double sum = 0;
+            for (var j = -halfWindow; j <= halfWindow; j++)
+            {
+                var idx = i + j;
+                if (idx < 0) idx = -idx;
+                if (idx >= n) idx = 2 * n - 2 - idx;
+                sum += coeffs[j + halfWindow] * data[idx];
+            }
+            result[i] = sum;
+        }
+        
+        return result;
+    }
+    
+    /// <summary>
+    /// 计算导数系数
+    /// </summary>
+    private static double[] ComputeDerivativeCoefficients(int windowSize, int polynomialOrder, 
+        int derivative, double sampleInterval)
+    {
+        var halfWindow = windowSize / 2;
+        var m = polynomialOrder;
+        
+        // 构建 Vandermonde 矩阵
+        var a = new double[windowSize, m + 1];
+        for (var i = 0; i < windowSize; i++)
+        {
+            var x = i - halfWindow;
+            a[i, 0] = 1;
+            for (var j = 1; j <= m; j++)
+                a[i, j] = a[i, j - 1] * x;
+        }
+        
+        // 计算 (A^T * A)^(-1)
+        var ata = new double[m + 1, m + 1];
+        for (var i = 0; i <= m; i++)
+        for (var j = 0; j <= m; j++)
+        for (var k = 0; k < windowSize; k++)
+            ata[i, j] += a[k, i] * a[k, j];
+        
+        var ataInv = MatrixInverse(ata, m + 1);
+        
+        // 计算导数系数
+        // 对于 d 阶导数，需要乘以 d! / (dt^d)
+        double factorial = 1;
+        for (var i = 2; i <= derivative; i++)
+            factorial *= i;
+        
+        var scale = factorial / Math.Pow(sampleInterval, derivative);
+        
+        var coeffs = new double[windowSize];
+        for (var i = 0; i < windowSize; i++)
+        {
+            double sum = 0;
+            for (var j = derivative; j <= m; j++)
+                sum += ataInv[derivative, j] * a[i, j];
+            coeffs[i] = sum * scale;
+        }
+        
+        return coeffs;
     }
 }

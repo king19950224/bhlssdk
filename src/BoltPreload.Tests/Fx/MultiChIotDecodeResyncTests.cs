@@ -29,6 +29,9 @@ public sealed class MultiChIotDecodeResyncTests
         protected override CancellationToken SessionToken { get; init; }
 
         protected override Task SendDataAsync(byte[] data) => Task.CompletedTask;
+
+        // 1.6 新增的抽象成员（解码致命错误时请求关会话）。解码测试不碰连接生命周期，空实现即可
+        protected override void RequestClose(SessionCloseReason reason, Exception? exception) { }
     }
 
     /// <summary>

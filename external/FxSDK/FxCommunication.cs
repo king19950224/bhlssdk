@@ -16,14 +16,12 @@ partial class FxClient
 {
     #region 会话管理相关
     private readonly ConcurrentDictionary<string, IoSession> _sessions = new();
-    private readonly Dictionary<int, ushort> _serverModels = new(); // 端口号-设备模型
     private void SubscribeSessionEvents(IoSession session)
     {
         try
         {
-            session.SessionConnected += OnSessionConnected;
-            session.SessionDisconnected += OnSessionDisconnected;
-            session.SessionDecResultsReceived += OnDecodedResultReceived;
+            session.SetLifecycleHandler(OnSessionConnected, OnSessionDisconnected);
+            session.SetDecodedResultHandler(OnDecodedResultReceived);
         }
         catch (Exception ex)
         {
@@ -34,27 +32,38 @@ partial class FxClient
     {
         try
         {
-            session.SessionConnected -= OnSessionConnected;
-            session.SessionDisconnected -= OnSessionDisconnected;
-            session.SessionDecResultsReceived -= OnDecodedResultReceived;
+            session.SetLifecycleHandler(null, null);
+            session.SetDecodedResultHandler(null);
         }
         catch (Exception ex)
         {
             Logger.Error($"FxClient UnSubscribeSessionEvents failed: {ex.Message}");
         }
     }
-    private async void OnSessionConnected(object? sender, EventArgs e)
+    private void OnSessionConnected(IoSession newSession)
     {
-        if (sender is not IoSession newSession)
-            return;
-
         try
         {
-            // 等待旧会话完全关闭
-            await CloseSessionAsync(newSession.SessionId).ConfigureAwait(false);
-            // 注册新会话
-            _sessions[newSession.SessionId] = newSession;
-            OnConnected?.Invoke(sender, EventArgs.Empty);
+            var replaced = _sessions.AddOrUpdate(
+                newSession.SessionId,
+                newSession,
+                (sessionId, oldSession) =>
+                {
+                    if (!ReferenceEquals(oldSession, newSession))
+                    {
+                        _ = CloseReplacedSessionAsync(oldSession, sessionId);
+                    }
+
+                    return newSession;
+                });
+
+            if (!ReferenceEquals(replaced, newSession))
+            {
+                Logger.Warn("Session replacement did not store the new session immediately. SessionId={SessionId}",
+                    newSession.SessionId);
+            }
+
+            OnConnected?.Invoke(newSession, EventArgs.Empty);
         }
         catch (Exception ex)
         {
@@ -62,9 +71,8 @@ partial class FxClient
             _ = newSession.CloseAsync();
         }
     }
-    private void OnSessionDisconnected(object? sender, SessionDisconnectedEventArgs e)
+    private void OnSessionDisconnected(IoSession session, SessionDisconnectedEventArgs e)
     {
-        if (sender is not IoSession session) return;
         UnSubscribeSessionEvents(session);
         // 1：查看当前字典中是谁
         if (_sessions.TryGetValue(session.SessionId, out var current))
@@ -73,7 +81,7 @@ partial class FxClient
             if (ReferenceEquals(current, session))
             {
                 _sessions.TryRemove(session.SessionId, out _);
-                OnDisconnected?.Invoke(sender, e);
+                OnDisconnected?.Invoke(session, e);
             }
             else
             {
@@ -81,17 +89,16 @@ partial class FxClient
             }
         }
     }
-    private void OnDecodedResultReceived(object? sender, DecodedResultsReceivedEventArgs e)
+    private void OnDecodedResultReceived(IoSession session, DecodedResultsReceivedEventArgs e)
     {
-        if (sender is not IoSession session) return;
         try
         {
-            OnResultReceived?.Invoke(session, new DecodedResultsReceivedEventArgs(e.Results));
+            OnResultReceived?.Invoke(session, e);
             //处理自动增益控制
-            if (_sessionAgcContext.TryGetValue(session.SessionId, out var agcContext) && !agcContext.Cts.IsCancellationRequested)
+            if (_sessionAgcContext.TryGetValue(session.SessionId, out var agcContext))
             {
                 if (e.Results.Length <= 0) return;
-                var decodeResult = e.Results.ToList().Last();
+                var decodeResult = e.Results[^1];
                 if (decodeResult is ChannelResult {EchoWave.WaveData.Count: > 0} chResult)
                 {
                     agcContext.AddWaveData(chResult.EchoWave.WaveData);   
@@ -100,27 +107,52 @@ partial class FxClient
         }
         catch (Exception ex)
         {
-            Logger.Error(ex, "OnDecodedResultReceived 处理过程中发生意外异常 - 会话 {SessionId}", session.SessionId);
+            Logger.Error(ex, "OnSessionExceptionCaught 处理过程中发生意外异常 - 会话 {SessionId}", session.SessionId);
         }
     }
     /// <summary>
     /// 尝试关闭同个sessionId 的会话
     /// </summary>
-    private async Task CloseSessionAsync(string sessionId)
+    private async Task CloseSessionAsync(string sessionId, bool fastClose = false, bool delayAfterClose = true)
     {
         if (_sessions.TryRemove(sessionId, out var oldSession))
         {
-            try
+            await CloseSessionInstanceAsync(oldSession, sessionId, fastClose, delayAfterClose).ConfigureAwait(false);
+        }
+    }
+
+    private async Task CloseReplacedSessionAsync(IoSession oldSession, string sessionId)
+    {
+        await CloseSessionInstanceAsync(oldSession, sessionId, fastClose: true, delayAfterClose: false)
+            .ConfigureAwait(false);
+    }
+
+    private async Task CloseSessionInstanceAsync(
+        IoSession session,
+        string sessionId,
+        bool fastClose,
+        bool delayAfterClose)
+    {
+        try
+        {
+            UnSubscribeSessionEvents(session);
+            if (fastClose)
             {
-                UnSubscribeSessionEvents(oldSession);
-                await oldSession.CloseAsync();
-                // 额外等待一小段时间,确保资源释放
-                await Task.Delay(200); 
+                await session.CloseFastAsync().ConfigureAwait(false);
             }
-            catch (Exception ex)
+            else
             {
-                Logger.Debug(ex, $"Error closing old session {sessionId}");
+                await session.CloseAsync().ConfigureAwait(false);
             }
+
+            if (delayAfterClose)
+            {
+                await Task.Delay(200).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, $"Error closing old session {sessionId}");
         }
     }
     #endregion
@@ -136,28 +168,10 @@ partial class FxClient
         return _sessions.GetValueOrDefault(sessionId);
     }
     #region 通讯连接相关
-    /// <summary>
-    /// 创建协议编解码器
-    /// 0 标准版协议
-    /// 1 专家版协议
-    /// 2 实时24通道版协议
-    /// 3 或默认 多通道监测版协议
-    /// </summary>
-    private FxProtocolHandler CreateProtocolHandler(ushort model)
-    {
-        return model switch
-        {
-            0 => new StandardProtocolHandler(),
-            1 => new ExpertProtocolHandler(),
-            2 => new IotR24ProtocolHandler(),
-            3 => new MultiChIotProtocolHandler(),
-            _ => new MultiChIotProtocolHandler()
-        };
-    }
     private async Task OpenConnectionAsync(DeviceConfig deviceConfig, CancellationToken cancellationToken)
     {
         // 根据设备模型选择协议处理器
-        var fxProtocolHandler = CreateProtocolHandler(deviceConfig.Model);
+        var fxProtocolHandler = FxProtocolHandlerFactory.Shared.Create(deviceConfig.Model);
         switch (deviceConfig.CommunicationType)
         {
             case 0: //串口
@@ -167,10 +181,9 @@ partial class FxClient
                 await ConnectTcpClientAsync(deviceConfig, fxProtocolHandler, cancellationToken);
                 break;
             case 2: //TCP服务器
-                var remotePort = GetLocalPort(deviceConfig.CommunicationParameters);
-                _serverModels[remotePort] = deviceConfig.Model;
-                await StartTcpServerAsync(deviceConfig, cancellationToken);
-                break;
+                throw new NotSupportedException(
+                    "TCP Server mode has moved to FxServer in FxSDK 2.0. " +
+                    "Use FxSDK.Server.FxServer.StartAsync(FxServerListenerOptions) for devices that actively connect to the SDK.");
             default:
                 throw new ArgumentException($"Unsupported communication type-{deviceConfig.CommunicationType}.",
                     nameof(deviceConfig.CommunicationType));
@@ -209,8 +222,9 @@ partial class FxClient
             // 等待旧会话完全关闭
             await CloseSessionAsync(config.GetSessionId()).ConfigureAwait(false);
         
+            var connectTimeout = TimeSpan.FromSeconds(Math.Max(1d, config.ConnTimeOut));
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(TimeSpan.FromSeconds(config.ConnTimeOut));
+            cts.CancelAfter(connectTimeout);
         
             if (!IPAddress.TryParse(host, out var address))
             {
@@ -223,11 +237,11 @@ partial class FxClient
             var endPoint = new IPEndPoint(address, port);
             await socket.ConnectAsync(endPoint, cts.Token).ConfigureAwait(false);
         
-            tcpSession = new TcpSession(socket, fxProtocolHandler, cancellationToken);
+            tcpSession = new TcpSession(socket, fxProtocolHandler, cancellationToken, config.TcpSessionOptions);
             SubscribeSessionEvents(tcpSession);
             await tcpSession.OpenAsync().ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
             if (tcpSession != null)
             {
@@ -239,81 +253,14 @@ partial class FxClient
                 // 确保 Socket 释放
                 try { socket.Dispose(); } catch { /*ignore*/ }
             }
+
+            if (ex is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException($"Connection timed out after {Math.Max(1d, config.ConnTimeOut):0.#}s.", ex);
+            }
+
             throw; // 重新抛出异常
         }
-    }
-    private readonly Dictionary<int, Socket> _serverSockets = new(); // 监听 Socket
-    private async Task StartTcpServerAsync(DeviceConfig config, CancellationToken cancellationToken)
-    {
-        var localPort = GetLocalPort(config.CommunicationParameters);
-        lock (_serverSockets)
-        {
-            if (_serverSockets.ContainsKey(localPort))
-                return;
-            var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            try
-            {
-                listener.Bind(new IPEndPoint(IPAddress.Any, localPort));
-                listener.Listen(100);
-                _serverSockets[localPort] = listener;
-                // 启动接受循环，传入 listener 引用
-                _ = Task.Run(() => TcpServerAcceptLoop(listener, localPort, cancellationToken), cancellationToken);
-            }
-            catch
-            {
-                listener.Dispose();
-            }
-        }
-    }
-    private async Task TcpServerAcceptLoop(Socket listener, int port, CancellationToken cancellationToken)
-    {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                var clientSocket = await listener.AcceptAsync(cancellationToken).ConfigureAwait(false);
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        var localEndpoint = (IPEndPoint)clientSocket.LocalEndPoint!;
-                        if (!_serverModels.TryGetValue(localEndpoint.Port, out var deviceModel))
-                        {
-                            clientSocket.Dispose();
-                            return;
-                        }
-                        var handler = CreateProtocolHandler(deviceModel);
-                        var session = new TcpSession(clientSocket, handler, cancellationToken);
-                        SubscribeSessionEvents(session);
-                        await session.OpenAsync().ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        clientSocket?.Dispose();
-                    }
-                }, cancellationToken);
-            }
-            catch (ObjectDisposedException)
-            {
-                break;
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
-            {
-                break;
-            }
-        }
-    }
-    /// <summary>
-    /// 获取连接的本地端口
-    /// </summary>
-    private int GetLocalPort(string commParam)
-    {
-        var paramArray = commParam.Split(new[] { ':', ',' }, StringSplitOptions.RemoveEmptyEntries);
-        if (paramArray.Length < 3)
-        {
-            throw new ArgumentException("Invalid communication parameter for TCP server.", nameof(commParam));
-        }
-        return int.Parse(paramArray[2]);
     }
     #endregion
 }
@@ -331,6 +278,8 @@ public static class CommunicationExceptionMapper
         return ex switch
         {
             CommunicationException => ex,
+            
+            OperationCanceledException => new OperationCanceledException(context),
 
             SocketException { SocketErrorCode: var code } =>
                 new CommunicationException($"Socket error ({code}): {ex.Message}", ex),

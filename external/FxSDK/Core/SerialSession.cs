@@ -17,7 +17,6 @@ public class SerialSession : IoSession
     // 使用原子操作确保线程安全
     private int _isClosed = 0; 
     private Task _decodeTask = Task.CompletedTask;
-    private Task _heartbeatTask = Task.CompletedTask;
     private Task[] _backgroundTasks = Array.Empty<Task>(); // 追踪后台任务
 
     public SerialSession(SerialPort serialPort, FxProtocolHandler fxProtocolHandler, CancellationToken externalToken)
@@ -44,6 +43,11 @@ public class SerialSession : IoSession
 
     protected sealed override CancellationToken SessionToken { get; init; }
 
+    protected override void RequestClose(SessionCloseReason reason, Exception? exception)
+    {
+        _ = CloseAsync(reason, exception);
+    }
+
     internal override async Task OpenAsync()
     {
         if (_serialPort is not { IsOpen: true })
@@ -53,17 +57,13 @@ public class SerialSession : IoSession
         _serialPort.DataReceived -= SerialPort_DataReceived;
         _serialPort.DataReceived += SerialPort_DataReceived;
         
-        await base.OpenAsync();
-
         if (!SessionToken.IsCancellationRequested)
         {
             await base.OpenAsync();
-            // 启动 I/O 循环任务
-            _heartbeatTask = SerialHeartbeatLoop();
             // 启动解码任务
             _decodeTask = DecodingLoop();
         }
-        _backgroundTasks = new[] { _heartbeatTask,_decodeTask };
+        _backgroundTasks = new[] { _decodeTask };
     }
 
     private void SerialPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
@@ -79,17 +79,20 @@ public class SerialSession : IoSession
 
             var buffer = new byte[bytesToRead];
             var read = _serialPort.Read(buffer, 0, bytesToRead);
-            if (read <= 0) 
-                return;
 
-            var receivedData = read == buffer.Length ? buffer : buffer.AsSpan(0, read).ToArray();
-
-            if (FxUtility.DeveloperMode)
+            if (read > 0)
             {
-                Logger.Debug($"receive: {ByteUtility.BytesToHexStr(receivedData)}");
+                var receivedData = read == buffer.Length ? buffer : buffer.AsSpan(0, read).ToArray();
+                if (FxUtility.DeveloperMode)
+                {
+                    Logger.Debug($"receive: {ByteUtility.BytesToHexStr(receivedData)}");
+                }
+                ProtocolHandler.Enqueue(receivedData);
             }
-
-            ProtocolHandler.Enqueue(receivedData);
+            else
+            {
+                Task.Delay(10, SessionToken);
+            }
         }
         catch (ObjectDisposedException ex)
         {
@@ -115,58 +118,11 @@ public class SerialSession : IoSession
             _ = CloseAsync(SessionCloseReason.ProtocolError, ex);
         }
     }
-
-    // ====== 心跳循环（可被取消）======
-    private const int HeartbeatMaxMissed = 3;
-
-    private async Task SerialHeartbeatLoop()
-    {
-        var missed = 0;
-        try
-        {
-            while (!SessionToken.IsCancellationRequested)
-            {
-                try
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(HeartbeatSeconds), SessionToken).ConfigureAwait(false);
-                    if (SessionToken.IsCancellationRequested) 
-                        break;
-
-                    await SendDataAsync(new byte[] { 0x00 }).ConfigureAwait(false);
-                    missed = 0; // 成功发送后重置计数
-                }
-                catch (OperationCanceledException)
-                {
-                    // 正常退出
-                    Logger.Debug("SerialHeartbeatLoop: Cancelled by token");
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warn(ex, "Serial heartbeat send failed");
-                    missed++;
-                    if (missed >= HeartbeatMaxMissed)
-                    {
-                        Logger.Warn($"Serial heartbeat failed {HeartbeatMaxMissed} times, closing session.");
-                        _ = CloseAsync(SessionCloseReason.HeartbeatTimeout, ex).ConfigureAwait(false);
-                        return;
-                    }
-                    // 继续循环，等待下次尝试
-                }
-            }
-            
-            Logger.Debug("SerialHeartbeatLoop exited normally");
-        }
-        catch (Exception ex)
-        {
-            Logger.Error(ex, "Fatal error in SerialHeartbeatLoop");
-        }
-    }
-
+    
     // ====== 发送数据 ======
     protected override Task SendDataAsync(byte[] data)
     {
-        if (data?.Length == 0 || _isClosed == 1 || SessionToken.IsCancellationRequested)
+        if (data is null || data.Length == 0 || _isClosed == 1 || SessionToken.IsCancellationRequested)
             return Task.CompletedTask;
 
         if (!_serialPort.IsOpen)
@@ -178,7 +134,7 @@ public class SerialSession : IoSession
 
         try
         {
-            _serialPort.Write(data, 0, data!.Length);
+            _serialPort.Write(data, 0, data.Length);
 
             if (FxUtility.DeveloperMode)
             {
@@ -212,10 +168,19 @@ public class SerialSession : IoSession
     // ====== 关闭逻辑 ======
     public override async Task CloseAsync()
     {
-        await CloseAsync(SessionCloseReason.Normal).ConfigureAwait(false);
+        await CloseAsync(SessionCloseReason.Normal, waitForBackgroundTasks: TimeSpan.FromSeconds(3), fastBaseClose: false).ConfigureAwait(false);
     }
 
-    private async Task CloseAsync(SessionCloseReason reason, Exception? exception = null)
+    public override async Task CloseFastAsync()
+    {
+        await CloseAsync(SessionCloseReason.Normal, waitForBackgroundTasks: TimeSpan.FromMilliseconds(200), fastBaseClose: true).ConfigureAwait(false);
+    }
+
+    private async Task CloseAsync(
+        SessionCloseReason reason,
+        Exception? exception = null,
+        TimeSpan? waitForBackgroundTasks = null,
+        bool fastBaseClose = false)
     {
         // 使用 Interlocked.CompareExchange 确保只有一个线程能执行核心关闭逻辑
         if (Interlocked.CompareExchange(ref _isClosed, 1, 0) != 0)
@@ -238,9 +203,9 @@ public class SerialSession : IoSession
             // 2. 关闭 SerialPort，中断所有阻塞的 I/O 操作
             try
             {
+                _serialPort.DataReceived -= SerialPort_DataReceived;
                 if (_serialPort is { IsOpen: true })
                 {
-                    _serialPort.DataReceived -= SerialPort_DataReceived;
                     _serialPort.Close(); // 这会中断 DataReceived 回调的读取操作
                 }
             }
@@ -254,13 +219,13 @@ public class SerialSession : IoSession
             {
                 try
                 {
-                    await Task.WhenAll(_backgroundTasks).WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+                    var timeout = waitForBackgroundTasks ?? TimeSpan.FromSeconds(3);
+                    await Task.WhenAll(_backgroundTasks).WaitAsync(timeout).ConfigureAwait(false);
                     Logger.Debug($"Session {SessionId} all background tasks completed successfully");
                 }
                 catch (TimeoutException)
                 {
-                    Logger.Warn($"Session {SessionId} background tasks did not complete within 3s. " +
-                              $"Task status: Heartbeat={_heartbeatTask.Status}");
+                    Logger.Warn($"Session {SessionId} background tasks did not complete within close timeout. ");
                 }
                 catch (Exception ex)
                 {
@@ -275,21 +240,30 @@ public class SerialSession : IoSession
         finally
         {
             // 4. 释放资源
+            try { _serialPort.DataReceived -= SerialPort_DataReceived; } catch { /* ignore */ }
+            try { _serialPort.Dispose(); } catch { /* ignore */ }
             try { _sessionCts?.Dispose(); } catch { /* ignore */ }
             try { _externalCancellationRegistration.Dispose(); } catch { /* ignore */ }
             
-            // 5. 触发事件
+            // 5. 通知生命周期回调
             try
             {
                 FireSessionDisconnected(reason, exception);
             }
             catch (Exception ex)
             {
-                Logger.Warn(ex, "Exception in SessionDisconnected event");
+                Logger.Warn(ex, "Exception in session disconnected lifecycle handler");
             }
             
             // 6. 调用基类清理
-            await base.CloseAsync().ConfigureAwait(false);
+            if (fastBaseClose)
+            {
+                await base.CloseFastAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                await base.CloseAsync().ConfigureAwait(false);
+            }
         }
     }
 }

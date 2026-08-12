@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using FxSDK.Codec;
 using FxSDK.Models;
 using FxSDK.Utility;
@@ -8,17 +9,37 @@ namespace FxSDK.Core;
 /// <summary>
 /// SDK和设备会话
 /// </summary>
-public abstract class IoSession
+public abstract class IoSession : IDisposable
 {
     private static readonly ILogger Logger = LogManager.GetCurrentClassLogger();
 
-    public event EventHandler<EventArgs>? SessionConnected;
-    public event EventHandler<SessionDisconnectedEventArgs>? SessionDisconnected;
-    public event EventHandler<DecodedResultsReceivedEventArgs>? SessionDecResultsReceived;
     internal readonly FxProtocolHandler ProtocolHandler;
+    private Action<IoSession, DecodedResultsReceivedEventArgs>? _decodedResultHandler;
+    private Action<IoSession, SessionTrafficObservedEventArgs>? _trafficObservedHandler;
+    private Action<IoSession>? _sessionConnectedHandler;
+    private Action<IoSession, SessionDisconnectedEventArgs>? _sessionDisconnectedHandler;
+    private bool _disposed = false; // 添加一个标志
+    private int _resourcesCleared;
+    private long _lastReceiveUtcTicks;
+    private long _lastDecodedUtcTicks;
+    private long _lastSendUtcTicks;
+    private readonly Channel<DecodedResult[]> _decodedResultQueue = Channel.CreateUnbounded<DecodedResult[]>(
+        new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false
+        });
+    private int _queuedResultBatchCount;
+    private Task _decodedResultDispatchTask = Task.CompletedTask;
+    private DateTime _lastResultQueueLogTime = DateTime.MinValue;
     protected IoSession(FxProtocolHandler protocolHandler)
     {
         ProtocolHandler = protocolHandler ?? throw new ArgumentNullException(nameof(protocolHandler));
+        var nowTicks = DateTime.UtcNow.Ticks;
+        _lastReceiveUtcTicks = nowTicks;
+        _lastDecodedUtcTicks = nowTicks;
+        _lastSendUtcTicks = nowTicks;
     }
 
     /// <summary>
@@ -27,33 +48,70 @@ public abstract class IoSession
     protected abstract CancellationToken SessionToken { get; init; }
 
     /// <summary>
-    /// 会话标识
+    /// 解码器发生无法恢复的异常时，请求派生会话异步关闭。
+    /// 调用方不能等待关闭完成，因为关闭流程会等待当前解码任务退出。
     /// </summary>
-    public string SessionId { get; protected set; }
+    protected abstract void RequestClose(SessionCloseReason reason, Exception? exception);
 
     /// <summary>
-    /// 心跳间隔（秒）。
-    /// 厂家原值 20s。实测 DEV_LAB_001 的 TCP 链路（192.168.0.7:23 串口服务器）约 5s 无流量即被对端断开：
-    /// 设备不上行数据时（未在测量），20s 心跳保不住连接，导致 MultiMeas 启动/轮询配置命令
-    /// 只能在原厂软件扫波"喂活"链路时才有机会生效。缩短到 2s 使空闲连接常驻。
-    /// 心跳内容是单字节 0x00 填充，协议解码按帧头(DE DE DE DE)同步，会自动忽略。
+    /// 会话标识
     /// </summary>
-    protected static readonly double HeartbeatSeconds = 2;
+    public string SessionId { get; protected set; } = string.Empty;
+
+    public virtual bool IsConnected => true;
+    public DateTime LastReceiveUtc => new(Interlocked.Read(ref _lastReceiveUtcTicks), DateTimeKind.Utc);
+    public DateTime LastDecodedUtc => new(Interlocked.Read(ref _lastDecodedUtcTicks), DateTimeKind.Utc);
+    public DateTime LastSendUtc => new(Interlocked.Read(ref _lastSendUtcTicks), DateTimeKind.Utc);
+
+    /// <summary>
+    /// 心跳间隔（秒）
+    /// </summary>
+    protected static readonly double HeartbeatSeconds = 20;
 
     #region 触发事件
     protected void FireSessionConnected()
     {
-        SessionConnected?.Invoke(this, EventArgs.Empty);
+        _sessionConnectedHandler?.Invoke(this);
     }
 
     protected void FireSessionDisconnected(SessionCloseReason reason, Exception? ex = null)
     {
-        SessionDisconnected?.Invoke(this, new SessionDisconnectedEventArgs(reason, ex));
+        _sessionDisconnectedHandler?.Invoke(this, new SessionDisconnectedEventArgs(reason, ex));
     }
 
-    internal void FireSessionDecodedResultReceived(DecodedResult[] batchResults)
+    internal void EnqueueDecodedResults(DecodedResult[] batchResults)
     {
-        SessionDecResultsReceived?.Invoke(this, new DecodedResultsReceivedEventArgs(batchResults));
+        if (batchResults.Length <= 0 || _disposed)
+        {
+            return;
+        }
+
+        Interlocked.Increment(ref _queuedResultBatchCount);
+        if (!_decodedResultQueue.Writer.TryWrite(batchResults))
+        {
+            Interlocked.Decrement(ref _queuedResultBatchCount);
+            Logger.Warn("Decoded result queue write failed. SessionId={SessionId}, BatchSize={BatchSize}", SessionId,
+                batchResults.Length);
+        }
+        LogResultQueuePressureIfNeeded();
+    }
+
+    internal void SetDecodedResultHandler(Action<IoSession, DecodedResultsReceivedEventArgs>? handler)
+    {
+        _decodedResultHandler = handler;
+    }
+
+    internal void SetTrafficObservedHandler(Action<IoSession, SessionTrafficObservedEventArgs>? handler)
+    {
+        _trafficObservedHandler = handler;
+    }
+
+    internal void SetLifecycleHandler(
+        Action<IoSession>? connectedHandler,
+        Action<IoSession, SessionDisconnectedEventArgs>? disconnectedHandler)
+    {
+        _sessionConnectedHandler = connectedHandler;
+        _sessionDisconnectedHandler = disconnectedHandler;
     }
     #endregion
 
@@ -64,73 +122,99 @@ public abstract class IoSession
     
     protected async Task DecodingLoop()
     {
-        var delayMs = GetDecodeDelayMilliseconds();
-    
         while (!SessionToken.IsCancellationRequested)
         {
-            SessionToken.ThrowIfCancellationRequested();
-            List<DecodedResult>? results = null;
-
             try
             {
-                // 在独立 Task 中运行 TryDecode，带超时
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(SessionToken);
-                cts.CancelAfter(TimeSpan.FromMilliseconds(200)); // 最多 200ms
-                var token = cts.Token;
-                var decodeTask = Task.Run(() => ProtocolHandler.TryDecode(this,token), token);
-                results = await decodeTask.ConfigureAwait(false);
+                await ProtocolHandler.WaitForDataAsync(SessionToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (SessionToken.IsCancellationRequested)
             {
-                break; //会话正常关闭
+                return;
             }
-            catch (OperationCanceledException)
+            
+            while (!SessionToken.IsCancellationRequested)
             {
-                // 解码超时（200ms 没返回）：多为坏数据卡住解码状态机。
-                // 旧实现在这里 break，解码循环退出但 TCP 和心跳还在，只能重启进程恢复。
-                // 改为清掉积压、复位解码状态继续跑，代价是丢掉缓冲里这一段数据。
-                Logger.Warn("TryDecode 超时（疑似坏数据卡住解码状态机），复位解码缓冲后继续。");
-                ProtocolHandler.ResetDecodeState();
-            }
-            catch (Exception e)
-            {
-                Logger.Error(e, "TryDecode 抛出异常，复位解码缓冲后继续。");
-                ProtocolHandler.ResetDecodeState();
-            }
+                SessionToken.ThrowIfCancellationRequested();
+                List<DecodedResult>? results = null;
 
-            if (results is {Count: > 0})
-            {
-                FireSessionDecodedResultReceived(results.ToArray());
-            }
+                try
+                {
+                    results = ProtocolHandler.TryDecode(this, SessionToken);
+                }
+                catch (OperationCanceledException) when (SessionToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception e)
+                {
+                    Logger.Error(e,
+                        "TryDecode threw an unrecoverable exception. Closing session. SessionId={SessionId}",
+                        SessionId);
+                    ProtocolHandler.ClearContext();
+                    RequestClose(SessionCloseReason.ProtocolError, e);
+                    return;
+                }
 
-            try
-            {
-                await Task.Delay(delayMs, SessionToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
+                if (results is not {Count: > 0})
+                {
+                    break;
+                }
+
+                MarkDecoded();
+                EnqueueDecodedResults(results.ToArray());
             }
         }
+    }
+
+    protected void MarkReceived()
+    {
+        Interlocked.Exchange(ref _lastReceiveUtcTicks, DateTime.UtcNow.Ticks);
+    }
+
+    protected void MarkSent()
+    {
+        Interlocked.Exchange(ref _lastSendUtcTicks, DateTime.UtcNow.Ticks);
+    }
+
+    protected void FireTrafficObserved(SessionTrafficDirection direction, ReadOnlyMemory<byte> data)
+    {
+        var handler = _trafficObservedHandler;
+        if (handler is null || data.IsEmpty)
+        {
+            return;
+        }
+
+        handler(this, new SessionTrafficObservedEventArgs(direction, data));
+    }
+
+    private void MarkDecoded()
+    {
+        Interlocked.Exchange(ref _lastDecodedUtcTicks, DateTime.UtcNow.Ticks);
     }
 
     /// <summary>
     /// 所有派生类必须调用
     /// </summary>
-    internal virtual async Task OpenAsync()
+    internal virtual Task OpenAsync()
     {
+        StartDecodedResultDispatchLoop();
         FireSessionConnected();
+        return Task.CompletedTask;
     }
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     internal async Task SendMsgAsync(IReadOnlyList<object> msgList)
     {
-        await _sendLock.WaitAsync(SessionToken);
+        var lockTaken = false;
         try
         {
+            await _sendLock.WaitAsync(SessionToken);
+            lockTaken = true;
             foreach (var msg in msgList)
             {
+                if (_disposed) return; // 检查是否已释放
                 if (msg.Equals(FxUtility.Delay500Ms))
                     await Task.Delay(500, SessionToken);
                 else if (msg.Equals(FxUtility.Delay100Ms))
@@ -147,40 +231,185 @@ public abstract class IoSession
         }
         catch (OperationCanceledException)
         {
-            // 会话正在关闭，指令没发出去。上抛让调用方感知，否则会白等设备回包到超时。
-            Logger.Warn("SendMsgAsync 取消：会话已关闭，指令未发出。");
             throw;
         }
         catch (Exception ex)
         {
-            // 旧实现吞掉异常只记 Warn，调用方以为指令已发出。上抛由上层决定重试或报错。
+            // 【我方补丁，1.6 重打】厂家原版吞掉异常只记 Warn，调用方以为指令已发出，
+            // 白等设备回包到超时；心跳 missed 计数也永远不会加。上抛由上层决定重试或报错。
+            // 1.4 时代的同一补丁见 sdk-changelog.md 0cb0d86。
             Logger.Warn(ex, $"SendMsgAsync failed: {ex.Message}");
             throw;
         }
         finally
         {
-            _sendLock.Release();
+            if (lockTaken)
+            {
+                try
+                {
+                    _sendLock.Release();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // 会话关闭和发送命令并发时，发送锁可能已经被释放。
+                }
+            }
         }
     }
 
     protected abstract Task SendDataAsync(byte[] data);
 
-    public virtual Task CloseAsync()
+    private void StartDecodedResultDispatchLoop()
+    {
+        if (!_decodedResultDispatchTask.IsCompleted)
+        {
+            return;
+        }
+
+        _decodedResultDispatchTask = Task.Run(DispatchDecodedResultsAsync);
+    }
+
+    private async Task DispatchDecodedResultsAsync()
     {
         try
         {
+            await foreach (var batchResults in _decodedResultQueue.Reader.ReadAllAsync().ConfigureAwait(false))
+            {
+                Interlocked.Decrement(ref _queuedResultBatchCount);
+                try
+                {
+                    _decodedResultHandler?.Invoke(this, new DecodedResultsReceivedEventArgs(batchResults));
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error(ex, "Decoded result dispatch failed. SessionId={SessionId}", SessionId);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Decoded result dispatch loop failed. SessionId={SessionId}", SessionId);
+        }
+    }
+
+    private void LogResultQueuePressureIfNeeded()
+    {
+        var queued = Volatile.Read(ref _queuedResultBatchCount);
+        if (queued < 1024)
+        {
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        if (now - _lastResultQueueLogTime < TimeSpan.FromSeconds(5))
+        {
+            return;
+        }
+
+        _lastResultQueueLogTime = now;
+        Logger.Warn("Decoded result channel backlog. SessionId={SessionId}, QueuedBatches={QueuedBatches}", SessionId,
+            queued);
+    }
+
+    public virtual async Task CloseAsync()
+    {
+        await CloseAsync(drainDecodedResults: true).ConfigureAwait(false);
+    }
+
+    public virtual async Task CloseFastAsync()
+    {
+        await CloseAsync(drainDecodedResults: false).ConfigureAwait(false);
+    }
+
+    private async Task CloseAsync(bool drainDecodedResults)
+    {
+        try
+        {
+            _disposed = true;
+            if (!drainDecodedResults)
+            {
+                _decodedResultHandler = null;
+            }
+
+            _decodedResultQueue.Writer.TryComplete();
+            try
+            {
+                var timeout = drainDecodedResults ? TimeSpan.FromSeconds(3) : TimeSpan.FromMilliseconds(200);
+                await _decodedResultDispatchTask.WaitAsync(timeout).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                Logger.Warn("Decoded result dispatch loop did not complete within timeout. SessionId={SessionId}, Drain={Drain}",
+                    SessionId, drainDecodedResults);
+            }
             ProtocolHandler.Dispose();
-            // 清理 session 上下文
-            SessionContext.ClearContext(this);
-            // 解绑事件
-            SessionConnected = null;
-            SessionDisconnected = null;
-            SessionDecResultsReceived = null;
         }
         catch (Exception ex)
         {
             Logger.Error(ex, $"IoSession.CloseAsync failed: {ex.Message}");
         }
-        return Task.CompletedTask;
+        finally
+        {
+            ClearSessionResources();
+        }
+    }
+
+    private void ClearSessionResources()
+    {
+        if (Interlocked.Exchange(ref _resourcesCleared, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(SessionId))
+            {
+                SessionContext.ClearContext(this);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Session context cleanup failed. SessionId={SessionId}", SessionId);
+        }
+
+        _sessionConnectedHandler = null;
+        _sessionDisconnectedHandler = null;
+        _decodedResultHandler = null;
+        _trafficObservedHandler = null;
+
+        try
+        {
+            _sendLock.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Send lock dispose failed. SessionId={SessionId}", SessionId);
+        }
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        try
+        {
+            _decodedResultQueue.Writer.TryComplete();
+        }
+        catch
+        {
+            // ignore dispose path cleanup errors
+        }
+
+        try
+        {
+            ProtocolHandler.Dispose();
+        }
+        catch
+        {
+            // ignore dispose path cleanup errors
+        }
+
+        ClearSessionResources();
+        GC.SuppressFinalize(this);
     }
 }

@@ -1,4 +1,5 @@
 using System.Text;
+using FxSDK.Models;
 using MathNet.Numerics.Statistics;
 using MathNet.Symbolics;
 
@@ -9,15 +10,22 @@ namespace FxSDK.Utility;
 /// </summary>
 public static class CalculateExtensions
 {
-    // 1,000,000 不是"秒转纳秒"（那是 1e9），而是 mm→m(1e-3) 与 s→ns(1e9) 两个换算的乘积。
-    // l 为 mm、v 为 m/s，结果为 ns。若把 l 改成以 m 为单位，这个系数要变 1e9，别照旧值抄。
-    private const string EchoTimeExpression = "2 * l * 1000000 / v";
-    private const string LengthMmExpression = "v * t / 2000000";//依据时间和声速，获取长度(t 为 ns，同上 1e6 系数，另含往返的 2)
+    private const string EchoTimeExpression = "2 * l * 1000000 / v"; // 乘1,000,000，用于将秒转换为纳秒(l为mm, v为m/s)
+    private const string LengthMmExpression = "v * t / 2000000";//依据时间和声速，获取长度
     private const decimal CalculationInterval = 1M;//计算用插值时间间隔
     private const double SoundVelocity = 5890.0d;
+    private const int MinMeasuredPeriodIntervals = 3;
+    private const double MaxPeriodMadRatio = 0.15d;
+    private const double PeriodEnvelopeRatio = 0.20d;
+    private const double TrackingSearchHalfPeriodRatio = 0.45d;
+    private const double InitialSearchMaxPeriodRatio = 1.05d;
+    private const decimal MinNominalPeriodRatio = 0.60M;
+    private const decimal MaxNominalPeriodRatio = 1.40M;
     public const decimal DefaultTempCoeff = 0.00010269M;//默认温度补偿系数
     public const decimal StandardTemperature = 22.22M; //基准温度
-    public const double NoiseWindowNs = 1500;//噪声端窗口 1500ns
+
+    private readonly record struct EnvelopeFrontResult(double[] Waveform, double[] SmoothedEnvelope,
+        EchoRegion MainEcho, decimal FrontIndex, decimal Threshold, double EnvelopeMax);
     /// <summary>
     /// 根据公式和变量值字典计算
     /// 多项式、指数、对数、三角函数等 支持科学计数法
@@ -139,13 +147,13 @@ public static class CalculateExtensions
     /// </summary>
     /// <param name="signal">信号</param>
     /// <param name="signalInterval">信号点间隔(ns)</param>
-    /// <param name="midResults">中间值(x1,y1,x2,y2)</param>
+    /// <param name="assist">回波辅助信息</param>
     /// <param name="noiseBase">噪声基线</param>
     /// <param name="threshold">阈值</param>
-    public static double CalcZeroIndexByThrSignal(List<double> signal, decimal signalInterval, out decimal[] midResults ,double noiseBase = 50d, 
+    public static double CalcZeroIndexByThrSignal(List<double> signal, decimal signalInterval, out EchoAssist assist ,double noiseBase = 50d, 
         short threshold = 0)
     {
-        midResults = new[] {0m, 0m, 0m, 0m};
+        assist = new EchoAssist();
         //1. 根据幅值判断信号是否有效
         var isValidSignal = signal.Any(s => Math.Abs(s) >= noiseBase);
         if (!isValidSignal)
@@ -154,7 +162,7 @@ public static class CalculateExtensions
         }
         var dynamicThreshold = threshold == 0 ? signal.Max() * 0.6d : threshold;
         var edgeType = dynamicThreshold < 0 ? ThresholdEdgeType.Falling : ThresholdEdgeType.Rising;
-        //2. 在阈值前后找 时间轴正向和反向过零点 将反向到正向过零点之间信号取出进行插值
+        //2. 在阈值前后找 1us 范围内插值  整us
         var thrCrossIdx = FindForwardThresholdCrossing(signal.ToArray(), dynamicThreshold, edgeType);
         if (thrCrossIdx < 0)
         {
@@ -169,99 +177,332 @@ public static class CalculateExtensions
         var calcSignal = SignalProcessor.InterpolateAndResample(rangeSignal, signalInterval, CalculationInterval);
         //3. 计算过阈值后的上升沿时间轴正向 过零点索引startIndex为0时
         var calcThrCrossIdx = FindForwardThresholdCrossing(calcSignal.ToArray(), dynamicThreshold, edgeType);
-        midResults[0] = usStartIdx + calcThrCrossIdx * CalculationInterval / signalInterval; 
-        midResults[1] = (decimal)dynamicThreshold;
+        assist.Mx = usStartIdx + calcThrCrossIdx * CalculationInterval / signalInterval; 
+        assist.My = (decimal)dynamicThreshold;
         
         var calcZeroIdxTuple = FindPositiveZeroCrossing(calcSignal.ToArray(), calcThrCrossIdx);
         //信号过阈值 时间轴正向过零点索引
         var calcZeroIdx = Convert.ToDecimal(calcZeroIdxTuple.Item1);
-        if (calcZeroIdxTuple.Item1 > 0)
+        if (calcZeroIdxTuple.Item1 >= 0 && calcZeroIdxTuple.Item1 + 1 < calcSignal.Count)
         {
-            var calcCurrentIdx = calcZeroIdxTuple.Item1;
-            var calcPrevIdx = calcZeroIdxTuple.Item1 - 1;
+            var calcPrevIdx = calcZeroIdxTuple.Item1;
+            var calcCurrentIdx = calcZeroIdxTuple.Item1 + 1;
             calcZeroIdx = CalcZeroCrossingIndex(calcPrevIdx, calcSignal[calcPrevIdx], calcCurrentIdx,calcSignal[calcCurrentIdx]);
         }
         var zeroIndex = usStartIdx + calcZeroIdx * CalculationInterval / signalInterval;
-        midResults[2] = zeroIndex;
+        assist.Zx = zeroIndex;
         return Convert.ToDouble(zeroIndex);
     }
+
     /// <summary>
-    /// 计算回波时间索引(计算过零含小数索引)-首峰法
-    /// -1 表示信号过小
-    /// -2 阈值异常
-    /// -4 信噪比低
+    /// 包络引导的上升沿过零自动法。
+    /// 包络只用于确定周期级粗位置；最终声时始终取预测位置附近的上升沿过零点。
     /// </summary>
-    /// <param name="signal">信号</param>
-    /// <param name="signalInterval">信号点间隔(ns)</param>
-    /// <param name="midResults">中间值</param>
-    /// <param name="noiseBase">噪声基线</param>
-    public static double CalcZeroIndexAuto(List<double> signal, decimal signalInterval, out decimal[] midResults, double noiseBase = 50d)
+    /// <remarks>
+    /// 置零后使用 ReferenceEnvTime/ReferenceEchoTime 计算包络位移预测值；没有置零锚点时，
+    /// 选择当前包络前沿之后的第一个合格上升沿过零点。返回值仍为输入波形中的小数索引。
+    /// </remarks>
+    public static double CalcZeroIndexByEnvelopeGuidedZero(List<double> signal, decimal signalInterval,
+        out EchoAssist assist, int consecutive = 20, double noiseBase = 50d,
+        EnvelopeTrackingContext? trackingContext = null)
     {
-        midResults = new[] {0m, 0m};
-        //1. 根据幅值判断信号是否有效(先用经验值判断)
-        var isValidSignal = signal.Any(s => Math.Abs(s) >= noiseBase);
-        if (!isValidSignal)
+        assist = new EchoAssist();
+        var locateStatus = TryLocateEnvelopeFront(signal, signalInterval, consecutive, noiseBase,
+            finThreshold: 0.09d, preferFirstValidRegion: false, out var envelopeFront);
+        if (locateStatus < 0)
         {
-            return -1;//无效信号状态码
-        }
-        // 2. 噪声估计：使用前1500ns（安全区域，避开回波）
-        var noiseSamples = (int)(NoiseWindowNs / (double)signalInterval); 
-        noiseSamples = Math.Min(noiseSamples, signal.Count / 4);
-        noiseSamples = Math.Max(noiseSamples, 30); // 至少30点
-        var noiseRegion = signal.Take(noiseSamples).ToArray();
-        var median = noiseRegion.Median();
-        var mad = noiseRegion.Select(x => Math.Abs(x - median)).ToArray().Median();
-        var noiseRms = 1.4826 * mad;//
-        var noiseLevel = 5 * noiseRms; // 5σ 阈值
-        //3. 查找首个过阈值的位置索引
-        var firstThrCrossIdx = FindForwardThresholdCrossing(signal.ToArray(), noiseLevel);
-        if (firstThrCrossIdx == -1)
-            return -2;//无效信号
-        //4.计算包络并平滑
-        var envSignal= SignalProcessor.HilbertEnvelope(signal.ToArray());
-        var smoothedEnvSignal = SavitzkyGolayFilter.Smooth(envSignal);
-        //5.计算包络梯度(5点stencil)
-        var gradient = new double[smoothedEnvSignal.Length];
-        for (var i = 2; i < smoothedEnvSignal.Length - 2; i++)
-        {
-            gradient[i] = (-smoothedEnvSignal[i+2] + 8*smoothedEnvSignal[i+1] 
-                - 8*smoothedEnvSignal[i-1] + smoothedEnvSignal[i-2]) / 12.0;
-        }
-        //6. 从大于包络大于5ς开始搜索 到梯度为负数结束
-        var firstPeakIdx = -1;
-        var maxGrad = double.MinValue;
-        var searchEnd = gradient.Length - 1;
-        for (var i = firstThrCrossIdx; i <= searchEnd; i++)
-        {
-            if (gradient[i] <= 0)
-            {
-                break;
-            }
-            if (gradient[i] > maxGrad)
-            {
-                maxGrad = gradient[i];
-                firstPeakIdx = i;
-            }
+            // 自动法对外只保留协议级粗分类：波形幅值不足沿用 -1；
+            // 主回波区域或包络前沿未定位统一映射为 -2（检测条件未满足）。
+            // TryLocateEnvelopeFront 的返回语义不改，避免影响复用它的动态特征法。
+            return locateStatus == (short)MeasStatusCode.SignalTooSmall
+                ? locateStatus
+                : (short)MeasStatusCode.ThresholdNotReached;
         }
 
-        if (firstPeakIdx == -1) return -2;
-        
-        midResults[0] = firstPeakIdx;//第一个回波 波峰位置
-        midResults[1] = (decimal)smoothedEnvSignal[firstPeakIdx];//第一个回波峰值
-        //7. 计算firstPeakIdx所在的整us 并插值 2us 的数据
-        var usSpan = (int) (1000 / signalInterval); //1us多少个离散点
-        var usStartIdx = (int) Math.Floor(firstPeakIdx / (decimal) usSpan) * usSpan;
-        var usEndIdx = usStartIdx + 2 * usSpan; 
-        if (usEndIdx >= signal.Count) usEndIdx = signal.Count - 1;
-        var rangeSignal = signal.GetRange(usStartIdx, usEndIdx - usStartIdx);
-        var calcSignal = SignalProcessor.InterpolateAndResample(rangeSignal, signalInterval, CalculationInterval);
-        //8. 计算过阈值后的上升沿时间轴正向 过零点索引(从首峰索引开始找)
-        var calcFirstPeakIdx = (firstPeakIdx - usStartIdx) * signalInterval  / CalculationInterval;
-        var calcZeroIdxTuple = FindPositiveZeroCrossing(calcSignal.ToArray(), (int)calcFirstPeakIdx);
-        //信号过阈值 时间轴正向过零点索引
-        var calcZeroIdx = Convert.ToDecimal(calcZeroIdxTuple.Item1);
-        return Convert.ToDouble(usStartIdx + calcZeroIdx * CalculationInterval / signalInterval);
+        assist.Mx = envelopeFront.FrontIndex;
+        assist.My = envelopeFront.Threshold;
+        assist.Fx = envelopeFront.FrontIndex;
+        assist.Fy = envelopeFront.Threshold;
+        assist.Sx = envelopeFront.MainEcho.Start;
+        assist.Ex = envelopeFront.MainEcho.End;
+
+        // 周期决定首次选点的最大相位距离、跟踪搜索窗和过零质量检查窗口。
+        // 优先使用扫波/置零形成的稳定周期；没有稳定周期时从当前主回波实测；
+        // 实测不可靠才使用探头配置的名义周期。两者都不可用时宁可失败，也不再静默假定 2MHz(500ns)。
+        var periodNs = ResolveCarrierPeriodNs(envelopeFront, signalInterval, trackingContext);
+        if (!periodNs.HasValue)
+        {
+            // 已经找到 F，但无法形成可信周期，归为特征跟踪失败。
+            return (short)MeasStatusCode.SimilarityLow;
+        }
+        assist.PeriodNs = periodNs.Value;
+        var periodPoints = Math.Max(2d, Convert.ToDouble(periodNs.Value / signalInterval));
+        var hasReferenceAnchor = trackingContext is
+        {
+            ReferenceEchoTime: not null,
+            ReferenceEnvTime: not null
+        };
+
+        var predictedIndex = envelopeFront.FrontIndex;
+        int searchStart;
+        int searchEnd;
+        if (hasReferenceAnchor)
+        {
+            var currentEnvelopeTimeNs = trackingContext!.EchoStart +
+                                        envelopeFront.FrontIndex * signalInterval;
+            var predictedEchoTimeNs = trackingContext.ReferenceEchoTime!.Value +
+                                      currentEnvelopeTimeNs - trackingContext.ReferenceEnvTime!.Value;
+            predictedIndex = (predictedEchoTimeNs - trackingContext.EchoStart) / signalInterval;
+            // 整数窗口只用于限制遍历范围。Ceiling 可能把 0.45T 扩大到 0.5T，
+            // 最终候选还要在下方按小数距离严格过滤，避免正好位于相邻周期中点时偏向前一周期。
+            var halfWindowPoints = Convert.ToInt32(Math.Ceiling(periodPoints * TrackingSearchHalfPeriodRatio));
+            searchStart = Convert.ToInt32(Math.Floor(predictedIndex)) - halfWindowPoints;
+            searchEnd = Convert.ToInt32(Math.Ceiling(predictedIndex)) + halfWindowPoints + 1;
+        }
+        else
+        {
+            // 首次/旧项目没有包络锚点时，在当前主回波附近捕获包络前沿之后的上升沿。
+            var paddingPoints = Convert.ToInt32(Math.Ceiling(periodPoints));
+            searchStart = envelopeFront.MainEcho.Start - paddingPoints;
+            searchEnd = envelopeFront.MainEcho.End + paddingPoints;
+        }
+
+        var risingCrossings = FindQualifiedRisingZeroCrossings(envelopeFront, searchStart, searchEnd,
+            periodPoints, noiseBase).ToList();
+        if (risingCrossings.Count == 0)
+        {
+            return (short)MeasStatusCode.SimilarityLow;
+        }
+
+        decimal selectedCrossing;
+        if (hasReferenceAnchor)
+        {
+            // 已有 F0/Z0 时继续围绕位移预测点选最近的同向过零点，避免包络点轻微抖动造成整周期跳变。
+            // 必须使用未取整的 0.45T 再过滤一次；整数搜索窗口因 Ceiling 扩大时，
+            // 不允许距离为 0.5T 的左右候选进入比较，否则等距时会固定偏向较早的过零点。
+            var maxTrackingOffsetPoints = Convert.ToDecimal(periodPoints * TrackingSearchHalfPeriodRatio);
+            var trackingCandidates = risingCrossings
+                .Where(index => Math.Abs(index - predictedIndex) <= maxTrackingOffsetPoints)
+                .ToList();
+            if (trackingCandidates.Count == 0)
+            {
+                return (short)MeasStatusCode.SimilarityLow;
+            }
+
+            selectedCrossing = trackingCandidates.MinBy(index => Math.Abs(index - predictedIndex));
+        }
+        else
+        {
+            // 首次扫波只接受包络粗定位点之后的第一个上升沿。包络前沿受平滑和阈值位置影响，
+            // F 到首个上升沿可能略大于 0.8T，因此放宽到 1.05T；仍然只取第一个合格点，
+            // 不会越过它去选择更后的周期。正式测量/监测的 ±0.45T 跟踪窗口保持不变。
+            var maxInitialOffsetPoints = Convert.ToDecimal(periodPoints * InitialSearchMaxPeriodRatio);
+            var firstCrossingAfterEnvelope = risingCrossings
+                .Where(index => index >= predictedIndex && index - predictedIndex <= maxInitialOffsetPoints)
+                .OrderBy(index => index)
+                .Cast<decimal?>()
+                .FirstOrDefault();
+            if (!firstCrossingAfterEnvelope.HasValue)
+            {
+                return (short)MeasStatusCode.SimilarityLow;
+            }
+
+            selectedCrossing = firstCrossingAfterEnvelope.Value;
+        }
+        assist.Zx = selectedCrossing;
+        return Convert.ToDouble(selectedCrossing);
     }
+
+    /// <summary>
+    /// 解析自动法使用的载波周期。稳定参考周期用于保持监测窗口不随单帧噪声抖动；
+    /// 当前主回波实测周期用于新扫波和旧项目自适应；探头频率只作为可靠兜底。
+    /// </summary>
+    private static decimal? ResolveCarrierPeriodNs(EnvelopeFrontResult envelopeFront, decimal signalInterval,
+        EnvelopeTrackingContext? trackingContext)
+    {
+        decimal? nominalPeriodNs = trackingContext?.ProbeFreqMhz is > 0
+            ? 1000M / trackingContext.ProbeFreqMhz.Value
+            : null;
+
+        // 已置零或已有稳定扫波锚点时，优先保持 T0。若探头频率后来发生明显变化，
+        // 旧 T0 会因超出名义周期允许范围而被拒绝，避免沿用错误搜索窗口。
+        if (trackingContext?.ReferencePeriodNs is > 0 &&
+            IsPeriodPlausible(trackingContext.ReferencePeriodNs.Value, nominalPeriodNs, signalInterval))
+        {
+            return trackingContext.ReferencePeriodNs.Value;
+        }
+
+        if (TryEstimateCarrierPeriodNs(envelopeFront, signalInterval, nominalPeriodNs, out var measuredPeriodNs))
+        {
+            return measuredPeriodNs;
+        }
+
+        return nominalPeriodNs is > 0 ? nominalPeriodNs : null;
+    }
+
+    /// <summary>
+    /// 从主回波高能量区的相邻上升沿过零间距估算实际载波周期。
+    /// 使用中位数和 MAD 剔除噪声过零、漏周期和局部畸变；至少需要三个稳定周期间距。
+    /// </summary>
+    private static bool TryEstimateCarrierPeriodNs(EnvelopeFrontResult envelopeFront, decimal signalInterval,
+        decimal? nominalPeriodNs, out decimal periodNs)
+    {
+        periodNs = 0;
+        if (signalInterval <= 0)
+        {
+            return false;
+        }
+
+        var waveform = envelopeFront.Waveform;
+        var start = Math.Clamp(envelopeFront.MainEcho.Start, 0, Math.Max(0, waveform.Length - 1));
+        var end = Math.Clamp(envelopeFront.MainEcho.End, start, waveform.Length);
+        if (end - start < 3)
+        {
+            return false;
+        }
+
+        var minEnvelope = envelopeFront.EnvelopeMax * PeriodEnvelopeRatio;
+        var risingCrossings = new List<double>();
+        for (var index = start; index < end - 1; index++)
+        {
+            if (!IsPositiveZeroCrossing(waveform[index], waveform[index + 1]))
+            {
+                continue;
+            }
+
+            // 只使用主回波高能量部分，避免衰减尾部和区域边界的噪声过零污染周期估计。
+            var envelopeIndex = Math.Clamp(index, 0, envelopeFront.SmoothedEnvelope.Length - 1);
+            if (envelopeFront.SmoothedEnvelope[envelopeIndex] < minEnvelope)
+            {
+                continue;
+            }
+
+            risingCrossings.Add(Convert.ToDouble(
+                CalcZeroCrossingIndex(index, waveform[index], index + 1, waveform[index + 1])));
+        }
+
+        if (risingCrossings.Count < MinMeasuredPeriodIntervals + 1)
+        {
+            return false;
+        }
+
+        var intervals = risingCrossings.Zip(risingCrossings.Skip(1), (left, right) => right - left)
+            .Where(interval => interval >= 2d)
+            .ToList();
+        if (nominalPeriodNs is > 0)
+        {
+            var nominalPoints = Convert.ToDouble(nominalPeriodNs.Value / signalInterval);
+            intervals = intervals
+                .Where(interval => interval >= nominalPoints * Convert.ToDouble(MinNominalPeriodRatio) &&
+                                   interval <= nominalPoints * Convert.ToDouble(MaxNominalPeriodRatio))
+                .ToList();
+        }
+        if (intervals.Count < MinMeasuredPeriodIntervals)
+        {
+            return false;
+        }
+
+        var initialMedian = intervals.Median();
+        var initialMad = intervals.Select(interval => Math.Abs(interval - initialMedian)).Median();
+        var outlierTolerance = Math.Max(initialMedian * 0.30d, initialMad * 3d);
+        var stableIntervals = intervals
+            .Where(interval => Math.Abs(interval - initialMedian) <= outlierTolerance)
+            .ToArray();
+        if (stableIntervals.Length < MinMeasuredPeriodIntervals)
+        {
+            return false;
+        }
+
+        var stableMedian = stableIntervals.Median();
+        var stableMad = stableIntervals.Select(interval => Math.Abs(interval - stableMedian)).Median();
+        if (!(stableMedian > 0) || stableMad / stableMedian > MaxPeriodMadRatio)
+        {
+            return false;
+        }
+
+        var measuredPeriodNs = Convert.ToDecimal(stableMedian) * signalInterval;
+        if (!IsPeriodPlausible(measuredPeriodNs, nominalPeriodNs, signalInterval))
+        {
+            return false;
+        }
+
+        periodNs = measuredPeriodNs;
+        return true;
+    }
+
+    private static bool IsPeriodPlausible(decimal periodNs, decimal? nominalPeriodNs, decimal signalInterval)
+    {
+        if (periodNs < signalInterval * 2)
+        {
+            return false;
+        }
+
+        return nominalPeriodNs is not > 0 ||
+               periodNs >= nominalPeriodNs.Value * MinNominalPeriodRatio &&
+               periodNs <= nominalPeriodNs.Value * MaxNominalPeriodRatio;
+    }
+
+    private static IEnumerable<decimal> FindQualifiedRisingZeroCrossings(EnvelopeFrontResult envelopeFront,
+        int searchStart, int searchEnd, double periodPoints, double noiseBase)
+    {
+        var waveform = envelopeFront.Waveform;
+        var start = Math.Clamp(searchStart, 0, Math.Max(0, waveform.Length - 1));
+        var end = Math.Clamp(searchEnd, start, waveform.Length);
+        var excursionWindow = Math.Max(2, Convert.ToInt32(Math.Ceiling(periodPoints * 0.30d)));
+        var minExcursion = Math.Max(1d, Math.Min(noiseBase * 0.30d, envelopeFront.EnvelopeMax * 0.06d));
+        var minEnvelope = envelopeFront.EnvelopeMax * 0.05d;
+
+        for (var index = start; index < end - 1; index++)
+        {
+            if (!IsPositiveZeroCrossing(waveform[index], waveform[index + 1]))
+            {
+                continue;
+            }
+
+            var envelopeIndex = Math.Clamp(index, 0, envelopeFront.SmoothedEnvelope.Length - 1);
+            if (envelopeFront.SmoothedEnvelope[envelopeIndex] < minEnvelope)
+            {
+                continue;
+            }
+
+            var localStart = Math.Max(0, index - excursionWindow);
+            var localEnd = Math.Min(waveform.Length, index + excursionWindow + 2);
+            var negativeExcursion = waveform.Skip(localStart).Take(index - localStart + 1).Min();
+            var positiveExcursion = waveform.Skip(index + 1).Take(localEnd - index - 1).Max();
+            if (negativeExcursion > -minExcursion || positiveExcursion < minExcursion)
+            {
+                continue;
+            }
+
+            yield return CalcZeroCrossingIndex(index, waveform[index], index + 1, waveform[index + 1]);
+        }
+    }
+
+    private static EchoRegion SelectMainEchoRegion(IReadOnlyList<EchoRegion> regions,
+        IReadOnlyList<double> smoothEnergy)
+    {
+        var regionEnergies = regions.Select(region => smoothEnergy.Skip(region.Start)
+            .Take(Math.Max(1, region.End - region.Start)).Sum()).ToList();
+        var maxEnergy = regionEnergies.Count == 0 ? 0 : regionEnergies.Max();
+        var waveformSpan = Math.Max(1, smoothEnergy.Count);
+        var bestIndex = 0;
+        var bestScore = double.MinValue;
+        for (var i = 0; i < regions.Count; i++)
+        {
+            var region = regions[i];
+            var energyScore = maxEnergy <= 0 ? 0 : regionEnergies[i] / maxEnergy;
+            var cycleScore = Math.Min(1d, region.NCycles / 3d);
+            var earlyScore = 1d - Math.Clamp(region.Start / (double)waveformSpan, 0d, 1d);
+            var score = 0.50d * energyScore + 0.30d * cycleScore + 0.20d * earlyScore;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
+        return regions[bestIndex];
+    }
+
     /// <summary>
     /// 计算回波时间索引(计算过零含小数索引)-动态特征
     /// -1 表示信号过小
@@ -269,57 +510,121 @@ public static class CalculateExtensions
     /// </summary>
     /// <param name="signal">信号</param>
     /// <param name="signalInterval">信号点间隔(ns)</param>
-    /// <param name="midResults">中间值</param>
+    /// <param name="assist">回波辅助信息</param>
+    /// <param name="consecutive"></param>
     /// <param name="noiseBase">噪声基线</param>
     /// <param name="dynThr">小数阈值小于0.5</param>
-    public static double CalcZeroIndexByEnv(List<double> signal, decimal signalInterval, out decimal[] midResults, double noiseBase = 50d
-        , double dynThr = 0.3d)
+    public static double CalcZeroIndexByEnv(List<double> signal, decimal signalInterval, out EchoAssist assist, 
+        int consecutive = 20, double noiseBase = 50d, double dynThr = 0.3d)
     {
-        midResults = new[] {0m, 0m, 0m};
-        //1. 根据幅值判断信号是否有效
-        var isValidSignal = signal.Any(s => Math.Abs(s) >= noiseBase);
-        if (!isValidSignal)
+        assist = new EchoAssist();
+        // 动态特征法保持原有“第一个有效主回波 + 30% 包络前沿”的选择语义；
+        // 只把纯包络定位步骤抽出，供新的自动法复用。
+        var locateStatus = TryLocateEnvelopeFront(signal, signalInterval, consecutive, noiseBase,
+            finThreshold: 0.08d, preferFirstValidRegion: true, out var envelopeFront, dynThr);
+        if (locateStatus < 0)
         {
-            return -1;//无效信号状态码
+            return locateStatus;
         }
-        //2. 获取正向包络信号
-        var envSignal= SignalProcessor.HilbertEnvelope(signal.ToArray());
-        var smoothedEnvSignal = GetSmoothingData(envSignal);
-        //3. 计算包络信号过阈值的索引(峰值最大点)
-        var envMax = smoothedEnvSignal.Max();
-        //3.1 先找45%确定第一个包络
-        var envDetectThr = envMax * 0.45;//特征检测线
-        var envDetectThrCrossIdx = FindForwardThresholdCrossing(smoothedEnvSignal, envDetectThr);//正向上升沿
-        //3.2 从45%索引点前找过阈值点
-        var envThr = envMax * dynThr;
-        var thrCrossIdx = FindBackwardThresholdCrossing(smoothedEnvSignal, envThr, ThresholdEdgeType.Falling, envDetectThrCrossIdx);//反向下降沿
-        //4. 取前后各 1us 进行插值
-        var usSpan = (int) (1000 / signalInterval); //1us多少个离散点
-        var usStartIdx = (int) Math.Floor(thrCrossIdx / (decimal) usSpan) * usSpan;
-        var usEndIdx = usStartIdx + 2 * usSpan; //只进行前后共2个us的点进行插值
-        if (usEndIdx >= smoothedEnvSignal.Length) usEndIdx = smoothedEnvSignal.Length - 1;
-        var rangeSignal = smoothedEnvSignal.ToList().GetRange(usStartIdx, usEndIdx - usStartIdx);
-        //5. 插值通过阈值进行高精度计算
-        var calcSignal = SignalProcessor.InterpolateAndResample(rangeSignal, signalInterval, CalculationInterval);
-        var calcThrCrossIdx = FindForwardThresholdCrossing(calcSignal.ToArray(), envThr);
-        
-        midResults[0] = usStartIdx + calcThrCrossIdx * CalculationInterval / signalInterval; 
-        midResults[1] = (decimal)envThr;
-        midResults[2] = (decimal) envDetectThr;
-        
-        //6. 直接使用包络过阈值点作为测量结果
-        return Convert.ToDouble(usStartIdx + calcThrCrossIdx * CalculationInterval / signalInterval);
+
+        assist.Mx = envelopeFront.FrontIndex;
+        assist.My = envelopeFront.Threshold;
+        assist.Sx = envelopeFront.MainEcho.Start;
+        assist.Ex = envelopeFront.MainEcho.End;
+        // 动态特征法仍直接返回包络过阈值点，不改变原有结果定义。
+        return Convert.ToDouble(envelopeFront.FrontIndex);
+    }
+
+    private static int TryLocateEnvelopeFront(List<double> signal, decimal signalInterval, int consecutive,
+        double noiseBase, double finThreshold, bool preferFirstValidRegion,
+        out EnvelopeFrontResult result, double dynThr = 0.3d)
+    {
+        result = default;
+        if (signal.Count < 3 || !signal.Any(value => Math.Abs(value) >= noiseBase))
+        {
+            return -1;
+        }
+
+        var dcEnd = Math.Min(signal.Count, Math.Max(40, signal.Count / 10));
+        var dcMean = signal.Take(dcEnd).Average();
+        var waveform = signal.Select(value => value - dcMean).ToArray();
+        var regions = SignalProcessor.DetectRegions(waveform, 0.25d, finThreshold, minWidth: consecutive)
+            .Where(region => region.End > region.Start && region.Start >= 0 && region.End <= waveform.Length)
+            .ToList();
+        if (regions.Count == 0)
+        {
+            return -5;
+        }
+
+        EchoRegion mainEcho;
+        if (preferFirstValidRegion)
+        {
+            mainEcho = regions.FirstOrDefault(region => region.NCycles >= 3) ?? regions.First();
+        }
+        else
+        {
+            var energy = waveform.Select(value => value * value).ToArray();
+            var smoothEnergy = SavitzkyGolayFilter.Smooth(energy);
+            mainEcho = SelectMainEchoRegion(regions, smoothEnergy);
+        }
+
+        var envelope = SignalProcessor.HilbertEnvelope(waveform);
+        var smoothedEnvelope = SavitzkyGolayFilter.Smooth(envelope);
+        var mainEchoData = smoothedEnvelope.Skip(mainEcho.Start).Take(mainEcho.End - mainEcho.Start).ToArray();
+        if (mainEchoData.Length == 0)
+        {
+            return -5;
+        }
+
+        var envelopeMax = mainEchoData.Max();
+        if (envelopeMax <= 0)
+        {
+            return -5;
+        }
+        var threshold = envelopeMax * dynThr;
+        var regionCrossing = FindForwardThresholdCrossing(mainEchoData, threshold);
+        if (regionCrossing < 0)
+        {
+            return -5;
+        }
+
+        var thresholdCrossing = regionCrossing + mainEcho.Start;
+        var usSpan = Math.Max(1, Convert.ToInt32(1000M / signalInterval));
+        var usStartIndex = Math.Max(0, thresholdCrossing / usSpan * usSpan);
+        var usEndIndex = usStartIndex + 2 * usSpan;
+        if (usEndIndex >= smoothedEnvelope.Length)
+        {
+            // 保持原动态特征法的末端取样边界语义。
+            usEndIndex = smoothedEnvelope.Length - 1;
+        }
+        if (usEndIndex - usStartIndex < 2)
+        {
+            return -5;
+        }
+
+        var rangeSignal = smoothedEnvelope.Skip(usStartIndex).Take(usEndIndex - usStartIndex).ToList();
+        var calculatedSignal = SignalProcessor.InterpolateAndResample(rangeSignal, signalInterval, CalculationInterval);
+        var calculatedCrossing = FindForwardThresholdCrossing(calculatedSignal.ToArray(), threshold);
+        if (calculatedCrossing < 0)
+        {
+            return -5;
+        }
+
+        var frontIndex = usStartIndex + calculatedCrossing * CalculationInterval / signalInterval;
+        result = new EnvelopeFrontResult(waveform, smoothedEnvelope, mainEcho, frontIndex,
+            Convert.ToDecimal(threshold), envelopeMax);
+        return 0;
     }
     /// <summary>
     /// 计算回波时间索引(计算过零含小数索引)-波谷法
     /// -1 表示信号过小
     /// </summary>
     /// <param name="signal">信号</param>
-    /// <param name="midResults">中间值</param>
+    /// <param name="assist">回波辅助信息</param>
     /// <param name="noiseBase">噪声基线</param>
-    public static double CalcZeroIndexByAutoValley(List<double> signal, out decimal[] midResults, double noiseBase = 10d)
+    public static double CalcZeroIndexByAutoValley(List<double> signal, out EchoAssist assist, double noiseBase = 10d)
     {
-        midResults = new[] {0m, 0m, 0m, 0m};
+        assist = new EchoAssist();
         //1. 根据幅值判断信号是否有效
         var isValidSignal = signal.Any(s => Math.Abs(s) >= noiseBase);
         if (!isValidSignal)
@@ -328,16 +633,17 @@ public static class CalculateExtensions
         }
         //2. 找最小波谷,然后找上升沿过零点
         var (minIndex,_) = FindMinMax(signal.ToArray());
-        midResults[0] = minIndex; midResults[1] = (decimal) signal[minIndex];
+        assist.Mx = minIndex; 
+        assist.My = (decimal) signal[minIndex];
         var zeroIndexTuple = FindPositiveZeroCrossing(signal.ToArray(), minIndex);
         var calcZeroIdx = Convert.ToDecimal(zeroIndexTuple.Item1);
-        if (zeroIndexTuple.Item1 > 0)
+        if (zeroIndexTuple.Item1 >= 0 && zeroIndexTuple.Item1 + 1 < signal.Count)
         {
-            var calcCurrentIdx = zeroIndexTuple.Item1;
-            var calcPrevIdx = zeroIndexTuple.Item1 - 1;
+            var calcPrevIdx = zeroIndexTuple.Item1;
+            var calcCurrentIdx = zeroIndexTuple.Item1 + 1;
             calcZeroIdx = CalcZeroCrossingIndex(calcPrevIdx, signal[calcPrevIdx], calcCurrentIdx,signal[calcCurrentIdx]);
         }
-        midResults[2] = calcZeroIdx;
+        assist.Zx = calcZeroIdx;
         return Convert.ToDouble(calcZeroIdx);
     }
     /// <summary>
@@ -346,11 +652,11 @@ public static class CalculateExtensions
     /// </summary>
     /// <param name="signal">信号</param>
     /// <param name="posIndex">信号</param>
-    /// <param name="midResults">中间值</param>
+    /// <param name="assist">回波辅助信息</param>
     /// <param name="noiseBase">噪声基线</param>
-    public static double CalcZeroIndexByPosition(List<double> signal,int posIndex, out decimal[] midResults, double noiseBase = 10d)
+    public static double CalcZeroIndexByPosition(List<double> signal,int posIndex, out EchoAssist assist, double noiseBase = 10d)
     {
-        midResults = new[] {0m, 0m, 0m, 0m};
+        assist = new EchoAssist();
         //1. 根据幅值判断信号是否有效
         var isValidSignal = signal.Any(s => Math.Abs(s) >= noiseBase);
         if (!isValidSignal)
@@ -360,19 +666,19 @@ public static class CalculateExtensions
         //2. 根据位置找上升沿过零点
         if (posIndex > 0)
         {
-            midResults[0] = posIndex; 
-            midResults[1] = (decimal) signal[posIndex];
+            assist.Mx = posIndex; 
+            assist.My = (decimal) signal[posIndex];
         }
 
         var zeroIndexTuple = FindPositiveZeroCrossing(signal.ToArray(), posIndex);
         var calcZeroIdx = Convert.ToDecimal(zeroIndexTuple.Item1);
-        if (zeroIndexTuple.Item1 > 0)
+        if (zeroIndexTuple.Item1 >= 0 && zeroIndexTuple.Item1 + 1 < signal.Count)
         {
-            var calcCurrentIdx = zeroIndexTuple.Item1;
-            var calcPrevIdx = zeroIndexTuple.Item1 - 1;
+            var calcPrevIdx = zeroIndexTuple.Item1;
+            var calcCurrentIdx = zeroIndexTuple.Item1 + 1;
             calcZeroIdx = CalcZeroCrossingIndex(calcPrevIdx, signal[calcPrevIdx], calcCurrentIdx,signal[calcCurrentIdx]);
         }
-        midResults[2] = calcZeroIdx;
+        assist.Zx = calcZeroIdx;
         return Convert.ToDouble(calcZeroIdx);
     }
     /// <summary>
@@ -381,12 +687,12 @@ public static class CalculateExtensions
     /// -2 阈值异常
     /// </summary>
     /// <param name="signal">信号</param>
-    /// <param name="midResults">中间值(x1,y1,x2,y2)</param>
+    /// <param name="assist">回波辅助信息</param>
     /// <param name="noiseBase">噪声基线</param>
     /// <param name="threshold">阈值</param>
-    public static double CalcZeroIndexBySimpleThr(List<double> signal, out decimal[] midResults ,double noiseBase = 10d, short threshold = 0)
+    public static double CalcZeroIndexBySimpleThr(List<double> signal, out EchoAssist assist ,double noiseBase = 10d, short threshold = 0)
     {
-        midResults = new[] {0m, 0m, 0m, 0m};
+        assist = new EchoAssist();
         //1. 根据幅值判断信号是否有效
         var isValidSignal = signal.Any(s => Math.Abs(s) >= noiseBase);
         if (!isValidSignal)
@@ -401,17 +707,66 @@ public static class CalculateExtensions
         {
             return -2;//阈值异常 波形比阈值小
         }
-        midResults[0] = thrCrossIdx; midResults[1] = (decimal) signal[thrCrossIdx];
+        assist.Mx = thrCrossIdx;
+        assist.My = (decimal) signal[thrCrossIdx];
         var zeroIndexTuple = FindPositiveZeroCrossing(signal.ToArray(), thrCrossIdx);
         var calcZeroIdx = Convert.ToDecimal(zeroIndexTuple.Item1);
-        if (zeroIndexTuple.Item1 > 0)
+        if (zeroIndexTuple.Item1 >= 0 && zeroIndexTuple.Item1 + 1 < signal.Count)
         {
-            var calcCurrentIdx = zeroIndexTuple.Item1;
-            var calcPrevIdx = zeroIndexTuple.Item1 - 1;
+            var calcPrevIdx = zeroIndexTuple.Item1;
+            var calcCurrentIdx = zeroIndexTuple.Item1 + 1;
             calcZeroIdx = CalcZeroCrossingIndex(calcPrevIdx, signal[calcPrevIdx], calcCurrentIdx,signal[calcCurrentIdx]);
         }
-        midResults[2] = calcZeroIdx;
+        assist.Zx = calcZeroIdx;
         return Convert.ToDouble(calcZeroIdx);
+    }
+    /// <summary>
+    /// 计算首个过阈值的显著极值点索引（正阈值 → 波峰，负阈值 → 波谷）
+    /// -1: 无有效信号（输入为空）
+    /// -2: 阈值异常（信号未越过阈值）
+    /// -3: 越过阈值但未找到有效极值点（如单调信号）
+    /// 返回值: 极值点索引（double，当前返回整数，预留亚采样插值扩展）
+    /// </summary>
+    public static double CalcFirstPeakIndexBySimpleThr(List<double>? signal, short threshold = 0)
+    {
+        if (signal == null || signal.Count == 0)
+            return -1; // 无信号
+
+        // 确定检测方向：正阈值 → 上升沿 + 找波峰；负阈值 → 下降沿 + 找波谷
+        var isFindingPeak = threshold >= 0;
+        var edgeType = isFindingPeak ? ThresholdEdgeType.Rising : ThresholdEdgeType.Falling;
+
+        // 查找首次越过阈值的位置
+        var thrCrossIdx = FindForwardThresholdCrossing(signal.ToArray(), threshold, edgeType);
+        if (thrCrossIdx < 0)
+            return -2; // 未越过阈值
+
+        // 从 crossing 点之后开始搜索极值点（至少需要 i-1, i, i+1）
+        for (var i = thrCrossIdx + 1; i < signal.Count - 1; i++)
+        {
+            var prev = signal[i - 1];
+            var curr = signal[i];
+            var next = signal[i + 1];
+
+            if (isFindingPeak)
+            {
+                // 波峰条件：prev < curr 且 curr >= next（允许平台右端）
+                if (curr > prev && curr >= next)
+                {
+                    return i;
+                }
+            }
+            else
+            {
+                // 波谷条件：prev > curr 且 curr <= next（允许平台右端）
+                if (curr < prev && curr <= next)
+                {
+                    return i;
+                }
+            }
+        }
+        // 越过阈值但未找到符合要求的极值点
+        return -3;
     }
     /// <summary>
     /// 时间轴正向查找过阈值索引（支持上升沿和下降沿）
@@ -531,20 +886,6 @@ public static class CalculateExtensions
         // 线性插值公式
         var interpolatedIndex = (x1 + (0 - y1) * ((x2 - x1) / (y2 - y1)));
         return Convert.ToDecimal(interpolatedIndex);
-    }
-    /// <summary>
-    /// 获取 平滑数据
-    /// </summary>
-    public static double[] GetSmoothingData(double[] signal,int windowSize = 5)
-    {
-        var mss = new MovingStatistics(windowSize);
-        var avgData = new double[signal.Length];
-        for (var i = 0; i < signal.Length; i++)
-        {
-            mss.Push(signal[i]);
-            avgData[i] = mss.Mean;
-        }
-        return avgData;
     }
     /// <summary>
     /// 获取同步时间(2000年1月1日之后的天数)

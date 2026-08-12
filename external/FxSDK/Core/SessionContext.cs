@@ -28,7 +28,11 @@ public static class SessionContext
     /// <summary>
     /// 温度前缀
     /// </summary>
-    private const string TempPrefix = "T|";
+    private const string ChannelTempPrefix = "T|";
+    /// <summary>
+    /// 包络过零跟踪上下文前缀
+    /// </summary>
+    private const string EnvelopeTrackingPrefix = "ENV-TRACK|";
     /// <summary>
     /// 设备模式标识
     /// </summary>
@@ -88,8 +92,27 @@ public static class SessionContext
     public static void StoreToSession(IoSession session, ChannelConfig config)
     {
         var channelKey = $"{ChannelPrefix}{config.Address}|{config.Channel}";
+        var previousConfig = GetSessionAttribute<ChannelConfig?>(session, channelKey);
+        if (previousConfig != null && HasEnvelopeTrackingRelevantChange(previousConfig, config))
+        {
+            ClearEnvelopeTrackingContext(session, config.Address, config.Channel);
+        }
         SetSessionAttribute(session, channelKey, config);
         StoreToSession(session, config.Channel, config.Address);//保存最后channel
+    }
+
+    private static bool HasEnvelopeTrackingRelevantChange(ChannelConfig previous, ChannelConfig current)
+    {
+        return previous.ProbeFreq != current.ProbeFreq ||
+               previous.EchoWin != current.EchoWin ||
+               previous.EchoWidth != current.EchoWidth ||
+               previous.Gain != current.Gain ||
+               previous.MeasMode != current.MeasMode ||
+               previous.PulseConfig.PulseVoltage != current.PulseConfig.PulseVoltage ||
+               previous.PulseConfig.PulseWidth != current.PulseConfig.PulseWidth ||
+               previous.PulseConfig.Duty != current.PulseConfig.Duty ||
+               previous.PulseConfig.Forward != current.PulseConfig.Forward ||
+               previous.PulseConfig.Reverse != current.PulseConfig.Reverse;
     }
     /// <summary>
     /// 保存最后通道到会话对象
@@ -190,16 +213,106 @@ public static class SessionContext
     /// </summary>
     public static void StoreChannelTemp(IoSession session, ushort address, ushort channel, decimal temperature)
     {
-        var channelTempKey = $"{TempPrefix}{address}|{channel}";
-        SetSessionAttribute(session, channelTempKey, temperature);
+        SetSessionAttribute(session, GetChannelTempKey(address, channel), temperature);
     }
     /// <summary>
     /// 获取通道温度
     /// </summary>
     public static decimal? GetChannelTemp(IoSession session, ushort address, ushort channel)
     {
-        var channelTempKey = $"{TempPrefix}{address}|{channel}";
-        return GetSessionAttribute<decimal?>(session, channelTempKey);
+        return GetSessionAttribute<decimal?>(session, GetChannelTempKey(address, channel));
+    }
+    /// <summary>
+    /// 获取会话内全部通道温度
+    /// </summary>
+    public static IReadOnlyList<(ushort Address, ushort Channel, decimal Temperature)> GetChannelTemps(IoSession session)
+    {
+        var tempPrefix = $"{session.SessionId}|{ChannelTempPrefix}";
+        var result = new List<(ushort Address, ushort Channel, decimal Temperature)>();
+        var sessionLock = SessionLocks.GetOrAdd(session.SessionId, _ => new object());
+        lock (sessionLock)
+        {
+            if (!SessionKeys.TryGetValue(session.SessionId, out var sessionSet))
+            {
+                return result;
+            }
+            foreach (var fullKey in sessionSet.ToList())
+            {
+                if (!fullKey.StartsWith(tempPrefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                var key = fullKey.Substring(session.SessionId.Length + 1);
+                var keyParts = key.Split('|', StringSplitOptions.RemoveEmptyEntries);
+                if (keyParts.Length != 3)
+                {
+                    continue;
+                }
+                if (!ushort.TryParse(keyParts[1], out var address) ||
+                    !ushort.TryParse(keyParts[2], out var channel))
+                {
+                    continue;
+                }
+                var temperature = GetSessionAttribute<decimal?>(session, key);
+                if (!temperature.HasValue)
+                {
+                    continue;
+                }
+                result.Add((address, channel, temperature.Value));
+            }
+        }
+        return result;
+    }
+    private static string GetChannelTempKey(ushort address, ushort channel)
+    {
+        return $"{ChannelTempPrefix}{address}|{channel}";
+    }
+    #endregion
+    #region 包络过零跟踪上下文
+    public static EnvelopeTrackingContext GetEnvelopeTrackingContext(IoSession session, ushort address, ushort channel)
+    {
+        var trackingKey = GetEnvelopeTrackingKey(address, channel);
+        var context = GetSessionAttribute<EnvelopeTrackingContext?>(session, trackingKey);
+        if (context != null)
+        {
+            return context;
+        }
+        context = new EnvelopeTrackingContext();
+        SetSessionAttribute(session, trackingKey, context);
+        return context;
+    }
+
+    public static void StoreEnvelopeTrackingAnchor(IoSession session, ushort address, ushort channel,
+        decimal envelopeTime, decimal echoTime, decimal? periodNs)
+    {
+        var context = GetEnvelopeTrackingContext(session, address, channel);
+        context.AddTrackingAnchor(envelopeTime, echoTime, periodNs);
+        SetSessionAttribute(session, GetEnvelopeTrackingKey(address, channel), context);
+    }
+
+    public static void BeginEnvelopeScan(IoSession session, ushort address, ushort channel)
+    {
+        var context = GetEnvelopeTrackingContext(session, address, channel);
+        context.ClearTrackingAnchor();
+        SetSessionAttribute(session, GetEnvelopeTrackingKey(address, channel), context);
+    }
+
+    public static void ClearEnvelopeTrackingContext(IoSession session, ushort address, ushort channel)
+    {
+        Remove(session, GetEnvelopeTrackingKey(address, channel));
+    }
+
+    public static void ClearEnvelopeTrackingContexts(IoSession session, ushort? address = null)
+    {
+        var prefix = address.HasValue
+            ? $"{session.SessionId}|{EnvelopeTrackingPrefix}{address.Value}|"
+            : $"{session.SessionId}|{EnvelopeTrackingPrefix}";
+        RemoveByFullKeyPrefix(session, prefix);
+    }
+
+    private static string GetEnvelopeTrackingKey(ushort address, ushort channel)
+    {
+        return $"{EnvelopeTrackingPrefix}{address}|{channel}";
     }
     #endregion
     #region 会话缓存上下文操作
@@ -237,6 +350,22 @@ public static class SessionContext
             if (SessionKeys.TryGetValue(session.SessionId, out var sessionSet) 
                 && sessionSet.Contains(fullKey))
             {
+                sessionSet.Remove(fullKey);
+            }
+        }
+    }
+    private static void RemoveByFullKeyPrefix(IoSession session, string fullKeyPrefix)
+    {
+        var sessionLock = SessionLocks.GetOrAdd(session.SessionId, _ => new object());
+        lock (sessionLock)
+        {
+            if (!SessionKeys.TryGetValue(session.SessionId, out var sessionSet))
+            {
+                return;
+            }
+            foreach (var fullKey in sessionSet.Where(key => key.StartsWith(fullKeyPrefix, StringComparison.Ordinal)).ToList())
+            {
+                ContextCache.TryRemove(fullKey, out _);
                 sessionSet.Remove(fullKey);
             }
         }

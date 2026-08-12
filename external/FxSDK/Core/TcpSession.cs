@@ -17,23 +17,23 @@ public class TcpSession : IoSession
     private readonly Pipe _pipe;
     private readonly CancellationTokenSource _sessionCts;
     private readonly CancellationTokenRegistration _externalCancellationRegistration;
+    private readonly TcpSessionOptions _tcpSessionOptions;
     
     private Task _receiveTask = Task.CompletedTask;
     private Task _sendTask = Task.CompletedTask;
     private Task _heartbeatTask = Task.CompletedTask;
     private Task _decodeTask = Task.CompletedTask;
     private Task[] _backgroundTasks = Array.Empty<Task>();
-
-    /// <summary>关闭时给后台任务自然退出的宽限期。超时文案共用它，见 CloseAsync。</summary>
-    private static readonly TimeSpan TaskExitGrace = TimeSpan.FromSeconds(10);
-
+    
     // 使用原子操作确保线程安全
     private int _isClosed = 0;
 
-    public TcpSession(Socket socket, FxProtocolHandler fxProtocolHandler, CancellationToken externalToken)
+    public TcpSession(Socket socket, FxProtocolHandler fxProtocolHandler, CancellationToken externalToken,
+        TcpSessionOptions? tcpSessionOptions = null)
         : base(fxProtocolHandler)
     {
         _socket = socket ?? throw new ArgumentNullException(nameof(socket));
+        _tcpSessionOptions = tcpSessionOptions?.Clone() ?? new TcpSessionOptions();
         _sessionCts = externalToken.CanBeCanceled 
             ? CancellationTokenSource.CreateLinkedTokenSource(externalToken) 
             : new CancellationTokenSource();
@@ -50,7 +50,9 @@ public class TcpSession : IoSession
             resumeWriterThreshold: 128 * 1024
         ));
         
-        SessionId = GetSessionId((IPEndPoint)_socket.RemoteEndPoint);
+        var remoteEndPoint = _socket.RemoteEndPoint as IPEndPoint
+                             ?? throw new InvalidOperationException("TCP remote endpoint is unavailable.");
+        SessionId = GetSessionId(remoteEndPoint);
         
         // 注册外部取消回调
         if (externalToken.CanBeCanceled)
@@ -64,6 +66,13 @@ public class TcpSession : IoSession
     }
 
     protected sealed override CancellationToken SessionToken { get; init; }
+
+    protected override void RequestClose(SessionCloseReason reason, Exception? exception)
+    {
+        _ = CloseAsync(reason, exception);
+    }
+
+    public override bool IsConnected => Volatile.Read(ref _isClosed) == 0;
 
     internal override async Task OpenAsync()
     {
@@ -102,7 +111,7 @@ public class TcpSession : IoSession
                 {
                     var bytesRead = await _socket.ReceiveAsync(buffer, SocketFlags.None, SessionToken).ConfigureAwait(false);
 
-                    if (bytesRead == 0)
+                    if (bytesRead == 0)//对端取消的 要主动close掉
                     {
                         Logger.Info("Remote side closed the connection gracefully.");
                         _ = CloseAsync(SessionCloseReason.RemoteClosed).ConfigureAwait(false);
@@ -110,7 +119,9 @@ public class TcpSession : IoSession
                     }
                     
                     var data = buffer.AsMemory(0, bytesRead);
-                    ProtocolHandler.Enqueue(data.ToArray());
+                    MarkReceived();
+                    FireTrafficObserved(SessionTrafficDirection.Received, data);
+                    ProtocolHandler.Enqueue(data.Span);
                     
                     if (FxUtility.DeveloperMode)
                     {
@@ -169,9 +180,19 @@ public class TcpSession : IoSession
                             {
                                 if (SessionToken.IsCancellationRequested || _socket == null)
                                     break;
-                                
-                                await _socket.SendAsync(segment, SocketFlags.None, SessionToken).ConfigureAwait(false);
-                                
+
+                                var remaining = segment;
+                                while (!remaining.IsEmpty)
+                                {
+                                    var bytesSent = await _socket.SendAsync(remaining, SocketFlags.None, SessionToken)
+                                        .ConfigureAwait(false);
+                                    if (bytesSent <= 0)
+                                    {
+                                        break;
+                                    }
+                                    remaining = remaining[bytesSent..];
+                                }
+                                MarkSent();
                                 if (FxUtility.DeveloperMode)
                                 {
                                     Logger.Debug($"send: {ByteUtility.BytesToHexStr(segment.ToArray())}");
@@ -228,9 +249,10 @@ public class TcpSession : IoSession
     
     private async Task HeartbeatLoop()
     {
-        if (HeartbeatSeconds <= 0)
+        var heartbeatSeconds = Math.Max(1d, _tcpSessionOptions.HeartbeatSeconds);
+        if (!_tcpSessionOptions.EnableHeartbeat && !_tcpSessionOptions.EnableReceiveActivityTimeout)
         {
-            Logger.Debug("Heartbeat disabled");
+            Logger.Debug("TCP heartbeat and receive activity timeout disabled");
             return;
         }
         
@@ -241,11 +263,30 @@ public class TcpSession : IoSession
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(HeartbeatSeconds), SessionToken)
+                    await Task.Delay(TimeSpan.FromSeconds(heartbeatSeconds), SessionToken)
                         .ConfigureAwait(false);
                     
-                    await SendDataAsync(new byte[] { 0x00 }).ConfigureAwait(false);
-                    missed = 0;
+                    if (_tcpSessionOptions.EnableHeartbeat)
+                    {
+                        await SendDataAsync(new byte[] { 0x00 }).ConfigureAwait(false);
+                        missed = 0;
+                    }
+
+                    if (_tcpSessionOptions.EnableReceiveActivityTimeout &&
+                        IsReceiveActivityTimedOut(out var timeout, out var silence))
+                    {
+                        var ex = new TimeoutException(
+                            $"No TCP data received for {silence.TotalSeconds:F0}s, timeout is {timeout.TotalSeconds:F0}s.");
+                        Logger.Warn(
+                            "TCP session {SessionId} receive activity timed out. Silence={SilenceSeconds:F0}s, Timeout={TimeoutSeconds:F0}s, LastReceiveUtc={LastReceiveUtc:o}, LastDecodedUtc={LastDecodedUtc:o}",
+                            SessionId,
+                            silence.TotalSeconds,
+                            timeout.TotalSeconds,
+                            LastReceiveUtc,
+                            LastDecodedUtc);
+                        _ = CloseAsync(SessionCloseReason.HeartbeatTimeout, ex).ConfigureAwait(false);
+                        return;
+                    }
                 }
                 catch (OperationCanceledException) when (SessionToken.IsCancellationRequested)
                 {
@@ -281,10 +322,36 @@ public class TcpSession : IoSession
     // ====== 优化的关闭逻辑 ======
     public override async Task CloseAsync()
     {
-        await CloseAsync(SessionCloseReason.Normal).ConfigureAwait(false);
+        await CloseAsync(
+            SessionCloseReason.Normal,
+            exception: null,
+            waitForBackgroundTasks: TimeSpan.FromSeconds(10),
+            fastBaseClose: false).ConfigureAwait(false);
+    }
+
+    public override async Task CloseFastAsync()
+    {
+        await CloseAsync(
+            SessionCloseReason.Normal,
+            exception: null,
+            waitForBackgroundTasks: TimeSpan.FromMilliseconds(200),
+            fastBaseClose: true).ConfigureAwait(false);
     }
 
     internal async Task CloseAsync(SessionCloseReason reason, Exception? exception = null)
+    {
+        await CloseAsync(
+            reason,
+            exception,
+            waitForBackgroundTasks: TimeSpan.FromSeconds(10),
+            fastBaseClose: false).ConfigureAwait(false);
+    }
+
+    private async Task CloseAsync(
+        SessionCloseReason reason,
+        Exception? exception,
+        TimeSpan waitForBackgroundTasks,
+        bool fastBaseClose)
     {
         if (Interlocked.CompareExchange(ref _isClosed, 1, 0) != 0)
             return;
@@ -301,13 +368,12 @@ public class TcpSession : IoSession
         {
             try
             {
-                await Task.WhenAll(_backgroundTasks).WaitAsync(TaskExitGrace).ConfigureAwait(false);
+                await Task.WhenAll(_backgroundTasks).WaitAsync(waitForBackgroundTasks).ConfigureAwait(false);
                 Logger.Debug($"Session {SessionId} all tasks completed successfully");
             }
             catch (TimeoutException)
             {
-                // 用同一个常量，别在日志里写死秒数：改了超时忘改文案，看日志的人会照错的数字排查
-                Logger.Warn($"Session {SessionId} tasks did not exit cleanly after {TaskExitGrace.TotalSeconds:F0}s.");
+                Logger.Warn($"Session {SessionId} tasks did not exit cleanly within close timeout.");
             }
         }
 
@@ -320,23 +386,32 @@ public class TcpSession : IoSession
         try { _sessionCts?.Dispose(); } catch { }
         try { _externalCancellationRegistration.Dispose(); } catch { }
         
-        // Step 5: 事件 & 基类
+        // Step 5: 生命周期回调 & 基类
         FireSessionDisconnected(reason, exception);
-        await base.CloseAsync().ConfigureAwait(false);
+        if (fastBaseClose)
+        {
+            await base.CloseFastAsync().ConfigureAwait(false);
+        }
+        else
+        {
+            await base.CloseAsync().ConfigureAwait(false);
+        }
     }
 
     protected override async Task SendDataAsync(byte[] data)
     {
         if (data.Length == 0)
             return;
-        // 会话已关闭时抛出而不是静默返回：旧实现直接 return，调用方以为发成功了
-        // 白等设备回包；心跳循环的 missed 计数也因此从未加过。
+        // 【我方补丁，1.6 重打】会话已关闭时抛出而不是静默返回：厂家原版直接 return，
+        // 调用方以为发成功了白等设备回包；心跳循环的 missed 计数也因此从未加过。
+        // 1.4 时代的同一补丁见 sdk-changelog.md 0cb0d86。
         if (_isClosed == 1 || SessionToken.IsCancellationRequested)
             throw new OperationCanceledException($"会话 {SessionId} 已关闭，数据未发送。");
 
         try
         {
             await _pipe.Writer.WriteAsync(data, SessionToken).ConfigureAwait(false);
+            FireTrafficObserved(SessionTrafficDirection.Sent, data);
         }
         catch (OperationCanceledException) when (SessionToken.IsCancellationRequested)
         {
@@ -375,6 +450,56 @@ public class TcpSession : IoSession
             IOException ioe => ioe.InnerException != null && IsConnectionError(ioe.InnerException),
             _ => false
         };
+    }
+
+    private bool IsReceiveActivityTimedOut(out TimeSpan timeout, out TimeSpan silence)
+    {
+        timeout = TimeSpan.Zero;
+        silence = DateTime.UtcNow - LastReceiveUtc;
+        var mode = SessionContext.GetDeviceMode(this);
+        if (!RequiresReceiveActivity(mode))
+        {
+            return false;
+        }
+
+        timeout = ResolveReceiveActivityTimeout(mode);
+        return timeout > TimeSpan.Zero && silence > timeout;
+    }
+
+    private TimeSpan ResolveReceiveActivityTimeout(WorkMode mode)
+    {
+        var heartbeatSeconds = Math.Max(1d, _tcpSessionOptions.HeartbeatSeconds);
+        var minTimeout = TimeSpan.FromSeconds(heartbeatSeconds * HeartbeatMaxMissed);
+        var config = SessionContext.GetDeviceConfig(this);
+        if (mode == WorkMode.MultiMeas && config?.MCRConfig?.DailyCount > 0)
+        {
+            var roundInterval = TimeSpan.FromSeconds(24d * 60d * 60d / config.MCRConfig.DailyCount);
+            return Max(roundInterval + minTimeout, roundInterval * 1.5);
+        }
+
+        if (config?.SampleInterval > 0)
+        {
+            var expectedInterval = TimeSpan.FromSeconds(Math.Max(1d, (double)config.SampleInterval * 10d));
+            return Max(minTimeout, expectedInterval);
+        }
+
+        return minTimeout;
+    }
+
+    private static bool RequiresReceiveActivity(WorkMode mode)
+    {
+        return mode is WorkMode.LWaveRead
+            or WorkMode.TWaveRead
+            or WorkMode.SingleMeas
+            or WorkMode.MultiMeas
+            or WorkMode.DualMeas
+            or WorkMode.FullWaveRead
+            or WorkMode.ReadParam;
+    }
+
+    private static TimeSpan Max(TimeSpan left, TimeSpan right)
+    {
+        return left >= right ? left : right;
     }
 
     private string GetSessionId(IPEndPoint remoteEndPoint)

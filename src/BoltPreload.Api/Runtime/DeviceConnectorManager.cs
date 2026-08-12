@@ -134,6 +134,13 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             _log.LogWarning("热加设备失败：devices 表无 id={DeviceId} 的启用设备", deviceId);
             return false;
         }
+        if (row.CommType == 2)
+        {
+            // SDK 1.6 移除了 TCP Server：comm_type=2 在 ConnectAsync 时直接抛 NotSupportedException。
+            // 新建/改参入口已在 DeviceEndpoints 拒掉 2，这里挡的是存量脏数据
+            _log.LogError("热加设备拒绝：device={DeviceId} comm_type=2(TCPServer) 已随 SDK 1.6 移除，设备主动连入需另立 FxServer 方案", deviceId);
+            return false;
+        }
 
         // 只建不连：连接、下发工作模式由 IngestionService 对账（2 秒内）拉起，与启动路径同一分工
         var runtime = BuildRealRuntimeFromDb(row, _configuration, _dataSource, _loggerFactory, isPrimary: false);
@@ -272,6 +279,13 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         ILogger log)
     {
         var rows = LoadEnabledDevices(dataSource, log);
+
+        // SDK 1.6 移除了 TCP Server（comm_type=2 连接时抛 NotSupportedException）。
+        // 存量脏行不能把整个启动构建炸穿：挑出来记 ERROR 跳过，其余设备照常起
+        foreach (var bad in rows.Where(r => r.CommType == 2))
+            log.LogError("跳过设备 device={DeviceId} code={Code}：comm_type=2(TCPServer) 已随 SDK 1.6 移除，设备主动连入需另立 FxServer 方案", bad.Id, bad.Code);
+        rows = rows.Where(r => r.CommType != 2).ToList();
+
         if (rows.Count == 0)
         {
             log.LogWarning("devices 表无启用设备（或查询失败），回退到 Fx:Real:* 单设备配置");

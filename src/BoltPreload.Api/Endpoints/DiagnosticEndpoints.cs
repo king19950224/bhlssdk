@@ -1062,22 +1062,30 @@ public static class DiagnosticEndpoints
                     explicitRefTempC: body?.RefTempC,
                     cancellationToken: ct);
                 logger.LogInformation(
-                    "重标定完成 device={DeviceId} ch={Ch} 新 RefTime={Rt}ns RefTemp={Rtemp}°C 波形 {Pts} 点",
-                    deviceId, channel, result.NewRefTimeNs, result.NewRefTempC, result.EchoWaveBytes);
+                    "重标定完成 device={DeviceId} ch={Ch} 新 RefTime={Rt}ns RefTemp={Rtemp}°C RefEnvTime={Env}ns 波形 {Pts} 点",
+                    deviceId, channel, result.NewRefTimeNs, result.NewRefTempC, result.NewRefEnvTimeNs, result.EchoWaveBytes);
 
                 // 同步基线到库（否则前端/换算仍按旧 RefTime 算 ΔTOF），并失效路由缓存让热路径立刻读到新基线。
                 // 基线写库与审计同事务（§0 责任链）：重标定覆盖的是安全攸关的标定基线，
                 // 设备侧那一步已经无法回滚了，库这侧至少要保证"改了基线必有谁改的记录"。
+                // 锚点/参考波形（SDK 1.6 自动法）与 RefTime 是同一组基线：一起写、一起被下次置零覆盖。
+                // 锚点为空时写 NULL 而不是保留旧值——新基线配旧锚点必然错帧。
                 long channelId = 0;
                 await using var conn = await ds.OpenConnectionAsync(ct);
                 await using var tx = await conn.BeginTransactionAsync(ct);
                 await using (var upd = new NpgsqlCommand(@"
-                    UPDATE channels SET ref_time_ns=@rt, ref_temp_c=@rtemp, updated_at=now()
+                    UPDATE channels SET ref_time_ns=@rt, ref_temp_c=@rtemp,
+                           ref_env_time_ns=@env, ref_period_ns=@period, ref_echo_wave=@wave,
+                           sdk_version=@sdkver, updated_at=now()
                     WHERE device_id=@d AND channel_no=@ch AND deleted_at IS NULL
                     RETURNING id", conn, tx))
                 {
                     upd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, result.NewRefTimeNs);
                     upd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, result.NewRefTempC);
+                    upd.Parameters.AddWithValue("env", NpgsqlDbType.Numeric, (object?)result.NewRefEnvTimeNs ?? DBNull.Value);
+                    upd.Parameters.AddWithValue("period", NpgsqlDbType.Numeric, (object?)result.NewRefPeriodNs ?? DBNull.Value);
+                    upd.Parameters.AddWithValue("wave", NpgsqlDbType.Bytea, (object?)result.RefEchoWave ?? DBNull.Value);
+                    upd.Parameters.AddWithValue("sdkver", NpgsqlDbType.Text, FxConnectorFactory.SdkVersion);
                     upd.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
                     upd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channel);
                     if (await upd.ExecuteScalarAsync(ct) is long id) channelId = id;
@@ -1091,7 +1099,7 @@ public static class DiagnosticEndpoints
                         VALUES (@uid, 'channel_recalibrate', 'channel', @cid, NULL, @after::jsonb, @note, now(), @ip)", conn, tx);
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, uid);
                     audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
-                    audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new { result.NewRefTimeNs, result.NewRefTempC, explicit_ = body?.RefTimeNs != null }));
+                    audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new { result.NewRefTimeNs, result.NewRefTempC, result.NewRefEnvTimeNs, result.NewRefPeriodNs, sdkVersion = FxConnectorFactory.SdkVersion, explicit_ = body?.RefTimeNs != null }));
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"重标定基线 device={deviceId} ch={channel} → RefTime={result.NewRefTimeNs}ns");
                     AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
@@ -1108,6 +1116,8 @@ public static class DiagnosticEndpoints
                     address = addr,
                     newRefTimeNs = result.NewRefTimeNs,
                     newRefTempC = result.NewRefTempC,
+                    newRefEnvTimeNs = result.NewRefEnvTimeNs,
+                    newRefPeriodNs = result.NewRefPeriodNs,
                     echoWavePoints = result.EchoWaveBytes,
                     timestamp = result.Timestamp,
                     note = "基线已写入设备并同步到库（缓存已失效）。"

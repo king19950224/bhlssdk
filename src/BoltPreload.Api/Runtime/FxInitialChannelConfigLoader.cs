@@ -44,7 +44,7 @@ public static class FxInitialChannelConfigLoader
                     continue;
                 }
 
-                MergeMissing(existing, fallback);
+                MergeMissing(existing, fallback, logger);
             }
         }
 
@@ -77,7 +77,8 @@ public static class FxInitialChannelConfigLoader
             using var cmd = dataSource.CreateCommand(@"
                 SELECT channel_no, probe_freq_mhz, gain, threshold, echo_win_ns,
                        echo_width_us, meas_mode, tc_mode, temp_coefficient,
-                       ref_time_ns, ref_temp_c
+                       ref_time_ns, ref_temp_c,
+                       ref_env_time_ns, ref_period_ns, ref_echo_wave
                 FROM channels
                 WHERE device_id = @device_id AND deleted_at IS NULL
                 ORDER BY channel_no");
@@ -100,7 +101,12 @@ public static class FxInitialChannelConfigLoader
                     TcMode = (ushort)reader.GetInt16(7),
                     TempCoefficient = reader.IsDBNull(8) ? null : reader.GetDecimal(8),
                     RefTime = reader.IsDBNull(9) ? null : reader.GetDecimal(9),
-                    RefTemp = reader.IsDBNull(10) ? null : reader.GetDecimal(10)
+                    RefTemp = reader.IsDBNull(10) ? null : reader.GetDecimal(10),
+                    // SDK 1.6 自动法锚点 + 参考波形（0031 迁移）：置零时由 /recalibrate 落库，
+                    // 这里回灌进会话，进程重启后自动法才不会重新捕获周期
+                    RefEnvTime = reader.IsDBNull(11) ? null : reader.GetDecimal(11),
+                    RefPeriodNs = reader.IsDBNull(12) ? null : reader.GetDecimal(12),
+                    RefEchoWave = reader.IsDBNull(13) ? null : reader.GetFieldValue<byte[]>(13)
                 };
             }
         }
@@ -179,12 +185,25 @@ public static class FxInitialChannelConfigLoader
             });
     }
 
-    private static void MergeMissing(FxChannelInit target, FxChannelInit fallback)
+    private static void MergeMissing(FxChannelInit target, FxChannelInit fallback, ILogger logger)
     {
         if (target.ProbeFreq <= 0m) target.ProbeFreq = fallback.ProbeFreq;
         if (target.Gain <= 0m) target.Gain = fallback.Gain;
         if (target.Threshold == 0 && fallback.Threshold != 0) target.Threshold = fallback.Threshold;
-        if (target.MeasMode == 2 && fallback.MeasMode != 2) target.MeasMode = fallback.MeasMode;
+        if (target.MeasMode == 2 && fallback.MeasMode != 2)
+        {
+            // 这行的赌注：2 是建表默认值，库里是 2 就当"没人配过"，让 appsettings 说了算。
+            // 但 2 同时也是生产主力的阈值法——库里如果是有意配的 2，会在这里被静默换成
+            // 自动/动态特征法，而那两档在 SDK 1.6 里是被整支替换过算法、要求重新标定的。
+            // 行为先不动（现场单设备部署依赖这个兜底），但换模式这件事必须喊出来，
+            // 别等到升级完对不上数才从头查（升级评估 §8 点名过这个陷阱）。
+            logger.LogWarning(
+                "通道 {Channel} 的测量模式被 appsettings 兜底从 2（阈值法）覆盖为 {Mode}。" +
+                "若库里的 2 是有意配置而非默认值，请把 Fx:Real:Channels 里该通道的 MeasMode 改回 2；" +
+                "模式 0/1 在 SDK 1.6 下需要重新置零与标定。",
+                target.Channel, fallback.MeasMode);
+            target.MeasMode = fallback.MeasMode;
+        }
         if (target.RefTime is null) target.RefTime = fallback.RefTime;
         if (target.RefTemp is null) target.RefTemp = fallback.RefTemp;
         if (target.TempCoefficient is null) target.TempCoefficient = fallback.TempCoefficient;

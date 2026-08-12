@@ -26,14 +26,14 @@ public class DeviceConfig
     /// 通讯方式(默认TCPClient)
     /// 0 串口
     /// 1 TCPClient
-    /// 2 TCPServer
+    /// 2 TCPServer(2.0 起请使用 FxSDK.Server.FxServer)
     /// </summary>
     public byte CommunicationType { get; set; } = 1;
     /// <summary>
     /// SDK 通讯参数
     /// 串口格式 COM3:115200,0,8,1
     /// 网络格式(本机作为TcpClient) 远端Ip:Port (示例 192.168.0.7:23)
-    /// 网络格式(本机作为TcpServer) 远端Ip:Port,监听端口 (示例192.168.0.7:23,6000)
+    /// TCP Server 模式请使用 FxSDK.Server.FxServerListenerOptions 配置监听端口。
     /// </summary>
     public string CommunicationParameters { get; set; } = string.Empty;
     /// <summary>
@@ -41,6 +41,10 @@ public class DeviceConfig
     /// 默认 20s
     /// </summary>
     public double ConnTimeOut { get; set; } = 20d;
+    /// <summary>
+    /// TCP 会话运行时选项。为空时使用 SDK 默认心跳和接收超时行为。
+    /// </summary>
+    public TcpSessionOptions? TcpSessionOptions { get; set; }
     /// <summary>
     /// 波特率参数
     /// </summary>
@@ -140,6 +144,10 @@ public class DeviceConfig
     /// 最大终端
     /// </summary>
     public ushort MaxTerminal { get; set; } = 1;//默认 1
+    /// <summary>
+    /// 显式终端地址集合。为空时保持按 1..MaxTerminal 的兼容行为。
+    /// </summary>
+    public ushort[] TerminalAddresses { get; set; } = Array.Empty<ushort>();
     /// <summary>
     /// 通过地址和通道号获取逻辑通通号
     /// </summary>

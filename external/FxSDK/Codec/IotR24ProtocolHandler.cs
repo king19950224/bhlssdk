@@ -49,7 +49,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
     private const byte EncFrameSize = 5;
 
     public const decimal OriginalInterval = 10M; //原始回波时钟
-
+    
     public const short NoiseBase = 10; //噪声带
     public const short SignalAuto = 90;//自动增益幅度
     public const short SignalMax = 110;//最大值
@@ -168,7 +168,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
         //编码 参考声时配置参数
         var refTimeParams = new byte[3];
         var wrTime = 0M;
-        if (config.IsDeltaToFMode && config is {RefTime: > 0, RefTemp: not null})
+        if (config.IsDeltaToFMode && config.RefTime.HasValue && config.RefTime.Value > 0 && config.RefTemp.HasValue)
         {
             wrTime = config.RefTime.Value;
             if (config.TcMode == 1)//1使用主机温度补偿则基础声时归一到标准温度
@@ -253,7 +253,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
         };
         return EncodeWriteParamCmd(0x06, commandParams);
     }
-
+    
     public override IReadOnlyList<object> EncodeWorkMode(IoSession session, WorkMode mode, ushort channel = 0, ushort address = 1)
     {
         var encodeMessages = new List<object>();
@@ -312,7 +312,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
         //忽略
         return new[] {FxUtility.Delay10Ms};
     }
-
+    
     #region 按照协议解码数据
     protected override List<DecodedResult> DoDecode(IoSession session, CancellationToken token)
     {
@@ -356,14 +356,14 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                     if (_headBeginIdx < 0)
                     {
                         var removeLength = ContextData.Count - DecEchoFrameHead.Length;
-                        ContextData.RemoveRange(0,removeLength); //保留帧头长度的字节
+                        ConsumeContext(removeLength); //保留帧头长度的字节
                         break;
                     }
                 }
                 //找到帧头,则清理帧头前面的无线字节
                 if (_headBeginIdx > 0)
                 {
-                    ContextData.RemoveRange(0,_headBeginIdx);
+                    ConsumeContext(_headBeginIdx);
                     _headBeginIdx = 0;
                 }
 
@@ -394,7 +394,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
 
                 var channelConfig = SessionContext.GetChannelConfig(session, ChannelConfig.DefaultAddress, channel);
                 var waveDataDouble = waveData.Select(o => (double) o).ToList();
-                short statusCode = -5;
+                var statusCode = MeasStatusCode.UnknownSignalError;
                 var threshold = waveDataDouble.Min() * 0.6d;
                 if (channelConfig != null)
                 {
@@ -402,12 +402,12 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                 }
                 if (decodedFrame[DecEchoFrameHead.Length + 6] >= 0x80)
                 {
-                    statusCode = 0;
+                    statusCode = MeasStatusCode.Normal;
                 }
-                var zeroIdx = CalculateExtensions.CalcZeroIndexByThrSignal(waveDataDouble, OriginalInterval, out var midResults, NoiseBase, Convert.ToInt16(threshold));
+                var zeroIdx = CalculateExtensions.CalcZeroIndexByThrSignal(waveDataDouble, OriginalInterval, out var assist, NoiseBase, Convert.ToInt16(threshold));
                 if (zeroIdx < 0)
                 {
-                    statusCode = Convert.ToInt16(zeroIdx);
+                    statusCode = MeasStatusCodeExtensions.FromZeroIndex(zeroIdx);
                 }
 
                 //波形起始3字节 高-低
@@ -432,10 +432,11 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                 //赋值到对象
                 var channelResult = new ChannelResult
                 {
-                    HexString = ByteUtility.BytesToHexStr(decodedFrame),
+                    HexString = BuildDiagnosticHexString(decodedFrame),
                     StatusCode = statusCode,
-                    MidResults = midResults,
+                    Assist = assist,
                     Channel = channel,
+                    RawTemp = spTemp,
                     SpTemp = spTemp,
                     EchoWave = new EchoWave
                     {
@@ -445,6 +446,11 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                     },
                     ReceiveTime = CurrentAcqTime.Value,
                 };
+                channelResult.RawTemp = ResolveSourceChannelTemperature(session, channelResult.Address,
+                    channelResult.Channel, channelResult.RawTemp);
+                ResolveEffectiveChannelTemperature(session, channelResult, channelConfig,
+                    sampleTime: channelResult.ReceiveTime);
+                var effectiveTemp = channelResult.SpTemp;
                 //根据判断的值开始计算
                 if (isDeltaToFMode)
                 {
@@ -452,11 +458,13 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                     if (channelConfig is {RefTime: > 0, RefTemp: not null})
                     {
                         var echoTime = channelConfig.RefTime.Value + channelResult.DeltaTof;
-                        if (channelConfig.TcMode == 1)//默认主机温度补偿
+                        if (channelConfig.TcMode == 1 && effectiveTemp.HasValue)//默认主机温度补偿
                         {
-                            var refNormal = CalculateExtensions.CalcNormalTof(channelConfig.RefTime.Value, channelConfig.RefTemp!.Value, CalculateExtensions.StandardTemperature);
+                            var refNormal = CalculateExtensions.CalcNormalTof(channelConfig.RefTime.Value, channelConfig.RefTemp!.Value, 
+                                CalculateExtensions.StandardTemperature);
                             var normalTof = refNormal + channelResult.DeltaTof;//标准声速下的Tof
-                            echoTime = CalculateExtensions.CalcNormalTof(normalTof!.Value, CalculateExtensions.StandardTemperature, spTemp);
+                            //从标准声速下的归化到当前温度
+                            echoTime = CalculateExtensions.CalcNormalTof(normalTof!.Value, CalculateExtensions.StandardTemperature, effectiveTemp.Value);  
                         }
                         else if (channelConfig.TcMode == 2)//使用自定义补偿系数,则DeltaTof先设置为null后面重算
                         {
@@ -468,33 +476,39 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                 else
                 {
                     channelResult.EchoTime = tof;
-                    if (channelConfig!.TcMode == 1)
+                    if (channelConfig is {TcMode: 1} && effectiveTemp.HasValue)
                     {
-                        channelResult.EchoTime = CalculateExtensions.CalcNormalTof(tof, CalculateExtensions.StandardTemperature, spTemp);
+                        channelResult.EchoTime = CalculateExtensions.CalcNormalTof(tof, CalculateExtensions.StandardTemperature, effectiveTemp.Value);  
                     }
                 }
                 //如果通道有参考声时没有声时差,则尝试计算声时差
-                if (channelConfig?.RefTime is > 0 && !channelResult.DeltaTof.HasValue)
+                if (channelConfig is {RefTime: > 0, RefTemp: not null} && channelResult.EchoTime.HasValue && !channelResult.DeltaTof.HasValue)
                 {
-                    channelResult.DeltaTof = CalculateExtensions.CalcDeltaTof(channelConfig.RefTime.Value,channelConfig.RefTemp!.Value,
-                        channelResult.EchoTime!.Value, spTemp, channelConfig.TcMode,channelConfig.TempCoefficient!.Value);
+                    channelResult.DeltaTof = CalculateDeltaTof(channelConfig, channelResult.EchoTime!.Value,
+                        channelResult.SpTemp);
                 }
                 //状态数据解析
                 var stateByte = decodedFrame[DecEchoFrameHead.Length + 6] & 0x7F;
                 channelResult.StatusCode = stateByte switch
                 {
-                    0x01 => -1,
-                    0x02 => -2,
-                    0x03 => -3,
+                    0x01 => MeasStatusCode.SignalTooSmall,
+                    0x02 => MeasStatusCode.ThresholdNotReached,
+                    0x03 => MeasStatusCode.SignalOverflow,
                     _ => channelResult.StatusCode
                 };
                 //下位机参数
                 var devGain = (BitConverter.ToUInt16(new[]{
                                    decodedFrame[DecEchoFrameHead.Length + 8],
                                    decodedFrame[DecEchoFrameHead.Length + 7]}) & 0xFFF) * 0.1M / 2.5M; //增益
-                var devEchoWin = BitConverter.ToUInt32(new[]{
-                    decodedFrame[DecEchoFrameHead.Length + 11], decodedFrame[DecEchoFrameHead.Length + 10],
-                    decodedFrame[DecEchoFrameHead.Length + 9], (byte) 0x00}) * 10M; //窗口参数
+                
+                // 直接位运算
+                var rawValue = (uint)(
+                    decodedFrame[DecEchoFrameHead.Length + 11] |
+                    (decodedFrame[DecEchoFrameHead.Length + 10] << 8) |
+                    ((decodedFrame[DecEchoFrameHead.Length + 9] & 0x0F) << 16)  // 只取低4位
+                );
+                var devEchoWin = rawValue * 10M;//窗口参数
+                //
                 var devThreshold = Convert.ToDecimal(decodedFrame[DecEchoFrameHead.Length + 12]);
                 if (devThreshold > 127)
                 {
@@ -506,11 +520,12 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                 }
                 channelResult.ParamsArray = new[] {devEchoWin, devGain, devThreshold};
                 decodedList.Add(channelResult);
-                ContextData.RemoveRange(0,decodedFrame.Count);
+                ConsumeContext(decodedFrame.Count);
                 _headBeginIdx = -1; //
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                LogDecodeWarning(session, nameof(DecodeChannelResults), _headBeginIdx, ex);
                 ContextData.RemoveAt(0); //删除首个元素，继续往后找
                 _headBeginIdx = -1;
                 break;
@@ -572,7 +587,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                             if (_headBeginIdx < 0)
                             {
                                 var removeRange = ContextData.Count - DecResultFrameHead.Length;
-                                ContextData.RemoveRange( 0,removeRange); //保留帧头长度的字节
+                                ConsumeContext(removeRange); //保留帧头长度的字节
                                 break;
                             }
                         }
@@ -580,7 +595,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                         //找到帧头，清理帧头以前的数据
                         if (_headBeginIdx > 0)
                         {
-                            ContextData.RemoveRange(0,_headBeginIdx);
+                            ConsumeContext(_headBeginIdx);
                             _headBeginIdx = 0;
                         }
 
@@ -588,7 +603,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                         {
                             break; //数据不全，等待补充完整
                         }
-
+                        
                         lock (AcqTimeLock)
                         {
                             CurrentAcqTime = CurrentAcqTime?.AddSeconds((double) devConfig!.SampleInterval) ?? DateTime.Now;
@@ -601,7 +616,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                         var spTemp = BitConverter.ToInt16(tempBytes) * TempUnit;
                         var multiChResult = new MultiChannelResult
                         {
-                            HexString = ByteUtility.BytesToHexStr(decodedFrame),
+                            HexString = BuildDiagnosticHexString(decodedFrame),
                             ReceiveTime = CurrentAcqTime.Value,
                             Results = new Dictionary<ushort, ChannelResult>(),
                         };
@@ -622,42 +637,46 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                             {
                                 var channelResult = new ChannelResult
                                 {
-                                    Channel = channel, DeltaTof = tof, SpTemp = spTemp,
+                                    Channel = channel, DeltaTof = tof, RawTemp = spTemp, SpTemp = spTemp,
                                     ReceiveTime = multiChResult.ReceiveTime,
                                 };
                                 var channelConfig = SessionContext.GetChannelConfig(session, ChannelConfig.DefaultAddress, channel);
+                                channelResult.RawTemp = ResolveSourceChannelTemperature(session,
+                                    channelResult.Address, channelResult.Channel, channelResult.RawTemp);
+                                ResolveEffectiveChannelTemperature(session, channelResult, channelConfig,
+                                    sampleTime: channelResult.ReceiveTime);
+                                var effectiveTemp = channelResult.SpTemp;
                                 if (channelConfig is {RefTime: > 0, RefTemp: not null})
                                 {
                                     var echoTime = channelConfig.RefTime.Value + channelResult.DeltaTof;
-                                    if (channelConfig.TcMode == 1)//默认主机温度补偿
+                                    if (channelConfig.TcMode == 1 && effectiveTemp.HasValue)//默认主机温度补偿
                                     {
                                         var refNormal = CalculateExtensions.CalcNormalTof(channelConfig.RefTime.Value, channelConfig.RefTemp!.Value, CalculateExtensions.StandardTemperature);
                                         var normalTof = refNormal + channelResult.DeltaTof;//标准声速下的Tof
-                                        echoTime = CalculateExtensions.CalcNormalTof(normalTof!.Value, channelConfig.RefTemp!.Value, spTemp);
+                                        echoTime = CalculateExtensions.CalcNormalTof(normalTof!.Value, channelConfig.RefTemp!.Value, effectiveTemp.Value);  
                                     }
                                     channelResult.EchoTime = echoTime;
                                 }
                                 channelResult.StatusCode = decodeStatusArray[i] switch
                                 {
-                                    0x01 => -1,
-                                    0x02 => -2,
-                                    0x03 => -3,
+                                    0x01 => MeasStatusCode.SignalTooSmall,
+                                    0x02 => MeasStatusCode.ThresholdNotReached,
+                                    0x03 => MeasStatusCode.SignalOverflow,
                                     _ => channelResult.StatusCode
                                 };
                                 //小窗口在线中值滤波
-                                channelResult.DeltaTof = (decimal) GetMedianValue(session, channelResult.Address, channelResult.Channel,
+                                channelResult.DeltaTof = (decimal) GetMedianValue(session, channelResult.Address, channelResult.Channel, 
                                     nameof(ChannelResult.DeltaTof), (double) channelResult.DeltaTof!);
-                                channelResult.SpTemp = (decimal) GetMedianValue(session, channelResult.Address, channelResult.Channel,
-                                    nameof(ChannelResult.SpTemp), (double) channelResult.SpTemp,10);
                                 multiChResult.Results.Add(channel, channelResult);
                             }
                         }
                         decodedList.Add(multiChResult);
-                        ContextData.RemoveRange(0,decodedFrame.Count);
+                        ConsumeContext(decodedFrame.Count);
                         _headBeginIdx = -1;
                     }
-                    catch (Exception)
+                    catch (Exception ex)
                     {
+                        LogDecodeWarning(session, nameof(DecodeMultiChannelResults), _headBeginIdx, ex);
                         ContextData.RemoveAt(0); //删除一个元素，继续往后找
                         _headBeginIdx = -1;
                         break;
@@ -667,7 +686,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
         }
         catch (Exception e)
         {
-            Console.WriteLine($"{nameof(DecodeMultiChannelResults)} 异常. 细节:{e.Message}");
+            LogDecodeWarning(session, $"{nameof(DecodeMultiChannelResults)}Outer", _headBeginIdx, e);
         }
 
         return decodedList;
@@ -715,7 +734,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                     if (_headBeginIdx < 0)
                     {
                         var removeLength = ContextData.Count - DecFullEchoFrameHead.Length;
-                        ContextData.RemoveRange(0,removeLength); //保留 4 个字节确保帧头不被清理
+                        ConsumeContext(removeLength); //保留 4 个字节确保帧头不被清理
                         break; //找不到帧头，清理前面的数据 等待新的数据再开始解析
                     }
                 }
@@ -723,7 +742,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                 //找到帧头，清理帧头以前的数据
                 if (_headBeginIdx > 0)
                 {
-                    ContextData.RemoveRange(0,_headBeginIdx);
+                    ConsumeContext(_headBeginIdx);
                     _headBeginIdx = 0;
                 }
 
@@ -739,7 +758,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                         break;
                     }
                     CurrentAcqTime = DateTime.Now;//全波采集时间采用当前时间
-
+                    
                     var decodedFrame = ContextData.GetRange(0,endIdx - _headBeginIdx).ToList();
                     var waveStartIdx = DecFullEchoFrameHead.Length + 3 + 3;
                     var waveData = new List<short>();
@@ -757,8 +776,8 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                     }
                     var channelResult = new ChannelResult
                     {
-                        ReceiveTime = CurrentAcqTime.Value,
-                        HexString = ByteUtility.BytesToHexStr(decodedFrame),
+                        ReceiveTime = CurrentAcqTime.Value, 
+                        HexString = BuildDiagnosticHexString(decodedFrame),
                         EchoWave = new EchoWave
                         {
                             ClockInt = Convert.ToUInt16(OriginalInterval),
@@ -767,7 +786,7 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                         },
                     };
                     decodedList.Add(channelResult);
-                    ContextData.RemoveRange(0,decodedFrame.Count);
+                    ConsumeContext(decodedFrame.Count);
                     _headBeginIdx = -1;
                 }
                 else
@@ -775,8 +794,9 @@ public class IotR24ProtocolHandler : FxProtocolHandler
                     break;
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                LogDecodeWarning(session, nameof(DecodeFullWaveResults), _headBeginIdx, ex);
                 ContextData.RemoveAt(0);//删除首个元素 继续找
                 _headBeginIdx = -1;
                 break;

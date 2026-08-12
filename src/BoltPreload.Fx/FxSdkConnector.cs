@@ -273,7 +273,9 @@ public sealed class FxSdkConnector : IFxConnector
                 c.RefTime,
                 c.RefTemp,
                 c.TcMode,
-                c.TempCoefficient))
+                c.TempCoefficient,
+                c.RefEnvTime,
+                c.RefPeriodNs))
             .ToArray();
     }
 
@@ -520,8 +522,9 @@ public sealed class FxSdkConnector : IFxConnector
         switch (result)
         {
             case ChannelResult cr:
-                // 只缓存有 EchoTime 的（设备真算出 TOF 的那一次），方便 Recalibrate 抓基线
-                if (cr.EchoTime is not null && cr.SpTemp is not null && cr.StatusCode >= 0)
+                // 只缓存有 EchoTime 的（设备真算出 TOF 的那一次），方便 Recalibrate 抓基线。
+                // IsSignalValid：>=0 都算有效——1.6 新增的 11/12（业务超限）测量值本身是好的，照常缓存
+                if (cr.EchoTime is not null && cr.SpTemp is not null && cr.StatusCode.IsSignalValid())
                 {
                     _latestChannelResult[cr.Channel] = cr;
                 }
@@ -535,7 +538,7 @@ public sealed class FxSdkConnector : IFxConnector
             case MultiChannelResult mcr:
                 foreach (var (chNo, sub) in mcr.Results)
                 {
-                    if (sub.EchoTime is not null && sub.SpTemp is not null && sub.StatusCode >= 0)
+                    if (sub.EchoTime is not null && sub.SpTemp is not null && sub.StatusCode.IsSignalValid())
                     {
                         _latestChannelResult[chNo] = sub;
                     }
@@ -585,6 +588,9 @@ public sealed class FxSdkConnector : IFxConnector
         //    - 显式参数优先（运维强制指定，比如设备当前测不出 TOF 时）
         //    - 否则取最近一次有效 ChannelResult（推荐路径）
         decimal refTime, refTemp;
+        // 自动法锚点只能取自"RefTime 所来自的那一帧"：Assist.Fx 是波形内索引，
+        // 跨帧配对（比如显式 RefTime 配缓存波形）算出来的锚点是错的，错锚点比没锚点更糟
+        ChannelResult? baselineFrame = null;
         if (explicitRefTimeNs.HasValue && explicitRefTempC.HasValue)
         {
             refTime = explicitRefTimeNs.Value;
@@ -597,6 +603,7 @@ public sealed class FxSdkConnector : IFxConnector
             refTemp = latestCr.SpTemp!.Value;
             // 显式参数若只传了其中之一，覆盖对应字段
             if (explicitRefTimeNs.HasValue) refTime = explicitRefTimeNs.Value;
+            else baselineFrame = latestCr;   // RefTime 真取自该帧，锚点才有同帧配对可言
             if (explicitRefTempC.HasValue) refTemp = explicitRefTempC.Value;
         }
         else
@@ -666,10 +673,19 @@ public sealed class FxSdkConnector : IFxConnector
 
         // 4. 构造 ChannelConfig（一次性整组写）：RefTime/RefTemp/LEchoWave 为新基线，
         //    MeasMode/Threshold 沿用设备现值（来自启动初始配置或最近一次 ReadChannelParam）。
+        //    ProbeFreq/Gain 等会话参数也必须带上——SDK 的 StoreToSession 是整包替换（1.4/1.6 皆然），
+        //    残缺对象会把会话里的 ProbeFreq/Gain 打回默认值；1.6 还会因参数"变化"顺手清掉包络锚点。
         var cfg = new ChannelConfig
         {
             Address = address,
             Channel = channel,
+            ProbeFreq = existingCfg.ProbeFreq,
+            Gain = existingCfg.Gain,
+            EchoWin = existingCfg.EchoWin,
+            EchoWidth = existingCfg.EchoWidth,
+            PulseConfig = existingCfg.PulseConfig,
+            TcMode = existingCfg.TcMode,
+            TempCoefficient = existingCfg.TempCoefficient,
             RefTime = refTime,
             RefTemp = refTemp,
             LEchoWave = latestWave,
@@ -677,11 +693,25 @@ public sealed class FxSdkConnector : IFxConnector
             Threshold = existingCfg.Threshold,
         };
 
+        // 自动法(MeasMode=0)置零要连锚点一起写，否则进程重启后包络追踪重新捕获，
+        // 过零点可能落到相邻载波周期（2MHz 下 500ns ≈ 数百 kN 假预紧力，且系统不会告警）。
+        // 公式对齐厂家参考实现 FxReader/DeviceRunner：锚点 = 同帧波形起始 + Fx 索引 × 采样间隔。
+        // 显式 RefTime 时 baselineFrame 为空 → 锚点留空并把旧锚点顶掉，别让新基线配旧锚点。
+        if (existingCfg.MeasMode == 0
+            && baselineFrame?.Assist?.Fx is { } fx
+            && baselineFrame.EchoWave is { } frameWave)
+        {
+            cfg.RefEnvTime = frameWave.EchoStart + fx * frameWave.ClockInt;
+            cfg.RefPeriodNs = baselineFrame.Assist.PeriodNs;
+        }
+
         _logger.LogInformation(
-            "重标定通道 {Ch}: RefTime={Rt}ns RefTemp={Rtemp}°C LEchoWave.pts={Pts}",
-            channel, cfg.RefTime, cfg.RefTemp, latestWave.WaveData?.Count ?? 0);
+            "重标定通道 {Ch}: RefTime={Rt}ns RefTemp={Rtemp}°C RefEnvTime={Env}ns RefPeriod={Period}ns LEchoWave.pts={Pts}",
+            channel, cfg.RefTime, cfg.RefTemp, cfg.RefEnvTime, cfg.RefPeriodNs, latestWave.WaveData?.Count ?? 0);
 
         await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.RefTime), sendCommand: true);
+        // 会话配置整包换新了，诊断快照跟着换，别让快照显示旧基线
+        _latestChannelConfig[channel] = cfg;
 
         return new RecalibrateResult(
             Channel: channel,
@@ -689,7 +719,12 @@ public sealed class FxSdkConnector : IFxConnector
             NewRefTimeNs: refTime,
             NewRefTempC: refTemp,
             EchoWaveBytes: latestWave.WaveData?.Count ?? 0,
-            Timestamp: DateTimeOffset.UtcNow);
+            Timestamp: DateTimeOffset.UtcNow,
+            NewRefEnvTimeNs: cfg.RefEnvTime,
+            NewRefPeriodNs: cfg.RefPeriodNs,
+            // 打包给上层落 channels.ref_echo_wave，重启回灌用；不打包锚点为空的情形——
+            // 阈值法通道也存着，哪天切自动法能少一次现场置零
+            RefEchoWave: FxRefWaveCodec.Pack(latestWave));
         }
         finally
         {
@@ -769,17 +804,21 @@ public sealed class FxSdkConnector : IFxConnector
         return new FxChannelResultDto(
             Address: cr.Address,
             Channel: cr.Channel,
-            StatusCode: cr.StatusCode,
+            // 1.6 把 StatusCode 从 short 改成 MeasStatusCode 枚举（底层仍 short，数值逐一对应），
+            // DTO/库/WAL/前端全按数值走，边界上转一次即可，存量数据不用迁移
+            StatusCode: cr.StatusCode.ToCode(),
             EchoTimeNs: cr.EchoTime,
             EchoTime2Ns: cr.EchoTime2,
             SpTempC: cr.SpTemp,
             DeltaTofNs: cr.DeltaTof,
-            Gain: 0f,  // SDK 1.4 的 ChannelResult 没有 Gain 字段（在 ChannelConfig）；如需真实增益须从通道配置带过来，当前固定 0
+            Gain: 0f,  // SDK 的 ChannelResult 没有 Gain 字段（在 ChannelConfig）；如需真实增益须从通道配置带过来，当前固定 0
             EchoWave: cr.EchoWave is null ? null : ToDto(cr.EchoWave),
             LowAi: cr.LowAi,
             HighAi: cr.HighAi,
             Angle: cr.Angle,
-            MidResults: cr.MidResults);
+            // 1.6 删了 MidResults（语义移到 Assist 结构化选点信息）。DTO 字段留住保 WAL 序列化兼容，
+            // 自动法锚点需要的 Assist.Fx/PeriodNs 走重标定链路单独取，不整包进 DTO
+            MidResults: null);
     }
 
     private static FxEchoWaveDto ToDto(EchoWave ew)
@@ -802,7 +841,8 @@ public sealed class FxSdkConnector : IFxConnector
     {
         _disposed = true;
         try { await DisconnectAsync(); } catch { /* swallow on dispose */ }
-        // FxClient 没实现 IDisposable，用 StopAllAsync 做清理（停所有监听器 + 关所有会话）
+        // FxClient 没实现 IDisposable，用 StopAllAsync 做清理（1.6 起只关所有会话，且调用后该实例不可复用——
+        // 我们只在 Dispose 里调，正好）
         try { await _client.StopAllAsync(); } catch { /* swallow on dispose */ }
         _channel.Writer.TryComplete();
         _sessionLock.Dispose();

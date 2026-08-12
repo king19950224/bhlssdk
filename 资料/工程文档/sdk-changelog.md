@@ -2,6 +2,21 @@
 
 对应项目内拷贝：`external/FxSDK/`（来源见该目录 README）。我方对 SDK 源码本体的修改也记在这里，厂家升级时按此对差异。
 
+## 2026-08-12 版本升级：C# 1.4.0 → 1.6.0
+
+评估与实施方案见 `sdk-1.6-upgrade-assessment.md` / `sdk-1.6-upgrade-plan.md`。厂家原包留档在 `bhls1.6/sdk16/`（目录原名 `sdk1.6包`，中文名会破坏 MSBuild/PowerShell，已改 ASCII）。要点：
+
+- **源码整树替换**：51 个 `.cs` 全部换成厂家 1.6.0；1.4 时代的 `._*` macOS 垃圾文件一并清掉。厂家 1.6 已吸收我方的 CRC 坏帧重同步补丁（`ResynchronizeAfterCorruptFrame`），`MultiChIotDecodeResyncTests` 保留钉行为。
+- **重打的补丁（仅一组）**：`IoSession.SendMsgAsync` / `TcpSession.SendDataAsync` 发送失败上抛——1.6 又回到吞异常只记 Warn，0cb0d86 的补丁原样重打（TcpSession 侧含"已关闭时抛 OperationCanceledException 而非静默 return"）。
+- **不再改源码的补丁**：心跳 20s→2s 不用再改 SDK 了，1.6 提供 `DeviceConfig.TcpSessionOptions`，在 `FxConnectorFactory.CreateReal` 里设 `HeartbeatSeconds=2`，同时 `EnableReceiveActivityTimeout=false`（1.6 新增的断线来源，与我方看门狗职责重叠，先关）。
+- **温度语义**：1.6 默认给 `SpTemp` 上 τ=180s 平滑（原始值挪到新字段 `RawTemp`）。`FxConnectorFactory` 静态构造里全局设 `TempTauProfile.Direct` 关掉，保 `sp_temp_c` 语义连续。注意 1.4 的 window=10 温度中值滤波在 1.6 没有了，PT1000 单点突跳（−40~120 范围内）会直接进库。
+- **csproj**：`TargetFrameworks=net6.0;net8.0` 改单数 `net8.0`（与 1.4 处理一致）；NLog 5.3.4→6.1.3、System.IO.Ports 8.0.0→10.0.9（沿用 2026-07-08 的统一版本）；System.IO.Pipelines 是 1.6 新依赖，取 8.0.0。
+- **CVE 提升删除**：`Directory.Build.props` 里的 System.Net.Http 4.3.4 / System.Text.RegularExpressions 4.3.1 提升不再需要——1.6 csproj 显式钉 FParsec 1.1.1，System.Net.Http 4.3.0 的传递链已断。实测 `--vulnerable --include-transitive` 干净。厂家下次升级若拿掉 FParsec 显式引用，记得重扫。
+- **我方适配面**（编译断点实际 3 处，比评估收窄）：`FxSdkConnector` 的 StatusCode 枚举转 short（`ToCode()`）与 `MidResults` 删除（DTO 字段保留传 null）；测试桩补 1.6 新抽象成员 `RequestClose`。`ByteUtility` 的 BitArray 死代码 1.6 又带回来了，这次不动（纯性能，等厂家回复求证清单再说）。
+- **自动法有状态化**（1.6 最大的行为变化）：置零锚点 `RefEnvTime`/`RefPeriodNs` + 参考波形持久化到 `channels`（0031 迁移），重启回灌；`/recalibrate` 自动法通道会从"同一帧"的 `Assist.Fx` 算锚点落库。标定记录与通道带 `sdk_version` 追溯，防跨算法版本混用系数。
+- **comm_type=2 (TCPServer) 被 1.6 移除**：入口校验拒绝、运行时装载跳过并记 ERROR。
+- 验证：`dotnet build` 0 警告 0 错误；`dotnet test` 397/397 通过（173 个 Postgres 集成测试无库跳过）。**数值验收（同源比对、真机四项、重启连续性）待现场金样，见 plan §6。**
+
 ## 2026-08-05 之前的源码修改（补记，按提交追溯）
 
 - 2026-07-31（7daeea7）：心跳间隔 20s → 2s——现场串口服务器约 5 秒无流量就掐 TCP，20s 心跳保不住连接；RefTime 存储读取波形命令修复；参数探测。

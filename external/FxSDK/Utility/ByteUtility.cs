@@ -60,6 +60,23 @@ namespace FxSDK.Utility
             return -1;
         }
         /// <summary>
+        /// 尝试从字节序列的指定位置读取大端无符号 32 位整数。
+        /// </summary>
+        public static bool TryReadUInt32BigEndian(IReadOnlyList<byte>? source, int offset, out uint value)
+        {
+            value = 0;
+            if (source == null || offset < 0 || offset > source.Count - sizeof(uint))
+            {
+                return false;
+            }
+
+            value = ((uint)source[offset] << 24)
+                    | ((uint)source[offset + 1] << 16)
+                    | ((uint)source[offset + 2] << 8)
+                    | source[offset + 3];
+            return true;
+        }
+        /// <summary>
         /// 计算 Modbus RTU 使用的 CRC-16 校验（多项式 0xA001，低位在前）
         /// </summary>
         /// <param name="data">输入数据</param>
@@ -232,6 +249,7 @@ namespace FxSDK.Utility
             var crc = InitialValue;
             foreach (var t in data)
             {
+                new BitArray(t).Reverse();
                 var index = (byte)(Reflect(t, 8) ^ (crc >> 8));
                 crc = (ushort)(Table[index] ^ (crc << 8));
             }

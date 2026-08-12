@@ -2,6 +2,7 @@ using BoltPreload.Api.Auth;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Calibration;
 using BoltPreload.Domain;
+using BoltPreload.Fx;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -155,7 +156,7 @@ public static class CalibrationEndpoints
                         uncertainty_breakdown, fitter_version,
                         ref_time_ns, ref_temp_c,
                         passed, notes, review_state,
-                        operator_signature_at, reviewer_signature_at, expires_at, created_at
+                        operator_signature_at, reviewer_signature_at, expires_at, created_at, sdk_version
                     ) VALUES (
                         @id, @bolt_id, 'quick',
                         @op, @rev,
@@ -165,7 +166,7 @@ public static class CalibrationEndpoints
                         NULL, 'quick:v1',
                         @rt, @rtemp,
                         true, @note, 'self_signed',
-                        now(), now(), @exp, now()
+                        now(), now(), @exp, now(), @sdkver
                     )", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
@@ -190,6 +191,8 @@ public static class CalibrationEndpoints
                     // 默认 30 天过期（GB/T 43232 推荐≤180 天，quick 模式更保守）
                     cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date,
                         DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? 30)));
+                    // 标定系数与 TOF 提取算法版本绑定（0031）：1.4/1.6 的自动法算法不同源，系数禁止混用
+                    cmd.Parameters.AddWithValue("sdkver", NpgsqlDbType.Text, FxConnectorFactory.SdkVersion);
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
 
@@ -411,13 +414,13 @@ public static class CalibrationEndpoints
                         loading_device, loading_device_cert, env_temp_c, env_humidity,
                         points_jsonb, k_l, k_l_uncertainty, r_squared, outliers_removed,
                         uncertainty_breakdown, fitter_version, ref_time_ns, ref_temp_c,
-                        passed, notes, review_state, operator_signature_at, reviewer_signature_at, expires_at, created_at
+                        passed, notes, review_state, operator_signature_at, reviewer_signature_at, expires_at, created_at, sdk_version
                     ) VALUES (
                         @id, @bolt_id, 'torque_estimate', @op, @rev,
                         @ld, NULL, @env_temp, NULL,
                         @points::jsonb, @kl, @klu, 0, 0,
                         @unc::jsonb, 'torque:v1', @rt, @rtemp,
-                        true, @note, 'self_signed', now(), now(), @exp, now()
+                        true, @note, 'self_signed', now(), now(), @exp, now(), @sdkver
                     )", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
@@ -436,6 +439,7 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
                     cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date,
                         DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? 7)));
+                    cmd.Parameters.AddWithValue("sdkver", NpgsqlDbType.Text, FxConnectorFactory.SdkVersion);
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
 
@@ -954,14 +958,14 @@ public static class CalibrationEndpoints
                         points_jsonb, k_l, k_l_uncertainty, k_l_intercept_ns,
                         r_squared, outliers_removed, uncertainty_breakdown, fitter_version,
                         ref_time_ns, ref_temp_c, passed, notes, review_state,
-                        operator_signature_at, reviewer_signature_at, expires_at, created_at
+                        operator_signature_at, reviewer_signature_at, expires_at, created_at, sdk_version
                     ) VALUES (
                         @id, @bolt_id, 'torque_fit', @op, @rev,
                         'torque wrench', NULL, NULL, NULL,
                         @points::jsonb, @kl, @klu, @intercept,
                         @r2, 0, @unc::jsonb, 'torque-fit:v1',
                         @rt, @rtemp, @passed, @note, 'self_signed',
-                        now(), now(), @exp, now()
+                        now(), now(), @exp, now(), @sdkver
                     )", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
@@ -981,6 +985,7 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
                     cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date,
                         DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req?.ExpiresDays ?? 7)));
+                    cmd.Parameters.AddWithValue("sdkver", NpgsqlDbType.Text, FxConnectorFactory.SdkVersion);
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
 
@@ -1167,14 +1172,14 @@ public static class CalibrationEndpoints
                         points_jsonb, k_l, k_l_uncertainty, k_l_intercept_ns,
                         r_squared, outliers_removed, uncertainty_breakdown, fitter_version,
                         ref_time_ns, ref_temp_c, passed, notes, review_state,
-                        operator_signature_at, reviewer_signature_at, expires_at, created_at
+                        operator_signature_at, reviewer_signature_at, expires_at, created_at, sdk_version
                     ) VALUES (
                         @id, @bolt_id, 'load_calibrated', @op, NULL,
                         @ld, @ldc, @et, @eh,
                         @pts::jsonb, @kl, @klu, @intercept,
                         @r2, @outliers, @unc::jsonb, 'lsq:v1',
                         @rt, @rtemp, true, @note, 'pending',
-                        now(), NULL, @exp, now()
+                        now(), NULL, @exp, now(), @sdkver
                     )", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
@@ -1195,6 +1200,7 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, req.RefTempC);
                     cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, (object?)req.Note ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date, DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? 180)));
+                    cmd.Parameters.AddWithValue("sdkver", NpgsqlDbType.Text, FxConnectorFactory.SdkVersion);
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
 

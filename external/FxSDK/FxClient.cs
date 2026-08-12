@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net.Sockets;
+using FxSDK.Codec;
 using FxSDK.Core;
 using FxSDK.Models;
 using FxSDK.Utility;
@@ -9,8 +10,7 @@ namespace FxSDK;
 
 public partial class FxClient
 {
-    // 原来抄成 nameof(TcpSession)，FxClient 的日志全挂在 TcpSession 名下，排查时归因错误
-    private static readonly ILogger Logger = LogManager.GetLogger(nameof(FxClient));
+    private static readonly ILogger Logger = LogManager.GetLogger(nameof(TcpSession));
     #region 公共事件 
     /// <summary>
     /// 会话连接成功事件
@@ -42,13 +42,12 @@ public partial class FxClient
     /// <param name="config">
     /// 设备连接配置对象，包含以下关键信息：
     /// <para>- <b>设备类型</b>：支持“3.多通道监测版”或“2.实时24通道版”等设备型号；</para>
-    /// <para>- <b>通讯方式</b>：0 表示串口通信，1 表示 TCP 客户端模式（SDK 作为 Client），2 表示 TCP 服务器模式（SDK 作为 Server，此时设备需主动连接 SDK 指定的客户端端口）。</para>
+    /// <para>- <b>通讯方式</b>：0 表示串口通信，1 表示 TCP 客户端模式（SDK 作为 Client）。TCP Server 模式请使用 <c>FxSDK.Server.FxServer</c>。</para>
     /// </param>
     /// <param name="cancellationToken">取消令牌</param>
     /// <exception cref="ArgumentNullException">当 <paramref name="config"/> 为 null 时抛出。</exception>
     /// <exception cref="ArgumentException">当 <paramref name="config"/> 中包含无效的设备类型或通讯方式时抛出。</exception>
     /// <remarks>
-    /// 在 TCP 服务器模式（通讯方式 = 2）下，请确保设备端已正确配置并尝试连接 SDK 所监听的端口。
     /// 该方法不会阻塞调用线程，应使用 <c>await</c> 等待连接完成。
     /// </remarks>
     public async Task ConnectAsync(DeviceConfig config, CancellationToken cancellationToken = default)
@@ -77,11 +76,19 @@ public partial class FxClient
     {
         try
         {
-            var session = GetSession(sessionId);
-            if(session == null) 
-                return;
-            UnSubscribeSessionEvents(session);//避免(未从会话触发断开事件时)事件订阅未解除
-            await session.CloseAsync();
+            await CloseSessionAsync(sessionId).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw ex.ToCommunicationException(ex.Message);
+        }
+    }
+
+    public async Task CloseFastAsync(string sessionId)
+    {
+        try
+        {
+            await CloseSessionAsync(sessionId, fastClose: true, delayAfterClose: false).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -124,7 +131,7 @@ public partial class FxClient
                 await session.SendMsgAsync(session.ProtocolHandler.EncodeDevice(session, config, propertyName));
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw ex.ToCommunicationException(ex.Message);
         }
@@ -165,11 +172,27 @@ public partial class FxClient
                 await session.SendMsgAsync(session.ProtocolHandler.EncodeChannel(session, config, propertyName));
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw ex.ToCommunicationException(ex.Message);
         }
     }
+
+    public void ClearEnvelopeTracking(string sessionId, ushort? address = null, ushort? channel = null)
+    {
+        var session = GetSession(sessionId);
+        if (session == null)
+        {
+            return;
+        }
+        if (address.HasValue && channel.HasValue)
+        {
+            SessionContext.ClearEnvelopeTrackingContext(session, address.Value, channel.Value);
+            return;
+        }
+        SessionContext.ClearEnvelopeTrackingContexts(session, address);
+    }
+
     /// <summary>
     /// 启动自动增益控制（AGC）流程，自动调节通道增益以达到目标峰值。
     /// </summary>
@@ -185,6 +208,7 @@ public partial class FxClient
     /// <param name="gainRange">
     /// 增益调节的有效范围，格式为 <c>[min, max]</c>。
     /// </param>
+    /// <param name="token">外部取消令牌</param>
     /// <param name="maxIterations">
     /// 最大迭代次数，默认为 20 次。
     /// </param>
@@ -192,7 +216,7 @@ public partial class FxClient
     /// 增益步长
     /// </param>
     /// <returns>
-    /// 返回包含最终增益值、是否收敛、迭代次数等信息的 <see cref="AgcContext"/> 对象。
+    /// 返回包含最终增益值、是否收敛、迭代次数等信息的 <see cref="AgcResult"/> 对象。
     /// </returns>
     /// <exception cref="CommunicationException">
     /// 当会话不存在、通信失败或 AGC 流程异常中断时抛出。
@@ -201,16 +225,17 @@ public partial class FxClient
     /// 该方法内部会取消同一会话上正在进行的其他 AGC 任务。
     /// AGC 过程依赖 <see cref="OnResultReceived"/> 事件反馈的解码结果来计算当前峰值。
     /// </remarks>
-    public async Task<AgcContext?> RunAgcControlAsync(string sessionId, ChannelConfig config, decimal targetPeak, double[] gainRange
-       , decimal gainStep , int maxIterations = 20)
+    public async Task<AgcResult?> RunAgcControlAsync(string sessionId, ChannelConfig config, decimal targetPeak, double[] gainRange
+       , decimal gainStep , CancellationToken token, int maxIterations = 20)
     {
         var session = GetSession(sessionId);
         if (session == null) 
             return null;
         
-        // 创建新的 AGC 上下文
-        config.Gain = (decimal)gainRange[0];//目前的算法 增益从最小增益开始收敛更快
-        var agcContext = new AgcContext(config.Gain, (double)targetPeak, gainRange, gainStep, maxIterations);
+        // 从当前增益开始搜索；AGC 内部会按设备范围夹逼，避免每次都从最小值重新爬坡。
+        config.Gain = ClampGain(config.Gain, gainRange);
+        var agcContext = new AgcContext(config.Gain, (double)targetPeak, gainRange, token, gainStep, maxIterations);
+        AgcResult? result = null;
         try
         {
             // 取消旧的 AGC（如果存在）
@@ -220,21 +245,33 @@ public partial class FxClient
             }
             // 注册新的 AGC 上下文
             _sessionAgcContext.AddOrUpdate(sessionId, agcContext, (_, _) => agcContext);
-            const int stableDelayMs = 200; // 数据稳定等待时间（毫秒）
+            var stableDelayMs = ResolveAgcSettleDelayMs(session.ProtocolHandler); // 等待增益指令生效后的新回波
+            var waveTimeout = TimeSpan.FromMilliseconds(stableDelayMs + 1200);
+            var nextGain = agcContext.Gain;
             for (var i = 1; i <= maxIterations; i++)
             {
-                // 检查是否已被取消（外部或内部）
+                // 检查是否已被取消
+                if (token.IsCancellationRequested)
+                {
+                    agcContext.Cancel();
+                    break;
+                }
+                
+                // 检查是否已内部取消
                 if (agcContext.Status != AgcContext.AgcStatus.Running)
                     break;
 
                 try
                 {
+                    token.ThrowIfCancellationRequested();
                     // 更新设备增益
-                    config.Gain = agcContext.Gain;
+                    config.Gain = nextGain;
                     await session.SendMsgAsync(session.ProtocolHandler.EncodeChannel(session, config, nameof(ChannelConfig.Gain)));
+                    token.ThrowIfCancellationRequested();
+                    agcContext.BeginGainProbe(TimeSpan.FromMilliseconds(stableDelayMs));
+                    agcContext.Gain = nextGain;
                     // 等待并处理下一轮回波数据
-                    await agcContext.WaitNextGainAsync(TimeSpan.FromSeconds(1),
-                        TimeSpan.FromMilliseconds(stableDelayMs));
+                    nextGain = await agcContext.WaitNextGainAsync(waveTimeout, TimeSpan.Zero);
                     //检查状态决定是否继续(收敛成功、达到最大迭代次数以及超时取消等都退出)
                     if (agcContext.Status != AgcContext.AgcStatus.Running)
                     {
@@ -244,6 +281,7 @@ public partial class FxClient
                 catch (OperationCanceledException)
                 {
                     // 被取消，退出循环
+                    agcContext.Cancel();
                     break;
                 }
                 catch (Exception ex)
@@ -253,11 +291,19 @@ public partial class FxClient
                     break;
                 }
             }
+            agcContext.CompleteIfStillRunning();
             // 开发者模式记录 AGC 最终结果
             if (FxUtility.DeveloperMode)
             {
                 Logger.Info(
                     $"AGC finished for session {sessionId}: Status={agcContext.Status}, FinalGain={agcContext.Gain}, Iterations={agcContext.FinalIterations}");
+            }
+
+            if (agcContext.Status != AgcContext.AgcStatus.Cancelled && config.Gain != agcContext.Gain)
+            {
+                // 二分搜索最终可能选中历史最优点，结束前把设备增益切回该点。
+                config.Gain = agcContext.Gain;
+                await session.SendMsgAsync(session.ProtocolHandler.EncodeChannel(session, config, nameof(ChannelConfig.Gain)));
             }
         }
         catch (Exception ex)
@@ -267,9 +313,30 @@ public partial class FxClient
         }
         finally
         {
-            _sessionAgcContext.TryRemove(sessionId, out _);
+            result = agcContext.ToResult();
+            // 只移除当前 AGC，避免旧任务结束时误删同一会话上的新 AGC。
+            ((ICollection<KeyValuePair<string, AgcContext>>)_sessionAgcContext)
+                .Remove(new KeyValuePair<string, AgcContext>(sessionId, agcContext));
+            agcContext.Dispose();
         }
-        return agcContext;
+        return result;
+    }
+
+    private static decimal ClampGain(decimal gain, double[] gainRange)
+    {
+        var minGain = (decimal)gainRange[0];
+        var maxGain = (decimal)gainRange[1];
+        if (gain < minGain)
+        {
+            return minGain;
+        }
+
+        return gain > maxGain ? maxGain : gain;
+    }
+
+    private static int ResolveAgcSettleDelayMs(FxProtocolHandler protocolHandler)
+    {
+        return protocolHandler is MultiChIotProtocolHandler ? 350 : 250;
     }
     /// <summary>
     /// 异步配置设备的模拟输出通道参数。
@@ -298,7 +365,7 @@ public partial class FxClient
             //发送指令到设备
             await session.SendMsgAsync(session.ProtocolHandler.EncodeOutputConfig(session, outputConfig, outputChannel));
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw ex.ToCommunicationException(ex.Message);
         }
@@ -330,12 +397,16 @@ public partial class FxClient
         {
             var session = GetSession(sessionId);
             if(session == null) return;
-            //存储到会话对象
-            SessionContext.StoreToSession(session,mode);
+            if (mode == WorkMode.LWaveRead && channel > 0)
+            {
+                SessionContext.BeginEnvelopeScan(session, address, channel);
+            }
+            // 按地址保存工作模式，多终端设备解码时需要使用对应终端的模式上下文。
+            SessionContext.StoreToSession(session, mode, address);
             //发送指令到设备
             await session.SendMsgAsync(session.ProtocolHandler.EncodeWorkMode(session, mode, channel, address));
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw ex.ToCommunicationException(ex.Message);
         }
@@ -372,7 +443,7 @@ public partial class FxClient
             //发送指令到设备
             await session.SendMsgAsync(session.ProtocolHandler.EncodeReadDeviceParameter(session, propertyName, address));
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw ex.ToCommunicationException(ex.Message);
         }
@@ -409,7 +480,7 @@ public partial class FxClient
             //发送指令到设备
             await session.SendMsgAsync(session.ProtocolHandler.EncodeReadChannelParameter(session, propertyName, channel, address));
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw ex.ToCommunicationException(ex.Message);
         }
@@ -438,13 +509,13 @@ public partial class FxClient
             if(session == null) return;
             await session.SendMsgAsync(new[] {data});
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw ex.ToCommunicationException(ex.Message);
         }
     }
     /// <summary>
-    /// 停止所有监听器并关闭所有活动会话，彻底清理 SDK 资源。
+    /// 关闭所有活动会话，彻底清理 SDK 资源。
     /// </summary>
     /// <exception cref="CommunicationException">
     /// 在关闭任一会话过程中发生通信错误时抛出。
@@ -456,17 +527,6 @@ public partial class FxClient
     /// </remarks>
     public async Task StopAllAsync()
     {
-        //停止所有监听器
-        lock (_serverSockets)
-        {
-            var listeners = _serverSockets.Values.ToList();
-            foreach (var listener in listeners)
-            {
-                try { listener.Dispose(); } catch { /* ignore */ }
-            }
-            _serverSockets.Clear();
-        }
-        _serverModels.Clear();
         // 关闭所有会话
         foreach (var session in _sessions.Values.ToList())
         {
@@ -496,6 +556,35 @@ public partial class FxClient
     public bool IsConnected(string sessionId)
     {
         var session = GetSession(sessionId);
-        return session != null;
+        return session is {IsConnected: true};
+    }
+
+    /// <summary>
+    /// 获取设备配置对应的会话标识。
+    /// </summary>
+    public string GetSessionId(DeviceConfig config)
+    {
+        return config.GetSessionId();
+    }
+
+    /// <summary>
+    /// 检查指定设备配置对应的会话是否已连接。
+    /// </summary>
+    public bool IsDeviceConnected(DeviceConfig config)
+    {
+        return IsConnected(GetSessionId(config));
+    }
+
+    /// <summary>
+    /// 关闭指定设备配置对应的会话。
+    /// </summary>
+    public async Task CloseDeviceAsync(DeviceConfig config)
+    {
+        await CloseAsync(GetSessionId(config));
+    }
+
+    public async Task CloseDeviceFastAsync(DeviceConfig config)
+    {
+        await CloseFastAsync(GetSessionId(config));
     }
 }
