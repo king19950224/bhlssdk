@@ -61,10 +61,14 @@ const SUBJECT_LABEL: Record<string, string> = { channel: '通道', monitor_group
 
 // 拉取失败要说出来，不能显示成"暂无报告"——那会让人重复生成已经存在的报告
 const loadError = ref<string | null>(null)
+// 达到后端单次上限（500）即视为截断：更早的报告不在本页,须提示（长期运行站点必然超）
+const truncated = ref(false)
 async function load() {
   loading.value = true
   try {
-    items.value = (await reportApi.list(typeFilter.value)).items
+    const r = await reportApi.list(typeFilter.value)
+    items.value = r.items
+    truncated.value = r.items.length >= 500
     loadError.value = null
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : '报告列表加载失败'
@@ -109,6 +113,9 @@ function fmt(iso: string) {
       <div v-if="loadError" class="load-error">
         <el-icon><WarningFilled /></el-icon> 报告列表加载失败（下方可能是旧数据）：{{ loadError }}
         <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
+      <div v-if="truncated" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 仅显示最近 500 份报告，更早的报告未列出（可按类型筛选缩小范围）。
       </div>
       <div class="tbl">
         <div class="tr th"><span>标题</span><span>类型</span><span>对象</span><span>状态</span><span>生成时间</span><span>操作</span></div>

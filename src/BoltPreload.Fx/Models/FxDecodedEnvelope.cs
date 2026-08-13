@@ -28,18 +28,20 @@ public enum FxResultType
 
 /// <summary>
 /// 单通道测量结果 DTO（解耦 SDK 类型）。
-/// 字段类型严格对齐 C# SDK 1.4 <c>FxSDK.Models.ChannelResult</c>。
+/// 字段对齐 C# SDK 1.6 <c>FxSDK.Models.ChannelResult</c>；StatusCode 在边界上从
+/// <c>MeasStatusCode</c> 枚举转回 short（数值与 1.4 逐一对应，存量数据无需迁移）。
 /// </summary>
 /// <remarks>
-/// 状态码（按 C# SDK 1.4 源码 ChannelResult 注释）：
+/// 状态码（SDK 1.6 <c>MeasStatusCode</c>）：
 /// <list type="bullet">
 /// <item><c> 0</c> 正常</item>
 /// <item><c>-1</c> 信号过小</item>
-/// <item><c>-2</c> 阈值异常</item>
+/// <item><c>-2</c> 阈值异常（阈值法未命中）</item>
 /// <item><c>-3</c> 信号溢出</item>
-/// <item><c>-4</c> 相似度低</item>
+/// <item><c>-4</c> 相似度低——自动法下实际为"周期估计失败/无合格过零点"（评估 §10 求证问题 3）</item>
 /// <item><c>-5</c> 未知异常</item>
 /// <item><c>-6</c> 信噪比低</item>
+/// <item><c>11/12</c> 低于/高于业务限值——<b>测量值有效</b>，不得当无效数据丢弃</item>
 /// </list>
 /// </remarks>
 /// <param name="Address">设备地址</param>
@@ -49,7 +51,7 @@ public enum FxResultType
 /// <param name="EchoTime2Ns">第二回波声时（双波法用）</param>
 /// <param name="SpTempC">温度（°C），来自设备 Pt1000</param>
 /// <param name="DeltaTofNs">声时差（ns），SDK 已做温度补偿</param>
-/// <param name="Gain">增益</param>
+/// <param name="Gain">增益（1~47 档；SDK 测量结果本身不带增益，此值取自会话通道配置快照，会话无该通道配置时为 0）</param>
 /// <param name="EchoWave">波形数据（如有）</param>
 /// <param name="LowAi">模拟低电平回读</param>
 /// <param name="HighAi">模拟高电平回读</param>

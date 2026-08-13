@@ -115,7 +115,29 @@ public static class FxInitialChannelConfigLoader
             logger.LogError(ex, "从 channels 表加载 Fx ChannelConfig 失败，改用 appsettings 兜底");
         }
 
+        // 锚点与 RefTime 是同一次置零的同帧配对，只有二者同源锚点才可信。
+        // 下面的参数历史覆盖可能把 RefTime 换成另一次置零的值（比如厂家工具在设备侧重新置零后
+        // 被 ReadChannelParam 读回落了历史）——旧锚点配新 RefTime 必然错帧，比没锚点更糟。
+        // 先记下库里的 RefTime，覆盖后不一致就把锚点整组丢掉，让自动法走 SDK 首帧捕获。
+        var dbRefTimes = configs.ToDictionary(kv => kv.Key, kv => kv.Value.RefTime);
+
         OverlayLatestDeviceParameters(dataSource, deviceId, configs, logger);
+
+        foreach (var (chNo, cfg) in configs)
+        {
+            if (cfg.RefEnvTime is null && cfg.RefPeriodNs is null && cfg.RefEchoWave is null)
+                continue;
+            var dbRefTime = dbRefTimes.GetValueOrDefault(chNo);
+            if (cfg.RefTime is null || dbRefTime is null || cfg.RefTime != dbRefTime)
+            {
+                logger.LogWarning(
+                    "通道 {Channel} 的自动法锚点与 RefTime 不同源（库 ref_time_ns={Db}，生效 RefTime={Eff}），丢弃锚点改走 SDK 首帧捕获。请尽快重新置零让基线归一",
+                    chNo, dbRefTime, cfg.RefTime);
+                cfg.RefEnvTime = null;
+                cfg.RefPeriodNs = null;
+                cfg.RefEchoWave = null;
+            }
+        }
 
         return configs.Values.ToList();
     }

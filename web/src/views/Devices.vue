@@ -9,6 +9,7 @@ import {
   type DeviceSettings,
 } from '../api'
 import { onRealtime, startRealtime, type OnChannelPresence } from '../api/realtime'
+import { ApiError } from '../api/client'
 import { useAuth } from '../stores/auth'
 import EmptyState from '../components/EmptyState.vue'
 import BoltCreateDialog from '../components/BoltCreateDialog.vue'
@@ -88,6 +89,14 @@ async function loadScan() {
     if (scanning.value && !scanTimer) pollScan()
   } catch (e) {
     if (selected.value?.deviceId !== did) return
+    // 404 = 该设备从未扫描过（/latest 无记录时按设计返 404），是正常空态不是故障——
+    // 之前把它也当错误挂横幅，新设备的扫描页永远显示"获取失败"，正常空态一次都出不来
+    if (e instanceof ApiError && e.status === 404) {
+      scan.value = null
+      scanning.value = false
+      scanError.value = null
+      return
+    }
     // 这里绝不能清掉 scan/scanning。原先失败时把 scanning 置 false，而 pollScan 的定时器
     // 每轮跑完就检查这个标志并清掉自己 —— 于是一次瞬时失败就让这轮扫描的进度永久停更，
     // 同时界面显示成"尚无扫描结果"，而设备其实还在一个个通道地扫。
@@ -231,6 +240,13 @@ async function recalibrate(c: ChannelHealth) {
   } catch { return }
   try {
     const r = await deviceApi.recalibrate(selected.value.deviceId, c.channelNo)
+    // warning 非空 = 基线移动明显（历史读数与新读数不可比、K_L 未重算），必须强提醒——
+    // 08-12 CH3 一天被重设 4 次基线无人感知，就是这条提示链缺失的实锅
+    if (r.warning) {
+      await ElMessageBox.alert(r.warning, '基线已重设 — 请注意', {
+        type: 'warning', confirmButtonText: '我已知晓',
+      }).catch(() => { /* 按 Esc 关闭也算已读 */ })
+    }
     ElMessage.success(`CH${c.channelNo} 基线已设为 ${Number(r.newRefTimeNs).toFixed(0)} ns`)
     await loadHealth()
   } catch (e) {
@@ -362,7 +378,8 @@ const HW_STATE: Record<string, { label: string; color: string }> = {
   unknown: { label: '未知', color: '#61748f' },
 }
 // 设备/扫描/通道状态枚举的中文映射（后端返回英文枚举，UI 统一汉化，未知值回退原值）
-const DEV_STATE: Record<string, string> = { Connected: '在线', Connecting: '连接中', Reconnecting: '重连中', Disconnected: '离线', Faulted: '故障' }
+// 与后端 FxConnectorState 六值对齐（Idle=已登记但采集任务尚未启动，之前缺失导致提示条中英混排"设备当前Idle"）
+const DEV_STATE: Record<string, string> = { Idle: '待启动', Connected: '在线', Connecting: '连接中', Reconnecting: '重连中', Disconnected: '离线', Faulted: '故障' }
 const SCAN_STATUS: Record<string, string> = { pending: '排队中', running: '检测中', completed: '已完成', failed: '失败', aborted: '已中止' }
 const CH_STATE: Record<string, string> = { manual: '手动', auto_discovered: '自动发现', auto: '自动' }
 // 测量计数用中文"万"做紧凑显示——原先的 1.2k 缩写易被误读成 kN
@@ -468,15 +485,15 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
             <el-button size="small" text type="primary" @click="loadScan">重试</el-button>
           </div>
           <div v-if="scan?.results?.length" class="tbl">
-            <div class="tr th scan"><span>CH</span><span>判定</span><span>SNR</span><span>声时σ</span><span>峰峰</span><span>样本</span><span>说明</span></div>
+            <div class="tr th scan"><span>CH</span><span>判定</span><span>SNR</span><span>声时σ</span><span>峰峰</span><span>样本(有波)</span><span>已绑螺栓</span></div>
             <div v-for="rrow in scan.results" :key="rrow.channelNo" class="tr scan">
               <span class="mono">{{ rrow.channelNo }}</span>
               <span><i class="vd" :style="`color:${VERDICT[rrow.verdict]?.color || 'var(--text-2)'}`">{{ VERDICT[rrow.verdict]?.label || rrow.verdict }}</i></span>
-              <span class="mono">{{ rrow.snrDb != null ? Number(rrow.snrDb).toFixed(1) : '—' }}</span>
+              <span class="mono">{{ rrow.snrAvgDb != null ? Number(rrow.snrAvgDb).toFixed(1) : '—' }}</span>
               <span class="mono">{{ rrow.echoStdNs != null ? Number(rrow.echoStdNs).toFixed(1) : '—' }}</span>
-              <span class="mono">{{ rrow.peakToPeak ?? '—' }}</span>
-              <span class="mono">{{ rrow.sampleCount }}</span>
-              <span class="dim">{{ rrow.reason || '—' }}</span>
+              <span class="mono">{{ rrow.peakToPeakAvg != null ? Number(rrow.peakToPeakAvg).toFixed(0) : '—' }}</span>
+              <span class="mono">{{ rrow.samples }}({{ rrow.samplesWithEcho }})</span>
+              <span class="dim">{{ rrow.boundBoltCode || '—' }}</span>
             </div>
           </div>
           <EmptyState v-else-if="!scanError" :empty="!scanning" :loading="scanning" empty-text="尚无扫描结果，点“发起自动检测”逐通道判定有无探头" />

@@ -1,5 +1,6 @@
 using BoltPreload.Api.Auth;
 using BoltPreload.Api.Runtime;
+using BoltPreload.Domain;
 using BoltPreload.Fx;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Devices.ProbeScan;
@@ -1054,6 +1055,76 @@ public static class DiagnosticEndpoints
                 "触发重标定 device={DeviceId} ch={Ch} addr={Addr} explicit RefTime={Rt} RefTemp={Rtemp}",
                 deviceId, channel, addr, body?.RefTimeNs, body?.RefTempC);
 
+            // ---------- 写设备之前的护栏（hardening §3）。设备侧写完无法回滚，检查必须全部前置 ----------
+            // 显式传 RefTime 的兜底路径不检查稳定性（那是"设备测不出 TOF"的场景，本来就没有窗口可查）。
+            decimal? oldRefTimeNs = null, oldKl = null;
+            EchoStabilityGuard.Snapshot? stability = null;
+            {
+                long chanId = 0;
+                decimal? klIntercept = null, oldRefTempC = null, targetN = null, tempCoeff = null;
+                await using (var cmd = ds.CreateCommand(@"
+                    SELECT c.id, c.k_l, c.k_l_intercept_ns, c.ref_time_ns, c.ref_temp_c,
+                           b.target_preload_n, b.temp_coefficient_per_c
+                    FROM channels c
+                    LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                    WHERE c.device_id = @d AND c.channel_no = @ch AND c.deleted_at IS NULL"))
+                {
+                    cmd.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
+                    cmd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channel);
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    if (await r.ReadAsync(ct))
+                    {
+                        chanId = r.GetInt64(0);
+                        oldKl = r.IsDBNull(1) ? null : r.GetDecimal(1);
+                        klIntercept = r.IsDBNull(2) ? null : r.GetDecimal(2);
+                        oldRefTimeNs = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                        oldRefTempC = r.IsDBNull(4) ? null : r.GetDecimal(4);
+                        targetN = r.IsDBNull(5) ? null : r.GetDecimal(5);
+                        tempCoeff = r.IsDBNull(6) ? null : r.GetDecimal(6);
+                    }
+                }
+
+                if (chanId > 0 && body?.RefTimeNs is null)
+                {
+                    // 基线，窗口取 60s：等待成本要低，5s 一条也有 12 个样本
+                    stability = await EchoStabilityGuard.MeasureAsync(ds, chanId, 60, ct);
+                    if (!stability.Stable && body?.Force != true)
+                        return Results.BadRequest(new
+                        {
+                            error = $"声时未达稳定判据（波动 {stability.StddevNs?.ToString("0.###") ?? "—"} ns，"
+                                + $"趋势 {stability.HalfWindowDriftNs?.ToString("0.###") ?? "—"} ns），此刻取的基线不可靠。"
+                                + "请保持螺栓静置等稳后重试；确认要用当前读数可传 force=true（会记入审计）。",
+                            stability = stability.ToDiagnostics(),
+                        });
+
+                    // 零载声明核对：按现行标定折算当前预紧力，明显带载就拒绝。
+                    // 折算口径与采集热路径一致（温补 + 截距），阈值 max(2kN, 5%目标)——
+                    // 低于它的残余力对基线的影响已小于扭矩法固有误差。
+                    if (body?.ExpectZeroLoad == true && body.Force != true
+                        && oldKl is > 0m && oldRefTimeNs is { } rt && oldRefTempC is { } rtemp
+                        && stability.AvgEchoNs is { } avgEcho)
+                    {
+                        var tc = tempCoeff ?? BoltPhysicsDefaults.SdkTempCoefficientPerC;
+                        var tempFactor = 1m + tc * ((stability.AvgTempC ?? rtemp) - rtemp);
+                        if (tempFactor > 0m)
+                        {
+                            var deltaTof = avgEcho / tempFactor - rt;
+                            var preloadN = (deltaTof - (klIntercept ?? 0m)) / oldKl.Value;
+                            var limitN = Math.Max(2000m, (targetN ?? 0m) * 0.05m);
+                            if (preloadN > limitN)
+                                return Results.BadRequest(new
+                                {
+                                    error = $"当前读数按现行标定折算约 {preloadN / 1000m:0.#} kN，螺栓似乎还带着载。"
+                                        + "零载基线必须在完全拧松状态下记录，否则之后所有读数整体偏低。"
+                                        + "请拧松后重试；确认当前就是零载（如现行标定本身已失真）可传 force=true。",
+                                    estimatedPreloadN = Math.Round(preloadN),
+                                    thresholdN = limitN,
+                                });
+                        }
+                    }
+                }
+            }
+
             try
             {
                 var result = await connector.RecalibrateChannelAsync(
@@ -1099,7 +1170,20 @@ public static class DiagnosticEndpoints
                         VALUES (@uid, 'channel_recalibrate', 'channel', @cid, NULL, @after::jsonb, @note, now(), @ip)", conn, tx);
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, uid);
                     audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
-                    audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new { result.NewRefTimeNs, result.NewRefTempC, result.NewRefEnvTimeNs, result.NewRefPeriodNs, sdkVersion = FxConnectorFactory.SdkVersion, explicit_ = body?.RefTimeNs != null }));
+                    audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        result.NewRefTimeNs,
+                        result.NewRefTempC,
+                        result.NewRefEnvTimeNs,
+                        result.NewRefPeriodNs,
+                        sdkVersion = FxConnectorFactory.SdkVersion,
+                        explicit_ = body?.RefTimeNs != null,
+                        expectZeroLoad = body?.ExpectZeroLoad == true,
+                        // 强闯护栏留痕：事后排查基线错位先看是不是 forced 进来的
+                        forcedPastGuards = body?.Force == true && stability is { Stable: false },
+                        stabilityStddevNs = stability?.StddevNs,
+                        stabilityDriftNs = stability?.HalfWindowDriftNs,
+                    }));
                     audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"重标定基线 device={deviceId} ch={channel} → RefTime={result.NewRefTimeNs}ns");
                     AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
@@ -1108,6 +1192,14 @@ public static class DiagnosticEndpoints
 
                 // 缓存失效放在提交之后：提前失效会让热路径回读到尚未提交的旧值，白失效一次。
                 resolver.Invalidate(deviceId, channel);
+
+                // 基线移动提示（hardening §3.2）：有在产标定时基线大挪移意味着历史读数与新读数不再可比，
+                // 且 K_L 没有重算。08-12 CH3 一天被重设 4 次基线、每次差几到三十 ns，操作者全程无感知——
+                // 这句话就是给那种情况的。提示不阻断：重设基线本就常用于"状态确实变了"的场景。
+                string? warning = null;
+                if (oldKl is > 0m && oldRefTimeNs is { } prevRt && Math.Abs(result.NewRefTimeNs - prevRt) > 2m)
+                    warning = $"基线移动了 {result.NewRefTimeNs - prevRt:+0.##;-0.##} ns（{prevRt:0.##} → {result.NewRefTimeNs:0.##}）。"
+                        + "历史读数与新读数不可直接对比；K_L 未重算，如螺栓/探头状态已变化请重新标定。";
 
                 return Results.Ok(new
                 {
@@ -1120,6 +1212,7 @@ public static class DiagnosticEndpoints
                     newRefPeriodNs = result.NewRefPeriodNs,
                     echoWavePoints = result.EchoWaveBytes,
                     timestamp = result.Timestamp,
+                    warning,
                     note = "基线已写入设备并同步到库（缓存已失效）。"
                 });
             }
@@ -1163,7 +1256,17 @@ public static class DiagnosticEndpoints
 /// </summary>
 /// <param name="RefTimeNs">显式 RefTime (ns)</param>
 /// <param name="RefTempC">显式 RefTemp (°C)</param>
-public sealed record RecalibrateRequest(decimal? RefTimeNs = null, decimal? RefTempC = null);
+/// <param name="ExpectZeroLoad">
+/// true = 调用方声明"螺栓当前是零载"（标定向导的新装/可松开场景）：
+/// 若通道有生效标定且按它折算当前预紧力明显大于零，说明螺栓还带着载，拒绝——
+/// 带载状态写成零载基线后所有读数整体偏低，且"拧松演示"会直接显示空白（08-12 CH3 实锅）。
+/// </param>
+/// <param name="Force">跳过稳定性/带载护栏（特殊现场），跳过记入审计。</param>
+public sealed record RecalibrateRequest(
+    decimal? RefTimeNs = null,
+    decimal? RefTempC = null,
+    bool? ExpectZeroLoad = null,
+    bool? Force = null);
 /// <summary>批量把通道参数从设备读回来。Channels / PropertyNames 不传就走默认通道集和默认参数集。</summary>
 public sealed record BatchReadChannelParamsRequest(
     ushort[]? Channels = null,

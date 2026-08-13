@@ -40,7 +40,7 @@ public static class AlarmRuleEndpoints
                 LEFT JOIN users cu ON cu.id = r.created_by
                 LEFT JOIN users au ON au.id = r.approved_by
                 ORDER BY (r.review_state = 'pending') DESC, r.created_at DESC
-                LIMIT 200";
+                LIMIT 500";
             await using var cmd = ds.CreateCommand(sql);
             var items = new List<object>();
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -71,10 +71,11 @@ public static class AlarmRuleEndpoints
                     reviewedAt = r.IsDBNull(20) ? null : (DateTime?)r.GetDateTime(20),
                 });
             }
-            return Results.Ok(new { count = items.Count, items });
+            // truncated：让前端能提示"历史记录超出显示上限"（待审规则排最前永不丢，截掉的只会是最老的历史）
+            return Results.Ok(new { count = items.Count, truncated = items.Count >= 500, items });
         })
         .WithName("ListAlarmRules")
-        .WithSummary("告警阈值规则列表（含待审/生效/驳回/已替代）");
+        .WithSummary("告警阈值规则列表（含待审/生效/驳回/已替代；最多 500 条，待审优先）");
 
         // 提案表单的目标下拉：部位与螺栓两张平铺表（资产端点是 项目→机组→部位 三级钻取，表单用不顺手）
         grp.MapGet("/targets", async (NpgsqlDataSource ds, CancellationToken ct) =>

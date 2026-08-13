@@ -183,20 +183,39 @@ function isLive(ch: number) {
   return nowTick.value - (liveAt[ch] ?? 0) < 2500
 }
 function fmtDay(ts: string | null) {
-  return ts ? ts.slice(0, 10) : ''
+  // 用本地日期而非 ISO 字符串前 10 位：accepted_at 是 UTC（带 Z），slice(0,10) 取到的是 UTC 日期，
+  // 北京时间 00:00–08:00 完成的验收会显示成前一天，和同页 toLocaleString 显示的时刻对不上
+  if (!ts) return ''
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`
 }
 
 // ---- 验收会话 ----
 const session = ref<AcceptanceSessionView | null>(null)
 const sessionBusy = ref(false)
+// 倒计时锚点：以服务器口径的 remainingSeconds 折算成本地到期时刻（收到响应那一刻起算），
+// 不直接拿 expiresAt 与本地时钟做差——客户端时钟偏差会让倒计时不准、横幅提前/滞后消失
+let sessionDeadlineMs: number | null = null
+function anchorSession(s: AcceptanceSessionView | null) {
+  session.value = s
+  sessionDeadlineMs = s?.active && s.remainingSeconds != null
+    ? Date.now() + s.remainingSeconds * 1000
+    : s?.active && s.expiresAt
+      ? new Date(s.expiresAt).getTime() // 老后端无 remainingSeconds 的兜底
+      : null
+}
 const sessionRemaining = computed(() => {
-  if (!session.value?.active || !session.value.expiresAt) return ''
-  const s = Math.max(0, Math.floor((new Date(session.value.expiresAt).getTime() - nowTick.value) / 1000))
+  if (!session.value?.active || sessionDeadlineMs == null) return ''
+  const s = Math.max(0, Math.floor((sessionDeadlineMs - nowTick.value) / 1000))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 })
 function expireSessionLocally() {
-  if (session.value?.active && session.value.expiresAt && new Date(session.value.expiresAt).getTime() <= Date.now())
+  if (session.value?.active && sessionDeadlineMs != null && sessionDeadlineMs <= Date.now()) {
     session.value = null
+    sessionDeadlineMs = null
+  }
 }
 function inSession(ch: number) {
   return !!session.value?.active && (session.value.channels ?? []).includes(ch)
@@ -205,8 +224,8 @@ async function loadSession() {
   if (deviceId.value == null) return
   try {
     const s = await acceptanceApi.session(deviceId.value)
-    session.value = s.active ? s : null
-  } catch { session.value = null }
+    anchorSession(s.active ? s : null)
+  } catch { anchorSession(null) }
 }
 async function startSession() {
   if (deviceId.value == null) return
@@ -219,7 +238,7 @@ async function startSession() {
   sessionBusy.value = true
   try {
     const s = await acceptanceApi.startSession(deviceId.value, {})
-    session.value = s
+    anchorSession(s)
     ElMessage.success(`验收会话已开启：${s.channels?.length ?? 0} 个通道，单通道刷新约 ${s.estimatedRefreshSeconds ?? '-'}s`)
   } catch (e) {
     ElMessage.error((e as Error)?.message || '开启失败')
@@ -232,7 +251,7 @@ async function endSession() {
   sessionBusy.value = true
   try {
     const r = await acceptanceApi.endSession(deviceId.value)
-    session.value = null
+    anchorSession(null)
     ElMessage.success(r.note || '验收会话已结束')
   } catch (e) {
     ElMessage.error((e as Error)?.message || '结束失败')

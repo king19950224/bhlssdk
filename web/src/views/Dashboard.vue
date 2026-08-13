@@ -380,15 +380,17 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
             </div>
           </div>
 
+          <!-- 分母口径与 donut 的"在测"不同（这里只计有保持率的螺栓，未配目标者算不出 ratio 不在内），
+               文案说清差异，避免同屏出现两个不相等的"在测 N 颗"让人以为数据错了 -->
           <div class="mb-card">
-            <div class="mb-title">保持率分布 <span class="mb-sub mono">{{ distBuckets.total }} 颗在测</span></div>
+            <div class="mb-title">保持率分布 <span class="mb-sub mono">{{ distBuckets.total }} 颗可评估（已配目标）</span></div>
             <div class="dist-body">
               <div v-for="b in distBuckets.items" :key="b.key" class="dist-item">
                 <span class="dist-label">{{ b.label }}</span>
                 <div class="dist-track"><div class="dist-fill" :style="`width:${distBuckets.total ? (b.count / distBuckets.total) * 100 : 0}%;background:${b.color}`" /></div>
                 <span class="dist-count mono" :style="`color:${b.color}`">{{ b.count }}</span>
               </div>
-              <div v-if="loaded && !distBuckets.total" class="dist-empty">暂无在测螺栓</div>
+              <div v-if="loaded && !distBuckets.total" class="dist-empty">暂无可评估保持率的在测螺栓</div>
             </div>
           </div>
         </div>

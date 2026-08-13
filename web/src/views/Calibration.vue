@@ -27,8 +27,9 @@ const displayedBolts = computed(() => {
     const da = days.has(a.id) ? days.get(a.id)! : 9999
     const db = days.has(b.id) ? days.get(b.id)! : 9999
     if (da !== db) return da - db
-    const rank = (s: string) => (s === 'expired' || s === 'uncalibrated' ? 0 : 1)
-    return rank(a.state) - rank(b.state) || a.code.localeCompare(b.code)
+    // 需要处理的（过期/未标定）排前——用权威字段判定，bolts.state 永远不会是 'expired'
+    const rank = (b2: BoltListItem) => (b2.calibrationExpired || !b2.calibrated ? 0 : 1)
+    return rank(a) - rank(b) || a.code.localeCompare(b.code)
   })
 })
 
@@ -65,15 +66,17 @@ function r2View(m: CalibMethod) {
   if (SINGLE_POINT.has(m.method) && Number(m.avgR2) === 0) return '—'
   return Number(m.avgR2).toFixed(3)
 }
-const BSTATE: Record<string, { label: string; cls: string }> = {
-  calibrated: { label: '已标定', cls: 'led--ok' },
-  uncalibrated: { label: '未标定', cls: 'led--off' },
-  expired: { label: '已过期', cls: 'led--warn' },
-  disabled: { label: '停用', cls: 'led--off' },
+// 标定状态基于后端权威字段（calibrated 已含过期判定 + calibrationExpired 区分"过期"与"从未标定"）。
+// 不再查 bolts.state——全后端没有写 state='expired'/'disabled' 的路径，按它显示"已过期"永不命中。
+function boltStateView(b: BoltListItem): { label: string; cls: string } {
+  if (b.calibrationExpired) return { label: '已过期', cls: 'led--warn' }
+  return b.calibrated ? { label: '已标定', cls: 'led--ok' } : { label: '未标定', cls: 'led--off' }
 }
 
 // 拉取失败要说出来，不能显示成"暂无螺栓"——那会让人以为这批螺栓还没建档而重复建
 const loadError = ref<string | null>(null)
+// 螺栓超过单次加载上限（1000）被截断：不提示的话排序在后的螺栓看着像"没建档"
+const listTruncated = ref(false)
 async function load() {
   loading.value = true
   try {
@@ -83,6 +86,7 @@ async function load() {
     ])
     methods.value = summary.methods
     bolts.value = boltList.items
+    listTruncated.value = !!boltList.hasMore
     if (focusExpiring.value) {
       // 失败不挡主列表：没有到期日时仍按 state 粗排
       try {
@@ -143,12 +147,15 @@ onMounted(load)
         <el-icon><WarningFilled /></el-icon> 标定列表加载失败（下方可能是旧数据）：{{ loadError }}
         <el-button size="small" text type="primary" @click="load">重试</el-button>
       </div>
+      <div v-if="listTruncated" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 螺栓数量超出单次加载上限（1000），未显示的螺栓请从资产监测按部位进入后标定。
+      </div>
       <div class="tbl" v-loading="loading">
         <div class="tr th"><span>螺栓</span><span>规格</span><span>状态</span><span>K_L</span><span>参考声时</span><span>参考温度</span><span>操作</span></div>
         <div v-for="b in displayedBolts" :key="b.id" class="tr" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
           <span class="mono">{{ b.code }}</span>
           <span>{{ b.nominalDiam }}·{{ b.grade }}</span>
-          <span class="bs"><span class="led" :class="BSTATE[b.state]?.cls || 'led--off'" />{{ BSTATE[b.state]?.label || b.state }}</span>
+          <span class="bs"><span class="led" :class="boltStateView(b).cls" />{{ boltStateView(b).label }}</span>
           <span class="mono">{{ b.kL != null ? Number(b.kL).toExponential(2) : '—' }}</span>
           <span class="mono">{{ b.refTimeNs != null ? Number(b.refTimeNs).toFixed(0) + 'ns' : '—' }}</span>
           <span class="mono">{{ b.refTempC != null ? Number(b.refTempC).toFixed(1) + '°C' : '—' }}</span>

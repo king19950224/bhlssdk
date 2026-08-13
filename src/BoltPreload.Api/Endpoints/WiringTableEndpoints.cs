@@ -44,7 +44,9 @@ public static class WiringTableEndpoints
             // 前 7 列与导入格式一致（可导出→修改→回导）；其后为只读信息列，导入时忽略。
             // 表头这几个中文词必须原样出现在前端 HEADER_ALIASES 里，否则导回来认不出列。
             // 末列特意叫"螺栓位号"而不是"位号"——"位号"在别名表里指向通道位置，同名会和第 2 列抢同一个字段。
-            csv.AppendLine("通道号,位置,螺栓编号,规格,等级,目标预紧力,报警下限,探头状态,验收时间,螺栓位号");
+            // "验收时间(当地)"：数据列输出服务器当地时间，表头必须说清时区，否则现场按 UTC/北京时间乱猜；
+            // 它是导入忽略列（不在 HEADER_ALIASES），改名不影响回导。
+            csv.AppendLine("通道号,位置,螺栓编号,规格,等级,目标预紧力,报警下限,探头状态,验收时间(当地),螺栓位号");
 
             await using var cmd = ds.CreateCommand(@"
                 SELECT c.channel_no, c.name, b.code, b.nominal_diam, b.grade,
@@ -68,7 +70,8 @@ public static class WiringTableEndpoints
                    .Append(r.IsDBNull(5) ? "" : r.GetDecimal(5).ToString("F0")).Append(',')
                    .Append(r.IsDBNull(6) ? "" : r.GetDecimal(6).ToString("F0")).Append(',')
                    .Append(r.IsDBNull(7) ? "" : DisplayLabels.HardwareState(r.GetString(7))).Append(',')
-                   .Append(r.IsDBNull(8) ? "" : r.GetDateTime(8).ToString("yyyy-MM-dd HH:mm:ss")).Append(',')
+                   // 验收时间列输出当地时间（timestamptz 读出为 UTC；无标记的 UTC 现场会按北京时间误读，差 8 小时）
+                   .Append(r.IsDBNull(8) ? "" : r.GetDateTime(8).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")).Append(',')
                    .Append(AcceptanceEndpoints.Csv(r.IsDBNull(9) ? "" : r.GetString(9))).Append('\n');
             }
             return Results.File(Encoding.UTF8.GetBytes(csv.ToString()), "text/csv; charset=utf-8",

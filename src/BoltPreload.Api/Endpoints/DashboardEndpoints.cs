@@ -17,18 +17,21 @@ public static class DashboardEndpoints
                 WITH {AssetEndpoints.BoltStatusCte} SELECT {AssetEndpoints.StatusAgg} FROM bolt_status;
 
                 WITH {AssetEndpoints.BoltStatusCte}
-                SELECT t.name AS turbine, mg.name AS grp, {AssetEndpoints.StatusAgg}
+                -- LEFT JOIN 机组（与 CTE 同约定）：monitor_groups.turbine_id 可空，INNER JOIN 会让
+                -- 未挂机组的螺栓计入 global 计数却从 byGroup/topLoose/approachingLimit 清单消失——
+                -- 结论条报“N 颗松动”、排行却找不到那颗，值班无法定位（安全静默失效项）。
+                SELECT COALESCE(t.name, '—') AS turbine, mg.name AS grp, {AssetEndpoints.StatusAgg}
                 FROM bolt_status bs
-                JOIN turbines t ON t.id = bs.turbine_id
+                LEFT JOIN turbines t ON t.id = bs.turbine_id
                 JOIN monitor_groups mg ON mg.id = bs.group_id
-                GROUP BY t.name, mg.name
-                ORDER BY t.name, mg.name;
+                GROUP BY 1, 2
+                ORDER BY 1, 2;
 
                 WITH {AssetEndpoints.BoltStatusCte}
-                SELECT b.code, t.name, mg.name, bs.preload_n, bs.preload_ratio, b.min_preload_n, bs.status, b.id
+                SELECT b.code, COALESCE(t.name, '—'), mg.name, bs.preload_n, bs.preload_ratio, b.min_preload_n, bs.status, b.id
                 FROM bolt_status bs
                 JOIN bolts b ON b.id = bs.id
-                JOIN turbines t ON t.id = bs.turbine_id
+                LEFT JOIN turbines t ON t.id = bs.turbine_id
                 JOIN monitor_groups mg ON mg.id = bs.group_id
                 WHERE bs.status IN ('loose', 'warn')
                 ORDER BY bs.preload_ratio ASC NULLS LAST
@@ -76,13 +79,13 @@ public static class DashboardEndpoints
                        AND (max(m.ts) - min(m.ts)) >= interval '24 hours'
                        AND regr_r2(m.preload_n, extract(epoch FROM m.ts)) >= 0.5
                 ), {AssetEndpoints.BoltStatusCte}
-                SELECT b.code, t.name, mg.name, bs.preload_n, b.min_preload_n, bs.preload_ratio, b.id,
+                SELECT b.code, COALESCE(t.name, '—'), mg.name, bs.preload_n, b.min_preload_n, bs.preload_ratio, b.id,
                        (rc.slope)::double precision AS slope_sec,
                        ((bs.preload_n - b.min_preload_n) / (-rc.slope * 86400.0))::double precision AS days_to_limit,
                        (rc.r2)::double precision AS r2
                 FROM bolt_status bs
                 JOIN bolts b ON b.id = bs.id
-                JOIN turbines t ON t.id = bs.turbine_id
+                LEFT JOIN turbines t ON t.id = bs.turbine_id
                 JOIN monitor_groups mg ON mg.id = bs.group_id
                 JOIN recent rc ON rc.bolt_id = b.id
                 WHERE bs.status IN ('normal','warn','loose') AND bs.preload_n IS NOT NULL
@@ -142,7 +145,8 @@ public static class DashboardEndpoints
             await using var cmd = ds.CreateCommand(sql);
             await using var r = await cmd.ExecuteReaderAsync(ct);
 
-            object global = new { total = 0L, normal = 0L, warn = 0L, loose = 0L, uncalibrated = 0L, nodata = 0L };
+            // 兜底对象字段必须与 Health() 投影完全一致（含 high）——少一个键，前端拿 undefined 算百分比全是 NaN
+            object global = new { total = 0L, normal = 0L, warn = 0L, loose = 0L, uncalibrated = 0L, nodata = 0L, high = 0L };
             if (await r.ReadAsync(ct)) global = AssetEndpoints.Health(r, 0);
 
             var byGroup = new List<object>();

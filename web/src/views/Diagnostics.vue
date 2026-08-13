@@ -214,7 +214,7 @@ const ascanOption = computed(() => {
     tooltip: { trigger: 'axis', backgroundColor: '#0d1320', borderColor: 'rgba(56,189,248,0.3)', textStyle: { color: '#e8eef8' } },
     legend: refData.length ? { data: ['当前波形', '参考波形'], textStyle: { color: '#61748f', fontSize: 11 }, right: 10, top: 2 } : undefined,
     xAxis: { type: 'value', min: xmin, max: xmax, name: '时间 ns', nameTextStyle: { color: '#61748f', fontSize: 11 }, axisLabel: { color: '#61748f', fontSize: 11 }, axisLine: { lineStyle: { color: 'rgba(148,163,184,0.2)' } }, splitLine: { show: false } },
-    yAxis: { type: 'value', scale: true, name: '幅值', nameTextStyle: { color: '#61748f', fontSize: 11 }, axisLabel: { color: '#61748f', fontSize: 11 }, splitLine: { lineStyle: { color: 'rgba(148,163,184,0.08)' } } },
+    yAxis: { type: 'value', scale: true, name: '幅值 (mV)', nameTextStyle: { color: '#61748f', fontSize: 11 }, axisLabel: { color: '#61748f', fontSize: 11 }, splitLine: { lineStyle: { color: 'rgba(148,163,184,0.08)' } } },
     series,
     animationDuration: 200,
   }

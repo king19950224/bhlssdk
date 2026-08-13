@@ -127,7 +127,10 @@ export function computePreloadHealth(inp: PreloadInput, nowMs: number = Date.now
     status = 'warn'
     reason = `接近下限,安全裕度仅 ${pct(safetyMargin)}`
   } else if (residualRatio != null && residualRatio > 1.1) {
-    // 偏高/超张力：保持率 > 110%（与服务端 bolt_status CTE 和告警 TriggerHighRatio 口径一致）
+    // 偏高/超张力：保持率 > 110%（与服务端 bolt_status CTE 和告警 TriggerHighRatio 口径一致）。
+    // 已知的口径时点差异：服务端用测量入库时存的 preload_ratio（按当时目标算），这里用
+    // 当前目标现算——修改目标预紧力后到下一条测量入库前的短窗口（采集周期+缓存 5min TTL）内，
+    // 两边结论可能不同；窗口一过自然收敛，属有意取舍（前端反映最新目标更符合直觉）。
     status = 'high'
     reason = `预紧力偏高,当前为目标的 ${pct(residualRatio)}(超张力风险)`
   } else {

@@ -30,6 +30,7 @@ const DEGRADE_TEXT: Record<string, string> = {
   db_down: '数据库不可达',
   db_write_failing: '入库持续失败',
   wal_saturated: 'WAL 满正在丢数',
+  low_disk: '磁盘余量不足',
 }
 const overall = computed(() => {
   const r = ready.value
@@ -43,10 +44,20 @@ const overall = computed(() => {
     return { level: 'crit' as const, text: `监测降级：${parts.join('、') || '后台服务失联'}` }
   }
   if ((r.wal?.pending ?? 0) > 0) return { level: 'warn' as const, text: `WAL 待补传 ${r.wal!.pending} 条` }
-  if (r.freeDiskGb != null && r.freeDiskGb < 2) return { level: 'warn' as const, text: `磁盘余量仅 ${r.freeDiskGb} GB` }
+  // 阈值以后端为准（Health:MinFreeDiskGb）；这里的 warn 是逼近阈值时的提前量，
+  // 真的低于阈值后端已经判 low_disk 降级，走上面的 crit 分支了
+  if (diskTight.value) return { level: 'warn' as const, text: `磁盘余量仅 ${r.freeDiskGb} GB` }
   if (r.ingestLagSeconds != null && r.ingestLagSeconds > 120)
     return { level: 'warn' as const, text: `入库延迟 ${r.ingestLagSeconds} 秒` }
   return { level: 'ok' as const, text: '系统就绪' }
+})
+
+// 余量已经进到阈值的 1.5 倍以内：还没触发降级，但该安排清盘了
+const diskTight = computed(() => {
+  const r = ready.value
+  if (!r || r.freeDiskGb == null) return false
+  const floor = r.minFreeDiskGb ?? 2
+  return floor > 0 && r.freeDiskGb < floor * 1.5
 })
 
 function fmtSec(v: number | null | undefined) {
@@ -109,14 +120,27 @@ onBeforeUnmount(() => {
           写失败 {{ ready.ingest?.totalDbWriteFailures ?? 0 }} · WAL 丢弃 {{ ready.ingest?.walDroppedTotal ?? 0 }} · 背压丢弃 {{ ready.ingest?.backpressureDropped ?? 0 }}
         </div>
       </div>
-      <div class="c panel" :class="ready.freeDiskGb != null && ready.freeDiskGb < 2 ? 'warn' : ''">
+      <div class="c panel" :class="diskTight ? 'warn' : ''">
         <div class="c-k">磁盘余量</div>
         <div class="c-v mono">{{ ready.freeDiskGb ?? '—' }} <span class="unit">GB</span></div>
+        <div class="c-sub mono">
+          <span v-if="ready.tightestDiskRoot">{{ ready.tightestDiskRoot }} 最紧张</span>
+          <span v-if="ready.tightestDiskRoot && ready.minFreeDiskGb"> · </span>
+          <span v-if="ready.minFreeDiskGb">低于 {{ ready.minFreeDiskGb }} GB 判降级</span>
+        </div>
       </div>
       <div class="c panel">
         <div class="c-k">进程内存</div>
         <div class="c-v mono">{{ ready.memory?.workingSetMb ?? '—' }} <span class="unit">MB</span></div>
         <div class="c-sub mono">私有 {{ ready.memory?.privateMb ?? '—' }} · GC {{ ready.memory?.gcHeapMb ?? '—' }}</div>
+      </div>
+    </div>
+
+    <div v-if="ready?.warnings?.length" class="panel warns">
+      <div class="panel-hd"><span class="panel-title">配置隐患</span></div>
+      <div class="warn-body">
+        <div class="warn-hint">下面这些现在还没影响运行，但迟早会在高峰或故障时发作，交付前应处理。</div>
+        <div v-for="(w, i) in ready.warnings" :key="i" class="warn-item">{{ w }}</div>
       </div>
     </div>
 
@@ -156,6 +180,9 @@ onBeforeUnmount(() => {
 .unit { font-size: 12px; font-weight: 500; color: var(--text-3); }
 .panel-hd { padding: 12px 16px 0; }
 .panel-title { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-2); }
+.warn-body { padding: 10px 16px 14px; display: flex; flex-direction: column; gap: 8px; }
+.warn-hint { font-size: 12px; color: var(--text-3); }
+.warn-item { font-size: 13px; color: var(--text-1); padding: 8px 10px; border-radius: 6px; background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.35); }
 .svc-tbl { padding: 8px 12px 14px; }
 .tr { display: grid; grid-template-columns: 1.4fr 0.6fr 0.8fr; gap: 8px; padding: 8px; font-size: 13px; }
 .tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.06em; }

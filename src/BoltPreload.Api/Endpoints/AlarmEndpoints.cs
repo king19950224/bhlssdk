@@ -22,9 +22,10 @@ public static class AlarmEndpoints
             .WithTags("Alarms")
             .RequireAuthorization(AuthPolicies.LoggedIn);
 
-        // 列告警（默认只列开启的；可选 includeCleared=true 看历史）
+        // 列告警（默认只列开启的；可选 includeCleared=true 看历史；boltId=按螺栓过滤——
+        // 螺栓详情页履历用它，替代"全站拉 N 条再客户端过滤"的截断做法）
         grp.MapGet("/", async (
-            NpgsqlDataSource ds, bool? includeCleared, string? severity, int? limit,
+            NpgsqlDataSource ds, bool? includeCleared, string? severity, long? boltId, int? limit,
             CancellationToken ct) =>
         {
             var n = Math.Clamp(limit ?? 100, 1, 1000);
@@ -44,10 +45,12 @@ public static class AlarmEndpoints
                 WHERE 1=1"
                 + (includeCleared == true ? "" : " AND a.cleared_at IS NULL")
                 + (severity is null ? "" : " AND a.severity = @sev")
+                + (boltId is null ? "" : " AND a.bolt_id = @bid")
                 + " ORDER BY a.triggered_at DESC LIMIT @n";
 
             await using var cmd = ds.CreateCommand(sql);
             if (severity is not null) cmd.Parameters.AddWithValue("sev", NpgsqlDbType.Varchar, severity);
+            if (boltId is not null) cmd.Parameters.AddWithValue("bid", NpgsqlDbType.Bigint, boltId.Value);
             cmd.Parameters.AddWithValue("n", NpgsqlDbType.Integer, n);
 
             var items = new List<object>();

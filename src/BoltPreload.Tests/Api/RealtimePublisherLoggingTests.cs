@@ -4,6 +4,7 @@ using BoltPreload.Application.Ingestion;
 using BoltPreload.Fx.Models;
 using FluentAssertions;
 using Microsoft.AspNetCore.SignalR;
+using Npgsql;
 using Xunit;
 
 namespace BoltPreload.Tests.Api;
@@ -16,11 +17,16 @@ namespace BoltPreload.Tests.Api;
 /// </summary>
 public class RealtimePublisherLoggingTests
 {
+    // 指向必然拒绝连接的地址：发布器补查 boltCode 的失败路径自带 try/catch 静默降级
+    //（boltCode=null 照常推送），所以测试无需真库——连接被拒即命中该降级分支。
+    private static readonly NpgsqlDataSource DeadDb =
+        NpgsqlDataSource.Create("Host=127.0.0.1;Port=1;Username=x;Password=x;Database=x;Timeout=1;Maximum Pool Size=1");
+
     [Fact]
     public async Task AlarmPublisher_LogsWarning_WhenPushFails()
     {
         var logger = new CapturingLogger<SignalRAlarmPublisher>();
-        var publisher = new SignalRAlarmPublisher(new ThrowingHubContext(), logger);
+        var publisher = new SignalRAlarmPublisher(new ThrowingHubContext(), DeadDb, logger);
 
         // 契约要求失败不抛：抛出去会反压入库主链
         await publisher.PublishAsync(Alarm(boltId: 42));
@@ -35,7 +41,7 @@ public class RealtimePublisherLoggingTests
     public async Task AlarmPublisher_DoesNotThrow_SoIngestionIsNeverBlocked()
     {
         var publisher = new SignalRAlarmPublisher(
-            new ThrowingHubContext(), new CapturingLogger<SignalRAlarmPublisher>());
+            new ThrowingHubContext(), DeadDb, new CapturingLogger<SignalRAlarmPublisher>());
 
         await publisher.Invoking(p => p.PublishAsync(Alarm(boltId: 1)))
             .Should().NotThrowAsync("推送失败不能反压入库，留痕靠日志不靠异常");

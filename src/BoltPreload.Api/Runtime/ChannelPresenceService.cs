@@ -218,11 +218,20 @@ public sealed class ChannelPresenceService : BackgroundService
                 // 自动建档的瞬时失败（DB 抖动等）随 sweep 重试，成功或条件不再成立即出队
                 if (_opt.AutoEnroll)
                     await _enroller.RetryPendingAsync(ct);
+
+                // 周期对账：事件丢失（消费失败/建行竞态）的终态兜底，约每分钟一次
+                if (_opt.ReconcileEverySweeps > 0 && ++_sweepsSinceReconcile >= _opt.ReconcileEverySweeps)
+                {
+                    _sweepsSinceReconcile = 0;
+                    await ReconcilePresenceAsync(ct);
+                }
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex) { _logger.LogError(ex, "在位静默扫描异常"); }
         }
     }
+
+    private int _sweepsSinceReconcile;
 
     /// <summary>
     /// 设备级假静默：挂起该设备的拔出判定并抬高静默地板。
@@ -251,34 +260,14 @@ public sealed class ChannelPresenceService : BackgroundService
             {
                 try
                 {
-                    var (channelId, boltId, boltCode) = await PersistAsync(change, ct);
-
-                    // 检测即螺栓：在位确认且通道无绑定螺栓 → 自动建档（编号自动、缺省规格）。
-                    // PersistAsync 已先把 hardware_state 置 healthy，enroller 事务内会复核在位+未绑定。
-                    if (change.Present && boltId is null && channelId is not null && _opt.AutoEnroll)
-                    {
-                        var enrolled = await _enroller.TryEnrollAsync(change.DeviceId, change.ChannelNo, ct);
-                        if (enrolled is not null) (boltId, boltCode) = (enrolled.BoltId, enrolled.Code);
-                    }
-
-                    try { await _publisher.PublishAsync(change, channelId, boltId, boltCode, ct); }
-                    catch (Exception ex) { _logger.LogDebug(ex, "在位事件推送失败 device={DeviceId} ch={Ch}", change.DeviceId, change.ChannelNo); }
-
-                    if (change.Present)
-                        _logger.LogInformation("探头插入 device={DeviceId} ch={Ch} bolt={Bolt}{Initial}",
-                            change.DeviceId, change.ChannelNo, boltCode ?? "未绑定", change.Initial ? "（启动确认）" : "");
-                    else if (change.Initial)
-                        // 启动后的首次"无探头"确认：空口的常态 + 陈旧 hardware_state 自愈，不是告警事件
-                        _logger.LogDebug("通道无探头（启动确认）device={DeviceId} ch={Ch} bolt={Bolt}",
-                            change.DeviceId, change.ChannelNo, boltCode ?? "未绑定");
-                    else
-                        _logger.LogWarning("探头断开 device={DeviceId} ch={Ch} bolt={Bolt}（UI 在位显示；signal_lost 告警由 SignalHealth 独立判定）",
-                            change.DeviceId, change.ChannelNo, boltCode ?? "未绑定");
+                    await ApplyChangeAsync(change, reconciled: false, ct);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "在位事件处理失败 device={DeviceId} ch={Ch}", change.DeviceId, change.ChannelNo);
+                    // 事件一次性消费，这里失败就丢了（状态机不会为同一状态再发一次）——
+                    // 终态一致由 ReconcilePresenceAsync 的周期对账兜底，此处只记账不重投
+                    _logger.LogError(ex, "在位事件处理失败 device={DeviceId} ch={Ch}（等待周期对账修复）", change.DeviceId, change.ChannelNo);
                 }
             }
         }
@@ -286,8 +275,120 @@ public sealed class ChannelPresenceService : BackgroundService
     }
 
     /// <summary>
+    /// 在位变化的统一应用路径：落库 + 自动建档 + 推送 + 日志。
+    /// 事件消费与周期对账共用（对账 reconciled=true：日志降级、事件带 Initial 语义让前端只刷状态不弹通知）。
+    /// 每一步都幂等：PersistAsync 是条件 UPDATE，enroller 事务内有在位/未绑定/hold 三重复核。
+    /// </summary>
+    private async Task ApplyChangeAsync(ChannelPresenceChange change, bool reconciled, CancellationToken ct)
+    {
+        var (channelId, boltId, boltCode) = await PersistAsync(change, ct);
+
+        // 检测即螺栓：在位确认且通道无绑定螺栓 → 自动建档（编号自动、缺省规格）。
+        // PersistAsync 已先把 hardware_state 置为在位词表态，enroller 事务内会复核在位+未绑定。
+        if (change.Present && boltId is null && channelId is not null && _opt.AutoEnroll)
+        {
+            var enrolled = await _enroller.TryEnrollAsync(change.DeviceId, change.ChannelNo, ct);
+            if (enrolled is not null) (boltId, boltCode) = (enrolled.BoltId, enrolled.Code);
+        }
+
+        try { await _publisher.PublishAsync(change, channelId, boltId, boltCode, ct); }
+        catch (Exception ex) { _logger.LogDebug(ex, "在位事件推送失败 device={DeviceId} ch={Ch}", change.DeviceId, change.ChannelNo); }
+
+        if (reconciled)
+            _logger.LogInformation("在位状态对账修复 device={DeviceId} ch={Ch} present={Present} bolt={Bolt}",
+                change.DeviceId, change.ChannelNo, change.Present, boltCode ?? "未绑定");
+        else if (change.Present)
+            _logger.LogInformation("探头插入 device={DeviceId} ch={Ch} bolt={Bolt}{Initial}",
+                change.DeviceId, change.ChannelNo, boltCode ?? "未绑定", change.Initial ? "（启动确认）" : "");
+        else if (change.Initial)
+            // 启动后的首次"无探头"确认：空口的常态 + 陈旧 hardware_state 自愈，不是告警事件
+            _logger.LogDebug("通道无探头（启动确认）device={DeviceId} ch={Ch} bolt={Bolt}",
+                change.DeviceId, change.ChannelNo, boltCode ?? "未绑定");
+        else
+            _logger.LogWarning("探头断开 device={DeviceId} ch={Ch} bolt={Bolt}（UI 在位显示；signal_lost 告警由 SignalHealth 独立判定）",
+                change.DeviceId, change.ChannelNo, boltCode ?? "未绑定");
+    }
+
+    // ===================== 周期对账（事件丢失的兜底） =====================
+
+    /// <summary>
+    /// "内存在位状态 vs 库"对账：事件消费失败（DB 抖动/WAL 降级）、通道行未建（首测建行竞态）
+    /// 都会让一次性消费的事件白丢——状态机不会为同一状态再发事件，不对账的话
+    /// 不一致会一直挂到下次插拔。规则见 probe-presence-hardening-design.md §2.3。
+    /// </summary>
+    // internal 供集成测试直调单轮对账
+    internal async Task ReconcilePresenceAsync(CancellationToken ct)
+    {
+        var snapshot = _tracker.Snapshot();
+        if (snapshot.Count == 0) return;
+
+        // 挂起设备（离线/扫描/整机静默）的内存状态是冻结的旧值，扫描期间库可能被 probe-scan 合法改写，
+        // 拿冻结值去覆盖必错——跳过，恢复后凭新回波证据再对
+        var eligible = snapshot.Select(s => s.DeviceId).Distinct()
+            .Where(id => !IsDeviceSuspended(id))
+            .ToHashSet();
+        if (eligible.Count == 0) return;
+
+        // 一次批量取全部候选通道的库侧状态
+        var db = new Dictionary<(long DeviceId, ushort ChannelNo), (string Hw, bool Hold, bool HasBolt)>();
+        await using (var cmd = _ds.CreateCommand(@"
+            SELECT c.device_id, c.channel_no, c.hardware_state, c.auto_enroll_hold, (b.id IS NOT NULL)
+            FROM channels c
+            LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+            WHERE c.device_id = ANY(@ids) AND c.deleted_at IS NULL"))
+        {
+            cmd.Parameters.AddWithValue("ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint, eligible.ToArray());
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                db[(r.GetInt64(0), (ushort)r.GetInt16(1))] =
+                    (r.IsDBNull(2) ? "unknown" : r.GetString(2), r.GetBoolean(3), r.GetBoolean(4));
+        }
+
+        foreach (var s in snapshot)
+        {
+            if (!eligible.Contains(s.DeviceId)) continue;
+
+            bool mismatch;
+            if (s.Present)
+            {
+                // 冻结的旧"在位"不外推；行还没被首测自动发现建出来的这轮修不了，行出现后下轮自然补上
+                if (!s.EvidenceFresh) continue;
+                if (!db.TryGetValue((s.DeviceId, s.ChannelNo), out var row)) continue;
+                // 在位但库不在在位词表 → 补状态；状态对但没建档（channelId=null 竞态的后遗症）→ 补建档。
+                // hold 挂着的不算 mismatch：人工删除抑制优先于对账
+                mismatch = !BoltAutoEnroller.PresentStates.Contains(row.Hw)
+                           || (_opt.AutoEnroll && !row.HasBolt && !row.Hold);
+            }
+            else
+            {
+                mismatch = db.TryGetValue((s.DeviceId, s.ChannelNo), out var row)
+                           && BoltAutoEnroller.PresentStates.Contains(row.Hw);
+            }
+            if (!mismatch) continue;
+
+            try
+            {
+                // Initial=true：对账是修复不是新事件，前端只刷状态不弹通知（与启动确认同一通道语义）
+                var change = new ChannelPresenceChange(
+                    s.DeviceId, s.ChannelNo, s.Present,
+                    s.LastEchoAt == default ? DateTimeOffset.UtcNow : s.LastEchoAt,
+                    Initial: true);
+                await ApplyChangeAsync(change, reconciled: true, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // 单通道修复失败不挡其他通道，下轮对账再来
+                _logger.LogWarning(ex, "在位状态对账修复失败 device={DeviceId} ch={Ch}（下轮重试）", s.DeviceId, s.ChannelNo);
+            }
+        }
+    }
+
+    /// <summary>
     /// 更新 channels.hardware_state / last_seen_at / last_present_at 并带回绑定信息。
-    /// 插入 → healthy；拔出 → no_data（与 probe-scan verdict→hardware_state 映射同一词表）。
+    /// 插入 → healthy，但已是在位词表态（healthy/noisy/suspect）时保留原值——
+    /// noisy/suspect 是 probe-scan 的细分判定，在位确认不该把它抹成 healthy（重启确认/对账修复尤其如此）。
+    /// 拔出 → no_data（与 probe-scan verdict→hardware_state 映射同一词表）。
     /// last_present_at 是“曾在位”的专用标记（识别页据此区分"失联"与"待接入"）——
     /// 只在 Present=true 时写，别的写入方没有（last_seen_at 会被任意上报刷新，语义不同）。
     /// Present=false 时清 auto_enroll_hold（人工删除抑制：真正离位后才允许再自动建档）。
@@ -298,7 +399,10 @@ public sealed class ChannelPresenceService : BackgroundService
         const string sql = @"
             WITH updated AS (
                 UPDATE channels
-                   SET hardware_state = @state,
+                   SET hardware_state = CASE
+                           WHEN @present AND hardware_state IN ('healthy','noisy','suspect') THEN hardware_state
+                           WHEN @present THEN 'healthy'
+                           ELSE 'no_data' END,
                        last_seen_at = CASE WHEN @present THEN @at ELSE last_seen_at END,
                        last_present_at = CASE WHEN @present THEN @at ELSE last_present_at END,
                        auto_enroll_hold = CASE WHEN @present THEN auto_enroll_hold ELSE false END,
@@ -311,7 +415,6 @@ public sealed class ChannelPresenceService : BackgroundService
             LEFT JOIN bolts b ON b.channel_id = u.id AND b.deleted_at IS NULL";
 
         await using var cmd = _ds.CreateCommand(sql);
-        cmd.Parameters.AddWithValue("state", NpgsqlDbType.Varchar, change.Present ? "healthy" : "no_data");
         cmd.Parameters.AddWithValue("present", NpgsqlDbType.Boolean, change.Present);
         cmd.Parameters.AddWithValue("at", NpgsqlDbType.TimestampTz, change.At);
         cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, change.DeviceId);

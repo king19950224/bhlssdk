@@ -12,7 +12,7 @@
 [Setup]
 AppId={{7E1B7C1E-BP12-4B7A-9C60-B0LTPRELOAD1}
 AppName=BoltPreload 螺栓预紧力在线监测系统
-AppVersion=1.2.1
+AppVersion=1.3.0
 AppPublisher=BoltPreload
 DefaultDirName=C:\BoltPreload
 DisableDirPage=no
@@ -20,7 +20,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputBaseFilename=BoltPreload-Setup-1.2.1
+OutputBaseFilename=BoltPreload-Setup-1.3.0
 OutputDir=output
 Compression=lzma2
 SolidCompression=yes

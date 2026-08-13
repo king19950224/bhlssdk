@@ -338,42 +338,8 @@ public sealed class FxSdkConnector : IFxConnector
         CancellationToken cancellationToken = default)
         => RunUnderSessionLockAsync(async session =>
         {
-            // ChannelConfig 是 stateful，必须先填好整个对象（address/channel + 要改的字段），
-            // 再用 propertyName 标记 SDK 只编码哪一项指令发到设备
-            var cfg = new FxSDK.Models.ChannelConfig
-            {
-                Address = address,
-                Channel = channel
-            };
-
-            // SDK 协议层（MultiChIotProtocolHandler.EncodeChannel）只支持 5 个 propertyName：
-            //     ProbeFreq / EchoWin / EchoWidth / PulseConfig / Gain
-            //   以及 RefTime —— 但它实际是“整组标定基线”：一条命令把
-            //   MeasMode + Threshold + RefTime + RefTemp + LEchoWave 一起写。
-            //   所以单写 RefTemp / Threshold / MeasMode / TcMode / TempCoefficient 都会被 SDK 拒绝。
-            //   这里只接受 SDK 真实支持的属性；RefTime 走专门的"重标定"流程（需先读到 LEchoWave）。
-            if (updates.ProbeFreqMhz is not null)
-            {
-                cfg.ProbeFreq = updates.ProbeFreqMhz.Value;
-                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.ProbeFreq), sendCommand: true);
-            }
-            if (updates.EchoWinNs is not null)
-            {
-                cfg.EchoWin = updates.EchoWinNs.Value;
-                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.EchoWin), sendCommand: true);
-            }
-            if (updates.EchoWidthUs is not null)
-            {
-                cfg.EchoWidth = updates.EchoWidthUs.Value;
-                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.EchoWidth), sendCommand: true);
-            }
-            if (updates.Gain is not null)
-            {
-                cfg.Gain = updates.Gain.Value;
-                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.Gain), sendCommand: true);
-            }
-
-            // 这些属性 SDK 协议不允许单独写，直接报错引导调用者用 /recalibrate
+            // 校验放最前：这些属性 SDK 协议不允许单独写。混合请求（比如 Gain+Threshold）
+            // 不能"先把 Gain 写进设备再报错"——那样调用方收到失败，设备却已经变了一半
             if (updates.RefTimeNs is not null || updates.RefTempC is not null
                 || updates.Threshold is not null || updates.MeasMode is not null
                 || updates.TcMode is not null || updates.TempCoefficient is not null)
@@ -384,7 +350,85 @@ public sealed class FxSdkConnector : IFxConnector
                     "1) 先 ReadChannelParam(LEchoWave) 拿当前波形；" +
                     "2) 然后 SDK 自带 RefTime 命令一次性写 MeasMode+Threshold+RefTime+RefTemp+LEchoWave 整组。");
             }
+
+            // ChannelConfig 是 stateful，SDK 的 StoreToSession 是整包替换、没有合并语义（1.4/1.6 皆然）：
+            // 残缺对象整组写会把会话里的 RefTime/MeasMode/ProbeFreq 打回默认值——DeltaTof 停算、
+            // 自动法通道被静默换成阈值法；1.6 还会因参数"变化"顺手清包络锚点。
+            // 以前这里就是裸 new + 单字段，全靠现场参数恰好等于默认值（ProbeFreq 2.0/MeasMode 2）才没炸。
+            // 现在以会话已知配置为底座克隆，只改指定字段——与重标定同一条防线。
+            var cfg = _latestChannelConfig.TryGetValue(channel, out var known)
+                ? CloneChannelConfig(known)
+                : new FxSDK.Models.ChannelConfig();
+            cfg.Address = address;
+            cfg.Channel = channel;
+            if (known is null)
+                _logger.LogWarning(
+                    "在线调参：通道 {Ch} 没有会话配置底座（未 provisioning?），整组写将按 SDK 默认值补齐其余字段", channel);
+
+            // SDK 协议层（MultiChIotProtocolHandler.EncodeChannel）只支持 5 个 propertyName：
+            //     ProbeFreq / EchoWin / EchoWidth / PulseConfig / Gain
+            //   以及 RefTime —— 但它实际是"整组标定基线"，走上面拦下来的重标定流程。
+            var wrote = false;
+            if (updates.ProbeFreqMhz is not null)
+            {
+                cfg.ProbeFreq = updates.ProbeFreqMhz.Value;
+                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.ProbeFreq), sendCommand: true);
+                wrote = true;
+            }
+            if (updates.EchoWinNs is not null)
+            {
+                cfg.EchoWin = updates.EchoWinNs.Value;
+                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.EchoWin), sendCommand: true);
+                wrote = true;
+            }
+            if (updates.EchoWidthUs is not null)
+            {
+                cfg.EchoWidth = updates.EchoWidthUs.Value;
+                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.EchoWidth), sendCommand: true);
+                wrote = true;
+            }
+            if (updates.Gain is not null)
+            {
+                cfg.Gain = updates.Gain.Value;
+                await _client.ConfigureChannelAsync(session, cfg, nameof(cfg.Gain), sendCommand: true);
+                wrote = true;
+            }
+
+            // 会话配置整包换新了，诊断快照和下次调参的底座跟着换；没写任何字段就不动快照
+            if (wrote)
+                _latestChannelConfig[channel] = cfg;
         }, cancellationToken);
+
+    /// <summary>
+    /// 全字段克隆。在线调参/重标定都必须以"会话已知配置"为底座整包写回——
+    /// <c>SessionContext.StoreToSession</c> 没有合并语义，漏一个字段就等于把它打回 SDK 默认值。
+    /// PulseConfig/TEchoConfig/LEchoWave 按引用共享：我们的链路把它们当不可变载荷，不原地改。
+    /// </summary>
+    private static ChannelConfig CloneChannelConfig(ChannelConfig src) => new()
+    {
+        Address = src.Address,
+        Channel = src.Channel,
+        ProbeFreq = src.ProbeFreq,
+        EchoWin = src.EchoWin,
+        EchoWidth = src.EchoWidth,
+        PulseConfig = src.PulseConfig,
+        Gain = src.Gain,
+        TEchoConfig = src.TEchoConfig,
+        MeasMode = src.MeasMode,
+        Threshold = src.Threshold,
+        MeasWin = src.MeasWin,
+        TcMode = src.TcMode,
+        TempProbe = src.TempProbe,
+        TempCoefficient = src.TempCoefficient,
+        RefTime = src.RefTime,
+        RefEnvTime = src.RefEnvTime,
+        RefPeriodNs = src.RefPeriodNs,
+        RefTemp = src.RefTemp,
+        IsDeltaToFMode = src.IsDeltaToFMode,
+        UseTempChannel = src.UseTempChannel,
+        TempTauSeconds = src.TempTauSeconds,
+        LEchoWave = src.LEchoWave
+    };
 
     // ========== SDK 事件 → 内部 Channel ==========
 
@@ -671,27 +715,18 @@ public sealed class FxSdkConnector : IFxConnector
                 "请先 ReadChannelParam 读回该通道配置（或在启动初始通道配置中提供该通道），再重标定。");
         }
 
-        // 4. 构造 ChannelConfig（一次性整组写）：RefTime/RefTemp/LEchoWave 为新基线，
-        //    MeasMode/Threshold 沿用设备现值（来自启动初始配置或最近一次 ReadChannelParam）。
-        //    ProbeFreq/Gain 等会话参数也必须带上——SDK 的 StoreToSession 是整包替换（1.4/1.6 皆然），
-        //    残缺对象会把会话里的 ProbeFreq/Gain 打回默认值；1.6 还会因参数"变化"顺手清掉包络锚点。
-        var cfg = new ChannelConfig
-        {
-            Address = address,
-            Channel = channel,
-            ProbeFreq = existingCfg.ProbeFreq,
-            Gain = existingCfg.Gain,
-            EchoWin = existingCfg.EchoWin,
-            EchoWidth = existingCfg.EchoWidth,
-            PulseConfig = existingCfg.PulseConfig,
-            TcMode = existingCfg.TcMode,
-            TempCoefficient = existingCfg.TempCoefficient,
-            RefTime = refTime,
-            RefTemp = refTemp,
-            LEchoWave = latestWave,
-            MeasMode = existingCfg.MeasMode,
-            Threshold = existingCfg.Threshold,
-        };
+        // 4. 构造 ChannelConfig（一次性整组写）：以会话已知配置为底座克隆（StoreToSession 整包替换、
+        //    无合并语义，残缺对象会把 ProbeFreq/Gain 等打回默认值；1.6 还会因参数"变化"顺手清锚点），
+        //    再覆盖新基线字段。MeasMode/Threshold 天然随克隆沿用设备现值。
+        var cfg = CloneChannelConfig(existingCfg);
+        cfg.Address = address;
+        cfg.Channel = channel;
+        cfg.RefTime = refTime;
+        cfg.RefTemp = refTemp;
+        cfg.LEchoWave = latestWave;
+        // 克隆带出来的是【旧基线】的锚点，新基线配旧锚点必然错帧——先清空，下面按同帧条件重算
+        cfg.RefEnvTime = null;
+        cfg.RefPeriodNs = null;
 
         // 自动法(MeasMode=0)置零要连锚点一起写，否则进程重启后包络追踪重新捕获，
         // 过零点可能落到相邻载波周期（2MHz 下 500ns ≈ 数百 kN 假预紧力，且系统不会告警）。
@@ -799,7 +834,7 @@ public sealed class FxSdkConnector : IFxConnector
             ParamValue: value);
     }
 
-    private static FxChannelResultDto ToDto(ChannelResult cr)
+    private FxChannelResultDto ToDto(ChannelResult cr)
     {
         return new FxChannelResultDto(
             Address: cr.Address,
@@ -811,7 +846,9 @@ public sealed class FxSdkConnector : IFxConnector
             EchoTime2Ns: cr.EchoTime2,
             SpTempC: cr.SpTemp,
             DeltaTofNs: cr.DeltaTof,
-            Gain: 0f,  // SDK 的 ChannelResult 没有 Gain 字段（在 ChannelConfig）；如需真实增益须从通道配置带过来，当前固定 0
+            // SDK 的测量结果本身不带增益（在 ChannelConfig）：从会话通道配置快照取真实值。
+            // 以前写死 0，异常记录 rawJson 里的 gain 永远是假的，排"信号过小"时会带偏
+            Gain: _latestChannelConfig.TryGetValue(cr.Channel, out var chCfg) ? (float)chCfg.Gain : 0f,
             EchoWave: cr.EchoWave is null ? null : ToDto(cr.EchoWave),
             LowAi: cr.LowAi,
             HighAi: cr.HighAi,
@@ -831,7 +868,7 @@ public sealed class FxSdkConnector : IFxConnector
             Threshold: ew.Thr);
     }
 
-    private static FxMultiChannelResultDto ToDto(MultiChannelResult mcr)
+    private FxMultiChannelResultDto ToDto(MultiChannelResult mcr)
     {
         var dict = mcr.Results.ToDictionary(kv => kv.Key, kv => ToDto(kv.Value));
         return new FxMultiChannelResultDto(dict);

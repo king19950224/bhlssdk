@@ -108,7 +108,8 @@ onMounted(async () => {
         <div class="tr th"><span>时间</span><span>操作人</span><span>动作</span><span>对象</span><span>说明</span></div>
         <div v-for="e in items" :key="e.id" class="tr">
           <span class="mono dim">{{ fmt(e.at) }}</span>
-          <span>{{ e.username || ('用户' + e.userId) }}</span>
+          <!-- user_id 可为空（system_degraded 等由采集链路写入的系统事件）：显示"系统"而不是字面量"用户null" -->
+          <span>{{ e.username || (e.userId != null ? '用户' + e.userId : '系统') }}</span>
           <span><span class="act">{{ e.actionLabel }}</span></span>
           <span class="mono dim">{{ e.targetTypeLabel ? e.targetTypeLabel + '#' + e.targetId : '—' }}</span>
           <span class="note">{{ e.note || '—' }}</span>

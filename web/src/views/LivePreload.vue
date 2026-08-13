@@ -5,11 +5,16 @@ import { boltApi, deviceApi, runtimeApi } from '../api'
 import { onRealtime, realtimeState } from '../api/realtime'
 
 // 实时预紧力波形：紧了上升、松了下降。
-// 数据口径与 BoltDetail 的“实时预紧力”一致——客户端按 (echo − RefTime) / K_L 连续换算，
-// 不走服务端 GB 30~90% 范围过滤，所以能“看着拧松一路掉到底、拧紧一路涨上去”。
-// 驱动：channelsLive 轮询（每通道最新回波，一次拿全部）为主 + SignalR OnMeasurement 即时加速。
+// 数据口径与 BoltDetail 的“实时预紧力”一致——客户端按热路径同款公式连续换算
+// （温补归一 + K_L 截距，见 preloadFromEcho），不走服务端 GB 30~90% 范围过滤，
+// 所以能“看着拧松一路掉到底、拧紧一路涨上去”。
+// 驱动：channelsLive 轮询（逐设备拿各通道最新回波）为主 + SignalR OnMeasurement 即时加速。
 
 interface LiveChan {
+  /** `${deviceId}:${channelNo}`——多设备部署时物理通道号会重复，所有索引/选中都必须带设备维度，
+   *  单用 channelNo 会让两台设备的同号通道互相覆盖、曲线混流（B 设备的回波画进 A 螺栓） */
+  key: string
+  deviceId: number
   channelNo: number
   channelId: number
   boltId: number
@@ -17,6 +22,9 @@ interface LiveChan {
   nominalDiam: string
   kL: number
   refTimeNs: number
+  refTempC: number | null
+  kLInterceptNs: number
+  tempCoefficientPerC: number
   target: number | null // N
   min: number | null // N
   series: { t: number; v: number }[] // v = 预紧力 N
@@ -37,7 +45,9 @@ const channels = ref<LiveChan[]>([])
 const live = ref(true)
 const unit = ref<'kN' | 'pct'>('kN')
 const windowKey = ref<(typeof WINDOWS)[number]['key']>('5m')
-const selected = ref<Set<number>>(new Set()) // 选中显示的 channelNo（默认一颗，可多选）
+const selected = ref<Set<string>>(new Set()) // 选中显示的通道 key（deviceId:channelNo；默认一颗，可多选）
+// 用户主动清空标志：置位后 watch(visible) 不再自动回选（visible 依赖 now 每秒重算,watch 每秒触发）
+let userCleared = false
 const smooth = ref(true) // 平滑：滑动平均压住声时量化抖动（±1ns≈±2kN）
 const loading = ref(true)
 const error = ref<string | null>(null)
@@ -79,7 +89,9 @@ function smoothSeries(pts: { t: number; v: number }[]): { t: number; v: number }
   return out
 }
 
-let deviceId: number | null = null
+// 运行时全部设备 id：轮询逐台拉 channelsLive。只轮主设备的话，多设备部署下
+// 其余设备的通道没有轮询兜底，SignalR 一断它们的曲线就冻住。
+let deviceIds: number[] = []
 let pollTimer: number | undefined
 let calibTimer: number | undefined
 let nowTimer: number | undefined
@@ -92,24 +104,43 @@ const num = (v: number | string | null | undefined) => {
 }
 const windowSec = computed(() => WINDOWS.find((w) => w.key === windowKey.value)!.sec)
 
-// 客户端换算（与 BoltDetail 同口径，便于两页数值一致）
-function preloadFromEcho(echoNs: number, kL: number, refTimeNs: number): number {
-  return (echoNs - refTimeNs) / kL
+// 客户端换算（与 BoltDetail / 采集热路径同口径）：温补归一 + K_L 截距。
+//   normEcho = echo / (1 + tc × (当前温度 − RefTemp)); preloadN = (normEcho − RefTime − 截距) / K_L
+// 此前缺温补与截距，带截距标定或温度偏离参考温度时本页读数与入库值系统性对不上。
+function preloadFromEcho(c: LiveChan, echoNs: number, tempC: number | null): number {
+  let norm = echoNs
+  if (c.refTempC != null && tempC != null && Number.isFinite(c.tempCoefficientPerC)) {
+    const f = 1 + c.tempCoefficientPerC * (tempC - c.refTempC)
+    if (f > 0) norm = echoNs / f
+  }
+  return (norm - c.refTimeNs - c.kLInterceptNs) / c.kL
 }
 
-function findChan(channelNo: number): LiveChan | undefined {
-  return channels.value.find((c) => c.channelNo === channelNo)
+const chanKey = (deviceId: number, channelNo: number) => `${deviceId}:${channelNo}`
+function findChan(deviceId: number, channelNo: number): LiveChan | undefined {
+  return channels.value.find((c) => c.deviceId === deviceId && c.channelNo === channelNo)
 }
+// 多设备时通道芯片要能区分是哪台设备的 CH（单设备保持原样不加噪音）
+const multiDevice = computed(() => new Set(channels.value.map((c) => c.deviceId)).size > 1)
 
-// 应用一条最新测量（声时）：去重（按 ts）后推入滚动序列并更新当前值
-function applyMeasurement(channelNo: number, tsIso: string, echoNs: number | null) {
+// 应用一条最新测量（声时）：推入滚动序列并更新当前值。
+// 去重按解析后的毫秒时间“只前进”（与 BoltDetail.applyLiveMeasurement 同款）：
+// 同一条测量会从 SignalR 推送和 channelsLive 轮询两条路到达，且两边 ISO 字符串格式不同
+// （推送带内存 7 位小数，轮询是入库后 6 位微秒），字符串比对挡不住，同一时刻会被塞成两个点
+// ——axis 提示框在该时刻就列出同名螺栓两行（平滑窗口位置不同，两行数值还略有差异）。
+// 乱序回灌的旧点也一并丢弃，避免曲线时间回跳。
+function applyMeasurement(deviceId: number, channelNo: number, tsIso: string, echoNs: number | null, tempC: number | null) {
   if (!live.value || echoNs == null || !tsIso) return
-  const c = findChan(channelNo)
-  if (!c || tsIso === c.lastTs) return
-  c.lastTs = tsIso
-  const v = preloadFromEcho(Number(echoNs), c.kL, c.refTimeNs)
-  c.cur = v
+  // 按 (deviceId, channelNo) 精确匹配：SignalR 向所有客户端广播所有设备的测量，
+  // 不滤 deviceId 会把 B 设备同号通道的回波换算后画进 A 螺栓的曲线
+  const c = findChan(deviceId, channelNo)
+  if (!c) return
   const t = new Date(tsIso).getTime()
+  const lastT = c.series.length ? c.series[c.series.length - 1].t : 0
+  if (!Number.isFinite(t) || t <= lastT) return
+  c.lastTs = tsIso
+  const v = preloadFromEcho(c, Number(echoNs), tempC != null ? Number(tempC) : null)
+  c.cur = v
   c.series.push({ t, v })
   const cutoff = Date.now() - BUFFER_MS
   while (c.series.length && c.series[0].t < cutoff) c.series.shift()
@@ -117,30 +148,41 @@ function applyMeasurement(channelNo: number, tsIso: string, echoNs: number | nul
   rev.value++
 }
 
-// 拉取标定参数（kL / RefTime / 目标 / 下限），建立或刷新通道清单；保留已有滚动序列
+// 拉取标定参数（kL / RefTime / 截距 / 温补 / 目标 / 下限），建立或刷新通道清单；保留已有滚动序列
 async function loadCalibration(seed: boolean) {
-  const items = (await boltApi.list()).items
-  // 只保留【当前仍已标定】的通道：以旧列表为缓存复用滚动序列，next 仅收录本次 API 返回的已标定通道，
-  // 失标定/解绑的通道自然被剔除（原先把旧通道全部预置进 next,会导致失标定通道残留不消失）
-  const prev = new Map<number, LiveChan>(channels.value.map((c) => [c.channelNo, c]))
-  const next = new Map<number, LiveChan>()
+  const res = await boltApi.list()
+  // 超出 limit 护栏（默认 1000）被截断时必须让用户知道——排序在后的螺栓不在本页,不提示会被当"不存在"
+  listTruncated.value = !!res.hasMore
+  const items = res.items
+  // 只保留【当前仍已标定】的通道（calibrated 含"标定过期"判定——过期通道与未标定一样不出实时数）。
+  // 以旧列表为缓存复用滚动序列，next 仅收录本次 API 返回的已标定通道，
+  // 失标定/解绑的通道自然被剔除（原先把旧通道全部预置进 next,会导致失标定通道残留不消失）。
+  // 键为 deviceId:channelNo——多设备下通道号会撞，单 channelNo 作键会互相覆盖丢螺栓。
+  const prev = new Map<string, LiveChan>(channels.value.map((c) => [c.key, c]))
+  const next = new Map<string, LiveChan>()
   for (const b of items) {
     const kL = num(b.kL)
     const refTimeNs = num(b.refTimeNs)
     if (!b.calibrated || kL == null || kL <= 0 || refTimeNs == null) continue // 仅展示已标定通道
-    const existing = prev.get(b.channelNo)
+    const key = chanKey(b.deviceId, b.channelNo)
+    const existing = prev.get(key)
     if (existing) {
       existing.kL = kL
       existing.refTimeNs = refTimeNs
+      existing.refTempC = num(b.refTempC)
+      existing.kLInterceptNs = num(b.kLInterceptNs) ?? 0
+      existing.tempCoefficientPerC = num(b.tempCoefficientPerC) ?? 0
       existing.target = num(b.targetPreloadN)
       existing.min = num(b.minPreloadN)
       existing.code = b.code
       existing.boltId = b.id      // 通道可能换绑螺栓：同步 boltId/channelId，避免跳转到旧螺栓
       existing.channelId = b.channelId
-      next.set(b.channelNo, existing)
+      next.set(key, existing)
       continue
     }
     const chan: LiveChan = {
+      key,
+      deviceId: b.deviceId,
       channelNo: b.channelNo,
       channelId: b.channelId,
       boltId: b.id,
@@ -148,6 +190,9 @@ async function loadCalibration(seed: boolean) {
       nominalDiam: b.nominalDiam,
       kL,
       refTimeNs,
+      refTempC: num(b.refTempC),
+      kLInterceptNs: num(b.kLInterceptNs) ?? 0,
+      tempCoefficientPerC: num(b.tempCoefficientPerC) ?? 0,
       target: num(b.targetPreloadN),
       min: num(b.minPreloadN),
       series: [],
@@ -156,25 +201,40 @@ async function loadCalibration(seed: boolean) {
     }
     // 用最后一条已知回波播种首点，避免空图
     if (seed && b.lastEchoTimeNs != null && b.lastTs) {
-      chan.cur = preloadFromEcho(Number(b.lastEchoTimeNs), kL, refTimeNs)
+      chan.cur = preloadFromEcho(chan, Number(b.lastEchoTimeNs), num(b.lastSpTempC))
       chan.series.push({ t: new Date(b.lastTs).getTime(), v: chan.cur })
       chan.lastTs = b.lastTs
     }
-    next.set(b.channelNo, chan)
+    next.set(key, chan)
   }
-  channels.value = Array.from(next.values()).sort((a, b) => a.channelNo - b.channelNo)
+  channels.value = Array.from(next.values()).sort((a, b) => a.deviceId - b.deviceId || a.channelNo - b.channelNo)
   rev.value++
 }
 
-// channelsLive 轮询：一次拿全部通道最新回波（轻量，且作为 SignalR 断线兜底）
+// 螺栓列表被 limit 护栏截断的提示（规模超 1000 颗时排序在后的螺栓不在本页）
+const listTruncated = ref(false)
+
+// channelsLive 轮询：逐设备拿各通道最新回波（轻量，且作为 SignalR 断线兜底）
 async function poll() {
-  if (!live.value || deviceId == null || document.hidden) return
+  if (!live.value || !deviceIds.length || document.hidden) return
+  // 快照本次轮询的设备集：deviceIds 是模块级变量，retry→init 会重赋；
+  // 若重赋发生在 await 期间且顺序变化，results[i] 与新数组错位会把 A 设备的回波
+  // 写进 B 设备的通道——正是组合键重构要防的跨设备串数据
+  const ids = deviceIds
   try {
-    const r = await deviceApi.channelsLive(deviceId)
-    for (const it of r.items) {
-      if (it.echoNs != null && it.lastTs) applyMeasurement(it.channelNo, it.lastTs, it.echoNs)
+    const results = await Promise.allSettled(ids.map((id) => deviceApi.channelsLive(id)))
+    let anyOk = false
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i]
+      if (r.status !== 'fulfilled') continue
+      anyOk = true
+      for (const it of r.value.items) {
+        if (it.echoNs != null && it.lastTs)
+          applyMeasurement(ids[i], it.channelNo, it.lastTs, it.echoNs, it.tempC)
+      }
     }
-    error.value = null
+    if (anyOk) error.value = null
+    else if (results.length) error.value = '实时数据拉取失败'
   } catch (e) {
     error.value = e instanceof Error ? e.message : '实时数据拉取失败'
   }
@@ -182,17 +242,18 @@ async function poll() {
 
 async function init() {
   loading.value = true
+  userCleared = false // 重载视为新会话,恢复"无选中自动选一颗"
   try {
-    // 取主设备 id（channelsLive 需要）
+    // 取全部运行时设备 id（channelsLive 逐台轮询；多设备时不能只轮主设备）
     try {
       const rt = await runtimeApi.devices()
-      deviceId = (rt.items.find((d) => d.isPrimary) ?? rt.items[0])?.deviceId ?? null
+      deviceIds = rt.items.map((d) => d.deviceId)
     } catch {
       /* 无设备运行时也允许只看历史播种点 */
     }
     await loadCalibration(true)
     // 默认只显示一颗（首个有数据的通道），其余由用户点选加入，避免多线拥挤
-    if (!selected.value.size && visible.value.length) selected.value = new Set([visible.value[0].channelNo])
+    if (!selected.value.size && visible.value.length) selected.value = new Set([visible.value[0].key])
     error.value = null
   } catch (e) {
     error.value = e instanceof Error ? e.message : '初始化失败'
@@ -200,15 +261,19 @@ async function init() {
     loading.value = false
   }
   startTimers()
-  // SignalR 即时加速（按物理通道号匹配；单设备部署足够）。retry 会重入 init，故先退订上一次，避免句柄累积。
+  // SignalR 即时加速：按 (deviceId, channel) 组合匹配——推送是全设备广播，必须过滤设备维度。
+  // retry 会重入 init，故先退订上一次，避免句柄累积。
   unsubMeas?.()
-  unsubMeas = onRealtime('OnMeasurement', (m) => applyMeasurement(m.channel, m.ts, m.echoTimeNs))
+  unsubMeas = onRealtime('OnMeasurement', (m) => applyMeasurement(m.deviceId, m.channel, m.ts, m.echoTimeNs, m.spTempC))
 }
 
 function startTimers() {
   stopTimers()
   pollTimer = window.setInterval(poll, POLL_MS)
-  calibTimer = window.setInterval(() => void loadCalibration(false), 30000)
+  // 标定刷新失败要落到错误横幅：后端不可用期间否则每 30s 一条 unhandled rejection,页面毫无表示
+  calibTimer = window.setInterval(
+    () => loadCalibration(false).catch((e) => { error.value = e instanceof Error ? e.message : '标定参数刷新失败' }),
+    30000)
   nowTimer = window.setInterval(() => { now.value = Date.now() }, 1000)
   void poll()
 }
@@ -222,16 +287,21 @@ function toggleLive() {
   live.value = !live.value
   if (live.value) void poll()
 }
-function toggleSelect(channelNo: number) {
+function toggleSelect(key: string) {
   const s = new Set(selected.value)
-  if (s.has(channelNo)) s.delete(channelNo)
-  else s.add(channelNo)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
   selected.value = s
+  // 逐个取消到 0 也是主动清空;重新选中任意通道则恢复"无选中时自动选一颗"的默认行为
+  userCleared = s.size === 0
 }
 function selectAll() {
-  selected.value = new Set(visible.value.map((c) => c.channelNo))
+  userCleared = false
+  selected.value = new Set(visible.value.map((c) => c.key))
 }
 function clearSel() {
+  // 记住"是用户主动清空的"：不打标志的话清空后 1 秒内第一颗通道又被自动回选,"清空"形同虚设
+  userCleared = true
   selected.value = new Set()
 }
 async function retry() {
@@ -258,9 +328,11 @@ function isStale(c: LiveChan): boolean {
 const visible = computed(() => channels.value.filter((c) => !isStale(c)))
 const onlineCount = computed(() => visible.value.length)
 
-// 默认选中第一个有数据的通道；页面打开时全无数据的话，等首个通道上线自动选中
+// 默认选中第一个有数据的通道；页面打开时全无数据的话，等首个通道上线自动选中。
+// userCleared 置位期间不回选,否则"未选择通道"空态永远不可达（见 clearSel/toggleSelect）。
 watch(visible, (list) => {
-  if (!selected.value.size && list.length) selected.value = new Set([list[0].channelNo])
+  if (userCleared) return
+  if (!selected.value.size && list.length) selected.value = new Set([list[0].key])
 })
 
 // 展示用值：kN 或 保持率%（相对自身目标）
@@ -306,9 +378,18 @@ function fmtVal(valN: number | null, target: number | null): string {
   return unit.value === 'kN' ? d.toFixed(1) : d.toFixed(0)
 }
 
-const shown = computed(() => visible.value.filter((c) => selected.value.has(c.channelNo)))
+const shown = computed(() => visible.value.filter((c) => selected.value.has(c.key)))
 const calibratedCount = computed(() => channels.value.length)
 const staleSec = computed(() => (lastUpdate.value ? Math.round((now.value - lastUpdate.value) / 1000) : null))
+
+// 提示框取值容差：悬停时刻与通道最近数据点相差超过该值，视为"该时刻此通道无数据"，行内显示 —
+const TOOLTIP_NEAR_MS = 15_000
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+function fmtAxisTime(t: number): string {
+  const d = new Date(t)
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+}
 
 const option = computed<Record<string, unknown>>(() => {
   void rev.value // 触发依赖
@@ -316,25 +397,30 @@ const option = computed<Record<string, unknown>>(() => {
   const list = shown.value
   const single = list.length === 1 ? list[0] : null
 
-  const series: Record<string, unknown>[] = list.map((c) => {
+  // 曲线数据先落到中间结构：series 渲染用它，自定义提示框也用它按悬停时刻就近取值
+  const plotted = list.map((c) => {
     const color = PALETTE[channels.value.indexOf(c) % PALETTE.length]
     const raw = c.series.filter((p) => p.t >= cutoff)
-    const data = smoothSeries(raw).map((p) => [p.t, toDisplay(p.v, c.target)])
-    return {
-      name: c.code || `CH${c.channelNo}`,
-      type: 'line',
-      smooth: true,
-      symbol: 'none',
-      connectNulls: true,
-      data,
-      color,
-      itemStyle: { color },
-      lineStyle: { color, width: single ? 2.4 : 1.6 },
-      areaStyle: single ? { color: 'rgba(34,211,238,0.10)' } : undefined,
-      emphasis: { focus: 'series' },
-      z: 2,
-    }
+    const data = smoothSeries(raw).map((p) => [p.t, toDisplay(p.v, c.target)] as [number, number | null])
+    // 多设备时图例/提示框带设备前缀，否则两台设备的同名默认编号（如"通道1-1号螺栓"）无法区分
+    const name = (c.code || `CH${c.channelNo}`) + (multiDevice.value ? `（设备${c.deviceId}）` : '')
+    return { name, color, data }
   })
+
+  const series: Record<string, unknown>[] = plotted.map((p) => ({
+    name: p.name,
+    type: 'line',
+    smooth: true,
+    symbol: 'none',
+    connectNulls: true,
+    data: p.data,
+    color: p.color,
+    itemStyle: { color: p.color },
+    lineStyle: { color: p.color, width: single ? 2.4 : 1.6 },
+    areaStyle: single ? { color: 'rgba(34,211,238,0.10)' } : undefined,
+    emphasis: { focus: 'series' },
+    z: 2,
+  }))
 
   // 参考线：单通道聚焦时画自身目标/下限；全部视图下若各通道目标一致则画共线
   const tgts = list.map((c) => c.target).filter((x): x is number => x != null)
@@ -353,7 +439,7 @@ const option = computed<Record<string, unknown>>(() => {
 
   // y 轴范围：显式覆盖数据 + 参考线（否则 scale 紧贴数据会把目标/下限挤出视野，单通道时尤甚）
   const yVals: number[] = []
-  for (const s of series) for (const p of s.data as [number, number | null][]) if (p[1] != null) yVals.push(p[1] as number)
+  for (const p of plotted) for (const pt of p.data) if (pt[1] != null) yVals.push(pt[1])
   if (targetY != null) yVals.push(targetY)
   if (minY != null) yVals.push(minY)
   let yMin: number | undefined
@@ -375,10 +461,34 @@ const option = computed<Record<string, unknown>>(() => {
       : undefined,
     tooltip: {
       trigger: 'axis',
+      confine: true,
       backgroundColor: '#0d1320',
       borderColor: 'rgba(56,189,248,0.3)',
       textStyle: { color: '#e8eef8' },
-      valueFormatter: (v: number) => (v == null ? '—' : v.toFixed(unit.value === 'kN' ? 1 : 0) + ' ' + unitLabel.value),
+      // 各通道测量时刻天然不对齐（设备按通道轮巡，时间戳彼此错开），原生 axis 提示框只列
+      // "恰好命中吸附时刻"的那条序列——多选时悬停看着只剩一颗螺栓。改成自定义渲染：
+      // 以悬停时刻为基准，每条已选曲线各自取最近的点，把所有通道一次列全
+      formatter: (params: unknown) => {
+        const first = (Array.isArray(params) ? params[0] : params) as { axisValue?: number | string } | undefined
+        const t = Number(first?.axisValue)
+        if (!Number.isFinite(t)) return ''
+        const rows = plotted.map((p) => {
+          let bestV: number | null = null
+          let bestD = Infinity
+          for (const pt of p.data) {
+            const d = Math.abs(pt[0] - t)
+            if (d < bestD) { bestD = d; bestV = pt[1] }
+          }
+          const val = bestD <= TOOLTIP_NEAR_MS && bestV != null
+            ? bestV.toFixed(unit.value === 'kN' ? 1 : 0) + ' ' + unitLabel.value
+            : '—'
+          return '<div style="display:flex;align-items:center;gap:8px;line-height:1.9">'
+            + `<span style="width:9px;height:9px;border-radius:50%;background:${p.color};flex:none"></span>`
+            + `<span style="margin-right:16px">${esc(p.name)}</span>`
+            + `<b style="margin-left:auto">${val}</b></div>`
+        })
+        return `<div style="color:#9fb0c8;font-size:12px;margin-bottom:2px">${fmtAxisTime(t)}</div>` + rows.join('')
+      },
     },
     xAxis: { type: 'time', axisLine: { lineStyle: { color: 'rgba(148,163,184,0.2)' } }, axisLabel: { color: '#61748f', fontSize: 11 }, splitLine: { show: false } },
     yAxis: {
@@ -438,6 +548,12 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
       <span>实时通道已断开，正在自动重连；当前曲线依靠轮询更新，可能滞后数秒</span>
     </div>
 
+    <!-- 螺栓清单被 limit 护栏截断：排序在后的螺栓不在本页，必须显式提示而不是静默缺通道 -->
+    <div v-if="listTruncated" class="lp-error">
+      <el-icon><WarningFilled /></el-icon>
+      <span>螺栓数量超出单次加载上限（1000），本页仅显示前 1000 颗对应的通道，未显示的螺栓请从资产监测按部位进入</span>
+    </div>
+
     <!-- 当前值卡片：点选要显示的螺栓（默认一颗，可多选）。无数据的通道自动隐藏，恢复上报自动回来 -->
     <div class="chips-wrap" v-if="visible.length">
       <div class="chips-bar">
@@ -450,18 +566,18 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
       <div class="chips">
         <div
           v-for="c in visible"
-          :key="c.channelNo"
+          :key="c.key"
           class="chip"
-          :class="{ active: selected.has(c.channelNo), dim: !selected.has(c.channelNo) }"
+          :class="{ active: selected.has(c.key), dim: !selected.has(c.key) }"
           role="button"
           tabindex="0"
-          @click="toggleSelect(c.channelNo)"
-          @keydown.enter="toggleSelect(c.channelNo)"
+          @click="toggleSelect(c.key)"
+          @keydown.enter="toggleSelect(c.key)"
         >
           <div class="chip-top">
             <span class="chip-dot" :style="`background:${chipStatus(c).color}`" />
             <span class="chip-code">{{ c.code || 'CH' + c.channelNo }}</span>
-            <span class="chip-ch mono">CH{{ c.channelNo }}</span>
+            <span class="chip-ch mono">{{ multiDevice ? `D${c.deviceId}·` : '' }}CH{{ c.channelNo }}</span>
           </div>
           <div class="chip-val">
             <b>{{ fmtVal(curOf(c), c.target) }}</b><i>{{ unitLabel }}</i>
@@ -497,7 +613,7 @@ const hasData = computed(() => shown.value.some((c) => c.series.length >= 1))
 
     <div class="lp-foot">
       <el-icon><InfoFilled /></el-icon>
-      实时值为客户端按 <b class="mono">(回波声时 − 零载基线 RefTime) / K_L</b> 连续换算（与螺栓详情同口径），不经 GB 30~90% 范围过滤，故可完整呈现拧松→拧紧的全程升降；正式读数以螺栓详情 / 报告为准。
+      实时值为客户端按 <b class="mono">(温补归一声时 − 基线 RefTime − K_L 截距) / K_L</b> 连续换算（与螺栓详情、采集入库同一套公式），不经 GB 30~90% 范围过滤，故可完整呈现拧松→拧紧的全程升降；正式读数以螺栓详情 / 报告为准。
     </div>
   </div>
 </template>

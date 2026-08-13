@@ -66,6 +66,14 @@ builder.Host.UseSerilog();
 // DI 配置
 // ============================================================================
 
+// ============================================================================
+// 明文监听防线：生产环境不许把 HTTP 端口开到本机之外
+// 装完的默认形态就是明文 HTTP，而改成对外地址只要动一个环境变量，setup-https.ps1 是另一个
+// 可选步骤——两者之间此前没有任何硬约束，现场为了让操作员能访问顺手改成 0.0.0.0 再开防火墙，
+// JWT 就明文过局域网了，还不会有任何提示。判定与放行开关见 PlaintextBindingGuard。
+// ============================================================================
+PlaintextBindingGuard.EnsureSafe(builder.Configuration, builder.Environment.IsProduction());
+
 var connectionString = builder.Configuration.GetConnectionString("Postgres");
 if (string.IsNullOrWhiteSpace(connectionString))
     throw new InvalidOperationException(
@@ -77,15 +85,15 @@ if (string.IsNullOrWhiteSpace(connectionString))
 // + 0~1×抑制查询 + 0~N×告警持久化，叠加十来个后台服务的周期查询），高峰会把 100 吃满——
 // 池耗尽的表象是入库超时进 WAL，像 DB 故障其实是自己人挤自己人。连接串没显式给就抬到 200；
 // 现场要精调直接在连接串写 Maximum Pool Size，这里不覆盖显式配置。
-builder.Services.AddSingleton(_ =>
-{
-    var csb = new Npgsql.NpgsqlConnectionStringBuilder(connectionString);
-    if (!connectionString.Contains("Maximum Pool Size", StringComparison.OrdinalIgnoreCase)
-        && !connectionString.Contains("Max Pool Size", StringComparison.OrdinalIgnoreCase))
-        csb.MaxPoolSize = 200;
-    var dsBuilder = new NpgsqlDataSourceBuilder(csb.ConnectionString);
-    return dsBuilder.Build();
-});
+// 抬到 200 的另一面：PostgreSQL 自己默认只有 100，两边错配的表现和 DB 故障一模一样。
+// 启动后由 DbPoolCapacityCheck 查服务端 max_connections 核对一次，不通过就报错并挂进 /ready。
+var poolCsb = new NpgsqlConnectionStringBuilder(connectionString);
+if (!connectionString.Contains("Maximum Pool Size", StringComparison.OrdinalIgnoreCase)
+    && !connectionString.Contains("Max Pool Size", StringComparison.OrdinalIgnoreCase))
+    poolCsb.MaxPoolSize = 200;
+var effectiveConnectionString = poolCsb.ConnectionString;
+builder.Services.AddSingleton(_ => new NpgsqlDataSourceBuilder(effectiveConnectionString).Build());
+builder.Services.AddSingleton(new DbPoolCapacityCheck(poolCsb.MaxPoolSize));
 
 // EF Core（业务表 CRUD 的预留入口 + EF 模型↔手写 schema 漂移测试基线）。
 // 采集热路径走原生 NpgsqlDataSource（绕开 change tracking）；此 DbContext 当前不在热路径注入，
@@ -176,6 +184,16 @@ builder.Services.AddSingleton<NotificationDispatcher>();
 builder.Services.AddHostedService<NotificationDispatcherService>();
 builder.Services.AddHttpClient(WebhookNotificationTransport.HttpClientName,
     c => c.Timeout = TimeSpan.FromSeconds(10));
+
+// 系统自身故障的判定与外发。
+// 上面那条通知链的出口是 notification_outbox，而发件箱在库里——库一挂，告警写不进 alarms、
+// 也入不了发件箱，"数据库挂了"这件事永远推不出去，偏偏那是最需要有人知道的时刻。
+// 所以系统级故障单开一条旁路：判定只看进程内存与本地磁盘，渠道地址从 appsettings 读，全程不碰库。
+builder.Services.Configure<HealthThresholdOptions>(builder.Configuration.GetSection(HealthThresholdOptions.SectionName));
+builder.Services.Configure<SystemAlertOptions>(builder.Configuration.GetSection(SystemAlertOptions.SectionName));
+builder.Services.AddSingleton<SystemHealthEvaluator>();
+builder.Services.AddHostedService<SystemAlertService>();
+
 builder.Services.AddSingleton<IChannelConfigService, PostgresChannelConfigService>();
 
 // 通道自动检测（Probe Scan）
@@ -301,6 +319,8 @@ app.MapGet("/api/health/ready", async (
     IMeasurementWal wal,
     IOptions<MeasurementWalOptions> walOpt,
     IngestDegradeState degrade,
+    SystemHealthEvaluator systemHealth,
+    DbPoolCapacityCheck poolCheck,
     CancellationToken ct) =>
 {
     // 1) DB 连通性（硬性：down → 503，运维/负载均衡据此摘流）
@@ -339,14 +359,14 @@ app.MapGet("/api/health/ready", async (
         if (maxIdle is null || idle > maxIdle) maxIdle = idle;
     }
 
-    // 3) 磁盘余量：WAL/波形/日志都靠本地盘,磁盘满会静默丢数——纳入 readiness 观测
-    double? freeDiskGb = null;
-    try
-    {
-        var drive = new DriveInfo(Path.GetPathRoot(AppContext.BaseDirectory) ?? "/");
-        freeDiskGb = Math.Round(drive.AvailableFreeSpace / 1024.0 / 1024 / 1024, 1);
-    }
-    catch { /* 探测尽力 */ }
+    // 3) 系统级故障判定（降级理由 + 失联服务 + 磁盘余量）。
+    //    与系统告警外发（SystemAlertService）共用 SystemHealthEvaluator 这一份口径——
+    //    此前两边各写一套的话，会出现界面横幅报降级而通知一声不吭。
+    //    DB 已在上面探过，探不通就直接 503 返回了，走到这里一定是通的，故 dbDown=false。
+    //    后台服务快照在这里取一次传进去，返回体里的明细与失联名单才出自同一张快照。
+    var services = svcHealth.Snapshot();
+    var verdict = systemHealth.Evaluate(dbDown: false, serviceSnapshot: services);
+    var freeDiskGb = verdict.FreeDiskGb;
 
     // 4) 进程内存（plan §9.23 BITE）：工控机内存泄漏不会立刻把进程打崩，但会拖慢采集；
     //    纳入 readiness 让健康度一屏与开机自检能看见，阈值由运维侧告警，这里不武断 503。
@@ -410,19 +430,17 @@ app.MapGet("/api/health/ready", async (
         app.Logger.LogDebug(ex, "/api/health/ready 入库延迟探测失败");
     }
 
-    // 7) 后台服务存活：宿主配了 BackgroundServiceExceptionBehavior.Ignore（一个服务崩不拖停整机），
+    // 7) 后台服务存活明细：宿主配了 BackgroundServiceExceptionBehavior.Ignore（一个服务崩不拖停整机），
     //    代价是服务死了进程还活着。此前本接口只看 DB，采集看门狗 / 信号健康停摆时依旧返回 ready ——
     //    最坏情况是 SignalHealthService 死了、探头脱落不再产生 signal_lost，而探针一路绿灯。
     //    失联（超过正常间隔 3 倍未心跳）即 503，让运维探针能发现"进程在、监测已停"。
-    var services = svcHealth.Snapshot();
-    var deadServices = services.Where(s => s.Stale).Select(s => s.Name).ToArray();
+    //    明细与失联名单同出上面那张快照。
+    var deadServices = verdict.DeadServices;
 
-    // 8) 采集降级态：DB probe 通了不代表写入健康（磁盘满、权限、锁等照样写不进）。
+    // 8) 采集降级态明细：DB probe 通了不代表写入健康（磁盘满、权限、锁等照样写不进）。
     //    降级窗口内 warn 级预紧力告警不评估——此态必须让探针和前端横幅看得见，不能只躺在日志里。
     //    背压丢弃是连接器侧累计计数（消费跟不上被挤掉的测量），一并暴露。
-    var degradeReasons = new List<string>();
-    if (degrade.DbWriteDegraded) degradeReasons.Add("db_write_failing");
-    if (degrade.WalDroppedRecently) degradeReasons.Add("wal_saturated");
+    var degradeReasons = verdict.DegradeReasons;
     long backpressureDropped = 0;
     foreach (var rt in manager.Runtimes)
         backpressureDropped += rt.Connector.DroppedCount;
@@ -437,7 +455,12 @@ app.MapGet("/api/health/ready", async (
         backpressureDropped,
     };
 
-    var notReady = deadServices.Length > 0 || degradeReasons.Count > 0;
+    // 9) 配置类隐患：现在还没炸、但迟早要炸的，单独放 warnings，不进 degradeReasons。
+    //    进降级会让装完就 503，逼着人去把检查关掉，那还不如不做。
+    var warnings = new List<string>();
+    if (poolCheck.Warning is { } poolWarning) warnings.Add(poolWarning);
+
+    var notReady = deadServices.Count > 0 || degradeReasons.Count > 0;
     var payload = new
     {
         status = notReady ? "degraded" : "ready",
@@ -446,10 +469,14 @@ app.MapGet("/api/health/ready", async (
         maxIdleSeconds = maxIdle,
         ingestLagSeconds,
         freeDiskGb,
+        minFreeDiskGb = systemHealth.MinFreeDiskGb,
+        // 余量取自程序、WAL、波形三处所在盘里最紧张的那个；说清是哪个盘，省得排障时先猜半天
+        tightestDiskRoot = verdict.TightestDiskRoot,
         memory,
         wal = walInfo,
         ingest,
         degradeReasons,
+        warnings,
         backgroundServices = services,
         deadServices,
         timestamp = now
@@ -457,7 +484,7 @@ app.MapGet("/api/health/ready", async (
 
     if (notReady)
     {
-        if (deadServices.Length > 0)
+        if (deadServices.Count > 0)
             app.Logger.LogError("/api/health/ready 后台服务失联：{Dead}", string.Join(", ", deadServices));
         if (degradeReasons.Count > 0)
             app.Logger.LogError("/api/health/ready 采集降级：{Reasons}", string.Join(", ", degradeReasons));
@@ -589,6 +616,18 @@ _ = app.Lifetime.ApplicationStarted.Register(() =>
         try
         {
             var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
+
+            // 连接池 vs 服务端 max_connections 核对：错配的表现和 DB 故障一模一样，
+            // 排障会顺着数据库方向查很久，这里查一次让它无处可藏（只报错不拦启动）。
+            // 带停机令牌：库没起来时它会隔 30 秒重试几轮，进程要停就别让它拖着。
+            // 单开一条任务：它和下面几件事没有先后关系，串在一个 try 里的话，
+            // admin 自举一失败（库刚建、迁移还没跑）核对就被整段跳过，等于这个检查在最需要它的机器上没有。
+            _ = Task.Run(() => app.Services.GetRequiredService<DbPoolCapacityCheck>()
+                .ProbeAsync(
+                    app.Services.GetRequiredService<NpgsqlDataSource>(),
+                    logger,
+                    app.Lifetime.ApplicationStopping));
+
             await AdminBootstrap.EnsureAdminAsync(app.Services, app.Configuration, isDevelopment, logger, CancellationToken.None);
 
             // 清理上次崩溃残留的 probe scan 脏记录（status=pending/running）

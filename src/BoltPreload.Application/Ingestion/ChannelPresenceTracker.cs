@@ -55,6 +55,13 @@ public sealed class ChannelPresenceOptions
     /// <summary>静默扫描周期（秒）。</summary>
     public int SweepIntervalSeconds { get; set; } = 5;
 
+    /// <summary>
+    /// 每多少轮 sweep 做一次"内存在位状态 vs 库"对账（默认 12 轮 ≈ 每分钟）。
+    /// 对账是事件链的兜底：在位事件消费失败（DB 抖动/WAL 降级）或通道行未建（首测建行竞态）时，
+    /// 事件一次性消费即丢、状态机又不会再翻转，不对账的话不一致会一直挂到下次插拔。≤0 关闭。
+    /// </summary>
+    public int ReconcileEverySweeps { get; set; } = 12;
+
     /// <summary>按设备通道数计算生效的拔出静默阈值（秒）：max(下限, 轮转周期×圈数)。channelCount≤0 时用下限。</summary>
     public int EffectiveUnplugSilenceSeconds(int channelCount)
     {
@@ -64,6 +71,18 @@ public sealed class ChannelPresenceOptions
         return Math.Max(UnplugSilenceSeconds, adaptive);
     }
 }
+
+/// <summary>
+/// 对账用的在位快照条目（仅含已确认态的通道）。
+/// EvidenceFresh 只对 Present=true 有意义：挂起（离线/扫描）后没有新回波佐证的"在位"是冻结的旧值，
+/// 拿去覆盖库可能把扫描期间合法写入的状态翻掉——对账方必须跳过这类条目。
+/// </summary>
+public sealed record PresenceSnapshotEntry(
+    long DeviceId,
+    ushort ChannelNo,
+    bool Present,
+    DateTimeOffset LastEchoAt,
+    bool EvidenceFresh);
 
 /// <summary>通道在位状态变化事件。</summary>
 /// <param name="DeviceId">设备 ID</param>
@@ -274,6 +293,28 @@ public sealed class ChannelPresenceTracker
             }
         }
         return changes ?? (IReadOnlyList<ChannelPresenceChange>)Array.Empty<ChannelPresenceChange>();
+    }
+
+    /// <summary>
+    /// 对账用只读快照：仅含已确认态（Present 非 null）的通道。
+    /// 低频调用（分钟级），逐项短暂加既有 per-state 锁，无热路径影响。
+    /// </summary>
+    public IReadOnlyList<PresenceSnapshotEntry> Snapshot()
+    {
+        var list = new List<PresenceSnapshotEntry>(_states.Count);
+        foreach (var ((deviceId, channelNo), state) in _states)
+        {
+            lock (state)
+            {
+                if (state.Present is not { } present) continue;
+                var floor = _silenceFloor.TryGetValue(deviceId, out var f) ? f : DateTimeOffset.MinValue;
+                if (state.SilenceFloor > floor) floor = state.SilenceFloor;
+                list.Add(new PresenceSnapshotEntry(
+                    deviceId, channelNo, present, state.LastEchoAt,
+                    EvidenceFresh: state.LastEchoAt >= floor));
+            }
+        }
+        return list;
     }
 
     private void Emit(ChannelPresenceChange change)

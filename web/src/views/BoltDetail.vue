@@ -37,9 +37,11 @@ const liveTs = ref<string | null>(null)
 
 const MEAS_MODE: Record<number, string> = { 0: '自动峰值', 1: '位置法（RefTime）', 2: '阈值法' }
 const TC_MODE: Record<number, string> = { 0: '不补偿', 1: '材料补偿', 2: '自定义系数' }
-// 设备测量状态码（SDK ChannelResult 口径）：0 正常,负值为各类信号异常
+// 设备测量状态码（SDK ChannelResult 口径）：0 正常,负值为各类信号异常,11/12 值有效但业务超限
+// -4 在 SDK 1.6 自动法下的实际含义是"周期定位失败"（枚举名 SimilarityLow 名不副实，厂家求证清单 #3）
 const STATUS_CODE: Record<number, string> = {
-  0: '正常', [-1]: '信号过小', [-2]: '阈值异常', [-3]: '信号溢出', [-4]: '相似度低', [-5]: '未知异常', [-6]: '信噪比低',
+  0: '正常', [-1]: '信号过小', [-2]: '阈值异常', [-3]: '信号溢出', [-4]: '相似度低/周期定位失败', [-5]: '未知异常', [-6]: '信噪比低',
+  11: '低于业务下限', 12: '高于业务上限',
 }
 
 const bolt = ref<BoltListItem | null>(null)
@@ -88,9 +90,13 @@ const form = reactive({
 
 // 状态元数据用全局共享表（含 high/偏高——本地副本曾缺 high，凡偏高螺栓详情页渲染即崩、卡死在加载遮罩）
 const STATUS = STATUS_META
-// 通道标定生命周期状态：仅在“过期/停用”时覆盖标签（避免把仍有 K_L、在出数的临时标定误标为未标定），
-// 其余回退到 calibrated 布尔。让“标定过期”不再笼统显示为“已标定”，与总览“未标定/过期”桶口径一致。
-const STATE_LABEL: Record<string, string> = { expired: '标定过期', disabled: '已停用' }
+// 标定生命周期标签直接由后端权威字段驱动（calibrationExpired / calibrated），
+// 不再读 bolts.state——全后端没有任何路径写 state='expired'，靠它的 STATE_LABEL 是永不命中的死代码。
+const calibStateLabel = computed(() => {
+  const b = bolt.value
+  if (!b) return ''
+  return b.calibrationExpired ? '标定过期' : b.calibrated ? '已标定' : '未标定'
+})
 // 趋势时段 Tab 的中文标签
 const RANGE_LABEL: Record<string, string> = { '1h': '1 小时', '24h': '24 小时', '7d': '7 天' }
 // 通道配置来源枚举的中文映射
@@ -160,15 +166,25 @@ const prediction = computed(() => {
   return { trend: p.trend, perDay: p.ratePerDay ?? 0, days: p.daysToLimit, r2: p.r2, windowDays: p.windowDays, samples: p.sampleCount }
 })
 
+// 每档显式指定 bucket + maxPoints，不用 auto：auto 档位按"服务器 now − 浏览器 since"的跨度选，
+// 服务器时钟只要慢于浏览器 1 秒，24h 请求就翻档到 1min 桶（1440 桶 > 默认 500）被静默截成最近 8.3 小时。
+// maxPoints 按满窗桶数给足余量（后端上限 5000）。
+const RANGE_QUERY: Record<'1h' | '24h' | '7d', { hours: number; bucket: string; maxPoints: number }> = {
+  '1h': { hours: 1, bucket: '10s', maxPoints: 500 },
+  '24h': { hours: 24, bucket: '1min', maxPoints: 1600 },
+  '7d': { hours: 168, bucket: '5min', maxPoints: 2200 },
+}
+// 后端仍可能截断（超长窗口/异常数据量），必须把 truncated 透出给用户,不能让历史段静默消失
+const trendTruncated = ref(false)
 let trendSeq = 0
 async function loadTrend() {
-  const hours = rangeKey.value === '1h' ? 1 : rangeKey.value === '24h' ? 24 : 168
-  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
+  const rq = RANGE_QUERY[rangeKey.value]
+  const since = new Date(Date.now() - rq.hours * 3600 * 1000).toISOString()
   const seq = ++trendSeq
   try {
-    const items = (await boltApi.preloadTrend(boltId, `?bucket=auto&since=${since}`)).items
+    const res = await boltApi.preloadTrend(boltId, `?bucket=${rq.bucket}&maxPoints=${rq.maxPoints}&since=${since}`)
     // 快速切换 1h/24h/7d 时丢弃过期响应
-    if (seq === trendSeq) { trend.value = items; trendError.value = null }
+    if (seq === trendSeq) { trend.value = res.items; trendTruncated.value = !!res.truncated; trendError.value = null }
   } catch (e) {
     if (seq !== trendSeq) return
     trendError.value = e instanceof Error ? e.message : '趋势加载失败'
@@ -243,7 +259,9 @@ const tightness = computed(() => {
   if (refNs == null || echo == null) return null
   const dt = echo - refNs // ns
   const kL = chCfg.value?.kL != null ? Number(chCfg.value.kL) : null
-  const dF = kL && kL > 0 ? dt / kL : null // N（已标定才有）
+  // ΔTOF 是纯声时观测，无标定依赖可照常显示；折算成 N 的 dF 必须有【有效】标定——
+  // 过期 K_L 折算出的力值与"标定过期"标签打架（bolt.calibrated 已含过期判定）
+  const dF = bolt.value?.calibrated && kL && kL > 0 ? dt / kL : null
   let band: 'tight' | 'loose' | 'base'
   let label: string
   let color: string
@@ -255,14 +273,28 @@ const tightness = computed(() => {
   return { dt, dF, band, label, color }
 })
 
-// 实时预紧力（客户端连续计算 = (echo−零载基线)/K_L，不走 GB 30~90% 范围过滤）。
-// 服务端 preload_n 在 GB 适用范围外会置空（防欠张紧值被当真),适合“看着拧松一路掉到底”的实时视图。
+// 实时预紧力（客户端连续计算，不走 GB 30~90% 范围过滤——服务端 preload_n 在 GB 适用范围外
+// 会置空防欠张紧值被当真，本视图适合"看着拧松一路掉到底"）。
+// 换算口径与采集热路径/诊断端点完全一致：温补归一 + K_L 截距。
+//   normEcho = echo / (1 + tc × (当前温度 − RefTemp)); preloadN = (normEcho − RefTime − 截距) / K_L
+// 此前缺温补与截距两项，带截距标定或温度偏离参考温度时，本页 KPI 与资产页入库值系统性对不上。
 const livePreloadN = computed<number | null>(() => {
+  // 标定过期/未标定不出数：过期 K_L 换算出的数值被后端明确拒绝出具（假安全），实时区块同样不能显示
+  if (!bolt.value?.calibrated) return null
   const refNs = chCfg.value?.refTimeNs != null ? Number(chCfg.value.refTimeNs) : null
   const kL = chCfg.value?.kL != null ? Number(chCfg.value.kL) : null
   const echo = liveEchoNs.value
   if (refNs == null || kL == null || kL <= 0 || echo == null) return null
-  return (echo - refNs) / kL
+  let normEcho = echo
+  const refTemp = chCfg.value?.refTempC != null ? Number(chCfg.value.refTempC) : null
+  const temp = liveTempC.value
+  const tc = Number(bolt.value?.tempCoefficientPerC)
+  if (refTemp != null && temp != null && Number.isFinite(tc)) {
+    const factor = 1 + tc * (temp - refTemp)
+    if (factor > 0) normEcho = echo / factor
+  }
+  const intercept = chCfg.value?.kLInterceptNs != null ? Number(chCfg.value.kLInterceptNs) : 0
+  return (normEcho - refNs - intercept) / kL
 })
 const liveRatio = computed<number | null>(() => {
   const t = bolt.value?.targetPreloadN != null ? Number(bolt.value.targetPreloadN) : null
@@ -303,6 +335,13 @@ async function setBaseline() {
   baselining.value = true
   try {
     const r = await deviceApi.recalibrate(c.deviceId, c.channelNo)
+    // warning 非空 = 基线移动明显（历史读数与新读数不可比、K_L 未重算），必须强提醒——
+    // 08-12 CH3 一天被重设 4 次基线全程无人感知，就是这条提示链缺失的实锅。
+    if (r.warning) {
+      await ElMessageBox.alert(r.warning, '基线已重设 — 请注意', {
+        type: 'warning', confirmButtonText: '我已知晓',
+      }).catch(() => { /* 用户按 Esc 关闭也算已读 */ })
+    }
     ElMessage.success(`基线已设为 ${Number(r.newRefTimeNs).toFixed(0)} ns。客户端实时预紧力将从新基线重新累计（旧 K_L + 新基线的换算在下一次标定前仅供参考）`)
     chCfg.value = await boltApi.channelConfig(boltId)
     // 基线变了，旧基线算出的实时序列不再可比：清空重新累计，避免曲线出现悬崖式跳变误导现场
@@ -369,20 +408,29 @@ async function init() {
         calibrations.value = []
         calibError.value = e instanceof Error ? e.message : '标定档案加载失败'
       }
-      const al = await alarmApi.list('?includeCleared=true&limit=200')
+      // 服务端按 boltId 过滤（不再"全站拉 200 条客户端筛"——全站告警超 200 后本螺栓早期告警会被挤出窗口静默缺失）
+      const al = await alarmApi.list(`?includeCleared=true&boltId=${boltId}&limit=200`)
       // 审计履历是 reviewer+ 专属接口：operator 请求会 403。仅 reviewer 拉取，且单独 try 兜底，
       // 避免因审计 403 让 Promise.all 整体失败、后续波形/实时订阅不执行（operator 打开详情页残缺）。
       let auditItems: { at: string; actionLabel: string; note: string | null }[] = []
       if (auth.isReviewer) {
         try {
-          auditItems = (await auditApi.query(`?targetId=${bolt.value.channelId}&limit=80`)).items
+          // 审计写入分两种口径：螺栓类动作 target=('bolt', boltId)（建档/改阈值/解绑），
+          // 标定类动作 target=('channel', channelId)。必须带 targetType 各查一次再合并——
+          // 原先只按 channelId 查且不带类型：漏掉本螺栓的建档/改阈值记录，还混入 target_id
+          // 数值恰好相同的其他实体（用户/监测组/别的螺栓）的审计。
+          const [byBolt, byChannel] = await Promise.all([
+            auditApi.query(`?targetType=bolt&targetId=${boltId}&limit=80`),
+            auditApi.query(`?targetType=channel&targetId=${bolt.value.channelId}&limit=80`),
+          ])
+          auditItems = [...byBolt.items, ...byChannel.items]
         } catch { /* 审计不可用不阻断本页其它区块 */ }
       }
       const ev: typeof events.value = []
       // 履历三种来源的标题都要出中文：标定方法、告警类型走本地词表，审计动作用后端给的 actionLabel
       for (const c of calibrations.value)
         ev.push({ at: c.createdAt, kind: 'calib', title: `标定 · ${calibrationMethodLabel(c.method)}`, note: c.passed ? '通过' : '未通过', color: c.passed ? '#10b981' : '#f43f5e' })
-      for (const a of al.items.filter((x) => x.boltId === boltId))
+      for (const a of al.items)
         ev.push({ at: a.triggeredAt, kind: 'alarm', title: `告警 · ${alarmTypeLabel(a.type)}`, note: a.message || '', color: '#f59e0b' })
       for (const e of auditItems)
         ev.push({ at: e.at, kind: 'audit', title: e.actionLabel, note: e.note || '', color: '#38bdf8' })
@@ -511,7 +559,7 @@ const ascanOption = computed(() => {
     grid: { left: 52, right: 18, top: 18, bottom: 34 },
     tooltip: { trigger: 'axis', backgroundColor: '#0d1320', borderColor: 'rgba(56,189,248,0.3)', textStyle: { color: '#e8eef8' } },
     xAxis: { type: 'value', min: s.xmin, max: s.xmax, name: '时间 ns', nameTextStyle: { color: '#61748f', fontSize: 11 }, axisLabel: { color: '#61748f', fontSize: 11 }, axisLine: { lineStyle: { color: 'rgba(148,163,184,0.2)' } }, splitLine: { show: false } },
-    yAxis: { type: 'value', scale: true, name: '幅值', nameTextStyle: { color: '#61748f', fontSize: 11 }, axisLabel: { color: '#61748f', fontSize: 11 }, splitLine: { lineStyle: { color: 'rgba(148,163,184,0.08)' } } },
+    yAxis: { type: 'value', scale: true, name: '幅值 (mV)', nameTextStyle: { color: '#61748f', fontSize: 11 }, axisLabel: { color: '#61748f', fontSize: 11 }, splitLine: { lineStyle: { color: 'rgba(148,163,184,0.08)' } } },
     series: [
       { type: 'line', symbol: 'none', data: envUp, smooth: true, lineStyle: { color: 'rgba(167,139,250,0.45)', width: 1, type: 'dashed' }, silent: true, z: 1 },
       { type: 'line', symbol: 'none', data: envLo, smooth: true, lineStyle: { color: 'rgba(167,139,250,0.45)', width: 1, type: 'dashed' }, silent: true, z: 1 },
@@ -681,14 +729,15 @@ function ratioStr(r: number | null | undefined) {
   return r == null ? '—' : (Number(r) * 100).toFixed(1) + '%'
 }
 
-// 导出当前时段趋势 CSV（月报/年报原始数据；带 token 的接口用 fetch+blob 下载）
+// 导出当前时段趋势 CSV（月报/年报原始数据；带 token 的接口用 fetch+blob 下载）。
+// bucket 与趋势图同档显式传，不依赖 auto（时钟偏差会让 auto 翻档，导出与图上口径不一致）
 async function exportTrendCsv() {
-  const hours = rangeKey.value === '1h' ? 1 : rangeKey.value === '24h' ? 24 : 168
-  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
+  const rq = RANGE_QUERY[rangeKey.value]
+  const since = new Date(Date.now() - rq.hours * 3600 * 1000).toISOString()
   const until = new Date().toISOString()
   try {
     await downloadFile(
-      `/api/bolts/${boltId}/preload-trend/export.csv?since=${since}&until=${until}&bucket=auto`,
+      `/api/bolts/${boltId}/preload-trend/export.csv?since=${since}&until=${until}&bucket=${rq.bucket}`,
       `趋势-${bolt.value?.code || boltId}-${RANGE_LABEL[rangeKey.value]}.csv`)
     ElMessage.success('趋势数据已导出')
   } catch {
@@ -709,11 +758,14 @@ async function exportTrendCsv() {
       </div>
     </div>
 
-    <!-- 未标定引导横幅:告诉客户"下一步做什么",而不是让页面停在一排 — -->
-    <div v-if="bolt && !bolt.calibrated && !loading" class="calib-cta">
+    <!-- 未标定/标定过期引导横幅:告诉客户"下一步做什么",而不是让页面停在一排 — -->
+    <div v-if="bolt && !bolt.calibrated && !loading" class="calib-cta" :class="{ 'calib-cta--expired': bolt.calibrationExpired }">
       <el-icon><InfoFilled /></el-icon>
-      <span>该螺栓尚未标定，暂无法显示预紧力。完成标定后自动开始监测（现场约 3~5 分钟）。</span>
-      <el-button v-if="auth.isReviewer" size="small" type="primary" @click="wizardOpen = true">开始标定</el-button>
+      <span v-if="bolt.calibrationExpired">
+        该螺栓的生效标定已于 <b>{{ bolt.calibrationExpiresAt }}</b> 过期，过期标定不再出具预紧力（总览同步显示"未标定/过期"）。请重新标定后恢复监测。
+      </span>
+      <span v-else>该螺栓尚未标定，暂无法显示预紧力。完成标定后自动开始监测（现场约 3~5 分钟）。</span>
+      <el-button v-if="auth.isReviewer" size="small" type="primary" @click="wizardOpen = true">{{ bolt.calibrationExpired ? '重新标定' : '开始标定' }}</el-button>
       <span v-else class="dim">请联系复核员执行标定</span>
     </div>
 
@@ -725,7 +777,7 @@ async function exportTrendCsv() {
           <h2>{{ bolt.code }}</h2>
           <span class="status-tag" :style="`color:${STATUS[status].color};border-color:${STATUS[status].color}`">{{ STATUS[status].label }}</span>
         </div>
-        <div class="head-sub">{{ bolt.nominalDiam }} · {{ bolt.grade }} 级 · CH{{ bolt.channelNo }} · {{ STATE_LABEL[bolt.state] || (bolt.calibrated ? '已标定' : '未标定') }}</div>
+        <div class="head-sub">{{ bolt.nominalDiam }} · {{ bolt.grade }} 级 · CH{{ bolt.channelNo }} · {{ calibStateLabel }}</div>
       </div>
     </div>
 
@@ -832,6 +884,11 @@ async function exportTrendCsv() {
       <EChart v-if="trend.length" :option="trendOption" height="280px" />
       <div v-else-if="trendError" class="chart-empty chart-empty--err">趋势加载失败：{{ trendError }}</div>
       <div v-else-if="!loading" class="chart-empty">该时段无测量数据</div>
+      <!-- 下采样截断透出：不提示的话历史段静默消失，用户会把"只画了尾段"当成"历史没数据" -->
+      <div v-if="trendTruncated && trend.length" class="predict warn">
+        <el-icon><WarningFilled /></el-icon>
+        <span>数据点超出单次返回上限，当前仅显示<b>最近的 {{ trend.length }} 个聚合点</b>，更早的历史段未画出。可切换更短时段查看，或用"导出"取完整原始数据。</span>
+      </div>
       <div v-if="isStale && !loading && trend.length" class="predict stale">
         <el-icon><WarningFilled /></el-icon>
         <span v-if="offlineStale">数据已陈旧（{{ fmtAgo(effLastTs, now) }}无新测量），趋势预测已暂停，恢复采集后自动恢复。</span>
@@ -903,7 +960,8 @@ async function exportTrendCsv() {
       <div class="cfg-grid">
         <div class="cfg-cell"><span class="cfg-k">设备 / 通道</span><b class="mono">#{{ chCfg.deviceId }} · CH{{ chCfg.channelNo }}</b></div>
         <div class="cfg-cell"><span class="cfg-k">探头频率</span><b class="mono">{{ Number(chCfg.probeFreqMhz).toFixed(2) }} MHz</b></div>
-        <div class="cfg-cell"><span class="cfg-k">增益 Gain</span><b class="mono">{{ Number(chCfg.gain).toFixed(1) }} dB</b></div>
+        <!-- SDK 增益是 1~47 的档位值，厂家资料从未标 dB，别给现场造错误单位 -->
+        <div class="cfg-cell"><span class="cfg-k">增益 Gain</span><b class="mono">{{ Number(chCfg.gain).toFixed(0) }} 档</b></div>
         <div class="cfg-cell"><span class="cfg-k">回波窗 EchoWin</span><b class="mono">{{ chCfg.echoWinNs != null ? Number(chCfg.echoWinNs).toFixed(0) + ' ns' : '—' }}</b></div>
         <div class="cfg-cell"><span class="cfg-k">阈值 Threshold</span><b class="mono">{{ chCfg.threshold }}</b></div>
         <div class="cfg-cell"><span class="cfg-k">测量模式</span><b class="mono">{{ MEAS_MODE[chCfg.measMode] ?? chCfg.measMode }}</b></div>
@@ -983,10 +1041,11 @@ async function exportTrendCsv() {
 
     <!-- 预紧力设置 -->
     <el-dialog v-model="settings.visible" title="编辑预紧力设置" width="520px">
-      <!-- 后端语义是"留空 = 不修改"（COALESCE），清空输入框不会清掉库里已有的值——必须明示，
-           否则用户"清空阈值→保存成功→旧值还在"会误以为已取消告警阈值 -->
+      <!-- 后端语义：数值/文本字段"留空 = 不修改"（COALESCE）；唯独【位置标签】是"空串 = 清空"
+           （通道识别页需要能自助清错标）。两种行为都必须明示，否则一边"清空没生效"、
+           一边"没想清却被清了"都会让用户误判。 -->
       <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
-        留空的字段表示<b>保持原值不变</b>（不会清空）。如需取消某项阈值，请联系管理员在数据库层处理。
+        数值与材料字段留空表示<b>保持原值不变</b>（不会清空；取消阈值请联系管理员）。<b>位置标签例外</b>：清空后保存会真正清除该标签，法兰布局图的孔位随之更新。
       </el-alert>
       <el-form label-width="110px" label-position="left">
         <div class="form-sec">预紧力阈值（驱动状态判定与告警）</div>
@@ -1014,7 +1073,8 @@ async function exportTrendCsv() {
         提交后进入<b>参数变更审批队列</b>，须经另一名复核人审批→下发→读回验证方可生效，不会立即改变设备。
       </el-alert>
       <el-form label-width="120px" label-position="left">
-        <el-form-item label="增益 Gain (dB)"><el-input-number v-model="adjForm.gain" :step="1" :min="0" :max="100" controls-position="right" style="width: 100%" /></el-form-item>
+        <!-- 范围钉死 1~47：SDK/设备的增益档位范围，之前 0~100 会放进设备拒收的值 -->
+        <el-form-item label="增益 Gain (1~47 档)"><el-input-number v-model="adjForm.gain" :step="1" :min="1" :max="47" controls-position="right" style="width: 100%" /></el-form-item>
         <el-form-item label="探头频率 (MHz)"><el-input-number v-model="adjForm.probeFreqMhz" :step="0.5" :min="0.5" :max="20" :precision="2" controls-position="right" style="width: 100%" /></el-form-item>
         <el-form-item label="回波窗 (ns)"><el-input-number v-model="adjForm.echoWinNs" :step="100" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
       </el-form>
@@ -1048,6 +1108,10 @@ async function exportTrendCsv() {
 }
 .calib-cta .el-icon { color: var(--accent); font-size: 17px; }
 .calib-cta span:first-of-type { flex: 1; }
+/* 标定过期变体：琥珀色警示——过期不是"从未标定"，是"曾经可信、现在失效"，视觉上要更醒目 */
+.calib-cta--expired { border-color: rgba(245, 158, 11, 0.45); background: rgba(245, 158, 11, 0.07); }
+.calib-cta--expired .el-icon { color: var(--warn); }
+.calib-cta--expired b { color: var(--warn); }
 .form-sec { font-size: 12px; color: var(--accent-2); letter-spacing: 0.06em; margin: 2px 0 14px; padding-bottom: 7px; border-bottom: 1px solid var(--hairline); }
 
 .stale-banner {

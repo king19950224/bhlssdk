@@ -109,10 +109,15 @@ public sealed class BoltAutoEnroller
 
         long groupId;
         string groupCode;
+        // 组级目标预紧力：整圈法兰共用一个设计目标，建档时继承下来。
+        // 不继承的话新螺栓目标是空的，第一次扭矩法标定会把"当次扭矩估算值"兜底填成目标
+        // （CalibrationEndpoints 的 COALESCE），各通道扭矩不同就得到一组互不相同的假目标，
+        // 之后保持率全都相对这个假目标自洽，真实偏差反而看不出来。
+        decimal? groupTargetPreloadN;
         if (defaultGroupId is long gid)
         {
             await using var cmd = new NpgsqlCommand(
-                "SELECT code, project_id FROM monitor_groups WHERE id = @gid AND deleted_at IS NULL", conn, tx);
+                "SELECT code, project_id, target_preload_n FROM monitor_groups WHERE id = @gid AND deleted_at IS NULL", conn, tx);
             cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, gid);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             if (!await r.ReadAsync(ct) || r.GetInt64(1) != deviceProjectId)
@@ -123,17 +128,19 @@ public sealed class BoltAutoEnroller
             }
             groupId = gid;
             groupCode = r.GetString(0);
+            groupTargetPreloadN = r.IsDBNull(2) ? null : r.GetDecimal(2);
         }
         else
         {
             // 兜底：设备同项目恰好一个活跃组（单法兰部署的常态），多组/零组都不猜
-            var candidates = new List<(long Id, string Code)>();
+            var candidates = new List<(long Id, string Code, decimal? Target)>();
             await using (var cmd = new NpgsqlCommand(
-                "SELECT id, code FROM monitor_groups WHERE project_id = @p AND deleted_at IS NULL LIMIT 2", conn, tx))
+                "SELECT id, code, target_preload_n FROM monitor_groups WHERE project_id = @p AND deleted_at IS NULL LIMIT 2", conn, tx))
             {
                 cmd.Parameters.AddWithValue("p", NpgsqlDbType.Bigint, deviceProjectId);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
-                while (await r.ReadAsync(ct)) candidates.Add((r.GetInt64(0), r.GetString(1)));
+                while (await r.ReadAsync(ct))
+                    candidates.Add((r.GetInt64(0), r.GetString(1), r.IsDBNull(2) ? null : r.GetDecimal(2)));
             }
             if (candidates.Count != 1)
             {
@@ -141,7 +148,7 @@ public sealed class BoltAutoEnroller
                     "设备未设置默认监测组且无法兜底（同项目活跃组不唯一），在位通道不会自动建档——请到设备页设置默认监测组");
                 return null;
             }
-            (groupId, groupCode) = candidates[0];
+            (groupId, groupCode, groupTargetPreloadN) = candidates[0];
         }
 
         // ---------- 通道行锁 + 前置复核（与建档/换绑同一把锁语义） ----------
@@ -192,12 +199,13 @@ public sealed class BoltAutoEnroller
                 sound_velocity_ms, target_preload_n, min_preload_n, position_label,
                 install_date, gb_compliant, state, enabled)
             VALUES (@gid, @cid, @code, @nd, @grade, @rp02, @material,
-                    @e, @eff_len, @total_len, @csa, @v, NULL, NULL, @pos,
+                    @e, @eff_len, @total_len, @csa, @v, @target, NULL, @pos,
                     CURRENT_DATE, true, 'uncalibrated', true)
             ON CONFLICT (group_id, code) DO NOTHING
             RETURNING id", conn, tx))
         {
             cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+            cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, (object?)groupTargetPreloadN ?? DBNull.Value);
             cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
             cmd.Parameters.AddWithValue("code", NpgsqlDbType.Varchar, code);
             cmd.Parameters.AddWithValue("nd", NpgsqlDbType.Varchar, BoltSpecPresets.DefaultNominalDiam);
@@ -281,7 +289,10 @@ public sealed class BoltAutoEnroller
         {
             audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
             audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
-                $"[系统自动建档] 探头在位自动建档：{code} 绑定 CH{channelNo}（设备 {deviceId}，监测组 {groupCode}），缺省规格 M20/8.8，待补位置与目标值");
+                $"[系统自动建档] 探头在位自动建档：{code} 绑定 CH{channelNo}（设备 {deviceId}，监测组 {groupCode}），缺省规格 M20/8.8，"
+                + (groupTargetPreloadN is { } gt
+                    ? $"目标预紧力继承监测组 {(gt / 1000m):0.#} kN，待补位置"
+                    : "待补位置与目标值（监测组未配组级目标）"));
             AuditClientIp.Bind(audit.Parameters);
             await audit.ExecuteNonQueryAsync(ct);
         }

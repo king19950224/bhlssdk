@@ -483,13 +483,23 @@ public static class AssetEndpoints
         .WithName("CreateGroupBolt")
         .WithSummary("新建螺栓建档并绑定通道（规格预设 + 暂存数据回填 + 审计，一个事务）");
 
-        // 组孔位数编辑：法兰实际孔数与配置不符时（多接/扩容），现场自助修正，俯视图等分角度才对得上
+        // 组配置编辑：孔位数（法兰实际孔数与配置不符时现场自助修正，俯视图等分角度才对得上）
+        // 与组级目标预紧力（整圈法兰一个设计目标，新螺栓自动建档时继承它，见 BoltAutoEnroller）。
+        // 两项各自可单独下发，未传的字段不动。
         grp.MapPatch("/monitor-groups/{groupId:long}", async (
             long groupId, GroupPatchRequest? body, HttpContext http,
-            NpgsqlDataSource ds, CancellationToken ct) =>
+            NpgsqlDataSource ds, IChannelResolver resolver, CancellationToken ct) =>
         {
-            if (body?.ExpectedBoltCount is not { } n || n < 1 || n > 128)
-                return Results.BadRequest(new { error = "expectedBoltCount 必填且在 1..128 范围内" });
+            var n = body?.ExpectedBoltCount;
+            var target = body?.TargetPreloadN;
+            if (n is null && target is null)
+                return Results.BadRequest(new { error = "expectedBoltCount / targetPreloadN 至少传一个" });
+            if (n is { } cnt && (cnt < 1 || cnt > 128))
+                return Results.BadRequest(new { error = "expectedBoltCount 必须在 1..128 范围内" });
+            // 上限 10000 kN：远超最大规格螺栓（M100 12.9 级屈服约 6000 kN）的护栏，
+            // 挡住手滑把 kN 当 N 填（200 → 应为 200000）这类量级错误，而不是限制真实工程值。
+            if (target is { } t && (t <= 0 || t > 10_000_000m))
+                return Results.BadRequest(new { error = "targetPreloadN 必须大于 0 且不超过 10000 kN（单位是 N，200 kN 请填 200000）" });
 
             var user = UserContext.Require(http);
             await using var conn = await ds.OpenConnectionAsync(ct);
@@ -498,8 +508,9 @@ public static class AssetEndpoints
             // 先关 reader 再决定是否 Rollback（同一连接上开着 reader 时回滚会抛，404 变 500）
             string? groupCode = null;
             short? oldCount = null;
+            decimal? oldTarget = null;
             await using (var cmd = new NpgsqlCommand(@"
-                SELECT code, expected_bolt_count FROM monitor_groups
+                SELECT code, expected_bolt_count, target_preload_n FROM monitor_groups
                 WHERE id = @gid AND deleted_at IS NULL
                 FOR UPDATE", conn, tx))
             {
@@ -509,6 +520,7 @@ public static class AssetEndpoints
                 {
                     groupCode = r.GetString(0);
                     oldCount = r.IsDBNull(1) ? null : r.GetInt16(1);
+                    oldTarget = r.IsDBNull(2) ? null : r.GetDecimal(2);
                 }
             }
             if (groupCode is null)
@@ -519,36 +531,85 @@ public static class AssetEndpoints
 
             await using (var cmd = new NpgsqlCommand(@"
                 UPDATE monitor_groups
-                   SET expected_bolt_count = @n, updated_at = now()
+                   SET expected_bolt_count = COALESCE(@n, expected_bolt_count),
+                       target_preload_n    = COALESCE(@target, target_preload_n),
+                       updated_at = now()
                  WHERE id = @gid", conn, tx))
             {
-                cmd.Parameters.AddWithValue("n", NpgsqlDbType.Smallint, (short)n);
+                cmd.Parameters.AddWithValue("n", NpgsqlDbType.Smallint, (object?)(short?)n ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, (object?)target ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 
+            // 同步组内已有螺栓：改组目标默认只影响以后新建档的，老螺栓不动（各颗可能有自己的设计目标）。
+            // 显式勾选才整组覆盖——法兰整圈同规格是常态，一颗颗改现场受不了。
+            var applied = 0;
+            var applyToBolts = target is not null && body?.ApplyToBolts == true;
+            var touched = new List<(long DeviceId, short ChannelNo)>();
+            if (applyToBolts)
+            {
+                await using var cmd = new NpgsqlCommand(@"
+                    UPDATE bolts b SET target_preload_n = @target, updated_at = now()
+                    FROM channels c
+                    WHERE b.group_id = @gid AND b.deleted_at IS NULL
+                      AND c.id = b.channel_id AND c.deleted_at IS NULL
+                    RETURNING c.device_id, c.channel_no", conn, tx);
+                cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, target!.Value);
+                cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct))
+                {
+                    touched.Add((r.GetInt64(0), r.GetInt16(1)));
+                    applied++;
+                }
+            }
+
+            var changes = new List<string>();
+            if (n is not null) changes.Add($"孔位数 {oldCount?.ToString() ?? "—"} → {n}");
+            if (target is not null)
+                changes.Add($"组目标 {(oldTarget is { } ot ? (ot / 1000m).ToString("0.#") : "—")} → {(target.Value / 1000m):0.#} kN"
+                    + (applyToBolts ? $"（同步 {applied} 颗螺栓）" : ""));
+
             await using (var audit = new NpgsqlCommand(@"
                 INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
                 VALUES (@uid, 'update_group_config', 'monitor_group', @gid,
-                        jsonb_build_object('expectedBoltCount', @old::int),
-                        jsonb_build_object('expectedBoltCount', @new::int),
+                        jsonb_build_object('expectedBoltCount', @old::int, 'targetPreloadN', @old_target::numeric),
+                        jsonb_build_object('expectedBoltCount', @new::int, 'targetPreloadN', @new_target::numeric,
+                                           'appliedToBolts', @applied::int),
                         @note, now(), @ip)", conn, tx))
             {
                 audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
                 audit.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
                 audit.Parameters.AddWithValue("old", NpgsqlDbType.Integer, (object?)(int?)oldCount ?? DBNull.Value);
-                audit.Parameters.AddWithValue("new", NpgsqlDbType.Integer, n);
-                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"修改监测组 {groupCode} 孔位数 {oldCount?.ToString() ?? "—"} → {n}");
+                audit.Parameters.AddWithValue("new", NpgsqlDbType.Integer, (object?)n ?? (object?)(int?)oldCount ?? DBNull.Value);
+                audit.Parameters.AddWithValue("old_target", NpgsqlDbType.Numeric, (object?)oldTarget ?? DBNull.Value);
+                audit.Parameters.AddWithValue("new_target", NpgsqlDbType.Numeric, (object?)target ?? (object?)oldTarget ?? DBNull.Value);
+                audit.Parameters.AddWithValue("applied", NpgsqlDbType.Integer, applied);
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"修改监测组 {groupCode}：{string.Join("；", changes)}");
                 AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
 
             await tx.CommitAsync(ct);
-            return Results.Ok(new { groupId, code = groupCode, expectedBoltCount = n, previous = oldCount });
+
+            // 目标变了就得让采集热路径立刻重读，否则旧目标还在算 preload_ratio（缓存默认 5min TTL）
+            foreach (var (devId, chNo) in touched) resolver.Invalidate(devId, (ushort)chNo);
+
+            return Results.Ok(new
+            {
+                groupId,
+                code = groupCode,
+                expectedBoltCount = n ?? oldCount,
+                previous = oldCount,
+                targetPreloadN = target ?? oldTarget,
+                previousTargetPreloadN = oldTarget,
+                appliedToBolts = applied,
+            });
         })
         .RequireAuthorization(AuthPolicies.WriteAccess)
         .WithName("PatchMonitorGroup")
-        .WithSummary("修改监测组配置孔位数（expected_bolt_count，审计）");
+        .WithSummary("修改监测组配置：孔位数 / 组级目标预紧力（可选同步组内螺栓，审计）");
 
         return app;
     }
@@ -640,5 +701,12 @@ public sealed record BoltCreateRequest(
     bool? BackfillUnbound = null,
     string? Note = null);
 
-/// <summary>监测组配置修改请求（当前仅孔位数）。</summary>
-public sealed record GroupPatchRequest(int? ExpectedBoltCount = null);
+/// <summary>
+/// 监测组配置修改请求。孔位数与组级目标预紧力各自可单独下发，未传的不动。
+/// <paramref name="ApplyToBolts"/> 仅在传了 <paramref name="TargetPreloadN"/> 时有意义：
+/// true 才把新目标覆盖到组内全部已有螺栓，否则只影响之后自动建档的新螺栓。
+/// </summary>
+public sealed record GroupPatchRequest(
+    int? ExpectedBoltCount = null,
+    decimal? TargetPreloadN = null,
+    bool? ApplyToBolts = null);

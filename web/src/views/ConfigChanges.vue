@@ -37,7 +37,7 @@ const ST: Record<string, { label: string; color: string }> = {
 }
 // 通道超声参数的中文名（与后端 ChannelConfigUpdate 字段一一对应；历史数据可能存 PascalCase,统一小写匹配）
 const PARAM_LABEL: Record<string, string> = {
-  probefreqmhz: '探头频率（MHz）', gain: '增益（dB）', threshold: '检波阈值', measmode: '测量模式',
+  probefreqmhz: '探头频率（MHz）', gain: '增益（1~47 档）', threshold: '检波阈值', measmode: '测量模式',
   echowinns: '回波窗（ns）', echowidthus: '回波宽度（μs）', tcmode: '温补模式', tempcoefficient: '温度系数',
   reftimens: '参考声时（ns）', reftempc: '参考温度（°C）',
 }
@@ -46,10 +46,14 @@ const paramName = (k: string) => PARAM_LABEL[k.toLowerCase()] || k
 // 拉取失败绝不能显示成"无待办变更"：这一页的空态是绿灯，值班照着它会得出
 // "没有待审批的下发"的结论，而实际可能是一队参数变更正卡在那儿没人看。
 const loadError = ref<string | null>(null)
+// 达到后端单次上限（500）即视为截断：查"全部"页签时历史变更可能超页，须提示
+const truncated = ref(false)
 async function load() {
   loading.value = true
   try {
-    items.value = (await configChangeApi.list(statusFilter.value)).items
+    const r = await configChangeApi.list(statusFilter.value)
+    items.value = r.items
+    truncated.value = r.items.length >= 500
     loadError.value = null
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : '变更队列加载失败'
@@ -153,6 +157,9 @@ function fmt(iso: string | null) {
       <div v-if="loadError" class="load-error">
         <el-icon><WarningFilled /></el-icon> 变更队列加载失败（下方可能是旧数据，不代表没有待办）：{{ loadError }}
         <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
+      <div v-if="truncated" class="load-error">
+        <el-icon><WarningFilled /></el-icon> 仅显示最近 500 条变更记录，更早的历史未列出（可按状态筛选缩小范围）。
       </div>
       <div class="tbl">
         <div class="tr th"><span>#</span><span>设备/通道</span><span>变更参数</span><span>状态</span><span>提交</span><span>审批</span><span>操作</span></div>

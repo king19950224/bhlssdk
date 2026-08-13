@@ -87,12 +87,46 @@ public sealed class BoltAutoEnrollerTests
     {
         _fx.EnsureAvailable();
         // 未设默认组，但设备同项目恰好一个活跃组 → 兜底建档（其它项目的组不影响）
-        var s = await SeedAsync(setDefaultGroup: false, hardwareState: "healthy", extraGroup: false);
+        var s = await SeedAsync(setDefaultGroup: false, hardwareState: "healthy", extraGroup: false,
+            groupTargetPreloadN: 200_000m);
         var enroller = MakeEnroller();
 
         var enrolled = await enroller.TryEnrollAsync(s.DeviceId, s.ChannelNo, CancellationToken.None);
         enrolled.Should().NotBeNull("同项目唯一活跃组兜底");
         enrolled!.Code.Should().Be("通道1-7号螺栓");
+        (await ScalarAsync<decimal?>("SELECT target_preload_n FROM bolts WHERE id = @p0", enrolled.BoltId))
+            .Should().Be(200_000m, "兜底组同样要把组目标继承下来");
+    }
+
+    [PostgresFact]
+    public async Task TryEnroll_InheritsGroupTargetPreload()
+    {
+        _fx.EnsureAvailable();
+        // 组配了设计目标就带上：留空的话首次扭矩法标定会拿"当次扭矩的估算值"兜底填成目标
+        // （CalibrationEndpoints 的 COALESCE），各通道扭矩不同就得到一组互不相同的假目标。
+        var s = await SeedAsync(setDefaultGroup: true, hardwareState: "healthy", groupTargetPreloadN: 200_000m);
+        var enrolled = await MakeEnroller().TryEnrollAsync(s.DeviceId, s.ChannelNo, CancellationToken.None);
+
+        enrolled.Should().NotBeNull();
+        (await ScalarAsync<decimal?>("SELECT target_preload_n FROM bolts WHERE id = @p0", enrolled!.BoltId))
+            .Should().Be(200_000m);
+        (await ScalarAsync<long>(
+            "SELECT count(*) FROM audit_log WHERE target_id = @p0 AND action = 'create_bolt' AND note LIKE '%继承监测组 200 kN%'",
+            enrolled.BoltId))
+            .Should().Be(1, "继承来源要能从审计里查到");
+    }
+
+    [PostgresFact]
+    public async Task TryEnroll_LeavesTargetNullWhenGroupHasNoTarget()
+    {
+        _fx.EnsureAvailable();
+        // 组没配目标仍留空（沿用旧行为：等现场补规格），不能拿 0 之类的默认值糊上去
+        var s = await SeedAsync(setDefaultGroup: true, hardwareState: "healthy");
+        var enrolled = await MakeEnroller().TryEnrollAsync(s.DeviceId, s.ChannelNo, CancellationToken.None);
+
+        enrolled.Should().NotBeNull();
+        (await ScalarAsync<decimal?>("SELECT target_preload_n FROM bolts WHERE id = @p0", enrolled!.BoltId))
+            .Should().BeNull();
     }
 
     [PostgresFact]
@@ -173,7 +207,8 @@ public sealed class BoltAutoEnrollerTests
         bool setDefaultGroup = true,
         string hardwareState = "healthy",
         bool extraGroup = false,
-        int extraGroupCount = 1)
+        int extraGroupCount = 1,
+        decimal? groupTargetPreloadN = null)
     {
         var tag = Guid.NewGuid().ToString("N")[..10];
         long projectId, deviceId, groupId, channelId;
@@ -195,11 +230,12 @@ public sealed class BoltAutoEnrollerTests
             deviceId = (long)(await cmd.ExecuteScalarAsync())!;
         }
         await using (var cmd = _fx.DataSource.CreateCommand(@"
-            INSERT INTO monitor_groups (project_id, code, name, structure_type, expected_bolt_count, enabled)
-            VALUES (@p, @c, '法兰', 'flange', 48, true) RETURNING id"))
+            INSERT INTO monitor_groups (project_id, code, name, structure_type, expected_bolt_count, target_preload_n, enabled)
+            VALUES (@p, @c, '法兰', 'flange', 48, @target, true) RETURNING id"))
         {
             cmd.Parameters.AddWithValue("p", NpgsqlDbType.Bigint, projectId);
             cmd.Parameters.AddWithValue("c", NpgsqlDbType.Varchar, groupCode);
+            cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, (object?)groupTargetPreloadN ?? DBNull.Value);
             groupId = (long)(await cmd.ExecuteScalarAsync())!;
         }
         if (extraGroup)

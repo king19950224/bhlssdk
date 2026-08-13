@@ -265,6 +265,40 @@ IngestionService（BackgroundService 常驻）
 - **代价与开关**：全通道轮询稀释单通道刷新率（预紧力缓变量可接受）。`Fx:HotPlug:Enabled=false` 关热插拔；`AutoEnroll=false` 关自动建档（纯点位表流程）；
 - **License 口径**：授权通道数按 SDK 会话已配置通道统计，全通道轮询不改变该口径。
 
+#### 4.3.2 系统自身故障的通报路径（不碰数据库）
+
+螺栓类告警走 `alarms` 表，落库时按路由快照同事务写 `notification_outbox`，由派发服务发出去。
+这条链有个前提：数据库是好的。而系统级故障恰好包含“数据库不是好的”——库一挂，
+告警写不进 `alarms`、自然也入不了发件箱，这件事就永远推不出去。
+
+所以系统自身故障单开一条旁路，两者分工明确：
+
+| | 业务告警 | 系统告警 |
+|---|---|---|
+| 判什么 | 螺栓松没松、探头掉没掉 | 系统还能不能信 |
+| 谁判 | `StaticThresholdAlarmEvaluator` 等 | `SystemHealthEvaluator`（`Api/Runtime/`） |
+| 落库 | `alarms` 表，可确认、可搁置、进审计 | 不落库 |
+| 出站 | `notification_outbox` + 派发服务（走库） | `SystemAlertService` 直接发（不走库） |
+| 渠道配置 | `notification_channels` 表 | `appsettings` 的 `Notifications:SystemAlert` |
+
+`SystemHealthEvaluator` 是 `/api/health/ready` 与 `SystemAlertService` 共用的一份判定口径——
+两边各写一套的话，迟早出现界面横幅报降级而通知一声不吭。它只读进程内存状态与本地磁盘，
+不查库（库挂的时候它还得出得了结论），DB 连通性由调用方探完传进来。
+
+判定产出两类：
+
+- `degradeReasons`：现在就有问题。`db_down`、`db_write_failing`、`wal_saturated`、`low_disk`，
+  任意一条非空即 `/ready` 返回 503，前端全局横幅显示，同时触发外发。
+  其中 `low_disk` 看的是程序目录、WAL 目录、波形目录三处所在盘里最紧张的那个——
+  手册建议把后两者挪到独立数据分区，只盯程序盘会漏掉真正会先写满的那块。
+- `warnings`：现在还没炸但迟早要炸的配置隐患，当前只有一条——连接池上限超过 PostgreSQL
+  `max_connections` 的 80%（启动后由 `DbPoolCapacityCheck` 查，库没起来会隔 30 秒重试几轮）。
+  不进 `degradeReasons`，因为装完就 503 只会逼着人去把检查关掉。
+
+外发的节流规则在 `SystemAlertService.Decide`（纯函数，有回归测试）：故障与恢复各发一条，
+一直不恢复按 `RepeatMinutes` 重提醒，故障面变化立即发不等间隔。发不出去只记日志、
+不更新发送时刻，下一轮自然重试。
+
 ### 4.4 前后端通讯
 
 | 通道 | 协议 | 地址 | 说明 |
@@ -486,6 +520,7 @@ bhlssdk/
 5. 工程开启编译警告即错误（TreatWarningsAsErrors），提交前须保证 `dotnet build` 无警告、`dotnet test` 全部通过；
 6. 连接串、JWT 密钥、license 公钥等敏感配置不得提交仓库。开发环境置于 `appsettings.Development.json`（已 gitignore），生产环境通过环境变量（如 `ConnectionStrings__Postgres`）或 user-secrets 注入；
 7. 提交/接手前跑 `python3 tools/code-audit.py`（零依赖）复核代码卫生：后端 public 类型注释覆盖、前端文件头注释、活文档引用有效性、TODO/调试残留、文风统一（状态用文字不用表情符号、引号用中文弯引号）等六类门禁须全部归零。豁免清单与理由内联在脚本头部，新增豁免必须写明原因。
+8. 生产环境有两道会直接拒绝启动的防线，本地调试不受影响，但改相关代码时要知道它们在：`Fx:Mode=Simulated`（仿真数据不许出现在现场）与明文 HTTP 绑到本机之外（`PlaintextBindingGuard`，JWT 明文过局域网）。后者的放行开关是 `Security:AllowPlaintextOnNonLoopback`，只给物理隔离且现场书面确认过的站点用。
 
 ## 9. 常见问题
 

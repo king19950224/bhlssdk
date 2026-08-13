@@ -30,11 +30,18 @@ async function request<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(path, { ...opts, headers })
 
   if (res.status === 401) {
+    // 登录接口的 401 是"凭据错误"而非"登录态失效"：不触发全局登出处理（登录页会闪跳），
+    // 文案也不能是"未登录或登录已过期"——密码输错看到这句只会一头雾水
+    if (path.startsWith('/api/auth/login')) throw new ApiError(401, '用户名或密码错误')
     onUnauthorized?.()
     throw new ApiError(401, '未登录或登录已过期')
   }
   if (!res.ok) {
-    let msg = `请求失败（${res.status}）`
+    // 423/429 后端不带 body（登录连续失败锁定 / IP 限速），默认文案要能让人看懂而不是"请求失败（423）"
+    let msg =
+      res.status === 423 ? '连续失败次数过多，账号已临时锁定，请稍后再试'
+      : res.status === 429 ? '操作过于频繁，请稍后再试'
+      : `请求失败（${res.status}）`
     try {
       const j = await res.json()
       msg = j.error || j.message || msg

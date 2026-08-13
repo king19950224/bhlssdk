@@ -12,7 +12,8 @@ namespace BoltPreload.Tests.Integration;
 /// 螺栓建档闭环端点集成测试（现场"多接/新接探头"场景）：
 /// 1) POST /api/monitor-groups/{gid}/bolts：建档 + 通道置 bound + 暂存回填 + 绑定历史/审计，一个事务；
 /// 2) 通道已占用 / 组内编号重复 → 409；未知规格缺截面积 → 400；
-/// 3) PATCH /api/monitor-groups/{gid}：expected_bolt_count 修改 + 审计 + 越界校验。
+/// 3) PATCH /api/monitor-groups/{gid}：孔位数 / 组级目标预紧力修改 + 审计 + 越界校验，
+///    其中组目标只在显式 applyToBolts 时才覆盖组内已有螺栓。
 /// 测试替身见共享 harness <see cref="TestApi"/>。
 /// </summary>
 [Collection("postgres")]
@@ -167,7 +168,49 @@ public sealed class BoltProvisioningIntegrationTests
     }
 
     [PostgresFact]
-    public async Task PatchGroup_InvalidCount_Returns400_MissingGroup_Returns404()
+    public async Task PatchGroup_UpdatesTargetPreload_OnlyTouchesBoltsWhenAsked()
+    {
+        _fx.EnsureAvailable();
+
+        var s = await SeedAsync(extraChannelNo: 9);
+        var userId = await SeedUserAsync("operator");
+
+        using var factory = TestApi.CreateFactory(_fx);
+        using var client = TestApi.AuthedClient(factory, userId, "operator");
+
+        foreach (var chId in new[] { s.ChannelId, s.ExtraChannelId })
+            (await client.PostAsJsonAsync($"/api/monitor-groups/{s.GroupId}/bolts",
+                new { channelId = chId, targetPreloadN = 90000 }))
+                .StatusCode.Should().Be(HttpStatusCode.OK);
+
+        // 默认只改组目标：组内已有螺栓各有各的设计目标，不许被静默刷掉
+        var only = await client.PatchAsJsonAsync($"/api/monitor-groups/{s.GroupId}", new { targetPreloadN = 200000 });
+        only.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await only.Content.ReadFromJsonAsync<JsonElement>();
+        body.GetProperty("targetPreloadN").GetDecimal().Should().Be(200000m);
+        body.GetProperty("previousTargetPreloadN").GetDecimal().Should().Be(100000m, "种子组目标为 100 kN");
+        body.GetProperty("appliedToBolts").GetInt32().Should().Be(0);
+        body.GetProperty("expectedBoltCount").GetInt32().Should().Be(8, "只传目标时孔位数不受影响");
+        (await ScalarAsync<long>(
+            "SELECT count(*) FROM bolts WHERE group_id = @p0 AND target_preload_n = 90000", s.GroupId))
+            .Should().Be(2);
+
+        // 显式勾选才整组覆盖（法兰整圈同规格是常态，一颗颗改现场受不了）
+        var applied = await client.PatchAsJsonAsync($"/api/monitor-groups/{s.GroupId}",
+            new { targetPreloadN = 200000, applyToBolts = true });
+        applied.StatusCode.Should().Be(HttpStatusCode.OK);
+        (await applied.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("appliedToBolts").GetInt32().Should().Be(2);
+        (await ScalarAsync<long>(
+            "SELECT count(*) FROM bolts WHERE group_id = @p0 AND target_preload_n = 200000", s.GroupId))
+            .Should().Be(2);
+        (await ScalarAsync<long>(
+            "SELECT count(*) FROM audit_log WHERE action = 'update_group_config' AND target_id = @p0", s.GroupId))
+            .Should().Be(2, "两次组配置变更都要留痕");
+    }
+
+    [PostgresFact]
+    public async Task PatchGroup_InvalidInput_Returns400_MissingGroup_Returns404()
     {
         _fx.EnsureAvailable();
 
@@ -182,6 +225,11 @@ public sealed class BoltProvisioningIntegrationTests
         (await client.PatchAsJsonAsync($"/api/monitor-groups/{s.GroupId}", new { expectedBoltCount = 300 }))
             .StatusCode.Should().Be(HttpStatusCode.BadRequest);
         (await client.PatchAsJsonAsync($"/api/monitor-groups/{s.GroupId}", new { }))
+            .StatusCode.Should().Be(HttpStatusCode.BadRequest, "两项都不传等于没说要改什么");
+        (await client.PatchAsJsonAsync($"/api/monitor-groups/{s.GroupId}", new { targetPreloadN = 0 }))
+            .StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        // 把 kN 当 N 填反了（20000 kN）：量级护栏要拦住
+        (await client.PatchAsJsonAsync($"/api/monitor-groups/{s.GroupId}", new { targetPreloadN = 20_000_000 }))
             .StatusCode.Should().Be(HttpStatusCode.BadRequest);
         (await client.PatchAsJsonAsync("/api/monitor-groups/999999999", new { expectedBoltCount = 12 }))
             .StatusCode.Should().Be(HttpStatusCode.NotFound);

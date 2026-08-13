@@ -400,8 +400,9 @@ public static class AcceptanceEndpoints
             var csv = new StringBuilder();
             csv.Append('\uFEFF');
             // 设备编号压成一行：见 CsvExport.Inline —— 注释行上的引号不转义，带 CRLF 的编号能另起一行伪造公式
-            csv.AppendLine($"# 通道接入验收报告  设备 {CsvExport.Inline(deviceCode)}  导出时间(UTC) {DateTime.UtcNow:yyyy-MM-dd HH:mm}");
-            csv.AppendLine("通道,位置,电缆标签,螺栓编号,验收方式,声时ns,验收人,验收时间(UTC),备注");
+            // 验收报告是给现场/业主看的竣工资料，时间输出当地时间并注明——原先输出无标记 UTC，按北京时间读差 8 小时
+            csv.AppendLine($"# 通道接入验收报告  设备 {CsvExport.Inline(deviceCode)}  导出时间(当地) {DateTime.Now:yyyy-MM-dd HH:mm}");
+            csv.AppendLine("通道,位置,电缆标签,螺栓编号,验收方式,声时ns,验收人,验收时间(当地),备注");
 
             await using var cmd = ds.CreateCommand(AcceptanceListSql);
             cmd.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
@@ -415,7 +416,7 @@ public static class AcceptanceEndpoints
                    .Append(reader.IsDBNull(6) ? "未验收" : DisplayLabels.AcceptanceMethod(reader.GetString(6))).Append(',')
                    .Append(reader.IsDBNull(8) ? "" : reader.GetDecimal(8).ToString("F0")).Append(',')
                    .Append(Csv(reader.IsDBNull(9) ? "" : reader.GetString(9))).Append(',')
-                   .Append(reader.IsDBNull(5) ? "" : reader.GetDateTime(5).ToString("yyyy-MM-dd HH:mm:ss")).Append(',')
+                   .Append(reader.IsDBNull(5) ? "" : reader.GetDateTime(5).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")).Append(',')
                    .Append(Csv(reader.IsDBNull(10) ? "" : reader.GetString(10))).Append('\n');
             }
             var bytes = Encoding.UTF8.GetBytes(csv.ToString());

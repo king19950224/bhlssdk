@@ -100,6 +100,7 @@ const DEGRADE_TEXT: Record<string, string> = {
   db_down: '数据库不可达：测量未入库，此期间监测结论不可信',
   db_write_failing: '数据入库持续失败（降级）：此窗口内预警级告警不评估，仅严重档补报',
   wal_saturated: '断网缓存已满，最旧测量正被永久丢弃',
+  low_disk: '磁盘余量不足：缓存、波形与日志即将写不下，需立即清盘',
 }
 async function checkReady() {
   try {
@@ -160,7 +161,8 @@ function beep(severity: string) {
   } catch { /* 浏览器未授权音频时静默 */ }
 }
 
-async function showCriticalModal(a: { boltCode?: string; type?: string; message?: string | null; severity?: string }) {
+// boltCode 由推送直带（发布器按 boltId 补查；查失败为 null，此时退化为只显示 message）
+async function showCriticalModal(a: { boltCode?: string | null; type?: string; message?: string | null; severity?: string }) {
   if (criticalModalOpen) return
   criticalModalOpen = true
   try {

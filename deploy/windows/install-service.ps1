@@ -79,6 +79,23 @@ if ($JwtSigningKey.Length -lt 32) {
     throw "Jwt 签名密钥过短（当前 $($JwtSigningKey.Length) 字节），至少 32 字节，建议 64 字节随机串。"
 }
 
+# 明文监听预检。后端在 Production 下会拒绝把 HTTP 绑到本机之外（PlaintextBindingGuard），
+# 这里先拦一道：否则表现是服务装完起不来，得翻日志才知道为什么。
+$plaintextExposed = @($Urls -split ';' | Where-Object {
+    $u = $_.Trim()
+    $u -match '^http://' -and $u -notmatch '^http://(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:|/|$)'
+})
+if ($plaintextExposed.Count -gt 0) {
+    throw @"
+-Urls 里有明文 HTTP 绑到了本机之外：$($plaintextExposed -join '、')
+JWT 会以明文经过局域网，接到同一台交换机的任何设备都能截获后冒充操作员，服务会拒绝启动。
+正确做法：-Urls 保持 http://127.0.0.1:5000，装完接着跑 .\setup-https.ps1 由它配对外的 HTTPS。
+监测网物理隔离、现场书面确认不上 HTTPS 的，在 appsettings.Production.json 里加
+  "Security": { "AllowPlaintextOnNonLoopback": true }
+显式放行，并把这个决定写进验收记录。
+"@
+}
+
 $licensePath = Join-Path $InstallDir "license.json"
 if (!(Test-Path $licensePath)) {
     Write-Warning "未发现 $licensePath —— 授权将判为无效：监测会照常运行，但建档/标定/告警确认等写操作一律被拒(403)。请按 资料/工程文档/deployment-guide.md §4 签发后放入。"
@@ -160,9 +177,11 @@ if ($pgService) {
     Write-Host "本机未发现 PostgreSQL 服务（远端库场景），不设服务依赖"
 }
 
-# 防火墙：默认不开。本脚本配出的是 HTTP 明文监听，JWT 在网络上可截获——局域网访问
-# 请接着跑 setup-https.ps1 定稿 HTTPS（Kestrel 配置节会接管监听地址，此后这里的
-# ASPNETCORE_URLS 只剩摆设，启动日志的 Overriding 提示属预期），只给本机用才走 -OpenFirewall 放 HTTP 端口。
+# 防火墙：默认不开。本脚本配出的是只绑 127.0.0.1 的 HTTP 监听，局域网访问一律走 setup-https.ps1
+# 配出的 HTTPS 端口（Kestrel 配置节会接管监听地址，此后这里的 ASPNETCORE_URLS 只剩摆设，
+# 启动日志的 Overriding 提示属预期）。
+# 注意：默认 -Urls 下开这个端口是无效操作——进程压根不监听对外网卡，开了也连不上；
+# 真要局域网访问请跑 setup-https.ps1 -OpenFirewall 开 8443，而不是在这里开 5000。
 if ($OpenFirewall) {
     New-NetFirewallRule `
         -DisplayName "BoltPreload API $FirewallPort" `
@@ -199,7 +218,11 @@ if (-not $ready) {
 
 Write-Host ""
 Write-Host "接下来请按 资料/工程文档/deployment-guide.md §8 走一遍装完自检（尤其是：浏览器直接打开 /alarms 不应白屏、/api/license/status 应为 valid=true）。"
-Write-Host "交付硬化两件事别漏：HTTPS（.\setup-https.ps1，手册 §5）与每日备份任务（.\register-backup-task.ps1 -RunNow，手册 §7.1）。"
+Write-Host "交付硬化三件事别漏："
+Write-Host "  1) HTTPS：.\setup-https.ps1（手册 §5）。现在只有本机能访问，操作员用不了。"
+Write-Host "  2) 每日备份：.\register-backup-task.ps1 -RunNow（手册 §7.1）。没演练过的备份不算备份。"
+Write-Host "  3) 系统告警外发：往 appsettings.Production.json 写 Notifications:SystemAlert（手册 §7.3）。"
+Write-Host "     不配的话，库挂了、缓存满在丢数、后台服务死了这些事只会写在日志里，没人会知道。"
 if ($BootstrapAdminPassword -ne "") {
     Write-Host "提示：首个管理员已创建。建议登录确认后，重跑本脚本且不带 -BootstrapAdminPassword，把该密码从服务配置中移除。"
 }

@@ -149,8 +149,10 @@ dotnet run --project tools/LicenseSigner -- verify \
 | `BoltPreload__BootstrapAdminPassword` | **首装必需** | 空库里没有任何用户，而建账号接口要求 admin 鉴权 → 401，**没人能登录，系统装完打不开**。首个管理员建好后即可移除该变量 |
 | `License__PublicKeyPem` | **是** | 授权判无效 → 全部写操作 403（见 §4） |
 | `Fx__Mode` | 建议显式设 `Real` | 未设时按 `Real` 兜底并告警；若在 Production 环境显式配成 `Simulated`，服务直接拒绝启动（仿真数据不允许出现在现场，这是硬防线不是告警） |
-| `ASPNETCORE_URLS` | 建议 | 默认监听 5000。只给本机用则设 `http://127.0.0.1:5000`，给局域网用再放开并配防火墙 |
+| `ASPNETCORE_URLS` | 建议 | 默认监听 5000，保持 `http://127.0.0.1:5000`。**改成 `0.0.0.0`、`*` 或具体 IP 的明文地址会直接拒绝启动**（见下方 HTTPS 一节），局域网访问一律走 `setup-https.ps1` 配出来的 HTTPS 端口 |
 | `Ingestion__WaveSampling__Enabled` | 视需要 | 默认 `false`。真机 MultiMeas 模式不随测量带波形，**不开启则波形诊断页和 A-Scan 没有数据源** |
+| `Notifications__SystemAlert__Enabled` 与 `__WebhookUrl` | **无人值守必需** | 不配则系统自身故障（库不可达、入库持续失败、缓存满丢数、后台服务失联、磁盘不足）只写日志和界面横幅，值班收不到任何消息。详见 §7.3 |
+| `Health__MinFreeDiskGb` | 可选 | 默认 5。判定看的是程序目录、WAL 目录、波形目录三处所在盘里**最紧张**的那个，低于此值判 `low_disk` 降级并触发系统告警。把 WAL 与波形挪到独立数据分区后照样管用 |
 
 设备通讯地址二选一：
 
@@ -158,7 +160,20 @@ dotnet run --project tools/LicenseSigner -- verify \
 - 兜底：`devices` 表为空时回退到 `Fx:Real:CommParams`，其默认值是**实验室地址 `192.168.0.7:23`**，
   现场必须改掉，否则会连到不存在的设备（表现为反复重连、无数据）。
 
-### HTTPS（已定稿：自签证书进受信任根）
+### HTTPS（已定稿：自签证书进受信任根；明文对外是硬拦）
+
+先说约束：**生产环境把 HTTP 端口绑到本机之外会拒绝启动**。此前装完的默认形态就是明文 HTTP，
+而改成对外地址只要动一个环境变量，HTTPS 却是另一个可选脚本，两者之间没有任何硬约束——
+现场为了让操作员能访问顺手改成 `0.0.0.0` 再开防火墙，JWT 就明文过局域网了，还不会有任何提示。
+`install-service.ps1` 也会在装之前先拦一道，不用等服务起不来才去翻日志。
+
+隔离网段确实不上 HTTPS 的，在 `appsettings.Production.json` 里显式放行并写进验收记录：
+
+```json
+{ "Security": { "AllowPlaintextOnNonLoopback": true } }
+```
+
+要的就是让这个决定留在配置里能被审计看到，而不是默默那样跑了。
 
 纯局域网拿不到公网 CA 证书，定稿方案是单机一张自签服务器证书直接进受信任根，一条脚本配完：
 
@@ -219,8 +234,9 @@ dotnet run --project tools/LicenseSigner -- verify \
 | SDK 日志 | `logs/sdk-*.log` | 10MB 滚动，保留 10 个 |
 | 数据库 | PG 数据目录 | 测量表为 Timescale 超表，按合同约定保留期另行配置 |
 
-建议把 `WaveStore:RootPath`、`MeasurementWal:RootPath` 指到独立数据分区，
-避免系统盘写满导致静默丢数（`/api/health/ready` 会报告 `freeDiskGb`，可接入监控告警）。
+建议把 `WaveStore:RootPath`、`MeasurementWal:RootPath` 指到独立数据分区，避免系统盘写满导致静默丢数。
+挪到独立分区后余量判定照样覆盖：`/api/health/ready` 的 `freeDiskGb` 取的是程序、WAL、波形三处所在盘中
+最紧张的那个，`tightestDiskRoot` 会说明是哪个盘；低于 `Health:MinFreeDiskGb` 即判降级并触发系统告警（§7.3）。
 
 ### 7.1 数据库备份计划任务与恢复演练
 
@@ -256,6 +272,41 @@ NAS/业主存储的方式（任务计划 robocopy 即可），写进交接单。
 
 注意目标实例的 timescaledb 扩展版本不能低于备份源，跨大版本恢复前先看 Timescale 升级说明。
 
+### 7.3 系统告警外发（无人值守必配）
+
+螺栓类告警走 `alarms` 表加发件箱那条线，能确认、能留档、能审计。但发件箱在库里——
+**库一挂，告警写不进表也入不了发件箱，“数据库挂了”这件事就永远推不出去**，
+偏偏那是最该有人知道的时刻。所以系统自身故障单开一条不碰库的旁路：地址从配置文件读，
+判定只看进程内存与本地磁盘，直接发。
+
+往 `appsettings.Production.json` 加：
+
+```json
+{
+  "Notifications": {
+    "SystemAlert": {
+      "Enabled": true,
+      "WebhookUrl": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<群机器人 key>",
+      "Format": "wecom",
+      "SiteName": "某某风场 3 号机",
+      "RepeatMinutes": 30
+    }
+  }
+}
+```
+
+- `Format` 三选一：`wecom`（企业微信群机器人）、`dingtalk`（钉钉，用 `Secret` 加签）、
+  `raw`（通用 JSON，给业主自有接收端，`Secret` 走请求头 `X-BoltPreload-Token`）。
+- 接收端在内网时另需 `Notifications:AllowPrivateWebhookTargets=true`（默认拦私网，防 SSRF）。
+- `SiteName` 多站点务必填，否则收到告警不知道是哪台机器。
+- 会推的五类：`db_down` 库不可达、`db_write_failing` 入库持续失败、`wal_saturated` 缓存满在丢数、
+  `low_disk` 磁盘不足、后台服务失联。故障与恢复各推一条；一直不恢复按 `RepeatMinutes` 重提醒；
+  故障面发生变化（又坏一项或好了一项）立即推，不等间隔。
+- 不配的话启动日志里会有一条 Warning 点名说这条路没通。
+
+验证方式：把 `WebhookUrl` 填好后停掉 PostgreSQL 服务，一分钟内群里应该收到“系统故障”，
+起回来后应该收到“系统恢复”。这一步建议放进装完自检一起做。
+
 ---
 
 ## 8. 装完自检清单
@@ -279,6 +330,7 @@ curl http://localhost:5000/api/health/ready
 #          time-sync            设备校时 + 主机时钟漂移监视（plan §9.8）
 #          wal-replay           入库失败重放
 #          notification-dispatcher  出站通知派发
+#          system-alert         系统自身故障外发（未按 §7.3 配置时不会出现在列表里）
 #          unbound-retention    未绑定测量清理
 #          wave-retention       波形保留清理
 #    另检查 payload 中 memory / wal.sizeMb / ingestLagSeconds / freeDiskGb（§9.23 BITE 观测项）。
@@ -310,9 +362,21 @@ curl -o /dev/null -w "%{http_code}" http://localhost:5000/swagger/index.html   #
 # 8) 设备已连上、有数据在进
 curl http://localhost:5000/api/health/ready
 #    devices.connected 应等于配置的设备数；maxIdleSeconds 应持续保持在小值
+#    另看 warnings 字段应为空数组：非空表示存在配置隐患（如连接池上限超过 PG max_connections），
+#    现在还没炸但高峰或故障时会发作，交付前处理掉
+
+# 9) 系统告警外发真的能送到人（§7.3）
+#    停掉 PostgreSQL 服务 → 一分钟内群里应收到"系统故障：库不可达" → 起回来应收到"系统恢复"
+#    这一条不通，等于无人值守时库挂了没人知道。别用"配了就行"代替实际发一条
+Stop-Service postgresql-x64-16; Start-Sleep -Seconds 70; Start-Service postgresql-x64-16
+
+# 10) 对外访问确实是 HTTPS
+#    浏览器打开 https://<主机>:8443 应无证书告警；http://<主机>:5000 从别的机器应连不上
+#    （进程只在 127.0.0.1 监听明文口。若这一条能从别的机器连上，说明放行开关被打开了，核对是否有据）
 ```
 
 第 3、4 项是最容易漏的：前者曾因缺 SPA 回退导致"除首页外全是白页"，后者漏了就是"能看不能用"。
+第 9 项是本轮新增的：系统自己出事推不出去，在无人值守场景里和没有监测是一回事。
 
 ---
 

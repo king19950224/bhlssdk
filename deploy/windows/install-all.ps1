@@ -190,5 +190,11 @@ if ($machineCode) {
     Write-Host "机器码响应：$machineCode"
 }
 Write-Host "下一步：把机器码发给供应商签发 license.json → 放到 $InstallDir\license.json → Restart-Service BoltPreload.Api"
+Write-Host ""
+Write-Host "还差一件事：系统告警外发（docs\deployment-guide.md §7.3）。"
+Write-Host "  往 $InstallDir\appsettings.Production.json 加 Notifications:SystemAlert，填群机器人地址。"
+Write-Host "  不配的话，库挂了、缓存满在丢数、后台服务死了这些事只写日志，无人值守时没人会知道。"
+Write-Host "  配完停一次 PostgreSQL 验证真能收到消息，别只看配置对不对。"
+Write-Host ""
 Write-Host "自检：照 docs\deployment-guide.md §8 清单走一遍（浏览器开 /alarms 不白屏、license status valid=true）"
 Write-Host "========================================================"

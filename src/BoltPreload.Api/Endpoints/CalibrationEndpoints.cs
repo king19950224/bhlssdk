@@ -1,4 +1,5 @@
 using BoltPreload.Api.Auth;
+using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Calibration;
 using BoltPreload.Domain;
@@ -338,6 +339,20 @@ public static class CalibrationEndpoints
                 return Results.BadRequest(new { error = "估算预紧力 <= 0，请检查 torqueNm / nutFactor / diameter" });
 
             var sampleWindowSeconds = Math.Clamp(req.SampleWindowSeconds ?? 60, 5, 600);
+
+            // 采样稳定性护栏（hardening §2）：窗口里混着拧紧过程/松弛尾巴时拒绝。
+            // 不拦的话平均声时落在两个受力状态之间，K_L 错一个数量级还毫无征兆——
+            // 08-12 真机上 CH1/CH2/CH8 就是这么标废的（设完基线一分钟就提交，窗口 3/4 是松开状态）。
+            var stability = await EchoStabilityGuard.MeasureAsync(ds, channelId, sampleWindowSeconds, ct);
+            if (!stability.Stable && req.Force != true)
+                return Results.BadRequest(new
+                {
+                    error = $"采样窗口内声时未达稳定判据（波动 {Fmt(stability.StddevNs)} ns，前后半窗趋势 {Fmt(stability.HalfWindowDriftNs)} ns）。"
+                        + "多半是拧紧后还没等满采样窗口、或应力松弛未结束——请保持螺栓静置，等稳后重试；"
+                        + "确认要用当前数据可传 force=true（会记入审计）。",
+                    stability = stability.ToDiagnostics(),
+                });
+
             decimal avgEcho, avgTemp;
             long sampleCount;
             await using (var cmd = ds.CreateCommand(@"
@@ -502,7 +517,11 @@ public static class CalibrationEndpoints
                     kLUncertainty,
                     refTime,
                     refTemp,
-                    sampleCount
+                    sampleCount,
+                    // 强闯稳定性护栏必须留痕：事后排查坏标定时先看是不是 forced 进来的
+                    forcedPastStabilityGuard = !stability.Stable,
+                    stabilityStddevNs = stability.StddevNs,
+                    stabilityDriftNs = stability.HalfWindowDriftNs,
                 });
                 await WriteChannelAuditAsync(conn, tx, userId, "torque_calibrate", channelId, afterJson, note, ct);
 
@@ -576,6 +595,17 @@ public static class CalibrationEndpoints
             var estimatedPreloadN = req.TorqueNm / (nutFactor * (diameterMm / 1000m));
             var seconds = Math.Clamp(req.SampleWindowSeconds ?? 60, 5, 600);
             var minSamples = Math.Clamp(req.MinSamples ?? 20, 1, 10_000);
+
+            // 采样稳定性护栏（hardening §2）：阶梯点是拟合的原始证据，一个"拧的过程中采的"点
+            // 就能把斜率带偏。窗口不稳直接拒绝，别等拟合看 R² 才发现。
+            var stability = await EchoStabilityGuard.MeasureAsync(ds, channelId, seconds, ct);
+            if (!stability.Stable && req.Force != true)
+                return Results.BadRequest(new
+                {
+                    error = $"采样窗口内声时未达稳定判据（波动 {Fmt(stability.StddevNs)} ns，前后半窗趋势 {Fmt(stability.HalfWindowDriftNs)} ns）。"
+                        + "请拧到目标扭矩后保持静置、等满一个采样窗口再采点；确认要用当前数据可传 force=true（会记入审计）。",
+                    stability = stability.ToDiagnostics(),
+                });
 
             decimal avgEcho, avgTemp, normalizedEcho, deltaTof;
             decimal? stddevEcho, minEcho, maxEcho;
@@ -679,7 +709,10 @@ public static class CalibrationEndpoints
                 audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(new
                 {
                     pointId, boltId, req.TorqueNm, nutFactor, diameterMm,
-                    estimatedPreloadN, sampleCount, deltaTofNs = deltaTof
+                    estimatedPreloadN, sampleCount, deltaTofNs = deltaTof,
+                    forcedPastStabilityGuard = !stability.Stable,
+                    stabilityStddevNs = stability.StddevNs,
+                    stabilityDriftNs = stability.HalfWindowDriftNs,
                 }));
                 audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
                     $"采集扭矩阶梯点 #{pointId}：{req.TorqueNm} N·m，估算预紧力 {estimatedPreloadN:0} N（bolt #{boltId}）");
@@ -761,6 +794,132 @@ public static class CalibrationEndpoints
         })
         .WithName("ListTorqueTestPoints")
         .WithSummary("查询扭矩实验点");
+
+        // 稳定性预检（只读）：把采点/标定用的同一套判据暴露给前端当指示灯。
+        // 向导/阶梯页轮询它，灯绿了再放开"采点"按钮——前后端一个标准，
+        // 不会出现"前端说稳、后端打回"的两套口径。
+        // 注册在 app 级而不是 grp：grp 的 ReviewerAccess 会与 endpoint 策略叠加，
+        // 而这个只读指示灯值班（operator）也要能看。
+        app.MapGet("/api/channels/{channelId:long}/echo-stability", async (
+            long channelId, int? seconds, NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            var s = await EchoStabilityGuard.MeasureAsync(ds, channelId, seconds ?? 180, ct);
+            return Results.Ok(new
+            {
+                channelId,
+                stable = s.Stable,
+                sampleCount = s.SampleCount,
+                avgEchoNs = s.AvgEchoNs,
+                stddevNs = s.StddevNs,
+                halfWindowDriftNs = s.HalfWindowDriftNs,
+                stddevMaxNs = CalibrationThresholds.EchoStddevMaxNs,
+                halfWindowDriftMaxNs = CalibrationThresholds.EchoHalfWindowDriftMaxNs,
+                windowSeconds = s.WindowSeconds,
+            });
+        })
+        .RequireAuthorization(AuthPolicies.LoggedIn)
+        .WithTags("Calibration")
+        .WithName("ChannelEchoStability")
+        .WithSummary("采样稳定性预检：与标定护栏同判据，供前端指示灯轮询");
+
+        // 剔除 / 恢复一个扭矩阶梯点。
+        //
+        // 现场最常见的坏点是"扳手还在拧就采了"：采样窗口（默认 180s）里混着加载过程的声时，
+        // 均值落在两个扭矩档之间，把拟合斜率带偏且看不出来。其次是扭矩值输错、那段时间信号丢。
+        // 拟合与报告一直按 excluded=false 过滤，但在此之前没有任何接口能写这个标志——
+        // 坏点只能靠改库清理。这里补上，剔除是可逆的（误剔了能恢复），全程审计。
+        //
+        // 只打标志、不删行：标定原始数据是证据链的一部分，报告里坏点也要以剔除态列出来备查。
+        // 已生效的标定不受影响（K_L 是应用拟合那一刻的快照），下一次 apply-torque-fit 才会用上新点集。
+        grp.MapPatch("/torque-test-points/{pointId:long}", async (
+            long channelId, long pointId, TorqueTestPointPatchRequest? body,
+            HttpContext http, NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            if (body?.Excluded is not { } excluded)
+                return Results.BadRequest(new { error = "excluded 必填（true=剔除，false=恢复）" });
+            var reason = string.IsNullOrWhiteSpace(body.Reason) ? null : body.Reason.Trim();
+            if (excluded && reason is null)
+                return Results.BadRequest(new { error = "剔除必须填原因（记入标定档案与报告）" });
+
+            var user = UserContext.Require(http);
+            await using var conn = await ds.OpenConnectionAsync(ct);
+            await using var tx = await conn.BeginTransactionAsync(ct);
+
+            // 先关 reader 再决定回滚（同连接开着 reader 时回滚会抛，404 会变成 500）
+            decimal? torqueNm = null;
+            var wasExcluded = false;
+            await using (var cmd = new NpgsqlCommand(@"
+                SELECT torque_nm, excluded FROM torque_test_points
+                WHERE id = @pid AND channel_id = @cid
+                FOR UPDATE", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("pid", NpgsqlDbType.Bigint, pointId);
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (await r.ReadAsync(ct))
+                {
+                    torqueNm = r.GetDecimal(0);
+                    wasExcluded = r.GetBoolean(1);
+                }
+            }
+            if (torqueNm is null)
+            {
+                await tx.RollbackAsync(ct);
+                return Results.NotFound(new { error = "实验点不存在或不属于该通道", channelId, pointId });
+            }
+
+            await using (var cmd = new NpgsqlCommand(@"
+                UPDATE torque_test_points
+                   SET excluded = @excluded,
+                       exclude_reason = @reason
+                 WHERE id = @pid", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("excluded", NpgsqlDbType.Boolean, excluded);
+                cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, (object?)reason ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("pid", NpgsqlDbType.Bigint, pointId);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            await using (var audit = new NpgsqlCommand(@"
+                INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                VALUES (@uid, 'torque_point_exclude', 'channel', @cid,
+                        jsonb_build_object('pointId', @pid::bigint, 'excluded', @was),
+                        jsonb_build_object('pointId', @pid::bigint, 'excluded', @excluded, 'reason', @reason::text),
+                        @note, now(), @ip)", conn, tx))
+            {
+                audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, user.UserId);
+                audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                audit.Parameters.AddWithValue("pid", NpgsqlDbType.Bigint, pointId);
+                audit.Parameters.AddWithValue("was", NpgsqlDbType.Boolean, wasExcluded);
+                audit.Parameters.AddWithValue("excluded", NpgsqlDbType.Boolean, excluded);
+                audit.Parameters.AddWithValue("reason", NpgsqlDbType.Text, (object?)reason ?? DBNull.Value);
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                    excluded
+                        ? $"剔除扭矩阶梯点 #{pointId}（{torqueNm:0} N·m）：{reason}"
+                        : $"恢复扭矩阶梯点 #{pointId}（{torqueNm:0} N·m）参与拟合");
+                AuditClientIp.Bind(audit.Parameters);
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+
+            // 剩余有效点数：前端据此提示"还差几个点才能拟合"（apply-torque-fit 默认要 3 个）
+            long remaining;
+            await using (var cmd = new NpgsqlCommand(
+                "SELECT count(*) FROM torque_test_points WHERE channel_id = @cid AND excluded = false", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                remaining = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
+            }
+
+            await tx.CommitAsync(ct);
+            return Results.Ok(new
+            {
+                channelId, pointId, excluded, reason,
+                remainingValidPoints = remaining,
+                note = "已生效标定不受影响；下次应用拟合才会按新的点集重算。"
+            });
+        })
+        .WithName("PatchTorqueTestPoint")
+        .WithSummary("剔除 / 恢复一个扭矩阶梯实验点（只打标志不删行，审计）");
 
         grp.MapGet("/torque-test-points/summary", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
         {
@@ -1514,6 +1673,9 @@ public static class CalibrationEndpoints
         return app;
     }
 
+    /// <summary>护栏诊断文案里的可空数值：算不出来（样本不足/半窗断流）显示 —。</summary>
+    private static string Fmt(decimal? v) => v?.ToString("0.###") ?? "—";
+
     private static decimal ParseNominalDiameterMm(string nominalDiam)
     {
         var chars = nominalDiam.Where(c => char.IsDigit(c) || c == '.').ToArray();
@@ -1645,7 +1807,10 @@ public sealed record QuickCalibrateRequest(
     string? Note = null,
     int? ExpiresDays = null);
 
-/// <summary>扭矩法临时标定请求体</summary>
+/// <summary>
+/// 扭矩法临时标定请求体。
+/// <paramref name="Force"/>=true 跳过采样稳定性护栏（信号天然抖等特殊现场），跳过记入审计。
+/// </summary>
 public sealed record TorqueCalibrateRequest(
     decimal TorqueNm,
     decimal? NutFactor = null,
@@ -1660,16 +1825,29 @@ public sealed record TorqueCalibrateRequest(
     decimal? UncertaintyRatio = null,
     string? LoadingDevice = null,
     string? Note = null,
-    int? ExpiresDays = null);
+    int? ExpiresDays = null,
+    bool? Force = null);
 
-/// <summary>扭矩阶梯实验点采集请求体</summary>
+/// <summary>
+/// 扭矩阶梯实验点采集请求体。
+/// <paramref name="Force"/>=true 跳过采样稳定性护栏（信号天然抖等特殊现场），跳过记入审计。
+/// </summary>
 public sealed record TorqueTestPointRequest(
     decimal TorqueNm,
     decimal? NutFactor = null,
     decimal? NominalDiameterMm = null,
     int? SampleWindowSeconds = null,
     int? MinSamples = null,
-    string? Note = null);
+    string? Note = null,
+    bool? Force = null);
+
+/// <summary>
+/// 扭矩阶梯点剔除 / 恢复请求体。<paramref name="Excluded"/>=true 时 <paramref name="Reason"/> 必填，
+/// 剔除原因要进标定档案和阶梯报告，事后得说得清这个点为什么不算数。
+/// </summary>
+public sealed record TorqueTestPointPatchRequest(
+    bool? Excluded = null,
+    string? Reason = null);
 
 /// <summary>应用扭矩拟合请求体</summary>
 public sealed record ApplyTorqueFitRequest(

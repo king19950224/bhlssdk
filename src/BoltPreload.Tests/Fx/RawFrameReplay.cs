@@ -3,6 +3,7 @@ using System.Text;
 using FxSDK.Codec;
 using FxSDK.Core;
 using FxSDK.Models;
+using FxSDK.Utility;
 
 namespace BoltPreload.Tests.Fx;
 
@@ -76,6 +77,11 @@ public static class RawFrameReplay
         IEnumerable<ChannelConfig>? channels = null,
         WorkMode workMode = WorkMode.MultiMeas)
     {
+        // 温度口径对齐生产：FxConnectorFactory 静态构造把全局平滑设为 Direct（关平滑保历史口径），
+        // 重放台不经过工厂，不设的话 SpTemp 会吃 SDK 默认 τ=180s 平滑——同一帧重放出不同温度，
+        // 同源比对的温度列就废了（声时列不受影响，平滑不进 EchoTime 计算）。
+        FxUtility.TempTauProfile = TempTauProfile.Direct;
+
         var handler = new MultiChIotProtocolHandler();
         var session = new ReplaySession(handler);
         try

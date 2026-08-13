@@ -9,7 +9,10 @@ export interface OnMeasurement {
   statusCode: number; echoTimeNs: number | null; spTempC: number | null; gain: number; hasWave: boolean
 }
 export interface OnAlarm {
-  action: string; boltId: number; channelId: number; type: string; severity: string; ts: string
+  action: string; boltId: number
+  // 螺栓编号（发布器推送前按 boltId 补查；查失败为 null）——critical 弹窗靠它直接说"哪颗螺栓"
+  boltCode: string | null
+  channelId: number; type: string; severity: string; ts: string
   preloadN: number | null; preloadRatio: number | null; targetPreloadN: number | null
   thresholdLow: number | null; thresholdHigh: number | null; consecutive: number; message: string | null
 }

@@ -28,8 +28,9 @@ const STATUS_META: Record<string, { label: string; cls: string }> = {
   sent: { label: '已发', cls: 'st-sent' },
   dead: { label: '失败搁置', cls: 'st-dead' },
 }
-// 与后端 KnownAlarmTypes 同源的可订阅类型（no_data 是历史词条不是告警类型，不列）
-const TYPE_OPTIONS = ['preload_low', 'preload_high', 'preload_loss', 'signal_lost', 'wiring_suspect']
+// 与后端 KnownAlarmTypes 同源的可订阅类型（no_data 是历史词条不是告警类型，不列；
+// clock_drift 由 TimeSyncService 真实产生，后端白名单/词表都有，之前漏列导致无法显式订阅时钟漂移）
+const TYPE_OPTIONS = ['preload_low', 'preload_high', 'preload_loss', 'signal_lost', 'wiring_suspect', 'clock_drift']
 
 async function load() {
   try {
@@ -69,6 +70,9 @@ function fmtTime(iso: string | null) {
 const chDlg = reactive({
   visible: false, saving: false, id: null as number | null, hasSecret: false,
   name: '', format: 'wecom', url: '', secret: '', minIntervalSeconds: 60, enabled: true,
+  // 显式"清除已保存密钥"开关：后端支持空串=清除，但"留空=保留"的默认映射让清除操作在 UI 上无路可走，
+  // secret 配错后只能替换或删渠道重建
+  clearSecret: false,
 })
 function openChannel(c?: NotificationChannel) {
   chDlg.id = c?.id ?? null
@@ -79,6 +83,7 @@ function openChannel(c?: NotificationChannel) {
   chDlg.hasSecret = c?.hasSecret ?? false
   chDlg.minIntervalSeconds = c?.minIntervalSeconds ?? 60
   chDlg.enabled = c?.enabled ?? true
+  chDlg.clearSecret = false
   chDlg.visible = true
 }
 async function saveChannel() {
@@ -86,10 +91,14 @@ async function saveChannel() {
   if (!/^https?:\/\//i.test(chDlg.url)) return ElMessage.warning('Url 必须是 http(s) 地址')
   chDlg.saving = true
   try {
+    // secret 三态（后端语义：null 保留 / 空串清除 / 有值替换）：
+    // 勾了"清除"发空串；否则留空=保留现有，填了=替换
+    const secret = chDlg.id != null
+      ? (chDlg.clearSecret ? '' : (chDlg.secret === '' ? null : chDlg.secret))
+      : chDlg.secret
     const body = {
       name: chDlg.name.trim(), kind: 'webhook', url: chDlg.url.trim(), format: chDlg.format,
-      // 编辑时留空 = 保留现有 secret（后端语义：null 保留 / 空串清除 / 有值替换）
-      secret: chDlg.id != null && chDlg.secret === '' ? null : chDlg.secret,
+      secret,
       minIntervalSeconds: chDlg.minIntervalSeconds, enabled: chDlg.enabled,
     }
     if (chDlg.id == null) await notificationApi.createChannel(body)
@@ -317,8 +326,12 @@ const deadCount = computed(() => outbox.value.filter((o) => o.status === 'dead')
           <el-input v-model="chDlg.url" placeholder="群机器人的 webhook 地址（含 key）" />
         </el-form-item>
         <el-form-item label="密钥">
-          <el-input v-model="chDlg.secret" type="password" show-password
+          <el-input v-model="chDlg.secret" type="password" show-password :disabled="chDlg.clearSecret"
             :placeholder="chDlg.hasSecret ? '已配置（留空保留现有）' : '钉钉加签密钥 / 通用格式的请求头令牌，可不填'" />
+          <!-- 后端支持"空串=清除"，但输入框留空默认映射为"保留"——配错的密钥必须有显式清除入口 -->
+          <el-checkbox v-if="chDlg.id != null && chDlg.hasSecret" v-model="chDlg.clearSecret" style="margin-top: 4px">
+            清除已保存的密钥（保存后此渠道不再带签名/令牌发送）
+          </el-checkbox>
         </el-form-item>
         <el-form-item label="最小间隔 (秒)">
           <el-input-number v-model="chDlg.minIntervalSeconds" :min="0" :max="3600" :step="10" controls-position="right" />

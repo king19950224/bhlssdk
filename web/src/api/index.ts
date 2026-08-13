@@ -67,11 +67,18 @@ export interface ReadyStatus {
   devices?: { total: number; connected: number }
   maxIdleSeconds?: number | null
   ingestLagSeconds?: number | null
+  // 程序、WAL、波形三处所在盘里最紧张的那个的可用空间
   freeDiskGb?: number | null
+  // 磁盘余量下限（后端 Health:MinFreeDiskGb）。低于它后端就判 low_disk 降级，前端不再自己定阈值
+  minFreeDiskGb?: number | null
+  // 上面那个余量来自哪个盘。现场多半数据盘与系统盘分开，不说清等于让人去猜
+  tightestDiskRoot?: string | null
   memory?: { workingSetMb: number | null; privateMb: number | null; gcHeapMb: number | null }
   wal?: { enabled: boolean; pending: number; sizeMb: number | null }
-  // 采集降级态：db_down / db_write_failing / wal_saturated；空数组 = 无降级理由
+  // 采集降级态：db_down / db_write_failing / wal_saturated / low_disk；空数组 = 无降级理由
   degradeReasons?: string[]
+  // 配置类隐患：现在还没炸但迟早要炸的（如连接池上限超过 PG max_connections）。不影响 ready 判定
+  warnings?: string[]
   ingest?: {
     degraded: boolean
     degradedSince: string | null
@@ -172,8 +179,9 @@ export const alarmApi = {
   kpi: (windowHours = 24) => http.get<AlarmKpi>(`/api/alarms/kpi?windowHours=${windowHours}`),
   ack: (id: number, note?: string) => http.post(`/api/alarms/${id}/ack`, { note }),
   clear: (id: number, reason?: string) => http.post(`/api/alarms/${id}/clear`, { reason }),
-  // 维护时段抑制某 bolt+type 的告警（hours 1..168，reason ≥5 字）
-  shelve: (body: { boltId?: number; alarmType?: string; hours: number; reason: string }) =>
+  // 维护时段抑制某 bolt+type 的告警（hours 1..168，reason ≥5 字）。
+  // boltId 后端必填（bolt/type 双空会成为"全站静音键"，被禁止）——类型上也标必填，别再误标可选
+  shelve: (body: { boltId: number; alarmType?: string; hours: number; reason: string }) =>
     http.post<{ shelvingId: number; expiresAt: string }>('/api/alarms/shelve', body),
   // 生效中的抑制（可见可管理，避免"被静默的告警"成为盲区）
   shelvings: () => http.get<{ count: number; items: AlarmShelving[] }>('/api/alarms/shelvings'),
@@ -239,7 +247,8 @@ export interface AlarmRuleTargets {
   bolts: { id: number; code: string; groupCode: string }[]
 }
 export const alarmRuleApi = {
-  list: () => http.get<{ count: number; items: AlarmRule[] }>('/api/alarm-rules/'),
+  // truncated=true 表示历史记录超出后端 500 条上限被截（待审规则排最前永不丢）
+  list: () => http.get<{ count: number; truncated: boolean; items: AlarmRule[] }>('/api/alarm-rules/'),
   targets: () => http.get<AlarmRuleTargets>('/api/alarm-rules/targets'),
   propose: (body: AlarmRuleProposeBody) => http.post<{ id: number; reviewState: string }>('/api/alarm-rules/', body),
   approve: (id: number) => http.post<{ id: number; reviewState: string }>(`/api/alarm-rules/${id}/approve`),
@@ -357,10 +366,11 @@ export interface ConfigVerifyResult {
   comparisons: { param: string; requested: number; actual: number | null; match: boolean }[]
 }
 export const configChangeApi = {
-  // “全部”= 不传 status（后端把未知值当精确匹配,传 all 会永远查空）
-  list: (status = 'pending') =>
+  // “全部”= 不传 status（后端把未知值当精确匹配,传 all 会永远查空）。
+  // limit 用足后端上限 500（默认仅 100）：长期运行后历史变更超过默认页会静默"消失"
+  list: (status = 'pending', limit = 500) =>
     http.get<{ count: number; items: ConfigChange[] }>(
-      `/api/config-changes${status && status !== 'all' ? `?status=${status}` : ''}`),
+      `/api/config-changes?limit=${limit}${status && status !== 'all' ? `&status=${status}` : ''}`),
   approve: (id: number) => http.post(`/api/config-changes/${id}/approve`),
   reject: (id: number, reason: string) => http.post(`/api/config-changes/${id}/reject`, { reason }),
   execute: (id: number) => http.post(`/api/config-changes/${id}/execute`),
@@ -501,10 +511,18 @@ export const assetApi = {
   // 建档并绑定通道（含暂存数据回填），一个事务
   createBolt: (groupId: number, body: BoltCreateBody) =>
     http.post<BoltCreateResult>(`/api/monitor-groups/${groupId}/bolts`, body),
-  // 修改组配置孔位数（法兰实际孔数与配置不符时现场自助修正）
-  patchGroup: (groupId: number, body: { expectedBoltCount: number }) =>
-    http.patch<{ groupId: number; code: string; expectedBoltCount: number; previous: number | null }>(
-      `/api/monitor-groups/${groupId}`, body),
+  // 修改组配置：孔位数（现场孔数与配置不符时自助修正）/ 组级目标预紧力（新螺栓建档继承它，
+  // applyToBolts=true 才把新目标同步覆盖到组内已有螺栓）。两项各自可单独下发。
+  patchGroup: (
+    groupId: number,
+    body: { expectedBoltCount?: number; targetPreloadN?: number; applyToBolts?: boolean },
+  ) =>
+    http.patch<{
+      groupId: number; code: string
+      expectedBoltCount: number | null; previous: number | null
+      targetPreloadN: number | null; previousTargetPreloadN: number | null
+      appliedToBolts: number
+    }>(`/api/monitor-groups/${groupId}`, body),
 }
 
 // ---- 螺栓详情 ----
@@ -515,13 +533,21 @@ export interface TrendPoint {
 export interface BoltListItem {
   id: number; code: string; nominalDiam: string; grade: string; targetPreloadN: number | null
   positionLabel: string | null; state: string; channelId: number; channelNo: number
+  // calibrated 口径与后端 bolt_status CTE / 采集热路径一致（k_l + active_calibration_id + 未过期），
+  // 标定过期时为 false——此前只看 k_l 非空，过期后详情页仍当"已标定"出数（假安全）
   calibrated: boolean; kL: number | null; refTimeNs: number | null; refTempC: number | null
+  // 标定过期标记（K_L 还挂在通道上但生效标定已过期）：显示"标定过期"而非普通"未标定"
+  calibrationExpired: boolean; calibrationExpiresAt: string | null
   lastTs: string | null; lastPreloadN: number | null; lastRatio: number | null
   lastEchoTimeNs: number | null; lastSpTempC: number | null; minPreloadN: number | null
   material: string | null; elasticModulusGpa: number | null; soundVelocityMs: number | null
   effectiveLengthMm: number | null; crossSectionMm2: number | null; installTorqueNm: number | null
   // 扩展不确定度 U(k=2)，与 lastPreloadN 同一条测量。plan §9.15.4 要求数值带区间展示
   lastUncertaintyN: number | null
+  // 客户端实时换算与热路径同口径所需：K_L 截距（扭矩阶梯拟合产物）+ 温补系数（缺省已回退 SDK 默认）
+  kLInterceptNs: number | null; tempCoefficientPerC: number
+  // 所属设备：多设备部署时前端必须按 (deviceId, channelNo) 组合键索引通道，单用 channelNo 会跨设备串数据
+  deviceId: number
 }
 export interface BoltSettings {
   targetPreloadN?: number | null; minPreloadN?: number | null; material?: string | null
@@ -538,10 +564,15 @@ export interface CalibRecord {
   operatorUserId: number | null
 }
 export const boltApi = {
-  list: () => http.get<{ count: number; items: BoltListItem[] }>('/api/bolts'),
+  // hasMore=true 表示超出 limit 护栏被截断（默认 1000）——调用方须提示，不能当全量
+  list: () => http.get<{ count: number; hasMore: boolean; items: BoltListItem[] }>('/api/bolts'),
   // 详情页用单查（不存在 404 抛错），避免"全量拉列表再 find"在规模超过列表分页护栏后静默失配
   get: (id: number) => http.get<BoltListItem>(`/api/bolts/${id}`),
-  preloadTrend: (id: number, qs = '?bucket=auto') => http.get<{ items: TrendPoint[] }>(`/api/bolts/${id}/preload-trend${qs}`),
+  // truncated=true 表示桶数超 maxPoints 被截到最近 N 桶——调用方须提示"历史段未画全"。
+  // 调用方应显式传 bucket 而不是依赖 auto：auto 档位按 (服务器 now − 客户端 since) 的跨度选，
+  // 两边时钟有偏差时会翻档（如 24h 请求翻到 1min 桶 → 1440 桶超 500 上限被静默截断）。
+  preloadTrend: (id: number, qs = '?bucket=auto') =>
+    http.get<{ items: TrendPoint[]; truncated: boolean; bucket: string; count: number }>(`/api/bolts/${id}/preload-trend${qs}`),
   measurements: (id: number, limit = 30) =>
     http.get<{ items: { ts: string; echoTimeNs: number | null; spTempC: number | null; statusCode: number; preloadN: number | null; preloadRatio: number | null }[] }>(
       `/api/measurements/by-bolt/${id}/latest?limit=${limit}`),
@@ -561,6 +592,8 @@ export interface BoltChannelConfig {
   deviceId: number; channelNo: number; probeFreqMhz: number; gain: number; threshold: number; measMode: number
   echoWinNs: number | null; tcMode: number; refTimeNs: number | null; refTempC: number | null
   kL: number | null; kLUncertainty: number | null; configSource: string | null; configSyncedAt: string | null
+  // 扭矩阶梯拟合产生的截距。客户端实时换算须与热路径同口径：preloadN=(归一化ΔTOF−截距)/K_L
+  kLInterceptNs: number | null
 }
 
 // ---- 设备 / 通道健康 ----
@@ -613,9 +646,11 @@ export const deviceApi = {
   channelHealth: (deviceId: number, minutes = 5) =>
     http.get<{ deviceId: number; connectorState: string; count: number; items: ChannelHealth[] }>(
       `/api/devices/${deviceId}/channels/health?minutes=${minutes}`),
-  // 重标定：把当前回波声时设为零载/参考基线（设备侧整组写入 RefTime/RefTemp）
-  recalibrate: (deviceId: number, channel: number, body: { refTimeNs?: number; refTempC?: number } = {}) =>
-    http.post<{ newRefTimeNs: number; newRefTempC: number }>(`/api/devices/${deviceId}/channels/${channel}/recalibrate`, body),
+  // 重标定：把当前回波声时设为零载/参考基线（设备侧整组写入 RefTime/RefTemp）。
+  // expectZeroLoad=true 时后端会核对"当前折算预紧力≈0"，带载设零载基线直接被拒（hardening §3）；
+  // warning 非空表示基线移动明显（历史读数与新读数不可比），调用方必须展示。
+  recalibrate: (deviceId: number, channel: number, body: { refTimeNs?: number; refTempC?: number; expectZeroLoad?: boolean; force?: boolean } = {}) =>
+    http.post<{ newRefTimeNs: number; newRefTempC: number; warning: string | null }>(`/api/devices/${deviceId}/channels/${channel}/recalibrate`, body),
   // 点位与验收页数据源：各通道最新回波 + 信号强度 + 在位/验收状态
   channelsLive: (deviceId: number) =>
     http.get<{ deviceId: number; count: number; items: ChannelLive[] }>(`/api/devices/${deviceId}/channels/live`),
@@ -799,7 +834,9 @@ export interface TorquePointSnapshot {
 }
 export interface TorqueStepSnapshot {
   generatedAt: string
-  channel: { channelId: number; deviceId: number; channelNo: number; kL: number | null; kLInterceptNs: number | null; activeCalibrationId: string | null }
+  // 键名对齐快照 JSON 的实际序列化：.NET camelCase 把全大写前缀整体小写，C# 的 KL/KLInterceptNs
+  // 落库后是 kl/klInterceptNs（fit.kl 曾因此把报告详情页整页搞白屏）。别照 C# 属性名声明成 kL。
+  channel: { channelId: number; deviceId: number; channelNo: number; kl: number | null; klInterceptNs: number | null; activeCalibrationId: string | null }
   bolt: { boltId: number; code: string; nominalDiameter: string; targetPreloadN: number | null; installTorqueNm: number | null }
   points: TorquePointSnapshot[]
   fit: { pointCount: number; kL: number; interceptNs: number; rSquared: number } | null
@@ -814,7 +851,9 @@ export interface ReportDetail {
   snapshot: FlangeSnapshot | TorqueStepSnapshot | null
 }
 export const reportApi = {
-  list: (type = '') => http.get<{ count: number; items: ReportItem[] }>(`/api/reports${type ? `?type=${type}` : ''}`),
+  // limit 用足后端上限 500（默认仅 50）：报告超过默认页后旧报告在页面上静默"消失"
+  list: (type = '', limit = 500) =>
+    http.get<{ count: number; items: ReportItem[] }>(`/api/reports?limit=${limit}${type ? `&type=${type}` : ''}`),
   get: (id: number) => http.get<ReportDetail>(`/api/reports/${id}`),
   generateFlange: (groupId: number) =>
     http.post<{ reportId: number; title: string; overall: string; total: number; passed: number; calibrated: number }>(
@@ -859,6 +898,18 @@ export const calibrationApi = {
   captureTorquePoint: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; sampleWindowSeconds?: number; note?: string }) =>
     http.post<{ id: number; channelId: number; estimatedPreloadN: number }>(`/api/channels/${channelId}/torque-test-points`, body),
   torquePointSummary: (channelId: number) => http.get<TorqueFitSummary>(`/api/channels/${channelId}/torque-test-points/summary`),
+  // 稳定性预检：与采点/标定后端护栏同一套判据（stddev + 前后半窗趋势）。
+  // 向导轮询它当指示灯，stable=true 才放开采点——灯绿了就一定采得进去，不会前后端两套口径。
+  echoStability: (channelId: number, seconds = 180) =>
+    http.get<{
+      channelId: number; stable: boolean; sampleCount: number
+      avgEchoNs: number | null; stddevNs: number | null; halfWindowDriftNs: number | null
+      stddevMaxNs: number; halfWindowDriftMaxNs: number; windowSeconds: number
+    }>(`/api/channels/${channelId}/echo-stability?seconds=${seconds}`),
+  // 剔除/恢复一个阶梯点（只打标志不删行，剔除必须给原因）。已生效标定不受影响，下次拟合才按新点集算。
+  patchTorquePoint: (channelId: number, pointId: number, body: { excluded: boolean; reason?: string }) =>
+    http.patch<{ channelId: number; pointId: number; excluded: boolean; remainingValidPoints: number }>(
+      `/api/channels/${channelId}/torque-test-points/${pointId}`, body),
   applyTorqueFit: (channelId: number, body: { minPoints?: number; note?: string } = {}) =>
     http.post<{ channelId: number; calibrationId: string; kL: number; rSquared: number; passed: boolean }>(`/api/channels/${channelId}/apply-torque-fit`, body),
   // 正式多点载荷标定（提交后 pending，需异人会签 countersign 才激活，review_state=approved）
@@ -874,9 +925,14 @@ export const calibrationApi = {
 }
 
 // ---- 通道自动检测（probe-scan） ----
+// 字段名对齐后端 ProbeScanChannelResultView（此前前端凭空写了 snrDb/peakToPeak/sampleCount/reason，
+// 后端根本没有这些名字，扫描报告的指标列全渲染成 undefined）
 export interface ProbeScanChannelResult {
-  channelNo: number; verdict: string; snrDb: number | null; echoStdNs: number | null
-  peakToPeak: number | null; sampleCount: number; reason: string | null
+  channelNo: number; name: string | null; verdict: string
+  samples: number; samplesWithEcho: number; echoRatePct: number | null
+  echoAvgNs: number | null; echoStdNs: number | null
+  peakToPeakAvg: number | null; snrAvgDb: number | null
+  boundBoltCode: string | null
 }
 export interface ProbeScanView {
   scanRunId: number; deviceId: number; status: string; strategy: string

@@ -35,20 +35,27 @@ const limitIsUniform = computed(() => {
   return rs.length <= 1 || Math.max(...rs) - Math.min(...rs) < 0.005
 })
 
+// 显式 bucket + maxPoints，不用 auto：auto 档位按"服务器 now − 浏览器 since"的跨度选，
+// 服务器时钟慢于浏览器时 24h 请求会翻档到 1min 桶（1440 桶超默认 500）被静默截成尾段（历史消失）。
+// 组对比是多颗叠画，用比单颗略粗的桶即可（24h→5min 288 桶 / 7d→1hour 168 桶），也顺便省流量。
+const RANGE_QUERY: Record<'24h' | '7d', { hours: number; bucket: string; maxPoints: number }> = {
+  '24h': { hours: 24, bucket: '5min', maxPoints: 400 },
+  '7d': { hours: 168, bucket: '1hour', maxPoints: 400 },
+}
 let loadSeq = 0
 async function load() {
   if (!props.bolts.length) { seriesData.value = []; failedBolts.value = []; return }
   const seq = ++loadSeq // 竞态令牌：bolts/range 快速切换时，只保留最后一次发起的结果
   loading.value = true
-  const hours = range.value === '24h' ? 24 : 168
-  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString()
+  const rq = RANGE_QUERY[range.value]
+  const since = new Date(Date.now() - rq.hours * 3600 * 1000).toISOString()
   const failed: string[] = []
   try {
     // 单颗失败不连坐：其余照画，失败的记下编号在图下说明
     const results = await Promise.all(
       props.bolts.map((b) =>
         boltApi
-          .preloadTrend(b.id, `?bucket=auto&since=${since}`)
+          .preloadTrend(b.id, `?bucket=${rq.bucket}&maxPoints=${rq.maxPoints}&since=${since}`)
           .then((r) => ({ bolt: b, items: r.items }))
           .catch(() => {
             failed.push(b.code)

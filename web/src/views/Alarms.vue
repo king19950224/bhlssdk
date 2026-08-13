@@ -83,13 +83,17 @@ const openSelected = computed(() => filtered.value.filter((a) => a.isOpen && sel
 const loadError = ref<string | null>(null)
 // 抑制列表单独一个失败态：它容错退成空数组，但"空"和"没查到"得分开。
 const shelvingError = ref<string | null>(null)
+// 列表拉取上限（用足后端 1..1000 的最大值）；返回条数达到上限即视为截断，横幅提示——
+// 否则摘要卡（全量聚合）说"未闭合 1200"而列表只有 1000 条，两处数字对不上还无解释
+const LIST_LIMIT = 1000
+const listTruncated = ref(false)
 async function load() {
   loading.value = true
   shelvingError.value = null
   try {
     const withCleared = view.value === 'cleared' || view.value === 'all'
     const [list, sum, shv] = await Promise.all([
-      alarmApi.list(`?includeCleared=${withCleared}&limit=300`),
+      alarmApi.list(`?includeCleared=${withCleared}&limit=${LIST_LIMIT}`),
       alarmApi.summary(),
       // 抑制列表单独容错：它挂了不该把告警列表一起拖没（Promise.all 一拒全拒）。
       // 但失败得记在 shelvingError 上，不然静默退成空数组，"生效抑制"显示 0、下方面板消失，
@@ -100,6 +104,7 @@ async function load() {
       }),
     ])
     items.value = list.items
+    listTruncated.value = list.items.length >= LIST_LIMIT
     summary.value = sum.items
     shelvings.value = shv.items
     loadError.value = null
@@ -356,6 +361,11 @@ function limitOf(a: AlarmItem) {
       <div v-if="loadError" class="load-error">
         <el-icon><WarningFilled /></el-icon> 告警列表刷新失败（显示的可能是旧数据）：{{ loadError }}
         <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
+      <!-- 截断透出：摘要卡是全量聚合，列表被 limit 截断时两处数字会对不上，必须说明而不是让人猜 -->
+      <div v-if="listTruncated" class="load-error">
+        <el-icon><WarningFilled /></el-icon>
+        列表仅显示最近 {{ LIST_LIMIT }} 条，更早的告警未列出（摘要卡计数为全量口径）。可按级别筛选或缩小查看范围。
       </div>
       <div class="tbl" v-loading="loading">
         <div class="tr th">

@@ -255,7 +255,8 @@ public sealed class WiringTableIntegrationTests
 
         // 这份表要能导出→改→回导。列序变了前端就按错的列取值，把规格读成等级之类。
         // G7 门禁盯的是表头与前端别名表的对应，这里盯的是表头本身没被悄悄改掉。
-        lines[0].Should().Be("通道号,位置,螺栓编号,规格,等级,目标预紧力,报警下限,探头状态,验收时间,螺栓位号");
+        // "验收时间(当地)"：数据列输出当地时间后表头同步标注时区（导入忽略列，改名不影响回导）。
+        lines[0].Should().Be("通道号,位置,螺栓编号,规格,等级,目标预紧力,报警下限,探头状态,验收时间(当地),螺栓位号");
         lines.Should().HaveCountGreaterThan(1, "种子设备有一路通道，导出不该只有表头");
 
         (await client.GetAsync("/api/devices/999999999/wiring-table/export.csv"))

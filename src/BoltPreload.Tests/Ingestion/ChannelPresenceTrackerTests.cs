@@ -306,6 +306,42 @@ public class ChannelPresenceTrackerTests
     }
 
     [Fact]
+    public void Snapshot_ReturnsOnlyConfirmedStates()
+    {
+        var t = Make(plugConsecutive: 1, unplugSilence: 20);
+        t.Observe(1, 5, Echo, T0);   // 确认在位
+        t.Observe(1, 6, null, T0);   // 未知态（被轮询但无回波，未满静默阈值）
+
+        var snap = t.Snapshot();
+        snap.Should().ContainSingle(e => e.ChannelNo == 5 && e.Present);
+        snap.Should().NotContain(e => e.ChannelNo == 6, "未知态不进对账快照——没证据就不修库");
+
+        t.Sweep(T0.AddSeconds(30));                // ch5 静默翻拔出；ch6 静默确认无探头
+        t.Observe(1, 5, Echo, T0.AddSeconds(31));  // ch5 插回
+
+        snap = t.Snapshot();
+        snap.Should().Contain(e => e.ChannelNo == 5 && e.Present && e.LastEchoAt == T0.AddSeconds(31));
+        snap.Should().Contain(e => e.ChannelNo == 6 && !e.Present, "静默确认后的'无探头'是已确认态，参与对账");
+    }
+
+    [Fact]
+    public void Snapshot_EvidenceGoesStaleOnSuspension_AndFreshensOnNewEcho()
+    {
+        // 挂起（离线/扫描）期间内存"在位"是冻结旧值：对账不能拿它覆盖库，恢复后要有新回波佐证
+        var t = Make(plugConsecutive: 1, unplugSilence: 20);
+        t.Observe(1, 5, Echo, T0);
+        t.Snapshot().Should().ContainSingle(e => e.Present && e.EvidenceFresh);
+
+        t.Sweep(T0.AddSeconds(10), isDeviceSuspended: _ => true);   // 挂起抬高静默地板
+        t.Snapshot().Should().ContainSingle(e => e.Present && !e.EvidenceFresh,
+            "地板抬过之后，旧回波不再是'仍在位'的证据");
+
+        t.Observe(1, 5, Echo, T0.AddSeconds(15));
+        t.Snapshot().Should().ContainSingle(e => e.Present && e.EvidenceFresh,
+            "恢复后有了新回波，证据重新可信");
+    }
+
+    [Fact]
     public void Disabled_NeverEmits()
     {
         var t = new ChannelPresenceTracker(Options.Create(new ChannelPresenceOptions { Enabled = false }));

@@ -173,7 +173,8 @@ async function submit() {
         <el-input v-model="form.positionLabel" placeholder="如“5号”——俯视图按位号落孔位，强烈建议填" maxlength="64" />
       </el-form-item>
       <el-form-item label="编号">
-        <el-input v-model="form.code" placeholder="留空自动生成（组编号-CH通道号）" maxlength="64" />
+        <!-- 提示与后端 ChannelNaming.DefaultBoltCode 实际格式一致（原文案"组编号-CH通道号"与生成结果不符） -->
+        <el-input v-model="form.code" placeholder="留空自动生成（如 通道2-3号螺栓，重名自动加 -2/-3）" maxlength="64" />
       </el-form-item>
       <el-form-item label="规格 / 等级">
         <div class="spec-row">

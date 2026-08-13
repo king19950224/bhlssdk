@@ -1,6 +1,7 @@
 using System.Text;
 using BoltPreload.Api.Auth;
 using BoltPreload.Application.Ingestion;
+using BoltPreload.Domain;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -23,15 +24,25 @@ public static class BoltEndpoints
         {
             var lim = Math.Clamp(limit ?? 1000, 1, 5000);
             var off = Math.Max(offset ?? 0, 0);
+            // calibrated 口径与 bolt_status CTE / 采集热路径一致：k_l + active_calibration_id + 未过期。
+            // 只看 k_l 非空的旧口径在"标定过期"后仍返回 true（过期不清 k_l），详情页/实时页据此
+            // 继续用过期 K_L 做客户端换算并判"正常"，与总览"未标定/过期"口径分裂（假安全窗口）。
             const string sql = @"
                 SELECT b.id, b.code, b.nominal_diam, b.grade, b.target_preload_n, b.position_label, b.state,
                        c.id AS channel_id, c.channel_no, c.k_l, c.ref_time_ns, c.ref_temp_c,
                        last_m.ts AS last_ts, last_m.preload_n, last_m.preload_ratio, last_m.echo_time_ns, last_m.sp_temp_c,
                        b.min_preload_n,
                        b.material, b.elastic_modulus_gpa, b.sound_velocity_ms, b.effective_length_mm, b.cross_section_mm2, b.install_torque_nm,
-                       last_m.preload_uncertainty_n
+                       last_m.preload_uncertainty_n,
+                       (c.k_l IS NOT NULL AND c.active_calibration_id IS NOT NULL
+                          AND (acr.expires_at IS NULL OR (now() AT TIME ZONE 'UTC')::date <= acr.expires_at)) AS calibrated,
+                       (c.k_l IS NOT NULL AND acr.expires_at IS NOT NULL
+                          AND (now() AT TIME ZONE 'UTC')::date > acr.expires_at) AS calibration_expired,
+                       acr.expires_at AS calibration_expires_at,
+                       c.k_l_intercept_ns, c.device_id, b.temp_coefficient_per_c
                 FROM bolts b
                 JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
+                LEFT JOIN calibration_records acr ON acr.id = c.active_calibration_id
                 LEFT JOIN LATERAL (
                     SELECT ts, preload_n, preload_ratio, echo_time_ns, sp_temp_c, preload_uncertainty_n
                     FROM measurements m
@@ -60,7 +71,7 @@ public static class BoltEndpoints
                     state = r.GetString(6),
                     channelId = r.GetInt64(7),
                     channelNo = r.GetInt16(8),
-                    calibrated = !r.IsDBNull(9),
+                    calibrated = r.GetBoolean(25),
                     kL = r.IsDBNull(9) ? null : (decimal?)r.GetDecimal(9),
                     refTimeNs = r.IsDBNull(10) ? null : (decimal?)r.GetDecimal(10),
                     refTempC = r.IsDBNull(11) ? null : (decimal?)r.GetDecimal(11),
@@ -77,7 +88,14 @@ public static class BoltEndpoints
                     crossSectionMm2 = r.IsDBNull(22) ? null : (decimal?)r.GetDecimal(22),
                     installTorqueNm = r.IsDBNull(23) ? null : (decimal?)r.GetDecimal(23),
                     // 扩展不确定度 U(k=2)，plan §9.15.4 要求测量值带区间交付
-                    lastUncertaintyN = r.IsDBNull(24) ? null : (decimal?)r.GetDecimal(24)
+                    lastUncertaintyN = r.IsDBNull(24) ? null : (decimal?)r.GetDecimal(24),
+                    // 标定过期（K_L 还挂在通道上但生效标定已过期）：前端显示"标定过期"而非普通"未标定"
+                    calibrationExpired = r.GetBoolean(26),
+                    calibrationExpiresAt = r.IsDBNull(27) ? null : DateOnly.FromDateTime(r.GetDateTime(27)).ToString("yyyy-MM-dd"),
+                    // 客户端实时换算与热路径同口径所需（温补 + 截距）；deviceId 供多设备页面按设备隔离通道
+                    kLInterceptNs = r.IsDBNull(28) ? null : (decimal?)r.GetDecimal(28),
+                    deviceId = r.GetInt64(29),
+                    tempCoefficientPerC = r.IsDBNull(30) ? BoltPhysicsDefaults.SdkTempCoefficientPerC : r.GetDecimal(30)
                 });
             }
             return Results.Ok(new { count = items.Count, hasMore = items.Count >= lim, items });
@@ -95,9 +113,16 @@ public static class BoltEndpoints
                        last_m.ts AS last_ts, last_m.preload_n, last_m.preload_ratio, last_m.echo_time_ns, last_m.sp_temp_c,
                        b.min_preload_n,
                        b.material, b.elastic_modulus_gpa, b.sound_velocity_ms, b.effective_length_mm, b.cross_section_mm2, b.install_torque_nm,
-                       last_m.preload_uncertainty_n
+                       last_m.preload_uncertainty_n,
+                       (c.k_l IS NOT NULL AND c.active_calibration_id IS NOT NULL
+                          AND (acr.expires_at IS NULL OR (now() AT TIME ZONE 'UTC')::date <= acr.expires_at)) AS calibrated,
+                       (c.k_l IS NOT NULL AND acr.expires_at IS NOT NULL
+                          AND (now() AT TIME ZONE 'UTC')::date > acr.expires_at) AS calibration_expired,
+                       acr.expires_at AS calibration_expires_at,
+                       c.k_l_intercept_ns, c.device_id, b.temp_coefficient_per_c
                 FROM bolts b
                 JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
+                LEFT JOIN calibration_records acr ON acr.id = c.active_calibration_id
                 LEFT JOIN LATERAL (
                     SELECT ts, preload_n, preload_ratio, echo_time_ns, sp_temp_c, preload_uncertainty_n
                     FROM measurements m
@@ -123,7 +148,7 @@ public static class BoltEndpoints
                 state = r.GetString(6),
                 channelId = r.GetInt64(7),
                 channelNo = r.GetInt16(8),
-                calibrated = !r.IsDBNull(9),
+                calibrated = r.GetBoolean(25),
                 kL = r.IsDBNull(9) ? null : (decimal?)r.GetDecimal(9),
                 refTimeNs = r.IsDBNull(10) ? null : (decimal?)r.GetDecimal(10),
                 refTempC = r.IsDBNull(11) ? null : (decimal?)r.GetDecimal(11),
@@ -140,7 +165,12 @@ public static class BoltEndpoints
                 crossSectionMm2 = r.IsDBNull(22) ? null : (decimal?)r.GetDecimal(22),
                 installTorqueNm = r.IsDBNull(23) ? null : (decimal?)r.GetDecimal(23),
                 // 扩展不确定度 U(k=2)，plan §9.15.4 要求测量值带区间交付
-                lastUncertaintyN = r.IsDBNull(24) ? null : (decimal?)r.GetDecimal(24)
+                lastUncertaintyN = r.IsDBNull(24) ? null : (decimal?)r.GetDecimal(24),
+                calibrationExpired = r.GetBoolean(26),
+                calibrationExpiresAt = r.IsDBNull(27) ? null : DateOnly.FromDateTime(r.GetDateTime(27)).ToString("yyyy-MM-dd"),
+                kLInterceptNs = r.IsDBNull(28) ? null : (decimal?)r.GetDecimal(28),
+                deviceId = r.GetInt64(29),
+                tempCoefficientPerC = r.IsDBNull(30) ? BoltPhysicsDefaults.SdkTempCoefficientPerC : r.GetDecimal(30)
             });
         })
         .WithName("GetBolt")
@@ -308,13 +338,15 @@ public static class BoltEndpoints
             csv.Append('\uFEFF');
             // 编号是人填的自由文本，必须压成一行：带 CRLF 的编号会在这条注释行后面另起一行，
             // 而新行的首字符由输入决定，"=…" 就成了客户 Excel 里被执行的公式。
-            csv.AppendLine($"# 螺栓 {CsvExport.Inline(boltCode)} 预紧力趋势导出  窗口(UTC) {sinceUtc:yyyy-MM-dd HH:mm} ~ {untilUtc:yyyy-MM-dd HH:mm}  聚合 {bucketInterval}");
-            csv.AppendLine("时间(UTC),平均预紧力N,最小预紧力N,最大预紧力N,平均保持率,平均温度C,平均声时ns,样本数,有效预紧力数");
+            // CSV 是给现场/业主看的纸面材料，时间用服务器当地时间输出并在表头注明——
+            // 原先输出 UTC 却无任何标记，现场按北京时间读会差 8 小时（对账/追溯踩坑）。
+            csv.AppendLine($"# 螺栓 {CsvExport.Inline(boltCode)} 预紧力趋势导出  窗口(当地时间) {sinceUtc.ToLocalTime():yyyy-MM-dd HH:mm} ~ {untilUtc.ToLocalTime():yyyy-MM-dd HH:mm}  聚合 {bucketInterval}");
+            csv.AppendLine("时间(当地),平均预紧力N,最小预紧力N,最大预紧力N,平均保持率,平均温度C,平均声时ns,样本数,有效预紧力数");
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
             {
                 static string D(NpgsqlDataReader rr, int i, int dec) => rr.IsDBNull(i) ? "" : Math.Round(rr.GetDecimal(i), dec).ToString();
-                csv.Append(r.GetDateTime(0).ToString("yyyy-MM-dd HH:mm:ss")).Append(',')
+                csv.Append(r.GetDateTime(0).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")).Append(',')
                    .Append(D(r, 1, 0)).Append(',').Append(D(r, 2, 0)).Append(',').Append(D(r, 3, 0)).Append(',')
                    .Append(D(r, 4, 4)).Append(',').Append(D(r, 5, 1)).Append(',').Append(D(r, 6, 1)).Append(',')
                    .Append(r.GetInt64(7)).Append(',').Append(r.GetInt64(8)).Append('\n');
@@ -414,7 +446,7 @@ public static class BoltEndpoints
             await using var cmd = ds.CreateCommand(@"
                 SELECT c.device_id, c.channel_no, c.probe_freq_mhz, c.gain, c.threshold, c.meas_mode,
                        c.echo_win_ns, c.tc_mode, c.ref_time_ns, c.ref_temp_c, c.k_l, c.k_l_uncertainty,
-                       c.config_source, c.config_synced_at
+                       c.config_source, c.config_synced_at, c.k_l_intercept_ns
                 FROM bolts b JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
                 WHERE b.id = @id AND b.deleted_at IS NULL");
             cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
@@ -436,6 +468,8 @@ public static class BoltEndpoints
                 kLUncertainty = r.IsDBNull(11) ? (decimal?)null : r.GetDecimal(11),
                 configSource = r.IsDBNull(12) ? null : r.GetString(12),
                 configSyncedAt = r.IsDBNull(13) ? (DateTime?)null : r.GetDateTime(13),
+                // 扭矩阶梯拟合产生的截距（换算公式 preloadN=(ΔTOF−截距)/K_L）。客户端实时换算与热路径同口径需要它
+                kLInterceptNs = r.IsDBNull(14) ? (decimal?)null : r.GetDecimal(14),
             });
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)

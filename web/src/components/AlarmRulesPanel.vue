@@ -14,6 +14,8 @@ const targets = ref<AlarmRuleTargets>({ groups: [], bolts: [] })
 const loading = ref(false)
 const loadError = ref<string | null>(null)
 const showHistory = ref(false)
+// 历史记录超出后端 500 条上限被截断（待审规则排最前永不丢，截掉的只会是最老的历史）
+const truncated = ref(false)
 
 const activeRules = computed(() => rules.value.filter((r) => r.reviewState === 'active'))
 const visibleRules = computed(() =>
@@ -28,6 +30,7 @@ async function load() {
   try {
     const [list, tg] = await Promise.all([alarmRuleApi.list(), alarmRuleApi.targets()])
     rules.value = list.items
+    truncated.value = !!list.truncated
     targets.value = tg
     loadError.value = null
   } catch (e) {
@@ -188,6 +191,9 @@ async function reject(r: AlarmRule) {
       <div v-if="loadError" class="load-error">
         规则列表加载失败：{{ loadError }}
         <el-button size="small" text type="primary" @click="load">重试</el-button>
+      </div>
+      <div v-if="truncated && showHistory" class="load-error">
+        历史规则超出显示上限（500 条），最早的历史记录未列出；待审与生效规则不受影响。
       </div>
       <div class="tbl" v-loading="loading">
         <div class="tr th">

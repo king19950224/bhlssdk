@@ -143,6 +143,59 @@ async function editHoles() {
   }
 }
 
+// 组目标预紧力编辑：整圈法兰共用一个设计目标，新探头自动建档时继承它。
+// 组目标不设的话，螺栓建档时目标是空的，首次扭矩法标定会拿"当次扭矩的估算值"兜底填成目标，
+// 各通道扭矩不同就得到一组互不相同的假目标，之后保持率全都相对假目标自洽，真实偏差反而看不出来。
+async function editGroupTarget() {
+  const g = sel.value.group
+  if (!g) return
+  let value: string
+  try {
+    ({ value } = await ElMessageBox.prompt(
+      '整圈法兰的设计目标预紧力，单位 kN。新探头自动建档时继承它；不设的话首次扭矩标定会把当次扭矩的估算值当成目标填进去。',
+      '组目标预紧力',
+      {
+        confirmButtonText: '下一步', cancelButtonText: '取消',
+        inputValue: groupTargetN.value != null ? String(groupTargetN.value / 1000) : '',
+        inputPattern: /^\d{1,5}(\.\d{1,2})?$/,
+        inputErrorMessage: '请输入 kN 数值，例如 200',
+      }))
+  } catch { return /* 取消 */ }
+  const targetKn = Number(value)
+  if (!(targetKn > 0) || targetKn > 10000) {
+    ElMessage.error('目标预紧力需在 0 ~ 10000 kN 之间')
+    return
+  }
+
+  // 改组目标默认只对以后新建档的螺栓生效；组里已有的要不要一并覆盖，得让人明确点一下——
+  // 各颗可能有自己的设计目标，静默整组刷掉是危险动作
+  let applyToBolts = false
+  if (bolts.value.length) {
+    try {
+      await ElMessageBox.confirm(
+        `组内已有 ${bolts.value.length} 颗建档螺栓，是否把它们的目标一并改成 ${targetKn} kN？不同步的话，组目标只对以后新建档的螺栓生效。`,
+        '同步已有螺栓',
+        {
+          confirmButtonText: `同步 ${bolts.value.length} 颗`,
+          cancelButtonText: '仅改组目标',
+          distinguishCancelAndClose: true,
+        })
+      applyToBolts = true
+    } catch (act) {
+      if (act === 'close') return // 右上角 × / ESC 是"我再想想"，不是"仅改组目标"
+    }
+  }
+
+  try {
+    const r = await assetApi.patchGroup(g.id, { targetPreloadN: targetKn * 1000, applyToBolts })
+    g.targetPreloadN = r.targetPreloadN
+    ElMessage.success(`组目标已设为 ${targetKn} kN` + (r.appliedToBolts ? `，已同步 ${r.appliedToBolts} 颗螺栓` : ''))
+    if (r.appliedToBolts) await refreshCurrent() // 螺栓卡片上的目标/保持率得跟着变
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '保存失败')
+  }
+}
+
 // 部位级工程摘要：状态计数 + 目标/下限参考值（工程视图先给统计与基准，再看单根）
 const STATUS_SUMMARY = ['loose', 'warn', 'high', 'normal', 'uncalibrated', 'nodata'] as const
 const boltSummary = computed(() => {
@@ -378,11 +431,14 @@ function onProjectChange() {
           <div class="gs-ref" title="已建档探头数（检测即螺栓：在位自动生成）">
             <span class="gs-k">监测</span><b class="mono">{{ boltSummary.total }}</b><span class="gs-u">颗</span>
           </div>
-          <div class="gs-ref gs-holes" title="法兰物理孔位配置（工程结构，不与检测数自动同步）" @click="editHoles">
+          <div class="gs-ref gs-editable" title="法兰物理孔位配置（工程结构，不与检测数自动同步）" @click="editHoles">
             <span class="gs-k">配置孔位</span><b class="mono">{{ sel.group?.expectedBoltCount ?? '—' }}</b>
             <el-icon class="gs-edit"><Edit /></el-icon>
           </div>
-          <div class="gs-ref"><span class="gs-k">组目标</span><b class="mono">{{ kn(groupTargetN) }}</b></div>
+          <div class="gs-ref gs-editable" title="整圈法兰的设计目标预紧力（新探头自动建档时继承它）" @click="editGroupTarget">
+            <span class="gs-k">组目标</span><b class="mono">{{ kn(groupTargetN) }}</b>
+            <el-icon class="gs-edit"><Edit /></el-icon>
+          </div>
         </div>
         <div class="gs-stats">
           <span v-for="k in STATUS_SUMMARY" :key="k" class="gs-stat" :class="{ zero: !boltSummary[k] }">
@@ -541,9 +597,9 @@ function onProjectChange() {
 .gs-ref .gs-k { font-size: 11px; color: var(--text-3); letter-spacing: 0.06em; }
 .gs-ref b { font-size: 17px; font-weight: 700; color: var(--text-1); }
 .gs-ref .gs-u { font-size: 11px; color: var(--text-3); }
-.gs-holes { cursor: pointer; border-radius: 6px; padding: 2px 6px; margin: -2px -6px; transition: background 0.15s; }
-.gs-holes:hover { background: rgba(56, 189, 248, 0.08); }
-.gs-holes:hover .gs-edit { color: var(--accent); }
+.gs-editable { cursor: pointer; border-radius: 6px; padding: 2px 6px; margin: -2px -6px; transition: background 0.15s; }
+.gs-editable:hover { background: rgba(56, 189, 248, 0.08); }
+.gs-editable:hover .gs-edit { color: var(--accent); }
 .gs-edit { font-size: 12px; color: var(--text-3); margin-left: 2px; }
 .gs-stats { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 .gs-stat { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
