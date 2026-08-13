@@ -143,6 +143,7 @@ curl -s -XPOST $BASE/api/channels/<channelId>/apply-torque-fit \
 3. **重标定的前提是已知载荷状态**：基线必须在螺栓自由/零载（或已知力矩）时取，否则后续全部 ΔTOF 失真。
 
 > 提醒：仿真时代遗留的标定（`sim_baseline` / 过期 torque）对真机无效，接真机后须按本指南对真实螺栓重新标定。
-> 设备模拟器已整体移除，存量 `sim_baseline` 记录用 `deploy/scripts/20260813-purge-sim-baseline.sql` 清理。
+> 设备模拟器已整体移除，存量 `sim_baseline` 记录用 `deploy/scripts/20260813-purge-sim-baseline.sql` 清理
+> （它只作废假标定、不删真实测量历史；被清的通道回"未标定"，须按本指南重新置零）。
 > 某台机器某一时刻的通道标定现状不记在这份指南里——那类快照写完就失真，要看当下状态查
 > `GET /api/channels` 与 `GET /api/dashboard/summary`，历史快照见 site-debug 系列排障文档。
