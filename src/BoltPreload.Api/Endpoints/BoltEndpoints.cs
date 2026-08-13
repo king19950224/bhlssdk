@@ -24,9 +24,11 @@ public static class BoltEndpoints
         {
             var lim = Math.Clamp(limit ?? 1000, 1, 5000);
             var off = Math.Max(offset ?? 0, 0);
-            // calibrated 口径与 bolt_status CTE / 采集热路径一致：k_l + active_calibration_id + 未过期。
+            // calibrated 口径与 bolt_status CTE / 采集热路径一致：k_l + active_calibration_id + passed + 未过期。
             // 只看 k_l 非空的旧口径在"标定过期"后仍返回 true（过期不清 k_l），详情页/实时页据此
             // 继续用过期 K_L 做客户端换算并判"正常"，与总览"未标定/过期"口径分裂（假安全窗口）。
+            // passed 维度：热路径对 passed=false（如扭矩拟合 R² 已应用未达标）拒算预紧力——
+            // 界面若仍称"已标定"，读数却永远无数据，现场会往探头方向白排障。
             const string sql = @"
                 SELECT b.id, b.code, b.nominal_diam, b.grade, b.target_preload_n, b.position_label, b.state,
                        c.id AS channel_id, c.channel_no, c.k_l, c.ref_time_ns, c.ref_temp_c,
@@ -34,7 +36,7 @@ public static class BoltEndpoints
                        b.min_preload_n,
                        b.material, b.elastic_modulus_gpa, b.sound_velocity_ms, b.effective_length_mm, b.cross_section_mm2, b.install_torque_nm,
                        last_m.preload_uncertainty_n,
-                       (c.k_l IS NOT NULL AND c.active_calibration_id IS NOT NULL
+                       (c.k_l IS NOT NULL AND c.active_calibration_id IS NOT NULL AND acr.passed
                           AND (acr.expires_at IS NULL OR (now() AT TIME ZONE 'UTC')::date <= acr.expires_at)) AS calibrated,
                        (c.k_l IS NOT NULL AND acr.expires_at IS NOT NULL
                           AND (now() AT TIME ZONE 'UTC')::date > acr.expires_at) AS calibration_expired,
@@ -114,7 +116,7 @@ public static class BoltEndpoints
                        b.min_preload_n,
                        b.material, b.elastic_modulus_gpa, b.sound_velocity_ms, b.effective_length_mm, b.cross_section_mm2, b.install_torque_nm,
                        last_m.preload_uncertainty_n,
-                       (c.k_l IS NOT NULL AND c.active_calibration_id IS NOT NULL
+                       (c.k_l IS NOT NULL AND c.active_calibration_id IS NOT NULL AND acr.passed
                           AND (acr.expires_at IS NULL OR (now() AT TIME ZONE 'UTC')::date <= acr.expires_at)) AS calibrated,
                        (c.k_l IS NOT NULL AND acr.expires_at IS NOT NULL
                           AND (now() AT TIME ZONE 'UTC')::date > acr.expires_at) AS calibration_expired,

@@ -74,7 +74,10 @@ async function load() {
   }
 }
 onMounted(load)
-watch(() => props.bolts, load)
+// 按"螺栓 id 集合"而非数组引用触发重拉：父页(AssetMonitor)每 30s 轮询都会换新数组引用,
+// 按引用 watch 会让本组件每 30s 全量重发 N 颗 × N 个 trend 请求(一组 30 颗=每分钟 60 个重聚合查询)。
+// 成员没变就不重拉;状态字段变化只影响线色,由 option 计算属性自然生效,无需重查。
+watch(() => props.bolts.map((b) => b.id).join(','), () => void load())
 watch(range, load)
 
 const hasData = computed(() => seriesData.value.some((s) => s.pts.some((p) => p[1] != null)))

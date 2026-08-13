@@ -93,15 +93,37 @@ public sealed class PostgresAlarmSink : IAlarmSink
                          WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 WHEN 'info' THEN 1 ELSE 0
                        END
                 RETURNING id";
-            await using var cmd = _dataSource.CreateCommand(escalateSql);
-            cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, ev.BoltId);
-            cmd.Parameters.AddWithValue("type", NpgsqlDbType.Varchar, ev.Type);
-            cmd.Parameters.AddWithValue("sev", NpgsqlDbType.Varchar, ev.Severity);
-            cmd.Parameters.AddWithValue("msg", NpgsqlDbType.Text, (object?)ev.Message ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("ts", NpgsqlDbType.TimestampTz, ev.Ts);
-            var id = await cmd.ExecuteScalarAsync(ct);
-            _logger.LogWarning("告警升级 bolt={Bolt} type={Type} severity={Sev} alarmId={Id}",
-                ev.BoltId, ev.Type, ev.Severity, id);
+
+            // 升级到 critical 必须外发通知：告警可能以 warn 触发（静默窗内被路由过滤，或规则
+            // min_severity=critical 不命中），夜间恶化升到 critical 后若不入发件箱，
+            // "critical 无视静默窗"的承诺对升级路径就是空话——库里和界面有，值班手机永远没有。
+            // event_kind 复用 'trigger'（0029 的 CHECK 只有 trigger/clear；对接收方而言，
+            // 这就是这条 critical 的首次触达）。路由 Match 按升级后的 severity 匹配。
+            long? alarmId;
+            if (match is null || ev.Severity != "critical")
+            {
+                await using var cmd = _dataSource.CreateCommand(escalateSql);
+                BindEscalateParams(cmd, ev);
+                alarmId = (long?)await cmd.ExecuteScalarAsync(ct);
+            }
+            else
+            {
+                await using var conn = await _dataSource.OpenConnectionAsync(ct);
+                await using var tx = await conn.BeginTransactionAsync(ct);
+                await using (var cmd = new NpgsqlCommand(escalateSql, conn, tx))
+                {
+                    BindEscalateParams(cmd, ev);
+                    alarmId = (long?)await cmd.ExecuteScalarAsync(ct);
+                }
+                // RETURNING 空 = 没有可升级的开启行（已是 critical / 已闭合），无事件可通知；
+                // severity 只升不降保证同一行至多升级入队一次，不会重复触达
+                if (alarmId is not null)
+                    await EnqueueOutboxAsync(conn, tx, alarmId.Value, "trigger", ev, match, ct);
+                await tx.CommitAsync(ct);
+            }
+
+            _logger.LogWarning("告警升级 bolt={Bolt} type={Type} severity={Sev} alarmId={Id} notify={Channels}",
+                ev.BoltId, ev.Type, ev.Severity, alarmId, alarmId is not null && ev.Severity == "critical" ? match?.ChannelIds.Count ?? 0 : 0);
         }
         else // Clear
         {
@@ -142,6 +164,9 @@ public sealed class PostgresAlarmSink : IAlarmSink
         // 去重补写（C1，WAL 重放兜底）：同 (bolt_id, type) 已有未闭合告警则跳过；
         // 用 INSERT ... SELECT ... WHERE NOT EXISTS 做幂等插入，避免重放多条越限测量刷重复告警。
         // 补发的告警恰恰是断网窗口里漏掉的，同样入发件箱通知。
+        // 【有意不查 alarm_shelvings】：与在线路径（PostgresMeasurementSink 触发前查抑制）口径不同，
+        // 是权衡后的取舍——本方法只补最高危的 critical（脱落/严重越限），发生在"DB 故障窗 + 维护窗"
+        // 双重叠加的极端场景；宁可多补一条可人工闭合的告警，也不为尊重抑制而漏掉真实脱落。
         const string sql = @"
             INSERT INTO alarms (
                 bolt_id, channel_id, type, severity, triggered_at,
@@ -221,6 +246,15 @@ public sealed class PostgresAlarmSink : IAlarmSink
     {
         cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, ev.BoltId);
         cmd.Parameters.AddWithValue("type", NpgsqlDbType.Varchar, ev.Type);
+        cmd.Parameters.AddWithValue("ts", NpgsqlDbType.TimestampTz, ev.Ts);
+    }
+
+    private static void BindEscalateParams(NpgsqlCommand cmd, AlarmEvent ev)
+    {
+        cmd.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, ev.BoltId);
+        cmd.Parameters.AddWithValue("type", NpgsqlDbType.Varchar, ev.Type);
+        cmd.Parameters.AddWithValue("sev", NpgsqlDbType.Varchar, ev.Severity);
+        cmd.Parameters.AddWithValue("msg", NpgsqlDbType.Text, (object?)ev.Message ?? DBNull.Value);
         cmd.Parameters.AddWithValue("ts", NpgsqlDbType.TimestampTz, ev.Ts);
     }
 

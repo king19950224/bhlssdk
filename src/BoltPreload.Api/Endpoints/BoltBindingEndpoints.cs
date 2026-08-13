@@ -375,7 +375,8 @@ public static class BoltBindingEndpoints
                            echo_time_ns, delta_tof_ns, sp_temp_c, COALESCE(gain, 0), status_code,
                            wave_blob_url, 'phase1:raw:backfilled'
                     FROM unbound_measurements
-                    WHERE channel_id = @channel_id
+                    -- 负状态码异常帧不进 measurements（四处回填同构，表约定见 0001）
+                    WHERE channel_id = @channel_id AND status_code >= 0
                     ON CONFLICT (channel_id, ts) DO NOTHING", conn, tx);
                 cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
                 cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, toChannelId);

@@ -133,7 +133,12 @@ function goTile(to: string, query?: Record<string, string>) {
   router.push(query ? { name: to, query } : { name: to })
 }
 
+// in-flight 守卫：preload-health/trend 是重聚合，DB 变慢时 30s 轮询 + 推送节流会叠发同款查询,
+// 越慢越叠、越叠越慢。上一发未回就跳过本发（BigScreen 同款约定）。
+let refreshing = false
 async function refresh() {
+  if (refreshing) return
+  refreshing = true
   try {
     // 趋势是较重聚合，挂了不拖整页；失败记到 trendError，别显示成"暂无数据"
     const [d, t] = await Promise.all([
@@ -160,6 +165,7 @@ async function refresh() {
     if (disposed) return
     error.value = e instanceof Error ? e.message : '加载失败'
   } finally {
+    refreshing = false
     if (!disposed) { loaded.value = true; firstLoad.value = false }
   }
 }

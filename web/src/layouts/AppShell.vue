@@ -187,8 +187,9 @@ onMounted(() => {
   runtime.start()
   refresh()
   checkReady()
-  // 告警角标 30s 轮询作为 SignalR 的兜底（实时推送为主，断线时仍能慢刷新）
-  timer = window.setInterval(refresh, 30000)
+  // 告警角标 30s 轮询作为 SignalR 的兜底（实时推送为主，断线时仍能慢刷新）。
+  // 后台标签页暂停（与本页其余轮询、各页面轮询同一约定）：多标签常开时省一路无人看的请求
+  timer = window.setInterval(() => { if (!document.hidden) refresh() }, 30000)
   // 降级横幅 15s 一查：降级窗口内每一分钟都可能在漏报，检测延迟要压在告警周期以内
   readyTimer = window.setInterval(() => { if (!document.hidden) checkReady() }, 15000)
   // 实时推送：连上 Hub；收到告警立即刷新顶栏角标，不再纯靠轮询

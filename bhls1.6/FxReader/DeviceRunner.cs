@@ -617,6 +617,6 @@ sealed class DeviceRunner : IDisposable
         };
     }
 
-    // runner 跟进程同生共死，这里只是把命令锁按规矩收掉
+    // runner 跟进程一起存在，这里只是把命令锁按规矩收掉
     public void Dispose() => _commandLock.Dispose();
 }

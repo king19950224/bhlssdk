@@ -70,9 +70,12 @@ public static class DashboardEndpoints
                     LEFT JOIN cal ON cal.bolt_id = m.bolt_id
                     -- 拟合窗口夹到“上次标定 + 2h 沉降期”之后：避免跨标定边界（基线/kL 变化造成的台阶）
                     -- 与新标定后嵌入松弛瞬态污染斜率；刚标定不久（历史不足）自然被下面的门挡掉。
+                    -- 谓词必须保留独立的 ts >= 常量项：TimescaleDB 无法从 GREATEST(常量, join列) 推导
+                    -- 时间下界，chunk 排除失效后本查询会扫全部（含已压缩）chunk——数据积累数月后
+                    -- 这条被总览/大屏每 5s 驱动的查询会把 DB 打满。语义与 GREATEST 完全等价。
                     WHERE m.preload_n IS NOT NULL
-                      AND m.ts >= GREATEST(now() - interval '7 days',
-                                           COALESCE(cal.calibrated_at + interval '2 hours', now() - interval '7 days'))
+                      AND m.ts >= now() - interval '7 days'
+                      AND m.ts >= COALESCE(cal.calibrated_at + interval '2 hours', now() - interval '7 days')
                     GROUP BY m.bolt_id
                     -- 质量门：≥30 样本、跨度≥24h（按天外推才有意义）、R²≥0.5（确为线性下降而非抖动），杜绝几分钟数据外推出的垃圾天数
                     HAVING count(*) >= 30

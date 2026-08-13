@@ -30,6 +30,9 @@ public static class AssetEndpoints
                      -- 归 uncalibrated（前端文案'未标定/过期'）。不加这一档时，过期后到下一条测量间
                      -- 会拿旧 preload 继续判 normal（假安全窗口）、之后又落进 nodata 误导排查方向。
                      WHEN acr.expires_at IS NOT NULL AND (now() AT TIME ZONE 'UTC')::date > acr.expires_at THEN 'uncalibrated'
+                     -- passed=false（如扭矩拟合 R² 已应用未达标）：热路径拒算预紧力，该通道读数恒为空——
+                     -- 不归 uncalibrated 的话会落进 nodata，现场往探头/信号方向白排障（与 /api/bolts 口径一致）
+                     WHEN acr.passed IS NOT TRUE THEN 'uncalibrated'
                      WHEN l.preload_n IS NULL OR l.ts < now() - interval '10 minutes' THEN 'nodata'
                      WHEN b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n THEN 'loose'
                      WHEN b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n * 1.1 THEN 'warn'
@@ -409,7 +412,8 @@ public static class AssetEndpoints
                            echo_time_ns, delta_tof_ns, sp_temp_c, COALESCE(gain, 0), status_code,
                            wave_blob_url, 'phase1:raw:backfilled'
                     FROM unbound_measurements
-                    WHERE channel_id = @channel_id
+                    -- 负状态码（probe-scan 期间落库的异常帧）按 0001 表约定不进 measurements（四处回填同构）
+                    WHERE channel_id = @channel_id AND status_code >= 0
                     ON CONFLICT (channel_id, ts) DO NOTHING", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);

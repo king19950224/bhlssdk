@@ -236,6 +236,9 @@ public sealed class BoltAutoEnroller
         }
 
         // ---------- 暂存回填（与点位表导入同构：测量迁入 + 波形特征归属 + 清空暂存） ----------
+        // status_code >= 0 过滤：负码（probe-scan 期间落库的信号异常帧）按 0001 表约定只进
+        // measurement_anomalies，原样搬进 measurements 会让"近期测量"列表混入异常帧、
+        // 通道健康的 echoRate 分母被污染。负码暂存行随后续 DELETE 一并清掉，不留残余。
         long backfilled;
         await using (var cmd = new NpgsqlCommand(@"
             INSERT INTO measurements (
@@ -246,7 +249,7 @@ public sealed class BoltAutoEnroller
                    echo_time_ns, delta_tof_ns, sp_temp_c, COALESCE(gain, 0), status_code,
                    wave_blob_url, 'phase1:raw:backfilled'
             FROM unbound_measurements
-            WHERE channel_id = @channel_id
+            WHERE channel_id = @channel_id AND status_code >= 0
             ON CONFLICT (channel_id, ts) DO NOTHING", conn, tx))
         {
             cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);

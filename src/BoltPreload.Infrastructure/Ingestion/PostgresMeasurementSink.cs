@@ -268,7 +268,9 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         decimal? PreloadN,
         decimal? PreloadRatio,
         decimal? UncertaintyN,
-        decimal DeltaTofNs,
+        // 可空：SDK 没给 DeltaTof 且本地没算（标定过期/未达标/未标定路径）时列里落 NULL——
+        // 强转 0 会把"没有数据"伪装成"位移为零"，事后按 delta_tof 追溯基线漂移会被假零值误导
+        decimal? DeltaTofNs,
         string AlgoVersion,
         Guid? CalibrationId,
         decimal? RawPreloadN = null,
@@ -317,13 +319,13 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
             // 仍保留原始 echo/温度入库，但 preload_n/ratio 置空、algo_version 标记 calibration_expired，
             // 供审计回放与前端灰显；preload 为空 → 不会据此触发预紧力告警。
             if (route.Calibration.IsExpiredAsOf(DateTime.UtcNow))
-                return new(null, null, null, cr.DeltaTofNs ?? 0m,
+                return new(null, null, null, cr.DeltaTofNs,
                     $"phase1:calibration_expired:{route.Calibration.CalibrationId}", route.Calibration.CalibrationId);
 
             // 标定未达合格线（passed=false，例如 torque_fit R² 落在 [0.95,0.98) 临时可用层）：
             // 与过期一样不得当"正式"预紧力监测值；保留原始 echo/温度，preload 置空 + 专门 algo_version 供审计/灰显。
             if (!route.Calibration.Passed)
-                return new(null, null, null, cr.DeltaTofNs ?? 0m,
+                return new(null, null, null, cr.DeltaTofNs,
                     $"phase1:calibration_not_passed:{route.Calibration.CalibrationId}", route.Calibration.CalibrationId);
 
             // 多点拟合（如 torque_fit）会带截距 b：Δt = K_L * F + b。
@@ -422,8 +424,8 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         }
 
         // 未标定通道不计算 preload_n，避免把 "0N" 当成真实预紧力。
-        // SDK 如果有 ChannelConfig.RefTime/RefTemp，会给 DeltaTofNs；这里保留它。
-        return new(null, null, null, cr.DeltaTofNs ?? 0m, "phase1:raw:uncalibrated", null);
+        // SDK 如果有 ChannelConfig.RefTime/RefTemp，会给 DeltaTofNs；这里保留它（没有就落 NULL）。
+        return new(null, null, null, cr.DeltaTofNs, "phase1:raw:uncalibrated", null);
     }
 
     private async Task WriteMeasurementAsync(ChannelRoute route, FxDecodedEnvelope envelope, FxChannelResultDto cr, bool evaluateAlarms, CancellationToken ct)
@@ -868,16 +870,34 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
         var critical = _alarmEvaluator.EvaluateCriticalStateless(input);
         if (critical is null) return;
 
-        try
+        // 有限重试而非一次失败即弃：measurement 本体此刻已成功入库，WAL 文件随之删除，
+        // 这条补判没有"下次重放再来"的机会——而告警补写失败的典型原因恰是 DB 抖动
+        //（正是安全网要覆盖的场景），等几百毫秒再试大概率能成。仍失败只能记 Error 放弃：
+        // 不能重抛（重抛会让整个 WAL 文件重放，measurements 无唯一键会重复入库）。
+        var delays = new[] { TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(800), TimeSpan.FromSeconds(3) };
+        for (var attempt = 0; ; attempt++)
         {
-            var inserted = await _alarmSink.PersistCriticalIfAbsentAsync(critical, ct);
-            if (inserted && _alarmPublisher is not null)
-                _ = SafePublishAlarmAsync(critical, ct);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "WAL 重放兜底补发 critical 告警失败 bolt={Bolt} type={Type}", critical.BoltId, critical.Type);
+            try
+            {
+                var inserted = await _alarmSink.PersistCriticalIfAbsentAsync(critical, ct);
+                if (inserted && _alarmPublisher is not null)
+                    _ = SafePublishAlarmAsync(critical, ct);
+                return;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) when (attempt < delays.Length)
+            {
+                _logger.LogWarning(ex, "WAL 重放兜底补发 critical 告警失败，第 {Attempt} 次重试 bolt={Bolt} type={Type}",
+                    attempt + 1, critical.BoltId, critical.Type);
+                await Task.Delay(delays[attempt], ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "WAL 重放兜底补发 critical 告警在 {Retries} 次重试后仍失败，该样本的补判永久放弃（请人工核对告警中心）bolt={Bolt} type={Type}",
+                    delays.Length, critical.BoltId, critical.Type);
+                return;
+            }
         }
     }
 

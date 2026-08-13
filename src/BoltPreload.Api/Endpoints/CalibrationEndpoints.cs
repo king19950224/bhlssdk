@@ -46,7 +46,9 @@ public static class CalibrationEndpoints
                     cr.method,
                     COUNT(*) AS total,
                     COUNT(*) FILTER (WHERE cr.superseded_by IS NULL AND cr.review_state IN ('approved','self_signed')) AS active_count,
-                    COUNT(*) FILTER (WHERE cr.expires_at < CURRENT_DATE) AS expired_count,
+                    -- UTC 日粒度：与热路径 IsExpiredAsOf / bolt_status CTE 同口径。CURRENT_DATE 按会话时区，
+                    -- 本地 00:00~08:00 间会与其余三处的过期判定差一天
+                    COUNT(*) FILTER (WHERE cr.expires_at < (now() AT TIME ZONE 'UTC')::date) AS expired_count,
                     ROUND(AVG(cr.r_squared), 4) AS avg_r2
                 FROM calibration_records cr
                 JOIN bolts b ON b.id = cr.bolt_id AND b.deleted_at IS NULL
@@ -1482,8 +1484,9 @@ public static class CalibrationEndpoints
                     UPDATE calibration_records
                        SET reviewer_user_id = @rev, reviewer_signature_at = now(), review_state = 'approved',
                            -- 有效期从【激活(会签)】起算：pending 审核期间不消耗有效期
-                           --（原按提交时刻固定,久审后的标定一激活就快到期）
-                           expires_at = CURRENT_DATE + (expires_at - created_at::date)
+                           --（原按提交时刻固定,久审后的标定一激活就快到期）。
+                           -- 起算日用 UTC 日粒度，与过期判定三处（热路径/CTE/bolts API）同口径
+                           expires_at = (now() AT TIME ZONE 'UTC')::date + (expires_at - created_at::date)
                      WHERE id = @id", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("rev", NpgsqlDbType.Bigint, reviewerId);

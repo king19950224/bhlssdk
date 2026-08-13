@@ -69,6 +69,18 @@ public static class JwtAuthExtensions
                 // 代价：每个携带 JWT 的请求多一次按主键查询；监测系统 QPS 不高可接受，必要时可加短 TTL 缓存。
                 opts.Events = new JwtBearerEvents
                 {
+                    // SignalR 的浏览器端在 WebSocket/SSE 传输下无法带 Authorization 头，JWT 走
+                    // ?access_token= 查询串——不在这里接住的话，WS/SSE 升级请求恒 401，
+                    // 客户端会静默降级到 LongPolling（指示灯照样显示"已连接"，没人会发现），
+                    // 每客户端的 HTTP 请求量放大几十倍。只对 /hubs 前缀生效，普通 API 不接受 query 令牌。
+                    OnMessageReceived = ctx =>
+                    {
+                        var accessToken = ctx.Request.Query["access_token"];
+                        if (!string.IsNullOrEmpty(accessToken)
+                            && ctx.HttpContext.Request.Path.StartsWithSegments("/hubs"))
+                            ctx.Token = accessToken;
+                        return Task.CompletedTask;
+                    },
                     OnTokenValidated = async ctx =>
                     {
                         var principal = ctx.Principal;

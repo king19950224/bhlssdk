@@ -183,7 +183,10 @@ builder.Services.AddSingleton<INotificationTransport, WebhookNotificationTranspo
 builder.Services.AddSingleton<NotificationDispatcher>();
 builder.Services.AddHostedService<NotificationDispatcherService>();
 builder.Services.AddHttpClient(WebhookNotificationTransport.HttpClientName,
-    c => c.Timeout = TimeSpan.FromSeconds(10));
+        c => c.Timeout = TimeSpan.FromSeconds(10))
+    // 禁自动重定向：SSRF 校验（WebhookUrlGuard）只看配置的原始 URL，AllowAutoRedirect 默认开着的话，
+    // 一个通过校验的公网地址可以 302 到内网/元数据地址，重定向目标不再经过守卫
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
 
 // 系统自身故障的判定与外发。
 // 上面那条通知链的出口是 notification_outbox，而发件箱在库里——库一挂，告警写不进 alarms、
@@ -414,13 +417,18 @@ app.MapGet("/api/health/ready", async (
 
     // 6) 入库延迟：取近 1 小时 measurements 上 max(ingested_at) 距现在的秒数。
     //    与 maxIdleSeconds（设备信封空闲）互补——前者看“库里最新一条多久前进了”，后者看“设备多久没说话”。
+    //    窗口谓词必须落在分区列 ts 上：ingested_at 既非分区列也无索引，按它过滤等于全表
+    //    （含压缩 chunk）扫描，而这条查询被每个页面的 15s 探针驱动，数据积累数月后必然拖垮 DB。
+    //    ts 与 ingested_at 现场只差毫秒级摄取延迟，用 ts>now()-2h 圈 chunk、窗内再取 max(ingested_at)，
+    //    语义不变（正常运行时两者同窗；仅在停摆 >2h 后 lag 显示为 null，而那种停摆由 maxIdle/degrade 兜住）。
     double? ingestLagSeconds = null;
     try
     {
         await using var lagCmd = ds.CreateCommand(@"
             SELECT EXTRACT(EPOCH FROM (now() - max(ingested_at)))::double precision
             FROM measurements
-            WHERE ingested_at > now() - interval '1 hour'");
+            WHERE ts > now() - interval '2 hours'
+              AND ingested_at > now() - interval '1 hour'");
         var lagObj = await lagCmd.ExecuteScalarAsync(ct);
         if (lagObj is not null && lagObj != DBNull.Value)
             ingestLagSeconds = Math.Round(Convert.ToDouble(lagObj), 1);

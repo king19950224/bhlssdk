@@ -13,6 +13,21 @@
 --      → K_L = 68.1ns / 50000N = 1.362e-3 ns/N，不确定度按扭矩法惯例 30%；
 --      设备上线后应按阶梯向导重做正式标定替换（本记录 7 天过期兜底）。
 --   全部操作留审计（audit_log，user_id=1 管理员，note 标明 [运维直改]）。
+--
+-- 【执行前确认】
+--   a) SELECT id, username FROM users WHERE id = 1;  -- 审计与标定记录的 FK，必须存在
+--   b) SELECT channel_no, active_calibration_id FROM channels
+--      WHERE device_id = 1 AND channel_no IN (1,2,3,8) AND deleted_at IS NULL;
+--      -- CH1/2/8 的 active 应仍指向下面三条坏标定 UUID（第 1 段的 UPDATE 带了指向核验，
+--      -- 已被重标的通道会自动跳过，不会误清新标定）；CH3 记录旧值备查。
+-- 【执行后必做】
+--   c) 服务在运行则调 POST /api/diagnostics/cache-stats/reset（reviewer+）或重启服务——
+--      标定路由缓存 TTL 5 分钟，纯 SQL 直改不失效缓存，期间 CH1/2/8 仍按已作废 K_L 出虚高读数；
+--   d) CH3 若跑自动法（meas_mode=0）：本脚本只改 ref_time_ns/ref_temp_c，不动 0031 的锚点组
+--      （ref_env_time_ns/ref_period_ns/ref_echo_wave），上线后请对 CH3 重新执行一次置零
+--      （recalibrate），恢复"锚点与基线同帧配对"的不变量；
+--   e) 核对脚本末尾第 3 段验证输出：CH1/2/8 的 has_active 应为 f、CH3 为 t，
+--      review_state 计数中 rejected 应比执行前 +3。
 -- ============================================================================
 
 BEGIN;
@@ -28,15 +43,22 @@ WHERE id IN (
     'a976e5ed-5873-4ac0-8569-a3a028f3ad19'   -- 通道1-8号螺栓 K_L=2.9e-4
 );
 
-UPDATE channels SET
-    k_l = NULL, k_l_uncertainty = NULL, k_l_intercept_ns = NULL,
-    active_calibration_id = NULL, updated_at = now()
-WHERE device_id = 1 AND channel_no IN (1, 2, 8) AND deleted_at IS NULL;
-
+-- 清通道标定列时核验 active 指向：脚本落笔到执行之间若有人对这三路重新标定，
+-- 无条件按通道号清列会把新的好标定连带清掉；bolts.state 只对"确实被本脚本清过"的通道回退。
+WITH cleared AS (
+    UPDATE channels SET
+        k_l = NULL, k_l_uncertainty = NULL, k_l_intercept_ns = NULL,
+        active_calibration_id = NULL, updated_at = now()
+    WHERE device_id = 1 AND channel_no IN (1, 2, 8) AND deleted_at IS NULL
+      AND active_calibration_id IN (
+          '443d1dc1-69d6-40a8-b9be-1ecb4a5b30a0',
+          '32a2e6ce-2f61-44a7-8110-bac213ac9fc2',
+          'a976e5ed-5873-4ac0-8569-a3a028f3ad19')
+    RETURNING id
+)
 UPDATE bolts b SET state = 'uncalibrated', updated_at = now()
-FROM channels c
-WHERE c.id = b.channel_id AND c.device_id = 1 AND c.channel_no IN (1, 2, 8)
-  AND b.deleted_at IS NULL;
+FROM cleared c
+WHERE c.id = b.channel_id AND b.deleted_at IS NULL;
 
 INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
 SELECT 1, 'calibration_revoke', 'channel', c.id,
@@ -72,9 +94,12 @@ WITH new_calib AS (
     RETURNING id, bolt_id
 ),
 supersede AS (
+    -- 只顶替已生效的记录（与 API 口径一致，CalibrationEndpoints 同款）：
+    -- pending（提交待会签）的正式标定不动，避免把在审记录悄悄顶掉
     UPDATE calibration_records cr SET superseded_by = nc.id
     FROM new_calib nc
     WHERE cr.bolt_id = nc.bolt_id AND cr.id <> nc.id AND cr.superseded_by IS NULL
+      AND cr.review_state IN ('approved', 'self_signed')
     RETURNING cr.id
 ),
 upd_channel AS (
