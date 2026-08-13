@@ -147,7 +147,6 @@ public sealed class TimeSyncService : BackgroundService
         foreach (var rt in _manager.Runtimes)
         {
             if (ct.IsCancellationRequested) return;
-            if (!string.Equals(rt.Options.Mode, "Real", StringComparison.OrdinalIgnoreCase)) continue;
             if (rt.Connector.State != FxConnectorState.Connected) continue;
             if (_probeScan.IsRunning(rt.DeviceId)) continue;
 

@@ -88,7 +88,6 @@ public sealed class DeviceLifecycleIntegrationTests
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
             {
-                ["Fx:Mode"] = "Real",
                 ["Fx:Real:DeviceId"] = firstId.ToString(),
             })
             .Build();
@@ -138,7 +137,8 @@ public sealed class DeviceLifecycleIntegrationTests
         using var factory = TestApi.CreateFactory(_fx);
         using var client = TestApi.AuthedClient(factory, adminId, "admin");
 
-        // 新增：插行 + 建全通道目录（TestApi 是 Simulated，运行时不挂，仅落库）。
+        // 新增：插行 + 建全通道目录 + 热加运行时（只建不连，连接由 IngestionService 对账拉起，
+        // 而 TestApi 已把后台服务全拔了，所以这里不会真去拨号）。
         // 夹具库有一堆别的测试播的项目，多项目环境必须显式给 projectId
         long projectId;
         await using (var p = _fx.DataSource.CreateCommand(
@@ -158,7 +158,7 @@ public sealed class DeviceLifecycleIntegrationTests
         create.StatusCode.Should().Be(HttpStatusCode.OK);
         var created = await create.Content.ReadFromJsonAsync<JsonElement>();
         var deviceId = created.GetProperty("id").GetInt64();
-        created.GetProperty("runtimeAttached").GetBoolean().Should().BeFalse("Simulated 模式不热加运行时");
+        created.GetProperty("runtimeAttached").GetBoolean().Should().BeTrue("新建设备应热加运行时，不必重启进程");
         (await ScalarAsync<long>("SELECT count(*) FROM channels WHERE device_id = @arg AND deleted_at IS NULL", deviceId))
             .Should().Be(4, "通道目录一次建全");
 
@@ -351,7 +351,7 @@ public sealed class DeviceLifecycleIntegrationTests
             lock (_gate)
                 _map[connector.DeviceId] = new DeviceRuntimeContext(
                     connector.DeviceId, $"fake-{connector.DeviceId}", _map.Count == 0, connector,
-                    new IngestionRuntimeStatus(), new DeviceRuntimeOptions("Sim", "n/a", 1, 1, 3, 3));
+                    new IngestionRuntimeStatus(), new DeviceRuntimeOptions("n/a", 1, 1, 3, 3));
         }
 
         public void Remove(long deviceId)

@@ -188,7 +188,7 @@ public sealed class ChannelAcceptanceIntegrationTests
         _fx.EnsureAvailable();
         var seed = await _fx.SeedCalibratableChannelAsync("验收会话");
 
-        using var factory = TestApi.CreateFactory(_fx);
+        using var factory = await TestApi.CreateFactoryWithDeviceOutOfRuntimeAsync(_fx, seed.DeviceId);
         using var reviewer = TestApi.AuthedClient(factory, await _fx.SeedUserAsync("reviewer"), "reviewer");
 
         var url = $"/api/devices/{seed.DeviceId}/acceptance-session";

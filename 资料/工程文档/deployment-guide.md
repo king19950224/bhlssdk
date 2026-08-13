@@ -47,7 +47,7 @@ dotnet publish src/BoltPreload.Api/BoltPreload.Api.csproj -c Release -r win-x64 
 
 反向自检同样重要：`out/appsettings.Development.json` **必须不存在**（csproj 已设 `CopyToPublishDirectory=Never`）。
 该文件含开发库口令、开发 JWT 密钥，且 `AllowMissingLicenseInDevelopment=true`——一旦随包发出，现场把
-`ASPNETCORE_ENVIRONMENT` 改成 `Development` 就能绕过授权校验并跑起仿真模式。发现它出现在 `out/` 就别发货。
+`ASPNETCORE_ENVIRONMENT` 改成 `Development` 就能绕过授权校验。发现它出现在 `out/` 就别发货。
 
 另需一并带到现场：`deploy/sql/0*.sql`（全部迁移）、`deploy/windows/*.ps1`、签好的 `license.json`。
 
@@ -148,7 +148,7 @@ dotnet run --project tools/LicenseSigner -- verify \
 | `Jwt__SigningKey` | **是**，≥32 字节随机，建议 64 | 非 Development 下启动即失败并提示（已实测） |
 | `BoltPreload__BootstrapAdminPassword` | **首装必需** | 空库里没有任何用户，而建账号接口要求 admin 鉴权 → 401，**没人能登录，系统装完打不开**。首个管理员建好后即可移除该变量 |
 | `License__PublicKeyPem` | **是** | 授权判无效 → 全部写操作 403（见 §4） |
-| `Fx__Mode` | 建议显式设 `Real` | 未设时按 `Real` 兜底并告警；若在 Production 环境显式配成 `Simulated`，服务直接拒绝启动（仿真数据不允许出现在现场，这是硬防线不是告警） |
+| `Fx__Mode` | **不要设**（已废弃） | 设备模拟器已整体移除，只剩真机一条路。设成 `Real` 无害但多余；设成 `Simulated` 或其它值服务直接拒绝启动（配置与实际跑的不是一回事，本身就是故障源，这是硬防线不是告警） |
 | `ASPNETCORE_URLS` | 建议 | 默认监听 5000，保持 `http://127.0.0.1:5000`。**改成 `0.0.0.0`、`*` 或具体 IP 的明文地址会直接拒绝启动**（见下方 HTTPS 一节），局域网访问一律走 `setup-https.ps1` 配出来的 HTTPS 端口 |
 | `Ingestion__WaveSampling__Enabled` | 视需要 | 默认 `false`。真机 MultiMeas 模式不随测量带波形，**不开启则波形诊断页和 A-Scan 没有数据源** |
 | `Notifications__SystemAlert__Enabled` 与 `__WebhookUrl` | **无人值守必需** | 不配则系统自身故障（库不可达、入库持续失败、缓存满丢数、后台服务失联、磁盘不足）只写日志和界面横幅，值班收不到任何消息。详见 §7.3 |

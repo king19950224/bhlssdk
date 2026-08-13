@@ -1,7 +1,7 @@
 # 真机通道标定 / 重标定现场指南
 
 > 目的：把"真机已接入、在测原始声时"变成"算得出**可信预紧力**"。
-> 适用：`Fx:Mode=Real` 的现场设备。所有标定写操作要求 **reviewer+** 权限（登录账号角色为 `reviewer` 或 `admin`）。
+> 适用：已接入的现场设备（设备接入只有真机一条路）。所有标定写操作要求 **reviewer+** 权限（登录账号角色为 `reviewer` 或 `admin`）。
 
 ## 1. 原理：每个测量通道需要两样东西
 
@@ -143,5 +143,6 @@ curl -s -XPOST $BASE/api/channels/<channelId>/apply-torque-fit \
 3. **重标定的前提是已知载荷状态**：基线必须在螺栓自由/零载（或已知力矩）时取，否则后续全部 ΔTOF 失真。
 
 > 提醒：仿真时代遗留的标定（`sim_baseline` / 过期 torque）对真机无效，接真机后须按本指南对真实螺栓重新标定。
+> 设备模拟器已整体移除，存量 `sim_baseline` 记录用 `deploy/scripts/20260813-purge-sim-baseline.sql` 清理。
 > 某台机器某一时刻的通道标定现状不记在这份指南里——那类快照写完就失真，要看当下状态查
 > `GET /api/channels` 与 `GET /api/dashboard/summary`，历史快照见 site-debug 系列排障文档。

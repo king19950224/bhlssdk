@@ -97,11 +97,10 @@ internal sealed class FakeDeviceManager : IDeviceConnectorManager
 {
     private DeviceRuntimeContext _ctx;
 
-    /// <param name="mode">运行模式。真机路径专有的逻辑（如波形主动采集）只对 <c>Real</c> 生效。</param>
     /// <param name="model">设备型号。MCR 多通道轮询只有 model=3 支持。</param>
     /// <param name="channelCount">物理通道数。0 表示没有这项信息（老配置路径）。</param>
     public FakeDeviceManager(
-        IFxConnector connector, string mode = "Sim", ushort model = 3, ushort channelCount = 0)
+        IFxConnector connector, ushort model = 3, ushort channelCount = 0)
     {
         _ctx = new DeviceRuntimeContext(
             DeviceId: connector.DeviceId,
@@ -109,7 +108,7 @@ internal sealed class FakeDeviceManager : IDeviceConnectorManager
             IsPrimary: true,
             Connector: connector,
             RuntimeStatus: new IngestionRuntimeStatus(),
-            Options: new DeviceRuntimeOptions(mode, "n/a", 1, 1, model, channelCount));
+            Options: new DeviceRuntimeOptions("n/a", 1, 1, model, channelCount));
     }
 
     public IReadOnlyCollection<DeviceRuntimeContext> Runtimes => [_ctx];

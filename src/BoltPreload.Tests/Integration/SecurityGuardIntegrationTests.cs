@@ -252,7 +252,9 @@ public sealed class SecurityGuardIntegrationTests
         var operatorId = await SeedUserAsync("operator");
         var reviewerId = await SeedUserAsync("reviewer");
 
-        using var factory = TestApi.CreateFactory(_fx);
+        // 设备刻意留在运行时之外：本用例要断言的是"过了策略、到达业务分支"，
+        // 用 404（设备未加载）当到达业务层的证据，比构造一台连得上的设备便宜且稳定
+        using var factory = await TestApi.CreateFactoryWithDeviceOutOfRuntimeAsync(_fx, s.DeviceId);
 
         using (var op = TestApi.AuthedClient(factory, operatorId, "operator"))
         {
@@ -263,8 +265,7 @@ public sealed class SecurityGuardIntegrationTests
 
         using (var rev = TestApi.AuthedClient(factory, reviewerId, "reviewer"))
         {
-            // 测试环境不跑后台服务，设备不在运行时：reviewer 应通过鉴权、走到业务分支（未标定通道 → 设备未加载 404），
-            // 而不是被策略挡在门外（403）。
+            // reviewer 应通过鉴权、走到业务分支（设备未加载 404），而不是被策略挡在门外（403）。
             var resp = await rev.PostAsJsonAsync(
                 $"/api/devices/{s.DeviceId}/diagnostic/configure-channel/9/commission", new { gain = 20 });
             resp.StatusCode.Should().Be(HttpStatusCode.NotFound, "reviewer 过策略后应到达业务 404（设备未加载运行时）");

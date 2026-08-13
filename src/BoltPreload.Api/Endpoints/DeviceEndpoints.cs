@@ -152,7 +152,7 @@ public static class DeviceEndpoints
                 await tx.CommitAsync(ct);
             }
 
-            var (attached, runtimeNote) = await TryAddRuntimeAsync(manager, deviceId, ct);
+            var attached = await manager.AddAsync(deviceId, ct);
             LicenseCapacity.Reevaluate(manager, license, enforcement);
 
             return Results.Ok(new
@@ -160,7 +160,7 @@ public static class DeviceEndpoints
                 id = deviceId,
                 channelsCreated = req.ChannelCount,
                 runtimeAttached = attached,
-                note = runtimeNote ?? (attached ? "采集将在数秒内自动拉起（对账循环）" : null),
+                note = attached ? "采集将在数秒内自动拉起（对账循环）" : null,
             });
         })
         .WithName("CreateDevice")
@@ -285,23 +285,13 @@ public static class DeviceEndpoints
             {
                 primaryTransferred = manager.TransferPrimary(id);
                 if (!primaryTransferred)
-                    return Results.Conflict(new { error = "设备不在运行时中（禁用或 Simulated 模式），无法转移主设备", id });
+                    return Results.Conflict(new { error = "设备不在运行时中（已禁用或未启用），无法转移主设备", id });
             }
 
             var restarted = false;
-            string? note = null;
             if (connChanged && manager.Find(id) is not null)
-            {
-                try
-                {
-                    restarted = await manager.RestartAsync(id, StopTimeout, ct);
-                }
-                catch (NotSupportedException)
-                {
-                    note = "Simulated 模式：连接参数已落库，运行时不变";
-                }
-            }
-            return Results.Ok(new { id, updated = true, connChanged, restarted, primaryTransferred, note });
+                restarted = await manager.RestartAsync(id, StopTimeout, ct);
+            return Results.Ok(new { id, updated = true, connChanged, restarted, primaryTransferred });
         })
         .WithName("UpdateDevice")
         .WithSummary("改连接参数（在跑则热重启连接）；makePrimary=true 转移主设备（运行时概念，重启进程后按配置重选）");
@@ -360,9 +350,15 @@ public static class DeviceEndpoints
                 await tx.CommitAsync(ct);
             }
 
-            var (attached, runtimeNote) = await TryAddRuntimeAsync(manager, id, ct);
+            var attached = await manager.AddAsync(id, ct);
             LicenseCapacity.Reevaluate(manager, license, enforcement);
-            return Results.Ok(new { id, enabled = true, runtimeAttached = attached, note = runtimeNote });
+            return Results.Ok(new
+            {
+                id,
+                enabled = true,
+                runtimeAttached = attached,
+                note = attached ? "采集将在数秒内自动拉起（对账循环）" : null,
+            });
         })
         .WithName("EnableDevice")
         .WithSummary("启用设备（容量预检 + 热加运行时，采集数秒内自动拉起）");
@@ -432,21 +428,12 @@ public static class DeviceEndpoints
                 await tx.CommitAsync(ct);
             }
 
-            var taskStopped = true;
-            string? note = null;
-            try
-            {
-                await manager.RemoveAndStopAsync(id, StopTimeout, ct);
-                taskStopped = !registry.IsRunning(id);
-            }
-            catch (NotSupportedException)
-            {
-                note = "Simulated 模式：仅落库，运行时不变";
-            }
+            await manager.RemoveAndStopAsync(id, StopTimeout, ct);
+            var taskStopped = !registry.IsRunning(id);
 
             resolver.InvalidateDevice(id);
             LicenseCapacity.Reevaluate(manager, license, enforcement);
-            return Results.Ok(new { id, disabled = true, closedSignalLost, taskStopped, note });
+            return Results.Ok(new { id, disabled = true, closedSignalLost, taskStopped });
         })
         .WithName("DisableDevice")
         .WithSummary("禁用设备：停采集断 TCP、闭合名下 signal_lost、失效路由缓存、容量重估");
@@ -502,19 +489,6 @@ public static class DeviceEndpoints
     }
 
     // ==================================================================== helpers
-
-    private static async Task<(bool Attached, string? Note)> TryAddRuntimeAsync(
-        IDeviceConnectorManager manager, long deviceId, CancellationToken ct)
-    {
-        try
-        {
-            return (await manager.AddAsync(deviceId, ct), null);
-        }
-        catch (NotSupportedException)
-        {
-            return (false, "Simulated 模式：仅落库，运行时不变（模拟设备数量由 Fx:Simulator:DeviceCount 决定）");
-        }
-    }
 
     private static string? ValidateDeviceParams(string code, string commParams, int channelCount, int model, int commType, int address)
     {

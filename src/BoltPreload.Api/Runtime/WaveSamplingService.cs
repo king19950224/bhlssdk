@@ -30,8 +30,8 @@ public sealed class WaveSamplingOptions
 /// 回波经 PostgresMeasurementSink 落 <c>wave_features</c>，让 A-Scan / 相似度 / 主频诊断在真机上也有数据。
 /// </para>
 /// <para>
-/// 不打断 MultiMeas 监测（不切模式）；与探头扫描互斥（扫描中的设备跳过）；仅对 Real 模式设备采
-/// （模拟器自带波形，无需主动读）。<b>默认关闭</b>，现场接真机后按需开启
+/// 不打断 MultiMeas 监测（不切模式）；与探头扫描互斥（扫描中的设备跳过）；只对已连接的设备采。
+/// <b>默认关闭</b>，现场接真机后按需开启
 /// <c>Ingestion:WaveSampling:Enabled</c>。
 /// </para>
 /// </summary>
@@ -96,8 +96,7 @@ public sealed class WaveSamplingService : BackgroundService
         foreach (var rt in _manager.Runtimes)
         {
             if (ct.IsCancellationRequested) return;
-            // 仅真机采（模拟器自带波形）；未连接跳过；扫描中跳过（避免抢上行/工作模式）。
-            if (!string.Equals(rt.Options.Mode, "Real", StringComparison.OrdinalIgnoreCase)) continue;
+            // 未连接跳过；扫描中跳过（避免抢上行/工作模式）。
             if (rt.Connector.State != FxConnectorState.Connected) continue;
             if (_probeScan.IsRunning(rt.DeviceId)) continue;
 

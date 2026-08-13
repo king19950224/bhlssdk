@@ -25,6 +25,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Windows 控制台默认 GBK，报告里的 ✓ 和违规行里的生僻字会让 print 抛 UnicodeEncodeError，
+# 门禁跑不完就崩，看起来像"审计脚本坏了"而不是"代码有问题"。交付目标是 Windows 工控机，
+# 这条不是可选项。errors="replace" 保证个别不可映射字符只是显示成 ?，不影响退出码。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ---------------- 豁免清单(新增必须附理由) ----------------
 
 # G1:不扫描的目录
@@ -70,7 +77,9 @@ G4_WEB = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b|@ts-ignore|@ts-nocheck|eslint-di
 
 # 仓库文件索引要跳过的目录。资料/ 不全跳——只扫 资料/工程文档/（内部工程文档仍进 git）
 # payload 是安装包组包产物（gitignore 排除，含第三方 TimescaleDB SQL），不受本仓库文风约束
-INDEX_SKIP = {".git", "node_modules", "bin", "obj", "dist", "logs", "data", ".vs", ".idea", "payload"}
+# 厂家软件 是厂家上位机安装包与运行时（gitignore 排除，含压缩过的第三方 JS），同理不受约束
+INDEX_SKIP = {".git", "node_modules", "bin", "obj", "dist", "logs", "data", ".vs", ".idea",
+              "payload", "厂家软件"}
 INDEX_资料_ONLY = "工程文档"
 
 

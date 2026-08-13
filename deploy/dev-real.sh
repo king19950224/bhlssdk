@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# 真机联调整套栈一键起停：Postgres(docker) + API(:5085, Fx:Mode=Real) + 前端(:5173)
+# 真机联调整套栈一键起停：Postgres(docker) + API(:5085) + 前端(:5173)
 #
 # 前提：
 #   1. src/BoltPreload.Api/appsettings.Development.json 已存在（Real 模式 + 本地 PG +
@@ -28,7 +28,7 @@ case "${1:-status}" in
     for _ in $(seq 1 30); do [ "$(pg_health)" = healthy ] && break; sleep 2; done
     echo "      PG health=$(pg_health)"
 
-    echo "[2/3] API ($API_URL, Fx:Mode=Real) ..."
+    echo "[2/3] API ($API_URL) ..."
     ( cd "$ROOT" && ASPNETCORE_ENVIRONMENT=Development ASPNETCORE_URLS="$API_URL" \
         nohup dotnet run --no-launch-profile --project src/BoltPreload.Api >"$RUN/api.log" 2>&1 & echo $! >"$RUN/api.pid" )
 

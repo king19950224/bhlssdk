@@ -46,7 +46,7 @@ SELECT min(k_l), max(k_l), avg(k_l) FROM channels WHERE k_l IS NOT NULL;
 
 - 开 `Fx:DeveloperMode=true` 落 `logs/sdk-*.log` 原始帧，或参考 `bhls1.6/FxReader/RawWriter.cs` 的录制写法
 - 覆盖现场实际用到的每一种 `(meas_mode, threshold, probe_freq)` 组合，每组合至少几百帧、含温度变化时段
-- 这批帧是步骤 5 同源比对的唯一基准。`tools/FxDeviceSimulator` 是空壳、`SimulatedFxConnector` 绕过 SDK，都不能替代
+- 这批帧是步骤 5 同源比对的唯一基准。只有走真实解码器才算同源，任何绕过 SDK 直接造 DTO 的替身都不能替代（当时的进程内模拟器与 `tools/FxDeviceSimulator` 空壳后来都已整体移除）
 
 ---
 

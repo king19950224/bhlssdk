@@ -1,7 +1,6 @@
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Fx;
-using BoltPreload.Fx.Simulator;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 
@@ -10,9 +9,8 @@ namespace BoltPreload.Api.Runtime;
 /// <summary>
 /// 设备运行时管理器：统一构造/持有所有设备的连接器、运行状态。
 /// <para>
-/// Real 模式从 <c>devices</c> 表加载所有启用设备，逐个建运行时（多设备）；
+/// 从 <c>devices</c> 表加载所有启用设备，逐个建运行时（多设备）；
 /// 表为空或查询失败时回退到 <c>Fx:Real:*</c> 单设备配置（向后兼容）。
-/// Simulated 模式按 <c>Fx:Simulator:DeviceCount</c> 建 1..N 个进程内模拟设备（无硬件多设备测试用）。
 /// </para>
 /// <para>
 /// 所有业务/诊断服务必须经本管理器按 deviceId 解析连接器，禁止直接注入单例连接器，
@@ -26,7 +24,6 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
     private readonly object _gate = new();
     private readonly Dictionary<long, DeviceRuntimeContext> _runtimes;
     private long _primaryId;
-    private readonly bool _isSimulated;
     private readonly IConfiguration _configuration;
     private readonly NpgsqlDataSource _dataSource;
     private readonly ILoggerFactory _loggerFactory;
@@ -46,20 +43,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         _loggerFactory = loggerFactory;
         _registry = registry;
 
-        // 缺 Fx:Mode 时按 Real 兜底，不是 Simulated：模拟器会产出物理上自洽、看起来完全正常的预紧力，
-        // 现场若因配置丢失而静默跑成仿真，值班人员盯着的是假数据 —— 对安全监测系统这是最坏的失效方向。
-        // 退到 Real 时若没有可用设备配置，表现为"连不上/无数据"，是能被看见的失败。
-        var fxMode = configuration["Fx:Mode"];
-        if (string.IsNullOrWhiteSpace(fxMode))
-        {
-            fxMode = "Real";
-            log.LogWarning("未配置 Fx:Mode，按 Real（真机）兜底。若本机是开发/演示环境需显式设置 Fx:Mode=Simulated。");
-        }
-
-        _isSimulated = !string.Equals(fxMode, "Real", StringComparison.OrdinalIgnoreCase);
-        var runtimes = _isSimulated
-            ? BuildSimulatorRuntimes(configuration, loggerFactory, log)
-            : BuildRealRuntimes(configuration, dataSource, loggerFactory, log);
+        var runtimes = BuildRealRuntimes(configuration, dataSource, loggerFactory, log);
 
         if (runtimes.Count == 0)
             throw new InvalidOperationException("未构造出任何设备运行时：检查 devices 表或 Fx 配置。");
@@ -74,7 +58,7 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
         log.LogInformation("DeviceConnectorManager 载入 {Count} 个设备运行时：{List}",
             runtimes.Count,
             string.Join(", ", runtimes.Select(r =>
-                $"{r.DeviceId}/{r.Name}/{r.Options.Mode}{(r.IsPrimary ? "(primary)" : "")}")));
+                $"{r.DeviceId}/{r.Name}/{r.Options.CommunicationParameters}{(r.IsPrimary ? "(primary)" : "")}")));
     }
 
     public IReadOnlyCollection<DeviceRuntimeContext> Runtimes
@@ -119,9 +103,6 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
 
     public async Task<bool> AddAsync(long deviceId, CancellationToken ct = default)
     {
-        if (_isSimulated)
-            throw new NotSupportedException("Simulated 模式不支持热增删设备：模拟设备数量由 Fx:Simulator:DeviceCount 决定");
-
         lock (_gate)
         {
             if (_runtimes.ContainsKey(deviceId))
@@ -332,7 +313,6 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             Connector: connector,
             RuntimeStatus: new IngestionRuntimeStatus(),
             Options: new DeviceRuntimeOptions(
-                Mode: "Real",
                 CommunicationParameters: spec.CommParams,
                 Address: spec.Address,
                 TransferMode: spec.TransferMode,
@@ -372,7 +352,6 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
             Connector: connector,
             RuntimeStatus: new IngestionRuntimeStatus(),
             Options: new DeviceRuntimeOptions(
-                Mode: "Real",
                 CommunicationParameters: spec.CommParams,
                 Address: spec.Address,
                 TransferMode: spec.TransferMode,
@@ -451,51 +430,6 @@ public sealed class DeviceConnectorManager : IDeviceConnectorManager, IAsyncDisp
                 deviceId, fallback);
             return fallback;
         }
-    }
-
-    // ===================== Simulated（进程内模拟，可多设备） =====================
-
-    private static List<DeviceRuntimeContext> BuildSimulatorRuntimes(
-        IConfiguration configuration,
-        ILoggerFactory loggerFactory,
-        ILogger log)
-    {
-        var logger = loggerFactory.CreateLogger<SimulatedFxConnector>();
-        var baseDeviceId = configuration.GetValue<long>("Fx:Simulator:DeviceId", 1);
-        var address = configuration.GetValue<ushort>("Fx:Simulator:Address", 1);
-        var channelCount = configuration.GetValue<ushort>("Fx:Simulator:ChannelCount", 3);
-        var rate = configuration.GetValue<double>("Fx:Simulator:SamplingRateHz", 5);
-        var count = Math.Clamp(configuration.GetValue<int>("Fx:Simulator:DeviceCount", 1), 1, 50);
-
-        var list = new List<DeviceRuntimeContext>(count);
-        for (var i = 0; i < count; i++)
-        {
-            var deviceId = baseDeviceId + i;
-            var options = new SimulatorOptions(
-                DeviceId: deviceId,
-                Address: address,
-                ChannelCount: channelCount,
-                SamplingRateHz: rate);
-            var connector = new SimulatedFxConnector(options, logger);
-            list.Add(new DeviceRuntimeContext(
-                DeviceId: deviceId,
-                Name: $"Simulator-{deviceId}",
-                IsPrimary: i == 0,
-                Connector: connector,
-                RuntimeStatus: new IngestionRuntimeStatus(),
-                Options: new DeviceRuntimeOptions(
-                    Mode: "Simulated",
-                    CommunicationParameters: "in-process",
-                    Address: address,
-                    TransferMode: 1,
-                    Model: 3,
-                    ChannelCount: channelCount)));
-        }
-
-        if (count > 1)
-            log.LogInformation("多模拟器模式：{Count} 个模拟设备 deviceId={Base}..{Max}",
-                count, baseDeviceId, baseDeviceId + count - 1);
-        return list;
     }
 
     private sealed record DeviceRow(

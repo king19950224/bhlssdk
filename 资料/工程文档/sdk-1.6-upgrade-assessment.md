@@ -377,7 +377,7 @@ FxSDK -> bhls1.6\sdk16\FxSDK\bin\Release\net8.0\FxSDK.dll
 2. **搭离线重放 harness**。`src/BoltPreload.Tests/Fx/MultiChIotDecodeResyncTests.cs:21-32` 的 `FakeSession` + `Enqueue`/`TryDecode` 已经是现成写法，推广成“喂字节流、收 `DecodedResult`”即可
 3. 覆盖面要包含现场实际用到的每一种 `(meas_mode, threshold, probe_freq)` 组合
 
-当前 `tools/FxDeviceSimulator` 是空壳（`Program.cs:1-15` 只打印三行字），`SimulatedFxConnector` 完全绕过 SDK 直接产 DTO，两者都**不能**用于同源比对。
+当时的 `tools/FxDeviceSimulator` 是空壳（`Program.cs:1-15` 只打印三行字），进程内 `SimulatedFxConnector` 完全绕过 SDK 直接产 DTO，两者都**不能**用于同源比对——后来它们已随“移除模拟功能”一并删除。
 
 ### 阶段 B：适配与静态验证
 

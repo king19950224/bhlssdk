@@ -32,14 +32,20 @@ dotnet run
 
 浏览器开 <http://localhost:5000/swagger> 看 API 文档。
 
-要用模拟器产数据（无真机时），需在 `appsettings.Development.json` 里显式设 `Fx:Mode=Simulated` ——
-主配置 `appsettings.json` 的默认值是 `Real`，且缺该键时也按 `Real` 兜底（避免现场配置丢失时静默跑仿真、
-让值班人员盯着假数据）。设为 Simulated 后 `SimulatedFxConnector` 启动即产数据，5Hz × 12 通道
-（通道数见 `Fx:Simulator:ChannelCount`）。
+设备接入只有真机一条路。曾经有过一个进程内模拟器（`Fx:Mode=Simulated`），已整体移除：
+它出的假预紧力物理上自洽、界面上跟真数据一模一样，对安全监测系统来说这条路径本身就是风险。
+配置里若还残留 `Fx:Mode=Simulated`，进程会直接拒绝启动并告诉你删掉它。
 
-## 验证 Phase 1 里程碑
+**本机没有真机时**：`devices` 表照常建档、界面照常可点，但不会有实时数据流。
+要看有数据的界面，先跑 `deploy/sql/dev/` 下的种子脚本铺一批静态样本。
+要验证 SDK 解码链路本身，用 `src/BoltPreload.Tests/Fx/RawFrameReplay.cs` 重放真机录波帧。
 
-等 30 秒（让模拟器产数据），跑：
+接真机把 `appsettings.Development.json` 的 `Fx:Real:CommParams` 改成设备地址（如 `192.168.0.7:23`），
+或直接在 `devices` 表建行——表里有启用设备时以表为准，`Fx:Real:*` 只是空表时的单设备兜底。
+
+## 验证数据链路
+
+有真机或已铺种子数据后，跑：
 
 ```bash
 # 看入库总数（应该有几百条）
@@ -82,8 +88,9 @@ dotnet test BoltPreload.sln  # 直接跑测试
 
 ### "无法解析通道，丢弃数据" 日志
 
-`SimulatedFxConnector` 用的 `DeviceId=1`，需要数据库里有对应的 device 和通道目录（种子建 48 通道，
-螺栓不预插、由自动建档产生）。检查种子数据是否成功插入：
+测量上来了但落不进库，通常是设备/通道目录对不上：数据库里得有对应的 device 行与通道目录
+（种子建 48 通道，螺栓不预插、由自动建档产生），`devices.id` 要与实际采集的设备一致。
+检查种子数据是否成功插入：
 
 ```bash
 docker compose -f deploy/docker-compose.yml exec postgres \

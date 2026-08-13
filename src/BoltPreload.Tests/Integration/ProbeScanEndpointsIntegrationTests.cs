@@ -79,7 +79,7 @@ public sealed class ProbeScanEndpointsIntegrationTests
         _fx.EnsureAvailable();
         var seed = await _fx.SeedCalibratableChannelAsync("设备未加载");
 
-        using var factory = TestApi.CreateFactory(_fx);
+        using var factory = await TestApi.CreateFactoryWithDeviceOutOfRuntimeAsync(_fx, seed.DeviceId);
         using var client = TestApi.AuthedClient(factory, await _fx.SeedUserAsync("operator"), "operator");
 
         var resp = await StartAsync(client, seed.DeviceId, new { channels = new[] { 1, 2 } });

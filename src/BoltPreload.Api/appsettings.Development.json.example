@@ -3,9 +3,12 @@
   "ConnectionStrings": {
     "Postgres": "Host=localhost;Port=5432;Database=boltpreload;Username=boltpreload;Password=dev_only_NOT_for_production;Include Error Detail=true"
   },
+  "//Fx": "本机没有真机时：devices 表照常建档、界面照常可点，但不会有实时数据流（曾经的进程内模拟器已移除）。要看有数据的界面，先跑 deploy/sql/dev/ 下的种子脚本铺静态样本。接真机就改下面的 CommParams。",
   "Fx": {
-    "Mode": "Simulated",
-    "DeveloperMode": true
+    "DeveloperMode": true,
+    "Real": {
+      "CommParams": "192.168.0.7:23"
+    }
   },
   "License": {
     "AllowMissingLicenseInDevelopment": true,

@@ -15,7 +15,6 @@ using BoltPreload.Application.Realtime;
 using BoltPreload.Infrastructure.Alarm;
 using BoltPreload.Infrastructure.Notifications;
 using BoltPreload.Fx;
-using BoltPreload.Fx.Simulator;
 using BoltPreload.Infrastructure.Devices;
 using BoltPreload.Infrastructure.Devices.ProbeScan;
 using BoltPreload.Infrastructure.Ingestion;
@@ -31,16 +30,18 @@ var builder = WebApplication.CreateBuilder(args);
 var isDevelopment = builder.Environment.IsDevelopment();
 
 // ============================================================================
-// 仿真模式的生产防线，放在最前面，比任何配置校验都早
-// 模拟器只给开发和测试用。它出来的假预紧力物理上自洽、在界面上跟真数据一模一样，
-// 到现场就是拿仿真数据当监测结果看——螺栓松了照样显示正常。
-// 没配 Fx:Mode 时按 Real 算（跟 DeviceConnectorManager 一个口径）
+// 残留仿真配置的防线，放在最前面，比任何配置校验都早
+// 设备模拟器已整体移除，本进程只接真机。留这道检查是因为移除前的配置文件、环境变量和
+// 部署脚本里可能还写着 Fx:Mode=Simulated：那种配置现在不会再启用模拟器（已经没有了），
+// 但会让运维以为自己跑的是仿真、实际连的是真机，或反过来以为有仿真数据兜底。
+// 宁可拒绝启动，也不让"配置写的和实际跑的不是一回事"这种状态存在。
 // ============================================================================
-var fxSimulated = string.Equals(builder.Configuration["Fx:Mode"] ?? "Real", "Simulated", StringComparison.OrdinalIgnoreCase);
-if (fxSimulated && builder.Environment.IsProduction())
+var fxMode = builder.Configuration["Fx:Mode"];
+if (!string.IsNullOrWhiteSpace(fxMode) && !string.Equals(fxMode, "Real", StringComparison.OrdinalIgnoreCase))
     throw new InvalidOperationException(
-        "Production 环境不许跑 Fx:Mode=Simulated：模拟器出的是仿真数据，不是现场真实测量。" +
-        "接真机就设 Fx__Mode=Real；要演示就把 ASPNETCORE_ENVIRONMENT 改成 Development。");
+        $"检测到残留配置 Fx:Mode={fxMode}：设备模拟器已整体移除，本进程只接真机，该配置项已废弃。" +
+        "请从 appsettings*.json 与环境变量（Fx__Mode）中删除它——设为 Real 也可以，但删掉更干净。" +
+        "设备接入参数改由 devices 表驱动，单设备兜底见 Fx:Real:*。");
 
 // ============================================================================
 // 日志：Serilog 写控制台 + 滚动文件
@@ -263,11 +264,6 @@ builder.Services.AddHostedService<BoltPreload.Api.Runtime.WiringGuardService>();
 // 设备校时 + 主机时钟漂移（plan §9.8 / FMEA RPN 70）：连上已在 FxSdkConnector 校一次，这里做日周期与 NTP 跳变监视
 builder.Services.Configure<BoltPreload.Api.Runtime.TimeSyncOptions>(builder.Configuration.GetSection("Alarm:TimeSync"));
 builder.Services.AddHostedService<BoltPreload.Api.Runtime.TimeSyncService>();
-
-// 仿真模式下给模拟器驱动的通道写真标定，让采集链路照常算出预紧力，而不是往库里塞演示数据。
-// 生产环境早在文件开头就拦掉了，走到这里的一定是开发或测试环境。
-if (fxSimulated)
-    builder.Services.AddHostedService<BoltPreload.Api.Runtime.SimulatedCalibrationProvisioner>();
 
 // ============================================================================
 // Web API

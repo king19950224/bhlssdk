@@ -223,8 +223,8 @@ public sealed class ChannelPresenceTracker
 
     /// <summary>
     /// 周期静默扫描：把"在位或未知、但有效回波静默超阈值"的通道确认为拔出/无探头。
-    /// 未知态的确认（Initial=true）兼作陈旧 hardware_state 的自愈：停机期间拔掉的探头、
-    /// 模拟器遗留的假在位，重启后一个阈值周期内被翻正。
+    /// 未知态的确认（Initial=true）兼作陈旧 hardware_state 的自愈：停机期间拔掉的探头留下的
+    /// 假在位，重启后一个阈值周期内被翻正。
     /// </summary>
     /// <param name="now">当前时刻</param>
     /// <param name="isDeviceSuspended">返回 true 的设备本轮跳过判定并抬高静默地板
@@ -272,7 +272,7 @@ public sealed class ChannelPresenceTracker
                 }
                 // 已确认拔出的不重复判；在位(true)与未知(null)都参与静默判定——
                 // 未知态静默超阈值 = "启动后该通道被轮询过但持续无有效回波"，确认为无探头（Initial=true）。
-                // 这一步会自动纠正 DB 里的陈旧 hardware_state（如上次停机期间拔掉的探头、模拟器遗留的假在位），
+                // 这一步会自动纠正 DB 里的陈旧 hardware_state（如上次停机期间拔掉的探头留下的假在位），
                 // 否则重启后 DB 的 healthy 幽灵永远没人翻。
                 if (state.Present == false) continue;
                 var floor = _silenceFloor.TryGetValue(deviceId, out var f) ? f : DateTimeOffset.MinValue;

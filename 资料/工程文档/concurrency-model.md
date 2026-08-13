@@ -66,12 +66,13 @@ flowchart LR
     连接前的旧时间戳不算——避免刚（重）连、还没出新数据时被误判无穷陈旧而重连风暴。
 - `IsWriting` 由 `IIngestionRuntimeStatus.MarkWriteStart/End` 在 `IngestionService` 的 `WriteAsync` 前后置位。
 
-## 4. 仿真连接器（SimulatedFxConnector）为何天然安全
+## 4. 测试替身不承担并发契约
 
-[src/BoltPreload.Fx/Simulator/SimulatedFxConnector.cs](../../src/BoltPreload.Fx/Simulator/SimulatedFxConnector.cs)：
-- 无 `_sessionId` 等共享会话状态；命令方法（SetWorkMode/ReadChannelParam/Configure*/Recalibrate）都是**无状态的日志 no-op**，天然线程安全。
-- Connect/Disconnect/Reconnect 用 `_connectLock` 串行；采样循环 `SingleWriter=true`，断开会先取消并 `await` 旧循环再启新循环，不会两条循环并发写。
-- 故仿真路径不需要 `_sessionLock`；换真机（`FxSdkConnector`）时由第 1 节的会话锁提供同等保证。
+进程内仿真连接器已整体移除，`IFxConnector` 唯一的生产实现是 `FxSdkConnector`，其会话并发保证见第 1 节。
+
+测试里的替身（`BoltPreload.Tests` 的 `FakeConnector`、`RawFrameReplay`）**不复刻**上面这些锁：
+它们由单个测试方法独占驱动，不存在并发访问，因此也不能拿它们的行为去推断生产路径的线程安全。
+凡是要验证会话锁、重连串行化这类并发契约的，必须针对 `FxSdkConnector` 或其纯判定方法写测试。
 
 ## 5. 软删掉的行不能混进任何统计
 

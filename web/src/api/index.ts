@@ -628,7 +628,7 @@ export interface AdminDevice {
 export const deviceMgmtApi = {
   list: (includeDeleted = false) =>
     http.get<{ count: number; items: AdminDevice[] }>(`/api/devices/?includeDeleted=${includeDeleted}`),
-  // 新增：插行 + 建全通道目录 + 热加运行时（Simulated 模式只落库），前置授权容量预检（超限 409）
+  // 新增：插行 + 建全通道目录 + 热加运行时（不必重启进程），前置授权容量预检（超限 409）
   create: (body: { code: string; commParams: string; channelCount: number; model?: number; commType?: number; address?: number; transferMode?: number; projectId?: number; note?: string }) =>
     http.post<{ id: number; channelsCreated: number; runtimeAttached: boolean; note: string | null }>('/api/devices/', body),
   // 试连走临时连接器（5 秒超时用完即弃）；正在采集的设备会被抢占连接位，响应里带 warning

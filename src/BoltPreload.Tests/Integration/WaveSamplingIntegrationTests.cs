@@ -62,24 +62,11 @@ public sealed class WaveSamplingIntegrationTests
             "扫描正在逐通道切工作模式判探头，插进去抢上行会让判定结果掺进自己造成的干扰");
     }
 
-    [PostgresFact]
-    public async Task Sample_OnASimulatedDevice_ReadsNothing()
-    {
-        _fx.EnsureAvailable();
-        var seed = await _fx.SeedCalibratableChannelAsync("模拟器不采");
-        await SetSamplingAsync(seed.ChannelId, enabled: true);
-
-        var connector = new FakeConnector(seed.DeviceId);
-        await NewService(connector, mode: "Sim").SampleOnceAsync(default);
-
-        connector.ChannelParamReads.Should().BeEmpty("模拟器的测量自带波形，主动读是白跑一趟");
-    }
-
     // ---- helpers ----
 
     private WaveSamplingService NewService(
-        FakeConnector connector, ProbeScanState? scan = null, string mode = "Real") => new(
-        new FakeDeviceManager(connector, mode),
+        FakeConnector connector, ProbeScanState? scan = null) => new(
+        new FakeDeviceManager(connector),
         _fx.DataSource,
         scan ?? new ProbeScanState(),
         Options.Create(new WaveSamplingOptions { Enabled = true, PerChannelDelayMs = 0 }),

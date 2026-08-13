@@ -9,7 +9,7 @@ namespace BoltPreload.Api.Auth;
 /// JWT 就明文过局域网了，而且不会有任何提示。
 /// </para>
 /// <para>
-/// 所以这里按"生产环境默认拒绝"处理，和生产禁 Simulated 一个路数。监测网物理隔离、
+/// 所以这里按"生产环境默认拒绝"处理：危险的默认形态要靠代码拦住，不能靠人记得去改。监测网物理隔离、
 /// 现场确认不上 HTTPS 的场合，配 <c>Security:AllowPlaintextOnNonLoopback=true</c> 显式声明一次，
 /// 让它成为一个写在配置里、能被审计看到的决定，而不是默默就那样跑了。
 /// </para>

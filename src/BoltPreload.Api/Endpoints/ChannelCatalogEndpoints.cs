@@ -206,7 +206,7 @@ public static class ChannelCatalogEndpoints
             var sessionProvisioned = false;
             var mcrReconfigured = false;
             string? runtimeWarning = rt is null
-                ? "设备不在运行时中（Fx:Mode 或 devices.enabled 检查），目录已更新，重启服务后生效"
+                ? "设备不在运行时中（检查 devices.enabled 与 comm_type），目录已更新，重启服务后生效"
                 : null;
 
             if (rt is not null)

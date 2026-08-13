@@ -87,7 +87,6 @@ BoltPreload/
 │   ├── windows/                        工控机部署脚本（NSSM 服务注册、备份、诊断收集）
 │   └── installer/                      Windows Inno Setup 脚本（需本机装 Inno 构建）
 ├── tools/
-│   ├── FxDeviceSimulator/              设备模拟器
 │   ├── DeviceSmokeTest/                真机连通性烟测
 │   └── LicenseSigner/                  授权签发（供应商侧，不随交付包发出）
 └── 资料/工程文档/                       工程文档（开发/部署/标定/排障手册与设计方案）

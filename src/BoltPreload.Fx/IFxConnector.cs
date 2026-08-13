@@ -7,8 +7,9 @@ namespace BoltPreload.Fx;
 /// 设备连接抽象层（详见方案 §5.1 SDK 接入适配层）。
 /// <para>
 /// 把厂家 SDK 的 <c>event OnResultReceived</c> 转成内部 <see cref="Channel{T}"/>，下游消费方不直接依赖 SDK。
-/// 真实实现见 <c>FxSdkConnector</c>（包装 FxSDK 1.4）；
-/// 测试和开发用 <c>SimulatedFxConnector</c>（生成假数据，不依赖真机）。
+/// 唯一的生产实现是 <c>FxSdkConnector</c>（包装 FxSDK 1.6）；测试用自建替身（见 BoltPreload.Tests 的 FakeConnector）。
+/// 曾经有过一个生成假数据的进程内模拟器，已整体移除——它出的假预紧力物理上自洽、界面上跟真数据
+/// 一模一样，对安全监测系统来说这条路径本身就是风险。
 /// </para>
 /// </summary>
 public interface IFxConnector : IAsyncDisposable
@@ -106,7 +107,7 @@ public interface IFxConnector : IAsyncDisposable
     /// 的通道计算 EchoTime——不补配的话新通道插上探头也识别不出回波，只能等进程重启重新装载。
     /// 语义为"只补缺"：同一 (address, channel) 已有会话配置时跳过，不覆盖真实读回/重标定后的会话状态。
     /// </para>
-    /// 默认空实现（模拟器/测试桩没有 SDK 会话概念）。
+    /// 默认空实现（测试桩没有 SDK 会话概念）。
     /// </summary>
     Task ProvisionSessionChannelsAsync(IReadOnlyCollection<FxChannelInit> channels, CancellationToken cancellationToken = default)
         => Task.CompletedTask;
@@ -116,7 +117,7 @@ public interface IFxConnector : IAsyncDisposable
     /// <para>
     /// 厂家 C# SDK 无 SyncTime API；实际是 <c>GetSyncTimeBase2000</c> 填 <c>MeasConfig</c> 后
     /// <c>ConfigureDeviceAsync(..., nameof(MeasConfig))</c>。仅 model=3（MultiChIoT）协议会编码对时寄存器；
-    /// MeasConfig 只写不读，无法用协议回读校验设备钟差。模拟器默认空实现。
+    /// MeasConfig 只写不读，无法用协议回读校验设备钟差。测试桩默认空实现。
     /// </para>
     /// </summary>
     Task SyncDeviceTimeAsync(CancellationToken cancellationToken = default)
@@ -125,7 +126,7 @@ public interface IFxConnector : IAsyncDisposable
     /// <summary>
     /// 当前设备端 MCR 轮询启用的通道集（实时会话状态）。ProbeScan 扫描前据此快照，扫描后恢复业务通道集——
     /// 比读 DB 的 sampling_enabled 标志更可靠（后者可能与设备实际 MCR 不同步）。
-    /// 默认返回空（无 MCR 概念的实现，如模拟器 / 测试桩）。
+    /// 默认返回空（无 MCR 概念的实现，如测试桩）。
     /// </summary>
     IReadOnlyList<ushort> GetSessionMcrChannels() => Array.Empty<ushort>();
 }

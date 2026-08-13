@@ -263,7 +263,7 @@ CREATE INDEX idx_notification_outbox_due ON notification_outbox(next_attempt_at)
 - `RestartAsync(deviceId)` = Remove + Add，改连接参数后用；
 - `Version` 属性单调递增，字典每次变更 +1，供对账循环感知。
 
-primary 语义：primary 是不带 deviceId 的旧端点的默认路由，不允许直接删除——先把 primary 显式转移给另一台启用设备（PATCH 支持），再删。删除是低频操作，显式转移比自动挑选好排查。Simulated 模式不支持热增删，模拟设备数量维持 `Fx:Simulator:DeviceCount` 配置，开发场景用不上。
+primary 语义：primary 是不带 deviceId 的旧端点的默认路由，不允许直接删除——先把 primary 显式转移给另一台启用设备（PATCH 支持），再删。删除是低频操作，显式转移比自动挑选好排查。
 
 ### 5.3 采集服务改成对账循环
 

@@ -233,7 +233,8 @@ docker compose -f deploy/docker-compose.yml exec postgres \
 
 ### API 启动后日志一直刷 "无法解析通道 device=1 channel=X，丢弃数据"
 
-**原因**：种子数据没插入成功，或者 SimulatorOptions 的 DeviceId 跟数据库里的 device.id 对不上。
+**原因**：种子数据没插入成功，或者实际采集的设备号跟数据库里的 `devices.id` 对不上
+（`Fx:Real:DeviceId` 兜底路径下尤其容易，多设备一律以 `devices` 表为准）。
 
 **排查**：
 
@@ -249,8 +250,9 @@ docker compose -f deploy/docker-compose.yml exec postgres \
   psql -U boltpreload -d boltpreload -c "SELECT id, channel_id, code FROM bolts;"
 ```
 
-种子不预插螺栓：模拟器跑起来约 30 秒后，自动建档会按在位通道生成螺栓（code 形如 通道位号）。
-一直是空的话先确认 API 在跑、`Fx:Mode=Simulated` 已设；设备行都没有就跑 `bash setup.sh reset` 重新初始化。
+种子不预插螺栓：真机接上、通道有回波之后，自动建档会按在位通道生成螺栓（code 形如 通道位号）。
+一直是空的话先确认 API 在跑、真机连上了（`/api/runtime/devices` 看 state）；设备行都没有就跑
+`bash setup.sh reset` 重新初始化。**本机没有真机时这里本来就是空的**——设备模拟器已整体移除。
 
 ### API 启动报 "PartitioningStrategy not supported"
 
@@ -262,15 +264,15 @@ docker compose -f deploy/docker-compose.yml exec postgres \
 
 **症状**：API 健康，但数据不入库。
 
-**排查 1**：模拟器在跑吗？看 API 日志，应该有：
+**排查 1**：设备真的连上了吗？看 API 日志，应该有：
 
 ```
-模拟器开始连接 device=1, channels=12, rate=5Hz
+FxSdk 连接 device=1, params=192.168.0.7:23
+DeviceConnectorManager 载入 N 个设备运行时：...
 ```
 
-（通道数跟 `Fx:Simulator:ChannelCount` 配置走，当前默认 12。）
-
-如果没有，IFxConnector 的注册有问题。
+或直接查 `/api/runtime/devices`，看目标设备的 `state` 是否为 `Connected`。
+本机没有真机时这里恒为 0 是预期的——设备模拟器已整体移除，没有会自动产数据的东西。
 
 **排查 2**：数据进了 anomalies？
 

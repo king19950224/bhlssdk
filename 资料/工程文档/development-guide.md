@@ -25,7 +25,7 @@
 B/S 架构，几处关键设计：
 
 - 后端 .NET 8，厂家 SDK 直接以源码编进工程——出问题能下断点单步，不用隔着 dll 猜；
-- 业务代码不直接碰 SDK，设备接入收在 IFxConnector 一个接口后面。进程内模拟器（`Fx:Mode=Simulated`）只给无真机的开发和自动化测试用：Production 环境配 Simulated 会拒绝启动（见 Program.cs 开头的防线），独立模拟器工具 `tools/FxDeviceSimulator` 也不随交付包发布；
+- 业务代码不直接碰 SDK，设备接入收在 IFxConnector 一个接口后面。设备接入只有真机一条路：曾经的进程内模拟器与 `tools/FxDeviceSimulator` 空壳工具已整体移除，配置里残留 `Fx:Mode=Simulated` 会让进程拒绝启动（见 Program.cs 开头的防线）；
 - 测量数据落 PostgreSQL + TimescaleDB。写入频次高、按时间段查得多，所以走原生 Npgsql；业务表才用 EF Core；
 - 前端 REST API 拿数据、SignalR 推实时，页面不做轮询。
 
@@ -247,7 +247,7 @@ IngestionService（BackgroundService 常驻）
 
 设计要点：
 
-- 业务层不直接依赖厂家 SDK。所有设备操作经由 `BoltPreload.Fx.IFxConnector` 接口：真机实现为 `FxSdkConnector`，开发/测试实现为 `SimulatedFxConnector`（进程内模拟器），通过配置项 `Fx:Mode`（`Simulated` / `Real`）切换，业务代码无需改动；
+- 业务层不直接依赖厂家 SDK。所有设备操作经由 `BoltPreload.Fx.IFxConnector` 接口，唯一的生产实现是 `FxSdkConnector`；测试用自建替身（`BoltPreload.Tests` 的 `FakeConnector`）或真机录波重放（`RawFrameReplay`），业务代码不感知；
 - 入库兜底：数据库不可用时测量数据先写本地 WAL（`data/wal/`），数据库恢复后由 WalReplayService 自动重放补写；
 - 断线看门狗：默认 60 秒未收到数据自动重连，并重新下发工作模式。
 
@@ -435,10 +435,19 @@ bash setup.sh
 
 ### 6.5 验证数据链路
 
-默认配置 `Fx:Mode = Simulated`（`src/BoltPreload.Api/appsettings.Development.json`，首次启动自动从 .example 生成），由进程内模拟器产生 12 通道 5Hz 测量数据，无需真机。等待约 30 秒后验证：
+设备接入只有真机一条路，本机没有真机时**不会有实时数据流**（进程内模拟器已整体移除，理由见 §1）。
+三种验证手段按需选：
+
+| 想验证的东西 | 手段 |
+|---|---|
+| 界面、查询、标定、报表等业务链路 | 跑 `deploy/sql/dev/` 下的种子脚本铺静态样本，前端照常可点 |
+| SDK 解码 → EchoTime 提取 | `src/BoltPreload.Tests/Fx/RawFrameReplay.cs` 重放真机录波帧（录波用 `bhls1.6/FxReader`） |
+| 入库 → 报警 → SignalR 全链路 | 集成测试（`AlarmPipelineIntegrationTests` 等），直接喂 DTO 到 sink |
+
+接上真机后（见 §6.7）验证：
 
 ```bash
-curl http://localhost:5085/api/measurements/count     # 应返回数百条
+curl http://localhost:5085/api/measurements/count     # 应持续增长
 curl http://localhost:5085/api/measurements/latest | jq
 ```
 
@@ -461,7 +470,6 @@ curl http://localhost:5085/api/measurements/latest | jq
 ```json
 {
   "Fx": {
-    "Mode": "Real",
     "Real": {
       "DeviceId": 1,
       "Model": 3,
@@ -480,6 +488,7 @@ curl http://localhost:5085/api/measurements/latest | jq
 ```
 
 其中 `Channels` 为注入 SDK 本地会话的初始通道配置（对应 4.2.5 节前置条件），缺失时 EchoTime 恒为 null，必须配置。
+`Fx:Real:*` 是 `devices` 表为空时的单设备兜底；表里有启用设备时以表为准，多设备一律走表。
 
 3. 重启后端，通过日志确认连接成功、MultiMeas 模式下发、数据开始入库。现场联调问题参见 troubleshooting.md 与 site-debug-2026-05-21.md。
 
@@ -493,7 +502,7 @@ bhlssdk/
 │   ├── BoltPreload.Domain/          # 领域模型
 │   ├── BoltPreload.Application/     # 用例层：采集、报警、标定、许可
 │   ├── BoltPreload.Infrastructure/  # EF Core + Npgsql 数据访问
-│   ├── BoltPreload.Fx/              # SDK 适配层：IFxConnector、真机实现、模拟器
+│   ├── BoltPreload.Fx/              # SDK 适配层：IFxConnector 与真机实现 FxSdkConnector
 │   ├── BoltPreload.Algorithms/      # TOF、应力换算、温度补偿算法
 │   ├── BoltPreload.Calibration/     # 标定算法（K_L 拟合等）
 │   ├── BoltPreload.Api/             # ASP.NET Core 入口：Endpoints、Hubs、Auth
@@ -505,7 +514,7 @@ bhlssdk/
 │   ├── sql/                         # 数据库迁移脚本，按序号执行
 │   ├── installer/                   # Windows Inno Setup 脚本（需本机装 Inno 构建）
 │   └── windows/                     # 工控机部署脚本
-├── tools/FxDeviceSimulator/         # 独立 TCP 层设备模拟器（Phase 2 占位，现只有空跑）
+├── tools/                           # DeviceSmokeTest（真机连通性烟测）、LicenseSigner（授权签发，不随交付）
 └── 资料/
     ├── 工程文档/                    # 全部工程/运维文档（本文件所在目录，不随客户交付）
     └── …                            # 厂家原始包、软著/会议材料等（不进 git）
@@ -520,7 +529,7 @@ bhlssdk/
 5. 工程开启编译警告即错误（TreatWarningsAsErrors），提交前须保证 `dotnet build` 无警告、`dotnet test` 全部通过；
 6. 连接串、JWT 密钥、license 公钥等敏感配置不得提交仓库。开发环境置于 `appsettings.Development.json`（已 gitignore），生产环境通过环境变量（如 `ConnectionStrings__Postgres`）或 user-secrets 注入；
 7. 提交/接手前跑 `python3 tools/code-audit.py`（零依赖）复核代码卫生：后端 public 类型注释覆盖、前端文件头注释、活文档引用有效性、TODO/调试残留、文风统一（状态用文字不用表情符号、引号用中文弯引号）等六类门禁须全部归零。豁免清单与理由内联在脚本头部，新增豁免必须写明原因。
-8. 生产环境有两道会直接拒绝启动的防线，本地调试不受影响，但改相关代码时要知道它们在：`Fx:Mode=Simulated`（仿真数据不许出现在现场）与明文 HTTP 绑到本机之外（`PlaintextBindingGuard`，JWT 明文过局域网）。后者的放行开关是 `Security:AllowPlaintextOnNonLoopback`，只给物理隔离且现场书面确认过的站点用。
+8. 有两道会直接拒绝启动的防线，改相关代码时要知道它们在：残留 `Fx:Mode=Simulated` 配置（模拟器已移除，配置与实际跑的不一致本身就是故障源）与明文 HTTP 绑到本机之外（`PlaintextBindingGuard`，JWT 明文过局域网，仅生产环境拦）。后者的放行开关是 `Security:AllowPlaintextOnNonLoopback`，只给物理隔离且现场书面确认过的站点用。
 
 ## 9. 常见问题
 

@@ -872,7 +872,7 @@ public sealed class PostgresMeasurementSink : IMeasurementSink
 
         // 有限重试而非一次失败即弃：measurement 本体此刻已成功入库，WAL 文件随之删除，
         // 这条补判没有"下次重放再来"的机会——而告警补写失败的典型原因恰是 DB 抖动
-        //（正是安全网要覆盖的场景），等几百毫秒再试大概率能成。仍失败只能记 Error 放弃：
+        //（正是安全网要覆盖的场景），这类抖动的持续时间通常短于退避总时长。仍失败只能记 Error 放弃：
         // 不能重抛（重抛会让整个 WAL 文件重放，measurements 无唯一键会重复入库）。
         var delays = new[] { TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(800), TimeSpan.FromSeconds(3) };
         for (var attempt = 0; ; attempt++)

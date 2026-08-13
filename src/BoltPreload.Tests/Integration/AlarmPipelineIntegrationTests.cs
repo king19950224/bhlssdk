@@ -399,7 +399,7 @@ public sealed class AlarmPipelineIntegrationTests
             boltId = bolt.Id;
         }
 
-        // 标定档案（镜像 SimulatedCalibrationProvisioner 的列集，保证与 schema 一致）+ 通道指向该标定
+        // 标定档案（列集与 CalibrationEndpoints 写入口一致，保证与 schema 同步）+ 通道指向该标定
         Guid calibId;
         await using (var ins = _fx.DataSource.CreateCommand(@"
             INSERT INTO calibration_records

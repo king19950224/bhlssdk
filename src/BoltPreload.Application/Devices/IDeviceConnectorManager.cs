@@ -29,7 +29,7 @@ public interface IDeviceConnectorManager
     /// <summary>
     /// 热加设备：从 devices 表读该行建运行时（只建不连——连接与下发工作模式由 IngestionService
     /// 对账拉起，职责分工与启动路径相同）。已在运行时中返回 true（幂等）；
-    /// 行不存在/未启用/已软删返回 false。Simulated 模式抛 <see cref="NotSupportedException"/>。
+    /// 行不存在/未启用/已软删/comm_type=2 返回 false。
     /// </summary>
     Task<bool> AddAsync(long deviceId, CancellationToken ct = default) =>
         throw new NotSupportedException("该实现不支持热增删设备");
@@ -82,9 +82,8 @@ public sealed record DeviceRuntimeContext(
     IIngestionRuntimeStatus RuntimeStatus,
     DeviceRuntimeOptions Options);
 
-/// <param name="ChannelCount">设备物理通道数（devices.channel_count / 模拟器 ChannelCount）；热插拔全通道轮询的目标范围 1..N</param>
+/// <param name="ChannelCount">设备物理通道数（devices.channel_count）；热插拔全通道轮询的目标范围 1..N</param>
 public sealed record DeviceRuntimeOptions(
-    string Mode,
     string CommunicationParameters,
     ushort Address,
     ushort TransferMode,

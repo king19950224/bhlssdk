@@ -11,8 +11,8 @@ namespace BoltPreload.Tests.Fx;
 /// 离线重放台：把录下来的原始帧字节喂给 SDK 解码器，收 <see cref="DecodedResult"/>，出与 SDK 版本无关的摘要。
 /// <para>
 /// 这是 1.6 升级同源比对的地基（升级评估 §9 阶段 A 第 2 步）。比对的唯一可信做法是拿同一批
-/// 真机字节分别喂 1.4 和 1.6，逐帧比 EchoTime——进程内模拟器绕过 SDK 直接产 DTO，
-/// tools/FxDeviceSimulator 还是空壳，两个都干不了这活，所以单独搭这一个。
+/// 真机字节分别喂 1.4 和 1.6，逐帧比 EchoTime——只有走真实解码器才算得上同源，
+/// 任何绕过 SDK 直接造 DTO 的替身都干不了这活，所以单独搭这一个。
 /// </para>
 /// <para>
 /// 用法：现场用 bhls1.6/FxReader（rawDir 配上、rawHex=true）录 raw-*.csv，

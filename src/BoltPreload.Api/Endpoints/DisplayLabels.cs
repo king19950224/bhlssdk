@@ -22,6 +22,7 @@ public static class DisplayLabels
         ["torque_calibrate"] = "扭矩标定",
         ["apply_torque_fit"] = "应用扭矩拟合",
         ["torque_point_capture"] = "采集扭矩点",
+        ["torque_point_exclude"] = "排除扭矩点",
         ["calibration_renew"] = "标定续期",
 
         // 参数变更审批
