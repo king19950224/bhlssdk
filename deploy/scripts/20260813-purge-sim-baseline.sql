@@ -6,16 +6,18 @@
 -- 它写的是模拟器那套自洽的假物理参数（ref_time_ns=26000、k_l=0.003、ref_temp_c=22），
 -- 一旦落到装了真探头的通道上，这台通道就在拿一条假基线换算真回波。
 --
--- 【本机实测到的真实状况，决定了下面的处置口径】
+-- 【本机实测到的真实状况，决定了下面的处置口径】（行数为 2026-08-13 快照；CH8 在测，
+--   数字随时间涨，08-14 复核时已到 86219，口径不变）
 --   查库发现：11 条 sim_baseline 标定；2 个通道（CH6/CH8）的 active 仍指向它们；
 --   70540 条测量的 calibration_id 指向它们。
---   但那 70540 条**全是真探头数据**，不是模拟器产出的：
+--   但这些测量**全是真探头数据**，不是模拟器产出的：
 --     CH2  声时 32237~32267 ns
 --     CH11 声时 32719~32754 ns
---     CH8  6~7 月 32223~32313 ns、8 月 330 条 27221~27241 ns（探头重贴后回波位移）
---   模拟器把预紧力编码在 26000 ns 附近，上面一条都不在那个区间。
+--     CH8  6~7 月 32223~32313 ns、8 月起 27216~27241 ns（探头重贴后回波位移，仍在进）
+--   模拟器把预紧力编码在 26000 ns 附近（基准 RefTofNs=26000 + 预紧力对应的数百 ns），
+--   上面一条都不在那个区间。
 --   也就是说：测量是真的，只有标定关联是假的——真探头的测量被挂在了假标定 id 下。
---   这 70540 条的 preload_n 全部为 NULL（标定护栏已把它们拦成无效，界面没在显示假读数）。
+--   这批测量的 preload_n 全部为 NULL（标定护栏已把它们拦成无效，界面没在显示假读数）。
 --
 -- 处置（按上面的事实定的，与直觉相反的一条特别注明）：
 --   1) 删掉 sim_baseline 标定记录、清掉通道对它的指向，通道回"未标定"——CH8 是带真探头
@@ -33,10 +35,14 @@
 --   a) SELECT id, username FROM users WHERE id = 1;  -- 审计的 FK，必须存在
 --   b) 先只跑第 0 段。若你那台库的声时分布与上面记录的不同（出现大量 26000 附近的行），
 --      说明确实有模拟器产出的测量混在里面，那就得另外按时间窗处理，别直接跑下面的 BEGIN。
--- 【执行后必做】
---   c) 服务在运行则调 POST /api/diagnostics/cache-stats/reset（reviewer+）或重启服务——
---      标定路由缓存 TTL 5 分钟，纯 SQL 直改不失效缓存；
---   d) 核对文末第 4 段验证输出：sim_baseline 计数与悬空 calibration_id 均应为 0。
+-- 【执行后必做，顺序不能颠倒】（08-14 对本机库实跑校准过的流程）
+--   c) 先调 POST /api/diagnostics/cache-stats/reset（reviewer+）或重启服务——路由缓存
+--      TTL 5 分钟，主事务执行期间（本机实测 4.4 分钟，解压开销）在测通道仍按缓存里的
+--      旧标定 id 写入，不重置缓存悬空行会一直长；
+--   d) 再跑第 5 段补扫：把主事务窗口内写入的悬空行解关联（本机实测 20 条）；
+--   e) 核对第 4/5 段验证输出：sim_baseline 计数、sim 常数残值、与本次相关的悬空均应为 0。
+--      注意"悬空 calibration_id"不一定归零——本机就查出 303 条挂在更早被删的
+--      TorqueFit 等实验标定上的历史遗留（2026-06），那不是本脚本的对象，别顺手动它。
 -- ============================================================================
 
 -- ---------- 0. 干跑：先看清要动多少行，并确认测量到底是真是假（不改数据） ----------
@@ -59,10 +65,13 @@ SELECT '被 superseded_by 引用的 sim_baseline', count(*)::text
 FROM calibration_records cr
 WHERE cr.superseded_by IN (SELECT id FROM calibration_records WHERE method = 'sim_baseline');
 
--- 关键判据：声时落在模拟器编码区间（26000 附近）的行数。若明显非零，先停下来另作处置。
+-- 关键判据：声时落在模拟器编码区间的行数。若明显非零，先停下来另作处置。
+-- 区间取 25500~27000：模拟器基准 26000 加预紧力对应的数百 ns，再留温补余量；
+-- 别取更宽——CH8 探头重贴后的真实回波在 27.2k，粗暴放宽到 28000 会把真数据误圈进来
+-- （08-14 实测：25500~27000 命中 0 行，27000~28000 里的 1.6 万行全是 CH8 在测真数据）。
 SELECT c.channel_no,
        count(*) AS 总数,
-       count(*) FILTER (WHERE m.echo_time_ns BETWEEN 24000 AND 28000) AS 疑似模拟器区间,
+       count(*) FILTER (WHERE m.echo_time_ns BETWEEN 25500 AND 27000) AS 疑似模拟器区间,
        round(min(m.echo_time_ns), 0) AS 最小声时,
        round(max(m.echo_time_ns), 0) AS 最大声时
 FROM measurements m JOIN channels c ON c.id = m.channel_id
@@ -70,6 +79,13 @@ WHERE m.calibration_id IN (SELECT id FROM calibration_records WHERE method = 'si
 GROUP BY c.channel_no ORDER BY c.channel_no;
 
 BEGIN;
+
+-- measurements 是 TimescaleDB 压缩表，calibration_id 不是压缩段的分段键：下面第 2 段的
+-- UPDATE 只改几万行，却要把命中的整段解压来评估谓词，默认单事务 10 万元组的解压上限
+-- 直接爆（08-14 实测：4579306 元组，ERROR: tuple decompression limit exceeded）。
+-- SET LOCAL 只对本事务生效，提交/回滚后自动还原。被改的行落在未压缩区，
+-- 由压缩策略后台自行重新压缩，不必手工处理。
+SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0;
 
 -- ---------- 1. 审计先写：后面会把依据删掉，审计必须在删之前取快照 ----------
 INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
@@ -128,7 +144,7 @@ UNION ALL
 SELECT 'fitter_version=sim:1.0 残留（应为 0）', count(*)::text
 FROM calibration_records WHERE fitter_version = 'sim:1.0'
 UNION ALL
-SELECT 'measurements 悬空 calibration_id（应为 0）', count(*)::text
+SELECT 'measurements 悬空 calibration_id（见头部说明 e，可能有本脚本之外的历史遗留）', count(*)::text
 FROM measurements m
 WHERE m.calibration_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM calibration_records cr WHERE cr.id = m.calibration_id)
@@ -142,3 +158,48 @@ SELECT c.channel_no, b.code, b.state, c.meas_mode, c.k_l, c.ref_time_ns,
 FROM channels c LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
 WHERE c.device_id = 1 AND c.deleted_at IS NULL
 ORDER BY c.channel_no;
+
+-- ---------- 5. 补扫（先重置路由缓存，再跑这一段） ----------
+-- 5a. 主事务执行窗口内，在测通道按旧缓存写入的悬空行：解关联打同一标记。
+--     限最近两天：新行都在未压缩区，且避免 NOT EXISTS 谓词把全表压缩段都解开。
+BEGIN;
+SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0;
+
+UPDATE measurements SET
+    calibration_id = NULL,
+    algo_version = 'phase1:raw:sim_baseline_revoked'
+WHERE ts >= now() - interval '2 days'
+  AND calibration_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM calibration_records cr WHERE cr.id = measurements.calibration_id);
+
+-- 5b. 残值兜底：列值恰为 sim 常数三元组（k_l=0.003 / ref=26000.00）但 active 指针早已断开的
+--     通道（本机的 CH5 就是这样），第 3a 段按指针圈选扫不到。假基线残值与挂着假标定同级危险。
+--     谓词钉死在 sim 常数上，不会误伤真实标定（真实 k_l 量级 1e-3 但不会恰好等于 0.003000…
+--     且 ref 恰好 26000.00）。
+WITH cleared AS (
+    UPDATE channels SET
+        k_l = NULL, k_l_uncertainty = NULL, k_l_intercept_ns = NULL,
+        ref_time_ns = NULL, ref_temp_c = NULL, updated_at = now()
+    WHERE deleted_at IS NULL
+      AND active_calibration_id IS NULL
+      AND k_l = 0.003 AND ref_time_ns = 26000.00
+    RETURNING id, channel_no
+)
+INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at)
+SELECT 1, 'calibration_revoke', 'channel', c.id,
+       jsonb_build_object('kL', 0.003, 'refTimeNs', 26000.00),
+       jsonb_build_object('kL', NULL, 'refTimeNs', NULL),
+       '[运维直改] 清除通道 ' || c.channel_no || ' 的仿真基线残值（k_l=0.003/ref=26000，active 指针已断）：与挂着假标定同级危险',
+       now()
+FROM cleared c;
+
+COMMIT;
+
+-- 5c. 复核：与 sim 相关的悬空与残值应双双归零
+SELECT '近两天悬空 calibration_id（应为 0）' AS what, count(*)::text AS val
+FROM measurements m
+WHERE m.ts >= now() - interval '2 days' AND m.calibration_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM calibration_records cr WHERE cr.id = m.calibration_id)
+UNION ALL
+SELECT '残留 sim 常数的通道（应为 0）', count(*)::text
+FROM channels WHERE (k_l = 0.003 OR ref_time_ns = 26000.00) AND deleted_at IS NULL;
