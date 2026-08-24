@@ -81,8 +81,8 @@ public static class ChannelConfigChangeEndpoints
             var row = await LoadAsync(ds, id, ct);
             if (row is null) return Results.NotFound(new { error = "请求不存在", id });
             if (row.Status != "requested") return Results.Conflict(new { error = $"当前状态 {row.Status}，仅 requested 可审批", id });
-            if (row.RequestedBy == reviewerId)
-                return Results.BadRequest(new { error = "审批人必须与提交人不同（两人复核底线）。", requestedBy = row.RequestedBy });
+            // 2026-08-19 取消审批环节：本工作流只剩存量待办的处理用途，异人限制随之移除
+            //（新参数变更走 commission 直发，不再进本队列）
 
             // 审批与审计同事务（责任链不可断）
             await using var conn = await ds.OpenConnectionAsync(ct);
@@ -111,7 +111,7 @@ public static class ChannelConfigChangeEndpoints
         .RequireAuthorization(AuthPolicies.ReviewerAccess)
         .WithTags("ConfigChange")
         .WithName("ApproveConfigChange")
-        .WithSummary("审批参数变更（必须由不同于提交人的 reviewer）");
+        .WithSummary("批准存量参数变更待办（新变更走直发，不再进本队列）");
 
         // ---- 驳回 ----
         app.MapPost("/api/config-changes/{id:long}/reject", async (

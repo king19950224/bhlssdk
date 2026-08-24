@@ -8,12 +8,12 @@ using Xunit;
 namespace BoltPreload.Tests.Integration;
 
 /// <summary>
-/// 通道参数变更的审批工作流（<c>/api/config-changes</c>）：requested → approved → executed → verified，
+/// 通道参数变更工作流（<c>/api/config-changes</c>）：requested → approved → executed → verified，
 /// 外加 rejected / failed 两个终态。
 /// <para>
-/// 这套流程存在的意义就是不让操作员一个人把安全攸关的测量参数直接下发设备，所以真正要守的是两条：
-/// 审批人不能是提交人，执行前必须已审批。两条都失守时接口照样返回 200、参数照样下发，
-/// 只有事后翻审批单才看得出来。整组端点此前零 HTTP 覆盖。
+/// 2026-08-19 取消审批环节：新参数变更走 commission 直发不进本队列，本工作流只剩存量待办的处理用途，
+/// 异人限制随之移除（自批放行）。仍要守住的是状态机顺序（执行前必须 approved、验证前必须 executed）
+/// 和责任链（谁批的、谁执行的都落库落审计）。
 /// </para>
 /// <para>
 /// 状态守卫在设备查找之前，所以不接真机也能测到 execute/verify 的越级拦截；下发本身另有真机联调覆盖。
@@ -26,7 +26,7 @@ public sealed class ConfigChangeApprovalIntegrationTests
     public ConfigChangeApprovalIntegrationTests(PostgresFixture fx) => _fx = fx;
 
     [PostgresFact]
-    public async Task Approve_BySelf_IsRefused_AndLeavesTheRequestPending()
+    public async Task Approve_BySelf_IsAllowed_ForLegacyPending()
     {
         _fx.EnsureAvailable();
         var seed = await _fx.SeedCalibratableChannelAsync("自审批");
@@ -38,9 +38,10 @@ public sealed class ConfigChangeApprovalIntegrationTests
 
         var resp = await client.PostAsync($"/api/config-changes/{id}/approve", null);
 
-        resp.StatusCode.Should().Be(HttpStatusCode.BadRequest, "提交人自己审批要挡住，这是两人复核的底线");
-        (await StatusOfAsync(id)).Should().Be("requested", "挡住之后状态不能动，否则下一步就能执行了");
-        (await ApprovedByAsync(id)).Should().BeNull();
+        // 2026-08-19 取消审批环节：存量待办任何复核员可批准（含提交者本人），责任人照落库
+        resp.StatusCode.Should().Be(HttpStatusCode.OK, "异人限制已随审批环节取消移除");
+        (await StatusOfAsync(id)).Should().Be("approved");
+        (await ApprovedByAsync(id)).Should().Be(reviewer, "自批也要落责任人");
     }
 
     [PostgresFact]

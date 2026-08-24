@@ -107,9 +107,11 @@ public static class AlarmRuleEndpoints
         .WithName("ListAlarmRuleTargets")
         .WithSummary("规则提案的目标候选（平铺的部位/螺栓清单）");
 
-        // 提案（reviewer+）：落 pending，等另一人批准。参数链校验挡在入口，DB 的 CHECK 是最后防线
+        // 规则设定（reviewer+）：2026-08-19 取消审批环节——提交即生效（同目标旧规则自动置换，
+        // 签署人/时间/依据全部落档）。参数链校验挡在入口，DB 的 CHECK 是最后防线。
         grp.MapPost("/", async (
-            HttpContext http, AlarmRuleProposeRequest req, NpgsqlDataSource ds, CancellationToken ct) =>
+            HttpContext http, AlarmRuleProposeRequest req, NpgsqlDataSource ds,
+            IAlarmRuleProvider rules, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var u = UserContext.Require(http);
 
@@ -162,13 +164,27 @@ public static class AlarmRuleEndpoints
             long ruleId;
             try
             {
+                // 同目标只留一条 active：旧规则置 superseded（历史可查），新规则直接生效
+                var supersede = req.Scope switch
+                {
+                    "global" => "UPDATE alarm_rules SET review_state = 'superseded' WHERE review_state = 'active' AND scope = 'global'",
+                    "group" => "UPDATE alarm_rules SET review_state = 'superseded' WHERE review_state = 'active' AND scope = 'group' AND group_id = @target",
+                    _ => "UPDATE alarm_rules SET review_state = 'superseded' WHERE review_state = 'active' AND scope = 'bolt' AND bolt_id = @target",
+                };
+                await using (var s = new NpgsqlCommand(supersede, conn, tx))
+                {
+                    if (req.Scope != "global")
+                        s.Parameters.AddWithValue("target", NpgsqlDbType.Bigint, req.Scope == "group" ? req.GroupId!.Value : req.BoltId!.Value);
+                    await s.ExecuteNonQueryAsync(ct);
+                }
+
                 await using var cmd = new NpgsqlCommand(@"
                     INSERT INTO alarm_rules
                         (scope, group_id, bolt_id,
                          trigger_low_ratio, clear_low_ratio, trigger_high_ratio, clear_high_ratio,
                          trigger_consecutive, clear_consecutive, critical_deviation, preload_loss_ratio,
-                         reason, created_by)
-                    VALUES (@scope, @gid, @bid, @tl, @cl, @th, @ch, @tc, @cc, @cd, @pl, @reason, @uid)
+                         reason, created_by, review_state, approved_by, approved_at)
+                    VALUES (@scope, @gid, @bid, @tl, @cl, @th, @ch, @tc, @cc, @cd, @pl, @reason, @uid, 'active', @uid, now())
                     RETURNING id", conn, tx);
                 cmd.Parameters.AddWithValue("scope", NpgsqlDbType.Varchar, req.Scope);
                 cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, (object?)req.GroupId ?? DBNull.Value);
@@ -188,19 +204,30 @@ public static class AlarmRuleEndpoints
             catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
             {
                 await tx.RollbackAsync(ct);
-                return Results.Conflict(new { error = "同一目标已有待审提案，先处理掉它再提新的" });
+                return Results.Conflict(new { error = "同一目标已有待处理的历史提案，请先在规则列表处理它" });
             }
 
             await WriteRuleAuditAsync(conn, tx, u.UserId, "alarm_rule_propose", ruleId,
-                $"提案告警阈值规则 #{ruleId}（{targetLabel}），依据：{reason}", ct);
+                $"设定告警阈值规则 #{ruleId}（{targetLabel}）并生效，依据：{reason}", ct);
             await tx.CommitAsync(ct);
-            return Results.Ok(new { id = ruleId, reviewState = "pending" });
+
+            // 提交即生效：显式刷新快照，不等 30 秒定时轮。刷新失败不回滚（下一轮定时刷新会补上）
+            try
+            {
+                await rules.RefreshAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                loggerFactory.CreateLogger(nameof(AlarmRuleEndpoints))
+                    .LogWarning(ex, "规则 #{Id} 生效后快照刷新失败，最迟 30 秒后由定时刷新生效", ruleId);
+            }
+            return Results.Ok(new { id = ruleId, reviewState = "active" });
         })
         .RequireAuthorization(AuthPolicies.ReviewerAccess)
         .WithName("ProposeAlarmRule")
-        .WithSummary("提案告警阈值规则（落 pending，需另一人批准）");
+        .WithSummary("设定告警阈值规则（提交即生效，同目标旧规则自动置换；签署与依据落档）");
 
-        // 批准（reviewer+，异人）：同目标旧 active 置 superseded，本条置 active，批准即生效（刷新快照）
+        // 批准存量 pending（reviewer+）：同目标旧 active 置 superseded，本条置 active 并刷新快照
         grp.MapPost("/{id:long}/approve", async (
             long id, HttpContext http, NpgsqlDataSource ds, IAlarmRuleProvider rules,
             ILoggerFactory loggerFactory, CancellationToken ct) =>
@@ -237,11 +264,9 @@ public static class AlarmRuleEndpoints
                 await tx.RollbackAsync(ct);
                 return Results.Conflict(new { error = $"规则不在待审状态（当前 {state}）", id });
             }
-            if (createdBy == u.UserId)
-            {
-                await tx.RollbackAsync(ct);
-                return Results.BadRequest(new { error = "提案人不得批准自己的提案（异人复核）" });
-            }
+            // 2026-08-19 取消审批环节：异人限制移除。本端点只服务存量 pending（新规则提交即生效），
+            // 谁批准都记入 approved_by 留痕
+            _ = createdBy;
 
             // 同目标只留一条 active：旧规则置 superseded，历史可查
             var supersede = scope switch
@@ -283,7 +308,7 @@ public static class AlarmRuleEndpoints
         })
         .RequireAuthorization(AuthPolicies.ReviewerAccess)
         .WithName("ApproveAlarmRule")
-        .WithSummary("批准告警阈值规则（异人复核，批准即生效）");
+        .WithSummary("批准存量待审的告警规则（新规则提交即生效，本端点处理历史记录）");
 
         // 驳回（reviewer+）：提案人驳回自己的提案 = 撤回，允许
         grp.MapPost("/{id:long}/reject", async (

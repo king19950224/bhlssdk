@@ -91,16 +91,17 @@ public sealed class AlarmRuleIntegrationTests
         evaluator.Evaluate(Low(control)).Should().ContainSingle("无规则螺栓维持出厂 TriggerConsecutive=5");
     }
 
-    // ===================== 提案 → 异人批准 → 生效 → 替代 =====================
+    // ===================== 提交即生效 → 置换旧规则；存量 pending 走批准/驳回 =====================
+    // 2026-08-19 取消审批环节：POST /api/alarm-rules 直接落 active（自签 approved_by），
+    // approve/reject 端点只服务取消前的存量 pending，异人限制已移除。
 
     [PostgresFact]
-    public async Task ProposeApprove_CrossUserEnforced_TakesEffectAndSupersedes()
+    public async Task Submit_TakesEffectImmediately_AndSupersedesOldActive()
     {
         _fx.EnsureAvailable();
         await ClearRulesAsync();
 
         var reviewerA = await SeedUserAsync();
-        var reviewerB = await SeedUserAsync();
         var operatorId = await SeedUserAsync();
         var (projectId, deviceId) = await SeedProjectDeviceAsync();
         var g = await SeedGroupAsync(projectId);
@@ -108,51 +109,45 @@ public sealed class AlarmRuleIntegrationTests
 
         using var factory = TestApi.CreateFactory(_fx);
         using var clientA = TestApi.AuthedClient(factory, reviewerA, "reviewer");
-        using var clientB = TestApi.AuthedClient(factory, reviewerB, "reviewer");
         using var clientOp = TestApi.AuthedClient(factory, operatorId, "operator");
 
         // 无规则时生效链给出厂兜底
         var eff0 = await GetJsonAsync(clientA, $"/api/bolts/{boltId}/effective-alarm-rule");
         eff0.GetProperty("source").GetString().Should().Be("default");
 
-        // operator 无提案权限
+        // operator 无修改权限
         (await clientOp.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.60m)))
-            .StatusCode.Should().Be(HttpStatusCode.Forbidden, "提案是 reviewer+ 权限");
+            .StatusCode.Should().Be(HttpStatusCode.Forbidden, "规则修改是 reviewer+ 权限");
 
-        // A 提案 → A 自批被拒 → B 批准生效
-        var propose = await clientA.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.60m));
-        propose.StatusCode.Should().Be(HttpStatusCode.OK);
-        var ruleId = (await propose.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetInt64();
-
-        (await clientA.PostAsync($"/api/alarm-rules/{ruleId}/approve", null))
-            .StatusCode.Should().Be(HttpStatusCode.BadRequest, "提案人自批必须被后端拒绝");
-        (await clientB.PostAsync($"/api/alarm-rules/{ruleId}/approve", null))
-            .StatusCode.Should().Be(HttpStatusCode.OK);
+        // 提交即生效：不需要任何批准动作
+        var submit = await clientA.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.60m));
+        submit.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body1 = await submit.Content.ReadFromJsonAsync<JsonElement>();
+        var ruleId = body1.GetProperty("id").GetInt64();
+        body1.GetProperty("reviewState").GetString().Should().Be("active", "取消审批后提交即生效");
+        (await RuleStateAsync(ruleId)).Should().Be("active");
 
         var eff1 = await GetJsonAsync(clientA, $"/api/bolts/{boltId}/effective-alarm-rule");
         eff1.GetProperty("source").GetString().Should().Be("global");
         eff1.GetProperty("triggerLowRatio").GetDecimal().Should().Be(0.60m);
 
-        // 第二版获批后旧 active 置 superseded，同一目标只留一条生效
-        var propose2 = await clientA.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.58m));
-        var ruleId2 = (await propose2.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetInt64();
-        (await clientB.PostAsync($"/api/alarm-rules/{ruleId2}/approve", null)).StatusCode.Should().Be(HttpStatusCode.OK);
+        // 第二版提交后旧 active 置 superseded，同一目标只留一条生效
+        var submit2 = await clientA.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.58m));
+        var ruleId2 = (await submit2.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetInt64();
 
         (await RuleStateAsync(ruleId)).Should().Be("superseded");
         (await RuleStateAsync(ruleId2)).Should().Be("active");
 
-        // 同目标已有 pending 时再提 → 409
-        (await clientA.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.55m))).StatusCode.Should().Be(HttpStatusCode.OK);
-        (await clientA.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.54m)))
-            .StatusCode.Should().Be(HttpStatusCode.Conflict, "同目标同时只允许一条待审提案");
+        var eff2 = await GetJsonAsync(clientA, $"/api/bolts/{boltId}/effective-alarm-rule");
+        eff2.GetProperty("triggerLowRatio").GetDecimal().Should().Be(0.58m);
 
-        // 全程留审计
-        (await AuditCountAsync("alarm_rule_propose")).Should().BeGreaterThanOrEqualTo(3);
-        (await AuditCountAsync("alarm_rule_approve")).Should().Be(2);
+        // 签署与依据落档：自签 approved_by = 提交人
+        (await ApprovedByAsync(ruleId2)).Should().Be(reviewerA, "取消审批不等于不落责任人");
+        (await AuditCountAsync("alarm_rule_propose")).Should().BeGreaterThanOrEqualTo(2);
     }
 
     [PostgresFact]
-    public async Task Reject_SelfWithdrawAllowed_CanProposeAgain()
+    public async Task LegacyPending_AnyReviewerCanApprove_IncludingProposer()
     {
         _fx.EnsureAvailable();
         await ClearRulesAsync();
@@ -161,15 +156,34 @@ public sealed class AlarmRuleIntegrationTests
         using var factory = TestApi.CreateFactory(_fx);
         using var clientA = TestApi.AuthedClient(factory, reviewerA, "reviewer");
 
-        var propose = await clientA.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.62m));
-        var ruleId = (await propose.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetInt64();
+        // 直插一条取消审批前遗留的 pending（提交人 = reviewerA 本人）
+        var pendingId = await InsertPendingRuleAsync("global", 0.61m, reviewerA);
 
-        // 自驳 = 撤回，允许（与"自批必须异人"不同：撤回不产生生效规则）
-        (await clientA.PostAsJsonAsync($"/api/alarm-rules/{ruleId}/reject", new { note = "参数填错，撤回重提" }))
+        // 提交人本人批准也放行（异人限制已随审批环节取消移除）
+        (await clientA.PostAsync($"/api/alarm-rules/{pendingId}/approve", null))
+            .StatusCode.Should().Be(HttpStatusCode.OK, "存量 pending 任何复核员可激活，含提交者本人");
+        (await RuleStateAsync(pendingId)).Should().Be("active");
+        (await AuditCountAsync("alarm_rule_approve")).Should().Be(1);
+    }
+
+    [PostgresFact]
+    public async Task Reject_LegacyPending_SelfWithdrawAllowed_CanSubmitAgain()
+    {
+        _fx.EnsureAvailable();
+        await ClearRulesAsync();
+
+        var reviewerA = await SeedUserAsync();
+        using var factory = TestApi.CreateFactory(_fx);
+        using var clientA = TestApi.AuthedClient(factory, reviewerA, "reviewer");
+
+        var pendingId = await InsertPendingRuleAsync("global", 0.62m, reviewerA);
+
+        // 自驳 = 撤回存量 pending
+        (await clientA.PostAsJsonAsync($"/api/alarm-rules/{pendingId}/reject", new { note = "参数填错，撤回重提" }))
             .StatusCode.Should().Be(HttpStatusCode.OK);
-        (await RuleStateAsync(ruleId)).Should().Be("rejected");
+        (await RuleStateAsync(pendingId)).Should().Be("rejected");
 
-        // 撤回后同目标可再提案（pending 唯一索引不再挡）
+        // 撤回后同目标可再提交（直接生效）
         (await clientA.PostAsJsonAsync("/api/alarm-rules", GlobalRuleBody(0.63m))).StatusCode.Should().Be(HttpStatusCode.OK);
     }
 
@@ -235,6 +249,30 @@ public sealed class AlarmRuleIntegrationTests
     {
         await using var cmd = _fx.DataSource.CreateCommand("DELETE FROM alarm_rules");
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>直插一条取消审批环节前遗留的 pending 规则（模拟历史数据）。</summary>
+    private async Task<long> InsertPendingRuleAsync(string scope, decimal triggerLow, long createdBy)
+    {
+        await using var cmd = _fx.DataSource.CreateCommand(@"
+            INSERT INTO alarm_rules
+                (scope, trigger_low_ratio, clear_low_ratio, trigger_high_ratio, clear_high_ratio,
+                 trigger_consecutive, clear_consecutive, critical_deviation, preload_loss_ratio,
+                 reason, review_state, created_by)
+            VALUES (@scope, @tl, @tl + 0.02, 1.10, 1.08, 5, 10, 0.30, 0.05,
+                    '集成测试：取消审批前遗留的待审提案', 'pending', @u)
+            RETURNING id");
+        cmd.Parameters.AddWithValue("scope", NpgsqlDbType.Varchar, scope);
+        cmd.Parameters.AddWithValue("tl", NpgsqlDbType.Numeric, triggerLow);
+        cmd.Parameters.AddWithValue("u", NpgsqlDbType.Bigint, createdBy);
+        return (long)(await cmd.ExecuteScalarAsync())!;
+    }
+
+    private async Task<long?> ApprovedByAsync(long ruleId)
+    {
+        await using var cmd = _fx.DataSource.CreateCommand("SELECT approved_by FROM alarm_rules WHERE id=@id");
+        cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, ruleId);
+        return await cmd.ExecuteScalarAsync() is long v ? v : null;
     }
 
     private async Task InsertActiveRuleAsync(
