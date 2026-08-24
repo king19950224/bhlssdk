@@ -568,6 +568,8 @@ app.MapDeviceSettingsEndpoints();
 app.MapAcceptanceEndpoints();
 app.MapWiringTableEndpoints();
 app.MapCalibrationEndpoints();
+app.MapCalibrationTrialEndpoints();
+app.MapSpecLibraryEndpoints();
 app.MapBoltEndpoints();
 app.MapAlarmEndpoints();
 app.MapAlarmRuleEndpoints();
