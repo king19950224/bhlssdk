@@ -15,6 +15,18 @@ public static class AlarmEndpoints
     private static readonly HashSet<string> KnownAlarmTypes =
         new(StringComparer.Ordinal) { "preload_low", "preload_high", "preload_loss", "signal_lost", "wiring_suspect", "clock_drift" };
 
+    /// <summary>读数是否贴着告警阈值（0.90 / 1.10 的 ±0.15 带内）——信号抖动足以把正常值抬/压过阈值的区域。</summary>
+    private static bool IsNearThreshold(decimal? ratio) =>
+        ratio is not null && (Math.Abs(ratio.Value - 0.9m) < 0.15m || Math.Abs(ratio.Value - 1.1m) < 0.15m);
+
+    /// <summary>闭合归因白名单（与 0035 迁移的 CHECK 一致）。拼错会让归因统计口径碎掉。</summary>
+    private static readonly HashSet<string> KnownResolutions =
+        new(StringComparer.Ordinal)
+        {
+            "real_loosening", "real_overload",
+            "baseline_error", "sensor_issue", "config_error", "external_operation", "other",
+        };
+
     public static IEndpointRouteBuilder MapAlarmEndpoints(this IEndpointRouteBuilder app)
     {
         // 读告警 logged_in 即可；ack / shelve 需 write_access（operator+）
@@ -90,6 +102,149 @@ public static class AlarmEndpoints
         .WithName("ListAlarms")
         .WithSummary("告警列表（默认只列开启的）");
 
+        // ── 告警诊断（闭环核心）：告警不只报"越限了"，还要回答"下一步做什么" ──
+        // 五项规则检查（链路/信号质量/基线合理性/拒算率/同组共模），按优先级给出结论与处置建议。
+        // 今日实例：CH8 报 4776% 偏高，人工排查半小时定位到基线锁错回波——这五条规则就是那次排查的固化。
+        grp.MapGet("/{id:long}/diagnosis", async (long id, NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            long boltId, channelId; string alarmType; decimal? ratioAtTrigger;
+            string boltCode; short channelNo; decimal? targetN, refTimeNs; bool cleared;
+            await using (var q = ds.CreateCommand(@"
+                SELECT a.bolt_id, a.channel_id, a.type, a.preload_ratio_at_trigger, a.cleared_at IS NOT NULL,
+                       b.code, c.channel_no, b.target_preload_n, c.ref_time_ns
+                FROM alarms a
+                JOIN bolts b ON b.id = a.bolt_id
+                JOIN channels c ON c.id = a.channel_id
+                WHERE a.id = @id"))
+            {
+                q.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
+                await using var r = await q.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct)) return Results.NotFound(new { error = "告警不存在", id });
+                boltId = r.GetInt64(0);
+                channelId = r.GetInt64(1);
+                alarmType = r.GetString(2);
+                ratioAtTrigger = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                cleared = r.GetBoolean(4);
+                boltCode = r.GetString(5);
+                channelNo = r.GetInt16(6);
+                targetN = r.IsDBNull(7) ? null : r.GetDecimal(7);
+                refTimeNs = r.IsDBNull(8) ? null : r.GetDecimal(8);
+            }
+
+            // 一次查全五项证据（当前状态，不是触发时刻——诊断服务于"现在该做什么"）
+            long recentCount = 0, gateRejected = 0, gateTotal = 0;
+            decimal? lastEcho = null, lastValidRatio = null, snrDb = null, peerMedianRatio = null;
+            int peerCount = 0;
+            await using (var q = ds.CreateCommand(@"
+                SELECT
+                  (SELECT count(*) FROM measurements WHERE channel_id = @ch AND ts > now() - interval '90 seconds'),
+                  (SELECT echo_time_ns FROM measurements WHERE channel_id = @ch AND echo_time_ns IS NOT NULL
+                    ORDER BY ts DESC LIMIT 1),
+                  (SELECT preload_ratio FROM measurements WHERE channel_id = @ch AND preload_ratio IS NOT NULL
+                    ORDER BY ts DESC LIMIT 1),
+                  (SELECT snr_db FROM wave_features WHERE channel_id = @ch ORDER BY ts DESC LIMIT 1),
+                  (SELECT count(*) FROM measurements WHERE channel_id = @ch AND ts > now() - interval '10 minutes'
+                     AND algo_version LIKE '%out_of_gb_range'),
+                  (SELECT count(*) FROM measurements WHERE channel_id = @ch AND ts > now() - interval '10 minutes'),
+                  (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY m.preload_ratio)
+                     FROM bolts b2
+                     JOIN LATERAL (SELECT preload_ratio FROM measurements
+                                   WHERE bolt_id = b2.id AND preload_ratio IS NOT NULL
+                                   ORDER BY ts DESC LIMIT 1) m ON true
+                     WHERE b2.group_id = (SELECT group_id FROM bolts WHERE id = @bolt)
+                       AND b2.id <> @bolt AND b2.deleted_at IS NULL),
+                  (SELECT count(*) FROM bolts WHERE group_id = (SELECT group_id FROM bolts WHERE id = @bolt)
+                     AND id <> @bolt AND deleted_at IS NULL)"))
+            {
+                q.Parameters.AddWithValue("ch", NpgsqlDbType.Bigint, channelId);
+                q.Parameters.AddWithValue("bolt", NpgsqlDbType.Bigint, boltId);
+                await using var r = await q.ExecuteReaderAsync(ct);
+                await r.ReadAsync(ct);
+                recentCount = r.GetInt64(0);
+                lastEcho = r.IsDBNull(1) ? null : r.GetDecimal(1);
+                lastValidRatio = r.IsDBNull(2) ? null : r.GetDecimal(2);
+                snrDb = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                gateRejected = r.GetInt64(4);
+                gateTotal = r.GetInt64(5);
+                peerMedianRatio = r.IsDBNull(6) ? null : (decimal?)r.GetDouble(6);
+                peerCount = (int)r.GetInt64(7);
+            }
+
+            var deltaNs = lastEcho is not null && refTimeNs is not null ? lastEcho.Value - refTimeNs.Value : (decimal?)null;
+            var gateRejectPct = gateTotal > 0 ? (decimal)gateRejected / gateTotal : 0m;
+            var linkOk = recentCount > 0;
+            var snrOk = snrDb is null or >= 12m;
+            // 基线嫌疑：当前有效比值荒谬，或声时相对基线漂移超过 1000ns（≈74 万 N，物理不可能的量级）
+            var ratioAbsurd = lastValidRatio is not null && (lastValidRatio > 3m || lastValidRatio < 0.05m);
+            var baselineSuspect = ratioAbsurd || (deltaNs is not null && Math.Abs(deltaNs.Value) > 1000m);
+            // 共模：同组其他螺栓的中位比值也越限（同向）→ 工况/温度/系统性配置问题，不是本颗独立异常
+            var peerAlsoAbnormal = peerCount > 0 && peerMedianRatio is not null
+                && (peerMedianRatio < 0.9m || peerMedianRatio > 1.1m);
+
+            string verdict, recommendation;
+            if (!linkOk)
+            {
+                verdict = "link_down";
+                recommendation = "通道 90 秒内无任何上报：检查探头插拔/电缆接头/设备供电，到【采集设备】页看链路状态。";
+            }
+            else if (baselineSuspect)
+            {
+                verdict = "baseline_suspect";
+                recommendation = $"读数偏离物理可能范围（声时相对基线漂移 {(deltaNs is null ? "?" : Math.Abs(deltaNs.Value).ToString("F0"))} ns）："
+                    + "多为基线锁错回波或规格错误。到【采集设备】页重标定基线，再做在役锚定（认定当前=目标值）。";
+            }
+            else if (!snrOk && (gateRejectPct > 0.3m || IsNearThreshold(lastValidRatio)))
+            {
+                // 信号差 + 读数贴着阈值（±15% 带内）：越限更可能是回波抖动抬/压出来的，先治耦合再下结论。
+                // 真机实证：CH8 SNR 8.5dB 时读数在 97%~118% 摆，摆上 110% 阈值就报"偏高"，物理上没人动过螺栓。
+                verdict = "sensor_issue";
+                recommendation = $"信号质量差（SNR {snrDb:F1} dB < 12 dB）"
+                    + (gateRejectPct > 0.3m ? $"且 {gateRejectPct:P0} 测量被范围门拒算" : $"且读数（{lastValidRatio:P0}）贴近告警阈值摆动")
+                    + "：越限更可能是回波抖动所致，建议现场重新耦合探头（清洁端面、补耦合剂、压紧）后再判定。";
+            }
+            else if (peerAlsoAbnormal)
+            {
+                verdict = "common_mode";
+                recommendation = "同组其他螺栓中位读数也在越限：更像工况变化（温度/载荷）或全组目标配置问题，先核对同组趋势再动单颗。";
+            }
+            else
+            {
+                verdict = "likely_real";
+                recommendation = "链路、信号、基线均正常，同组其他螺栓读数正常——本颗越限大概率是真实状态，建议现场复核，必要时按力矩规程复拧。";
+            }
+
+            return Results.Ok(new
+            {
+                alarmId = id,
+                boltId,
+                boltCode,
+                channelNo,
+                type = alarmType,
+                cleared,
+                ratioAtTrigger,
+                verdict,
+                recommendation,
+                checks = new object[]
+                {
+                    new { key = "link", label = "探头链路", ok = linkOk,
+                          detail = linkOk ? $"最近 90 秒有 {recentCount} 条上报" : "最近 90 秒无任何上报" },
+                    new { key = "snr", label = "信号质量", ok = snrOk,
+                          detail = snrDb is null ? "无波形特征数据" : $"SNR {snrDb:F1} dB（门限 12 dB）" },
+                    new { key = "baseline", label = "基线合理性", ok = !baselineSuspect,
+                          detail = deltaNs is null ? "无回波数据" :
+                              $"声时相对基线漂移 {deltaNs:F0} ns" + (lastValidRatio is null ? "" : $"，最近有效比值 {lastValidRatio:P0}") },
+                    new { key = "gate", label = "范围门拒算率", ok = gateRejectPct <= 0.3m,
+                          detail = gateTotal == 0 ? "最近 10 分钟无测量" : $"最近 10 分钟 {gateRejectPct:P0}（{gateRejected}/{gateTotal}）被拒算" },
+                    new { key = "common", label = "同组共模", ok = !peerAlsoAbnormal,
+                          detail = peerCount == 0 ? "同组无其他螺栓可比" :
+                              $"同组 {peerCount} 颗中位比值 {(peerMedianRatio is null ? "—" : peerMedianRatio.Value.ToString("P0"))}" },
+                },
+            });
+        })
+        .RequireAuthorization(AuthPolicies.LoggedIn)
+        .WithName("DiagnoseAlarm")
+        .WithSummary("告警诊断：五项规则检查给出根因结论与处置建议（链路/信号/基线/拒算率/共模）");
+
         // 确认告警（operator+，user_id 强制取 HttpContext，不接客户端伪造）。
         // 状态更新与审计同事务：不允许出现"已 ack 但 audit_log 缺条"的断链。
         grp.MapPost("/{id:long}/ack", async (
@@ -145,6 +300,7 @@ public static class AlarmEndpoints
         .WithSummary("确认告警（不闭合，仅标记已读）");
 
         // 手动闭合告警（operator+）— 配合 0011_safety_fixes.sql 的 partial unique 索引。闭合与审计同事务。
+        // 0035 起闭合带结构化归因（resolution）：真实告警 vs 四类误报根因，反哺报警合理化统计。
         grp.MapPost("/{id:long}/clear", async (
             long id, HttpContext http, ClearRequest? body, NpgsqlDataSource ds,
             IAlarmEvaluator evaluator, CancellationToken ct) =>
@@ -154,13 +310,21 @@ public static class AlarmEndpoints
             if (string.IsNullOrEmpty(reason)) reason = null;
             if (reason is { Length: > 500 })
                 return Results.BadRequest(new { error = "闭合原因最多 500 字符", length = reason.Length });
+            var resolution = body?.Resolution?.Trim();
+            if (string.IsNullOrEmpty(resolution)) resolution = null;
+            if (resolution is not null && !KnownResolutions.Contains(resolution))
+                return Results.BadRequest(new
+                {
+                    error = $"未知归因 '{resolution}'，允许：{string.Join(" / ", KnownResolutions)}",
+                });
 
             // cleared_by 持久化到库（安全动作可追责）；NULL 才是系统自动闭合
             const string sql = @"
                 UPDATE alarms
                    SET cleared_at = now(),
                        cleared_by = @uid,
-                       cleared_reason = COALESCE(@reason, 'manual_reset')
+                       cleared_reason = COALESCE(@reason, 'manual_reset'),
+                       resolution = @resolution
                  WHERE id = @id AND cleared_at IS NULL
                  RETURNING type, cleared_reason, bolt_id, channel_id";
 
@@ -174,6 +338,7 @@ public static class AlarmEndpoints
                 cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, u.UserId);
                 cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, id);
                 cmd.Parameters.AddWithValue("reason", NpgsqlDbType.Text, (object?)reason ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("resolution", NpgsqlDbType.Varchar, (object?)resolution ?? DBNull.Value);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
                 if (await r.ReadAsync(ct))
                 {
@@ -190,7 +355,9 @@ public static class AlarmEndpoints
             }
 
             await WriteAlarmAuditAsync(conn, tx, u.UserId, "alarm_clear", id,
-                $"手动闭合告警 #{id}（{DisplayLabels.AlarmType(alarmType)}）原因：{clearedReason}", ct);
+                $"手动闭合告警 #{id}（{DisplayLabels.AlarmType(alarmType)}）"
+                + (resolution is null ? "" : $"归因：{DisplayLabels.AlarmResolution(resolution)}，")
+                + $"原因：{clearedReason}", ct);
             await tx.CommitAsync(ct);
 
             // 复位评估器状态机（重臂）：手动闭合时条件可能仍在越限——若不复位，内存槽位停在 active，
@@ -475,6 +642,29 @@ public static class AlarmEndpoints
                 ? Math.Round((double)topCount / totalTriggered, 4)
                 : 0d;
 
+            // 归因分布（0035）：窗口内人工闭合且带归因的告警按 resolution 聚合。
+            // real_* 为真实告警，其余是误报根因——误报占比是报警合理化评审的核心输入。
+            var resolutions = new List<object>();
+            long resolvedTotal = 0, falseAlarmCount = 0;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT resolution, count(*)
+                FROM alarms
+                WHERE cleared_at >= now() - (@hours * interval '1 hour') AND resolution IS NOT NULL
+                GROUP BY resolution
+                ORDER BY count(*) DESC"))
+            {
+                cmd.Parameters.AddWithValue("hours", NpgsqlDbType.Integer, hours);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct))
+                {
+                    var code = r.GetString(0);
+                    var c = r.GetInt64(1);
+                    resolvedTotal += c;
+                    if (!code.StartsWith("real_", StringComparison.Ordinal)) falseAlarmCount += c;
+                    resolutions.Add(new { code, label = DisplayLabels.AlarmResolution(code), count = c });
+                }
+            }
+
             return Results.Ok(new
             {
                 windowHours = hours,
@@ -517,7 +707,15 @@ public static class AlarmEndpoints
                 avgAckMinutes = avgAckMinutes.HasValue ? Math.Round(avgAckMinutes.Value, 1) : (double?)null,
                 avgClearMinutes = avgClearMinutes.HasValue ? Math.Round(avgClearMinutes.Value, 1) : (double?)null,
                 avgPerHour,
-                topFrequent = top
+                topFrequent = top,
+                // 归因闭环：已归因数、误报占比（分母是"带归因的人工闭合"，自动恢复不计入）
+                resolutionStats = new
+                {
+                    resolvedTotal,
+                    falseAlarmCount,
+                    falseAlarmRatio = resolvedTotal > 0 ? Math.Round((double)falseAlarmCount / resolvedTotal, 4) : (double?)null,
+                    items = resolutions,
+                },
             });
         })
         .WithName("AlarmKpi")
@@ -551,8 +749,11 @@ public static class AlarmEndpoints
 /// <summary>确认告警——值班的人看见了。备注可不填。</summary>
 public sealed record AckRequest(string? Note = null);
 
-/// <summary>人工闭合告警。原因可不填，但闭合人和原因都会落库，事后要靠它追责。</summary>
-public sealed record ClearRequest(string? Reason = null);
+/// <summary>
+/// 人工闭合告警。Resolution 为结构化归因（见 0035 迁移白名单，可不填=未归因），
+/// Reason 是自由文本补充。闭合人、归因、原因都落库，误报率统计与追责都靠它。
+/// </summary>
+public sealed record ClearRequest(string? Reason = null, string? Resolution = null);
 
 /// <summary>
 /// 把某颗螺栓的告警静音几小时（检修期间用）。BoltId 必须给：不给就成了全场静默，端点直接 400 拒掉。

@@ -213,6 +213,24 @@ public static class DisplayLabels
         ["sim_baseline"] = "初始基线",
     };
 
+    /// <summary>告警闭合归因码（与 0035 迁移 CHECK 白名单一致）。real_* 为真实告警，其余为误报根因。</summary>
+    private static readonly Dictionary<string, string> AlarmResolutions = new(StringComparer.Ordinal)
+    {
+        ["real_loosening"] = "真实松动（已处理）",
+        ["real_overload"] = "真实过载（已处理）",
+        ["baseline_error"] = "基线错误（已重标）",
+        ["sensor_issue"] = "探头/信号问题（已处理）",
+        ["config_error"] = "目标/规格配置错误（已修正）",
+        ["external_operation"] = "试验/检修操作（预期内）",
+        ["other"] = "其他",
+    };
+
+    /// <summary>告警闭合归因码转中文。</summary>
+    public static string AlarmResolution(string? code) => Lookup(AlarmResolutions, code, "归因");
+
+    /// <summary>已登记的告警归因码。</summary>
+    public static IReadOnlyCollection<string> KnownAlarmResolutions => AlarmResolutions.Keys;
+
     /// <summary>各词表已登记的码，供测试核对覆盖率。</summary>
     public static IReadOnlyCollection<string> KnownAuditActions => AuditActions.Keys;
 
