@@ -84,3 +84,20 @@ src/BoltPreload.Api/data/
 
 # 分析期的临时导出（路由清单、页面映射等），随查随删，不进 git
 tmp_*.txt
+
+# 调试/验证期临时工作区（测试输出、抓包、一次性脚本产物），随查随删，不进 git
+tmp/
+
+# 办公产物（周报、汇报 PPT/文档导出），非工程交付物，不进 git
+output/
+
+# tools/ 下的一次性文档处理残留（PPT 加工脚本、页面截图、导出 dump）；
+# 正经工程（LicenseSigner/、DeviceSmokeTest/、start-bhlssdk-stack.ps1、code-audit.py）不受影响
+tools/*.png
+tools/*.jpg
+tools/*.pdf
+tools/*.txt
+tools/*.docx
+tools/cur_imgs/
+tools/pptx_*.py
+tools/pdf_pages.py

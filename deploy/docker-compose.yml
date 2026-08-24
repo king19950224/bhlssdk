@@ -34,8 +34,11 @@ services:
       - "postgres"
       - "-c"
       - "shared_preload_libraries=timescaledb"
+      # 300 的依据：API 连接池上限 200（Npgsql 默认池 + EF 池）+ psql/工具连接余量。
+      # 100 时启动自检会告警"池上限超 max_connections 的 80%"，高峰打满库连接的表现是
+      # 采集 WAL 降级 + 页面查询超时（2026-08-18 排查确认，生产工控机原生 PG 同样按此配）
       - "-c"
-      - "max_connections=100"
+      - "max_connections=300"
       - "-c"
       - "shared_buffers=512MB"
       - "-c"
