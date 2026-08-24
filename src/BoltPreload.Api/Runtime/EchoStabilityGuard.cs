@@ -53,19 +53,26 @@ public static class EchoStabilityGuard
         /// 均值差算不出来就不能宣称"稳"）。样本数量下限由各调用方按自己的 minSamples 把守，
         /// 这里只管"稳不稳"。
         /// </summary>
-        public bool Stable =>
-            StddevNs is { } sd && sd <= CalibrationThresholds.EchoStddevMaxNs
-            && HalfWindowDriftNs is { } drift && Math.Abs(drift) <= CalibrationThresholds.EchoHalfWindowDriftMaxNs;
+        public bool Stable => IsStableWithin(
+            CalibrationThresholds.EchoStddevMaxNs,
+            CalibrationThresholds.EchoHalfWindowDriftMaxNs);
+
+        /// <summary>按指定上限判定（实验室 0.6ns / 在役置零 3ns·5ns）。</summary>
+        public bool IsStableWithin(decimal stddevMaxNs, decimal driftMaxNs) =>
+            StddevNs is { } sd && sd <= stddevMaxNs
+            && HalfWindowDriftNs is { } drift && Math.Abs(drift) <= driftMaxNs;
 
         /// <summary>给 400 响应用的诊断载荷（前端直接展示，现场知道差多少、还要等）。</summary>
-        public object ToDiagnostics() => new
+        public object ToDiagnostics(decimal? stddevMaxNs = null, decimal? driftMaxNs = null) => new
         {
-            stable = Stable,
+            stable = IsStableWithin(
+                stddevMaxNs ?? CalibrationThresholds.EchoStddevMaxNs,
+                driftMaxNs ?? CalibrationThresholds.EchoHalfWindowDriftMaxNs),
             sampleCount = SampleCount,
             stddevNs = StddevNs,
             halfWindowDriftNs = HalfWindowDriftNs,
-            stddevMaxNs = CalibrationThresholds.EchoStddevMaxNs,
-            halfWindowDriftMaxNs = CalibrationThresholds.EchoHalfWindowDriftMaxNs,
+            stddevMaxNs = stddevMaxNs ?? CalibrationThresholds.EchoStddevMaxNs,
+            halfWindowDriftMaxNs = driftMaxNs ?? CalibrationThresholds.EchoHalfWindowDriftMaxNs,
             windowSeconds = WindowSeconds,
         };
     }

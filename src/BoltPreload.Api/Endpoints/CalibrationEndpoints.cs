@@ -297,15 +297,16 @@ public static class CalibrationEndpoints
             var logger = lf.CreateLogger("Calibration");
             var userId = UserContext.Require(http).UserId;  // 操作人/审核人/审计一律取自 JWT，不信任客户端 user_id
 
-            long boltId, deviceId;
+            long boltId, deviceId, groupId;
             short channelNo;
             string nominalDiam;
             decimal? existingRefTime, existingRefTemp;
-            decimal? currentTarget, rp02Mpa, crossSectionMm2, boltTempCoeff;
+            decimal? currentTarget, rp02Mpa, crossSectionMm2, boltTempCoeff, effectiveLengthMm;
             await using (var cmd = ds.CreateCommand(@"
                 SELECT b.id, c.device_id, c.channel_no, b.nominal_diam,
                        c.ref_time_ns, c.ref_temp_c, b.target_preload_n,
-                       b.rp02_mpa, b.cross_section_mm2, b.temp_coefficient_per_c
+                       b.rp02_mpa, b.cross_section_mm2, b.temp_coefficient_per_c, b.group_id,
+                       b.effective_length_mm
                 FROM channels c
                 JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE c.id = @cid AND c.deleted_at IS NULL"))
@@ -325,45 +326,107 @@ public static class CalibrationEndpoints
                 rp02Mpa = r.IsDBNull(7) ? null : r.GetDecimal(7);
                 crossSectionMm2 = r.IsDBNull(8) ? null : r.GetDecimal(8);
                 boltTempCoeff = r.IsDBNull(9) ? null : r.GetDecimal(9);
+                groupId = r.GetInt64(10);
+                effectiveLengthMm = r.IsDBNull(11) ? null : r.GetDecimal(11);
             }
 
             var diameterMm = req.NominalDiameterMm ?? ParseNominalDiameterMm(nominalDiam);
-            if (diameterMm <= 0)
-                return Results.BadRequest(new { error = "无法确定螺栓公称直径，请传 nominalDiameterMm，例如 M20 传 20" });
-
             var nutFactor = req.NutFactor ?? 0.20m;
-            if (nutFactor <= 0)
-                return Results.BadRequest(new { error = "nutFactor 必须大于 0" });
 
-            // T = K F d，其中 d 用 m
-            var estimatedPreloadN = req.TorqueNm / (nutFactor * (diameterMm / 1000m));
-            if (estimatedPreloadN <= 0)
-                return Results.BadRequest(new { error = "估算预紧力 <= 0，请检查 torqueNm / nutFactor / diameter" });
+            // 锚点/标定预紧力 F₀ 的来源：
+            // 在役主路径：置零后认定当前 = 档案已设定的目标预紧力（target_preload_n），
+            // 之后只看动载荷（Δt 增大）和衰减（Δt 减小）。不走扭矩、不选表面状态 K。
+            // ① 请求显式传 anchorPreloadN（向导可改档案值）＞ ② 档案 target_preload_n
+            // ＞ ③ torqueNm 换算 T/(K·d)（实验室/API 兼容，向导主路径不再露出）。
+            decimal estimatedPreloadN;
+            var anchorBasis = "torque";
+            if (req.AnchorInService == true)
+            {
+                if (req.AnchorPreloadN is > 0m)
+                {
+                    estimatedPreloadN = req.AnchorPreloadN.Value;
+                    anchorBasis = "target_preload";
+                }
+                else if (currentTarget is > 0m)
+                {
+                    estimatedPreloadN = currentTarget.Value;
+                    anchorBasis = "target_preload";
+                }
+                else if (req.TorqueNm is > 0m)
+                {
+                    if (nutFactor <= 0)
+                        return Results.BadRequest(new { error = "nutFactor 必须大于 0" });
+                    if (diameterMm <= 0)
+                        return Results.BadRequest(new { error = "无法确定螺栓公称直径，请传 nominalDiameterMm，例如 M20 传 20" });
+                    estimatedPreloadN = req.TorqueNm.Value / (nutFactor * (diameterMm / 1000m));
+                    if (estimatedPreloadN <= 0)
+                        return Results.BadRequest(new { error = "估算预紧力 <= 0，请检查 torqueNm / nutFactor / diameter" });
+                    anchorBasis = "torque";
+                }
+                else
+                {
+                    return Results.BadRequest(new
+                    {
+                        error = "在役锚定需要目标预紧力：请先在螺栓档案设定 target_preload_n，或在请求里传 anchorPreloadN。"
+                            + "现场做法是置零后认定当前=设定的目标值，之后看动载荷和衰减。",
+                    });
+                }
+            }
+            else
+            {
+                if (nutFactor <= 0)
+                    return Results.BadRequest(new { error = "nutFactor 必须大于 0" });
+                if (req.TorqueNm is not > 0m)
+                    return Results.BadRequest(new { error = "torqueNm 必须大于 0" });
+                if (diameterMm <= 0)
+                    return Results.BadRequest(new { error = "无法确定螺栓公称直径，请传 nominalDiameterMm，例如 M20 传 20" });
+
+                // T = K F d，其中 d 用 m
+                estimatedPreloadN = req.TorqueNm.Value / (nutFactor * (diameterMm / 1000m));
+                if (estimatedPreloadN <= 0)
+                    return Results.BadRequest(new { error = "估算预紧力 <= 0，请检查 torqueNm / nutFactor / diameter" });
+            }
 
             var sampleWindowSeconds = Math.Clamp(req.SampleWindowSeconds ?? 60, 5, 600);
 
-            // 采样稳定性护栏（hardening §2）：窗口里混着拧紧过程/松弛尾巴时拒绝。
-            // 不拦的话平均声时落在两个受力状态之间，K_L 错一个数量级还毫无征兆——
-            // 08-12 真机上 CH1/CH2/CH8 就是这么标废的（设完基线一分钟就提交，窗口 3/4 是松开状态）。
-            var stability = await EchoStabilityGuard.MeasureAsync(ds, channelId, sampleWindowSeconds, ct);
-            if (!stability.Stable && req.Force != true)
-                return Results.BadRequest(new
-                {
-                    error = $"采样窗口内声时未达稳定判据（波动 {Fmt(stability.StddevNs)} ns，前后半窗趋势 {Fmt(stability.HalfWindowDriftNs)} ns）。"
-                        + "多半是拧紧后还没等满采样窗口、或应力松弛未结束——请保持螺栓静置，等稳后重试；"
-                        + "确认要用当前数据可传 force=true（会记入审计）。",
-                    stability = stability.ToDiagnostics(),
-                });
-
             decimal avgEcho, avgTemp;
             long sampleCount;
-            await using (var cmd = ds.CreateCommand(@"
-                SELECT ROUND(AVG(echo_time_ns), 6), ROUND(AVG(sp_temp_c), 6), COUNT(*)
-                FROM measurements
-                WHERE bolt_id = @bolt_id
-                  AND ts > now() - (@seconds || ' seconds')::interval
-                  AND echo_time_ns IS NOT NULL"))
+            EchoStabilityGuard.Snapshot? stability = null;
+            if (req.AnchorInService == true)
             {
+                // 锚定模式不采窗、不做稳定性检查：锚点时刻 ≡ 置零基准时刻。
+                // 在役流程是"记基准（那一步已过稳定护栏）→ 认定基准时刻的预紧力=F₀"，
+                // 锚定只是给置零基准贴力值标签（写截距），若再采一轮窗口，窗口里混着记基准之前的
+                // 漂移数据会被自己的护栏打回——真机实测：基准 60s 窗刚过检，锚定 180s 窗
+                // 立刻被拦（sd 2.7ns），现场卡死在最后一步。直接用通道基准声时做锚点，
+                // "后补锚定"（基准是几天前记的）同样自洽——认定的是【基准时刻】的状态 = 目标值。
+                if (existingRefTime is null || existingRefTemp is null)
+                    return Results.BadRequest(new { error = "在役锚定前请先记录基准（置零）：锚定的含义是认定【基准时刻】的预紧力为 F₀。" });
+                avgEcho = existingRefTime.Value;
+                avgTemp = existingRefTemp.Value;
+                sampleCount = 0;
+            }
+            else
+            {
+                // 采样稳定性护栏（hardening §2）：窗口里混着拧紧过程/松弛尾巴时拒绝。
+                // 不拦的话平均声时落在两个受力状态之间，K_L 错一个数量级还毫无征兆——
+                // 08-12 真机上 CH1/CH2/CH8 就是这么标废的（设完基线一分钟就提交，窗口 3/4 是松开状态）。
+                stability = await EchoStabilityGuard.MeasureAsync(ds, channelId, sampleWindowSeconds, ct);
+                if (!stability.Stable && req.Force != true)
+                    return Results.BadRequest(new
+                    {
+                        error = $"采样窗口内声时未达稳定判据（波动 {Fmt(stability.StddevNs)} ns，前后半窗趋势 {Fmt(stability.HalfWindowDriftNs)} ns）。"
+                            + "多半是拧紧后还没等满采样窗口、或应力松弛未结束——请保持螺栓静置，等稳后重试；"
+                            + "确认要用当前数据可传 force=true（会记入审计）。",
+                        stability = stability.ToDiagnostics(),
+                    });
+
+                await using var cmd = ds.CreateCommand(@"
+                    SELECT ROUND(AVG(echo_time_ns), 6), ROUND(AVG(sp_temp_c), 6), COUNT(*)
+                    FROM measurements
+                    WHERE bolt_id = @bolt_id
+                      AND ts > now() - (@seconds || ' seconds')::interval
+                      AND echo_time_ns IS NOT NULL");
                 cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
                 cmd.Parameters.AddWithValue("seconds", NpgsqlDbType.Integer, sampleWindowSeconds);
                 await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -375,26 +438,71 @@ public static class CalibrationEndpoints
                 sampleCount = r.GetInt64(2);
             }
 
-            var refTime = req.RefTimeNs ?? existingRefTime;
-            var refTemp = req.RefTempC ?? existingRefTemp;
-            if (refTime is null || refTemp is null)
-                return Results.BadRequest(new { error = "缺少 RefTime/RefTemp，请先同步通道配置或在请求里传 refTimeNs/refTempC" });
+            decimal kL, refTimeVal, refTempVal, normalizedEcho, deltaTof;
+            decimal? interceptNs = null;
+            string? kLSource = null;
+            if (req.AnchorInService == true)
+            {
+                // ===== 在役锚定模式（风机现场主路径）=====
+                // 现场做法：先采集基准、手动置零（RefTime = 当前声时），再认定"当前 = 档案目标 F₀"，
+                // 之后只看动载与衰减。置零基线不许被覆盖成虚拟零载 t₀——那会跟刚记下的基准打架。
+                // 热路径已有 F = (Δt − b) / K_L，令 b = −K_L·F₀ 即得 F = F₀ + Δt/K_L：
+                //   Δt=0（刚置零）→ F=F₀；声时变大 → 动载升高；声时变小 → 衰减/松弛。
+                // K_L 不需要拧动本颗螺栓：显式传入（同批实验室标定/理论估算）＞ 同组同规格同长度中位数。
+                var anchorKl = req.KL;
+                kLSource = "request";
+                if (anchorKl is null or <= 0m)
+                {
+                    anchorKl = await PeerMedianKlAsync(ds, groupId, nominalDiam, effectiveLengthMm, boltId, ct);
+                    kLSource = "peer_median";
+                }
+                if (anchorKl is null or <= 0m)
+                    return Results.BadRequest(new
+                    {
+                        error = "在役锚定需要 K_L（力-声时系数）：同组同规格螺栓尚无已生效标定可沿用，"
+                            + "请传入 kL（同批备件的实验室标定值，或按理论估算并经人工确认）。",
+                        hint = "K_L 是批次属性，不需要拧动本颗螺栓：对同批备件做一次载荷/阶梯标定即可全场复用。",
+                    });
 
-            // 用螺栓自身温度系数(缺省回退 SDK 默认)，与采集热路径(PostgresMeasurementSink)一致，避免标定/运行两套温补
-            var normalizedEcho = avgEcho / (1m + (boltTempCoeff ?? BoltPhysicsDefaults.SdkTempCoefficientPerC) * (avgTemp - refTemp.Value));
-            var deltaTof = normalizedEcho - refTime.Value;
-            var kL = deltaTof / estimatedPreloadN;
-            if (kL <= 0)
-                return Results.BadRequest(new { error = "计算得到 K_L <= 0，请检查 RefTime/当前 EchoTime/扭矩输入", avgEcho, normalizedEcho, refTime, deltaTof });
-            // 计算得到的 kL 也过一遍量级护栏（卡 RefTime/Δt/载荷异常导致的非物理 kL）
-            if (ValidateKLMagnitude(kL, refTime.Value, YieldForceN(rp02Mpa, crossSectionMm2), currentTarget) is { } klReject)
+                kL = anchorKl.Value;
+                refTempVal = avgTemp;                       // 基准时刻温度即参考温度（温补因子=1，自洽）
+                normalizedEcho = avgEcho;                   // = 刚记下的置零基准
+                deltaTof = 0m;                              // 置零后当前就是原点
+                refTimeVal = avgEcho;                       // 保持置零基线，不改写成虚拟 t₀
+                interceptNs = -kL * estimatedPreloadN;      // F = (Δt − b)/K_L = F₀ + Δt/K_L
+            }
+            else
+            {
+                // ===== 常规模式（实验室/安装前）：已有零载基线，反推 K_L =====
+                var refTime = req.RefTimeNs ?? existingRefTime;
+                var refTemp = req.RefTempC ?? existingRefTemp;
+                if (refTime is null || refTemp is null)
+                    return Results.BadRequest(new { error = "缺少 RefTime/RefTemp，请先同步通道配置或在请求里传 refTimeNs/refTempC" });
+
+                // 用螺栓自身温度系数(缺省回退 SDK 默认)，与采集热路径(PostgresMeasurementSink)一致，避免标定/运行两套温补
+                normalizedEcho = avgEcho / (1m + (boltTempCoeff ?? BoltPhysicsDefaults.SdkTempCoefficientPerC) * (avgTemp - refTemp.Value));
+                deltaTof = normalizedEcho - refTime.Value;
+                kL = deltaTof / estimatedPreloadN;
+                if (kL <= 0)
+                    return Results.BadRequest(new { error = "计算得到 K_L <= 0，请检查 RefTime/当前 EchoTime/扭矩输入", avgEcho, normalizedEcho, refTime, deltaTof });
+                refTimeVal = refTime.Value;
+                refTempVal = refTemp.Value;
+            }
+
+            // 两种模式的 kL 都过量级护栏（卡 RefTime/Δt/载荷/外部输入异常导致的非物理 kL）
+            if (ValidateKLMagnitude(kL, refTimeVal, YieldForceN(rp02Mpa, crossSectionMm2), currentTarget) is { } klReject)
                 return klReject;
 
             var uncertaintyRatio = req.UncertaintyRatio ?? 0.30m;
             var kLUncertainty = kL * uncertaintyRatio;
             var newCalibId = Guid.NewGuid();
-            var note = req.Note ??
-                $"扭矩法临时标定：T={req.TorqueNm}N·m, K={nutFactor}, d={diameterMm}mm, F≈{estimatedPreloadN:F1}N；正式验收需多点载荷标定替换。";
+            var note = req.Note ?? (req.AnchorInService == true
+                ? (anchorBasis == "target_preload"
+                    ? $"在役锚定标定：置零后认定当前=设定的目标预紧力 F₀={estimatedPreloadN:F0}N，"
+                    : $"在役锚定标定：置零后按安装/设计扭矩 T={req.TorqueNm}N·m, K={nutFactor}, d={diameterMm}mm 认定当前预紧力 F₀≈{estimatedPreloadN:F0}N，")
+                  + $"F=F₀+Δt/K_L（截距 b={interceptNs:F4} ns，K_L 来源：{(kLSource == "request" ? "人工录入/同批标定" : "同组同规格中位数")}）。"
+                  + "绝对值为认定参考，之后的动载与衰减按声时变化监测。"
+                : $"扭矩法临时标定：T={req.TorqueNm}N·m, K={nutFactor}, d={diameterMm}mm, F≈{estimatedPreloadN:F1}N；正式验收需多点载荷标定替换。");
 
             await using var conn = await ds.OpenConnectionAsync(ct);
             await using var tx = await conn.BeginTransactionAsync(ct);
@@ -410,7 +518,7 @@ public static class CalibrationEndpoints
                 {
                     new
                     {
-                        type = "torque_estimate",
+                        type = req.AnchorInService == true ? "in_service_anchor" : "torque_estimate",
                         torqueNm = req.TorqueNm,
                         nutFactor,
                         nominalDiameterMm = diameterMm,
@@ -421,7 +529,14 @@ public static class CalibrationEndpoints
                         deltaTofNs = deltaTof,
                         sampleCount,
                         sampleWindowSeconds,
-                        warning = "temporary torque estimate, not load-cell calibration"
+                        // 锚定模式记录锚点依据 + K_L 来源 + 截距——事后审查"这个绝对值哪来的"全靠这里
+                        anchorBasis = req.AnchorInService == true ? anchorBasis : null,
+                        kLSource,
+                        interceptNs,
+                        formula = req.AnchorInService == true ? "F = F0 + dt/KL (dt relative to zeroed baseline)" : null,
+                        warning = req.AnchorInService == true
+                            ? "in-service anchor: current state is taken as F0 (target preload / install torque); subsequent dynamic load and relaxation are Δt/K_L"
+                            : "temporary torque estimate, not load-cell calibration"
                     }
                 });
 
@@ -429,14 +544,14 @@ public static class CalibrationEndpoints
                     INSERT INTO calibration_records (
                         id, bolt_id, method, operator_user_id, reviewer_user_id,
                         loading_device, loading_device_cert, env_temp_c, env_humidity,
-                        points_jsonb, k_l, k_l_uncertainty, r_squared, outliers_removed,
+                        points_jsonb, k_l, k_l_uncertainty, k_l_intercept_ns, r_squared, outliers_removed,
                         uncertainty_breakdown, fitter_version, ref_time_ns, ref_temp_c,
                         passed, notes, review_state, operator_signature_at, reviewer_signature_at, expires_at, created_at, sdk_version
                     ) VALUES (
                         @id, @bolt_id, 'torque_estimate', @op, @rev,
                         @ld, NULL, @env_temp, NULL,
-                        @points::jsonb, @kl, @klu, 0, 0,
-                        @unc::jsonb, 'torque:v1', @rt, @rtemp,
+                        @points::jsonb, @kl, @klu, @intercept, 0, 0,
+                        @unc::jsonb, @fitver, @rt, @rtemp,
                         true, @note, 'self_signed', now(), now(), @exp, now(), @sdkver
                     )", conn, tx))
                 {
@@ -449,13 +564,19 @@ public static class CalibrationEndpoints
                     cmd.Parameters.AddWithValue("points", NpgsqlDbType.Jsonb, pointsJson);
                     cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, kL);
                     cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, kLUncertainty);
+                    cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, (object?)interceptNs ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("unc", NpgsqlDbType.Jsonb,
                         System.Text.Json.JsonSerializer.Serialize(new { uncertaintyRatio, source = "torque coefficient uncertainty" }));
-                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime.Value);
-                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp.Value);
+                    cmd.Parameters.AddWithValue("fitver", NpgsqlDbType.Text,
+                        req.AnchorInService == true ? "anchor:v2" : "torque:v1");
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTimeVal);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTempVal);
                     cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, note);
+                    // 有效期：常规扭矩标定 7 天（等正式标定替换）；在役锚定 365 天——
+                    // 风机现场无法拧动螺栓重标，短过期会让通道定期变"无数据"且现场无自救手段，
+                    // 锚定基准作为趋势参考系也不因时间失效，年检复核即可
                     cmd.Parameters.AddWithValue("exp", NpgsqlDbType.Date,
-                        DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? 7)));
+                        DateOnly.FromDateTime(DateTime.UtcNow.AddDays(req.ExpiresDays ?? (req.AnchorInService == true ? 365 : 7))));
                     cmd.Parameters.AddWithValue("sdkver", NpgsqlDbType.Text, FxConnectorFactory.SdkVersion);
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
@@ -464,11 +585,13 @@ public static class CalibrationEndpoints
 
                 // target_preload_n 是设计/合同目标，不能被扭矩法估算值悄悄覆写——
                 // 否则后续保持率永远相对"估算目标"自洽，掩盖真实偏差。仅在原本为空时兜底填入。
+                // install_torque_nm / nominal_diam 仅在提供了对应输入时更新（按目标预紧力锚定时
+                // 没有扭矩输入、直径也可能没解析，不能把档案里的值清掉）。
                 await using (var cmd = new NpgsqlCommand(@"
                     UPDATE bolts SET
-                        install_torque_nm = @torque,
+                        install_torque_nm = COALESCE(@torque, install_torque_nm),
                         target_preload_n = COALESCE(target_preload_n, @target),
-                        nominal_diam = @nominal,
+                        nominal_diam = COALESCE(@nominal, nominal_diam),
                         effective_length_mm = COALESCE(@effective_len, effective_length_mm),
                         total_length_mm = COALESCE(@total_len, total_length_mm),
                         cross_section_mm2 = COALESCE(@area, cross_section_mm2),
@@ -476,9 +599,10 @@ public static class CalibrationEndpoints
                         updated_at = now()
                     WHERE id = @bolt_id", conn, tx))
                 {
-                    cmd.Parameters.AddWithValue("torque", NpgsqlDbType.Numeric, req.TorqueNm);
+                    cmd.Parameters.AddWithValue("torque", NpgsqlDbType.Numeric, (object?)req.TorqueNm ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, estimatedPreloadN);
-                    cmd.Parameters.AddWithValue("nominal", NpgsqlDbType.Varchar, $"M{diameterMm:0}");
+                    cmd.Parameters.AddWithValue("nominal", NpgsqlDbType.Varchar,
+                        diameterMm > 0 ? $"M{diameterMm:0}" : (object)DBNull.Value);
                     cmd.Parameters.AddWithValue("effective_len", NpgsqlDbType.Numeric, (object?)req.EffectiveLengthMm ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("total_len", NpgsqlDbType.Numeric, (object?)req.TotalLengthMm ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("area", NpgsqlDbType.Numeric, (object?)req.CrossSectionMm2 ?? DBNull.Value);
@@ -490,7 +614,7 @@ public static class CalibrationEndpoints
                     UPDATE channels SET
                         k_l = @kl,
                         k_l_uncertainty = @klu,
-                        k_l_intercept_ns = NULL,
+                        k_l_intercept_ns = @intercept,
                         ref_time_ns = @rt,
                         ref_temp_c = @rtemp,
                         active_calibration_id = @cid,
@@ -499,8 +623,9 @@ public static class CalibrationEndpoints
                 {
                     cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, kL);
                     cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, kLUncertainty);
-                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTime.Value);
-                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTemp.Value);
+                    cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, (object?)interceptNs ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, refTimeVal);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, refTempVal);
                     cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Uuid, newCalibId);
                     cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
                     await cmd.ExecuteNonQueryAsync(ct);
@@ -517,21 +642,26 @@ public static class CalibrationEndpoints
                     estimatedPreloadN,
                     kL,
                     kLUncertainty,
-                    refTime,
-                    refTemp,
+                    interceptNs,
+                    refTimeNs = refTimeVal,
+                    refTempC = refTempVal,
                     sampleCount,
+                    anchorInService = req.AnchorInService == true,
+                    kLSource,
                     // 强闯稳定性护栏必须留痕：事后排查坏标定时先看是不是 forced 进来的
-                    forcedPastStabilityGuard = !stability.Stable,
-                    stabilityStddevNs = stability.StddevNs,
-                    stabilityDriftNs = stability.HalfWindowDriftNs,
+                    //（锚定模式不采窗无此护栏，stability 为 null → false/null）
+                    forcedPastStabilityGuard = stability is { Stable: false },
+                    stabilityStddevNs = stability?.StddevNs,
+                    stabilityDriftNs = stability?.HalfWindowDriftNs,
                 });
                 await WriteChannelAuditAsync(conn, tx, userId, "torque_calibrate", channelId, afterJson, note, ct);
 
                 await tx.CommitAsync(ct);
                 resolver.Invalidate(deviceId, (ushort)channelNo);
 
-                logger.LogWarning("扭矩法临时标定完成 channel={ChannelId} torque={Torque}Nm preload≈{Preload}N KL={KL}",
-                    channelId, req.TorqueNm, estimatedPreloadN, kL);
+                logger.LogWarning("{Mode}完成 channel={ChannelId} torque={Torque}Nm preload≈{Preload}N KL={KL} intercept={Intercept}",
+                    req.AnchorInService == true ? "在役锚定标定" : "扭矩法临时标定",
+                    channelId, req.TorqueNm, estimatedPreloadN, kL, interceptNs);
 
                 return Results.Ok(new
                 {
@@ -541,8 +671,15 @@ public static class CalibrationEndpoints
                     appliedAt = DateTime.UtcNow,
                     torque = new { req.TorqueNm, nutFactor, nominalDiameterMm = diameterMm, estimatedPreloadN },
                     measurement = new { avgEchoNs = avgEcho, avgTempC = avgTemp, normalizedEchoNs = normalizedEcho, deltaTofNs = deltaTof, sampleCount },
-                    activeCalibration = new { kL, kLUncertainty, refTimeNs = refTime, refTempC = refTemp },
-                    warning = "扭矩法临时估算，非载荷标定；正式验收需多点加载标定替换。"
+                    activeCalibration = new { kL, kLUncertainty, interceptNs, refTimeNs = refTimeVal, refTempC = refTempVal },
+                    anchor = req.AnchorInService == true
+                        ? new { anchoredPreloadN = estimatedPreloadN, anchorBasis, kLSource, interceptNs, formula = "F = F0 + dt/KL" }
+                        : null,
+                    warning = req.AnchorInService == true
+                        ? (anchorBasis == "target_preload"
+                            ? "在役锚定：置零后认定当前=设定的目标预紧力；之后的动载与衰减按声时变化监测（F=F₀+Δt/K_L）。"
+                            : "在役锚定：置零后按安装/设计扭矩认定当前预紧力（±30%）；之后的动载与衰减按声时变化监测。")
+                        : "扭矩法临时估算，非载荷标定；正式验收需多点加载标定替换。"
                 });
             }
             catch (Exception ex)
@@ -586,15 +723,26 @@ public static class CalibrationEndpoints
             if (refTime is null || refTemp is null)
                 return Results.BadRequest(new { error = "缺少 ref_time_ns/ref_temp_c，请先同步通道配置或做一次临时标定" });
 
+            // 力值直标：有实测力（拉伸机/测力传感器）就直接用，完全绕开 T=K·F·d——
+            // 扭矩折算的 ±30% 误差全部来自摩擦系数 K 靠猜，这是"标不准"的物理根源；
+            // 拟合本来就是 (F, Δt) 回归，力值哪来的它不关心。torque_nm 仍照录（可为 0）备查。
+            var forceMode = req.MeasuredForceN is > 0;
+            if (req.MeasuredForceN is <= 0)
+                return Results.BadRequest(new { error = "measuredForceN 必须大于 0（单位 N）" });
+
             var diameterMm = req.NominalDiameterMm ?? ParseNominalDiameterMm(nominalDiam);
-            if (diameterMm <= 0)
+            if (!forceMode && diameterMm <= 0)
                 return Results.BadRequest(new { error = "无法确定螺栓公称直径，请传 nominalDiameterMm" });
 
             var nutFactor = req.NutFactor ?? 0.20m;
-            if (nutFactor <= 0)
+            if (!forceMode && nutFactor <= 0)
                 return Results.BadRequest(new { error = "nutFactor 必须大于 0" });
+            if (!forceMode && req.TorqueNm <= 0)
+                return Results.BadRequest(new { error = "torqueNm 必须大于 0（或改传 measuredForceN 走力值直标）" });
 
-            var estimatedPreloadN = req.TorqueNm / (nutFactor * (diameterMm / 1000m));
+            var estimatedPreloadN = forceMode
+                ? req.MeasuredForceN!.Value
+                : req.TorqueNm / (nutFactor * (diameterMm / 1000m));
             var seconds = Math.Clamp(req.SampleWindowSeconds ?? 60, 5, 600);
             var minSamples = Math.Clamp(req.MinSamples ?? 20, 1, 10_000);
 
@@ -695,7 +843,11 @@ public static class CalibrationEndpoints
                 cmd.Parameters.AddWithValue("normalized_echo", NpgsqlDbType.Numeric, normalizedEcho);
                 cmd.Parameters.AddWithValue("delta_tof", NpgsqlDbType.Numeric, deltaTof);
                 cmd.Parameters.AddWithValue("user_id", NpgsqlDbType.Bigint, userId);
-                cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, (object?)req.Note ?? DBNull.Value);
+                // 力值来源标记进 note（不动表结构）：列表/报告/审计都要能看出这个点是实测力还是扭矩估算
+                var pointNote = forceMode
+                    ? ($"[力值直标 实测 {req.MeasuredForceN:0} N] {req.Note}".Trim())
+                    : req.Note;
+                cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text, (object?)pointNote ?? DBNull.Value);
 
                 pointId = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
             }
@@ -712,12 +864,14 @@ public static class CalibrationEndpoints
                 {
                     pointId, boltId, req.TorqueNm, nutFactor, diameterMm,
                     estimatedPreloadN, sampleCount, deltaTofNs = deltaTof,
+                    forceMode, measuredForceN = req.MeasuredForceN,
                     forcedPastStabilityGuard = !stability.Stable,
                     stabilityStddevNs = stability.StddevNs,
                     stabilityDriftNs = stability.HalfWindowDriftNs,
                 }));
-                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
-                    $"采集扭矩阶梯点 #{pointId}：{req.TorqueNm} N·m，估算预紧力 {estimatedPreloadN:0} N（bolt #{boltId}）");
+                audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, forceMode
+                    ? $"采集力值直标点 #{pointId}：实测 {estimatedPreloadN:0} N（bolt #{boltId}，拉伸机/测力传感器）"
+                    : $"采集扭矩阶梯点 #{pointId}：{req.TorqueNm} N·m，估算预紧力 {estimatedPreloadN:0} N（bolt #{boltId}）");
                 AuditClientIp.Bind(audit.Parameters);
                 await audit.ExecuteNonQueryAsync(ct);
             }
@@ -743,21 +897,35 @@ public static class CalibrationEndpoints
                 refTempC = refTemp,
                 normalizedEchoTimeNs = normalizedEcho,
                 deltaTofNs = deltaTof,
-                note = "扭矩实验点已记录。继续按 50/100/150/200 N·m 采点后可看 summary 拟合线性。"
+                forceMode,
+                note = forceMode
+                    ? "力值直标点已记录（实测力入拟合，不经扭矩折算）。多档加载后在 summary 查看拟合。"
+                    : "扭矩实验点已记录。继续按 50/100/150/200 N·m 采点后可看 summary 拟合线性。"
             });
         })
         .WithName("CaptureTorqueTestPoint")
-        .WithSummary("采集一个扭矩阶梯实验点（不改变标定）");
+        .WithSummary("采集一个扭矩/力值阶梯实验点（不改变标定；measuredForceN=力值直标）");
 
         grp.MapGet("/torque-test-points", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
         {
+            // 每个点存的 delta_tof_ns 是按【采点当时】的通道基线（ref_time_ns 快照）算的；
+            // 基线被重设（recalibrate）后旧点的参考系失效，拟合/摘要只认 baselineMatched 的点。
+            // 列表把匹配标志和当前基线一并给出，前端才解释得了"为什么这个点不参与拟合"。
+            decimal? currentRefTimeNs = null;
+            await using (var refCmd = ds.CreateCommand(
+                "SELECT ref_time_ns FROM channels WHERE id = @cid AND deleted_at IS NULL"))
+            {
+                refCmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                if (await refCmd.ExecuteScalarAsync(ct) is decimal cur) currentRefTimeNs = cur;
+            }
+
             // 上限护栏：拟合展示用最近 500 点足够（正常阶梯实验 4~20 点）
             const string sql = @"
                 SELECT id, torque_nm, nut_factor, nominal_diameter_mm, estimated_preload_n,
                        sample_count, window_start, window_end,
                        avg_echo_time_ns, stddev_echo_time_ns, avg_temp_c,
                        normalized_echo_time_ns, delta_tof_ns, note, created_at,
-                       excluded, exclude_reason
+                       excluded, exclude_reason, ref_time_ns
                 FROM torque_test_points
                 WHERE channel_id = @channel_id
                 ORDER BY created_at DESC
@@ -770,6 +938,7 @@ public static class CalibrationEndpoints
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
             {
+                var pointRefTimeNs = r.GetDecimal(17);
                 items.Add(new
                 {
                     id = r.GetInt64(0),
@@ -788,14 +957,96 @@ public static class CalibrationEndpoints
                     note = r.IsDBNull(13) ? null : r.GetString(13),
                     createdAt = r.GetDateTime(14),
                     excluded = r.GetBoolean(15),
-                    excludeReason = r.IsDBNull(16) ? null : r.GetString(16)
+                    excludeReason = r.IsDBNull(16) ? null : r.GetString(16),
+                    refTimeNs = pointRefTimeNs,
+                    baselineMatched = currentRefTimeNs.HasValue && pointRefTimeNs == currentRefTimeNs.Value
                 });
             }
 
-            return Results.Ok(new { channelId, count = items.Count, items });
+            return Results.Ok(new { channelId, count = items.Count, currentRefTimeNs, items });
         })
         .WithName("ListTorqueTestPoints")
-        .WithSummary("查询扭矩实验点");
+        .WithSummary("查询扭矩实验点（含与当前基线的匹配标志）");
+
+        // 在役锚定预填（只读）：向导锚定步骤一次拉齐——档案安装扭矩/目标力、同组同规格可沿用的
+        // K_L（中位数+样本数）、理论 K_L 参考值。理论值 K_L ≈ 2.5·t_now/(E·A)：弹性伸长贡献
+        // t₀/(E·A) 叠加声弹效应因子（2~3 取中值 2.5，见 hardening §0.1 的理论核算），
+        // 只作预填参考（±40% 量级），必须经人工确认才进标定。
+        grp.MapGet("/anchor-defaults", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
+        {
+            long boltId = 0, groupId = 0;
+            string nominalDiam = "";
+            decimal? installTorqueNm = null, targetPreloadN = null, elasticGpa = null, areaMm2 = null, effLenMm = null;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT b.id, b.group_id, b.nominal_diam, b.install_torque_nm, b.target_preload_n,
+                       b.elastic_modulus_gpa, b.cross_section_mm2, b.effective_length_mm
+                FROM channels c
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE c.id = @cid AND c.deleted_at IS NULL"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct))
+                    return Results.NotFound(new { error = $"channel_id={channelId} 不存在或未绑定 bolt", channelId });
+                boltId = r.GetInt64(0);
+                groupId = r.GetInt64(1);
+                nominalDiam = r.GetString(2);
+                installTorqueNm = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                targetPreloadN = r.IsDBNull(4) ? null : r.GetDecimal(4);
+                elasticGpa = r.IsDBNull(5) ? null : r.GetDecimal(5);
+                areaMm2 = r.IsDBNull(6) ? null : r.GetDecimal(6);
+                effLenMm = r.IsDBNull(7) ? null : r.GetDecimal(7);
+            }
+
+            var peerKl = await PeerMedianKlAsync(ds, groupId, nominalDiam, effLenMm, boltId, ct);
+            long peerCount;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT count(*)
+                FROM channels c
+                JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+                WHERE b.group_id = @gid AND b.nominal_diam = @diam AND b.id <> @self
+                  AND b.effective_length_mm IS NOT DISTINCT FROM @len
+                  AND c.deleted_at IS NULL AND c.k_l IS NOT NULL AND c.k_l > 0
+                  AND c.active_calibration_id IS NOT NULL"))
+            {
+                cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+                cmd.Parameters.AddWithValue("diam", NpgsqlDbType.Varchar, nominalDiam);
+                cmd.Parameters.AddWithValue("len", NpgsqlDbType.Numeric, (object?)effLenMm ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("self", NpgsqlDbType.Bigint, boltId);
+                peerCount = (long)(await cmd.ExecuteScalarAsync(ct) ?? 0L);
+            }
+
+            // 声时取值优先用通道基准（锚定的锚点时刻 ≡ 基准时刻），没有基准才退窗口均值
+            decimal? baselineRef = null;
+            await using (var cmd = ds.CreateCommand(
+                "SELECT ref_time_ns FROM channels WHERE id = @cid AND deleted_at IS NULL"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                if (await cmd.ExecuteScalarAsync(ct) is decimal rt) baselineRef = rt;
+            }
+            var snapshot = await EchoStabilityGuard.MeasureAsync(ds, channelId, 60, ct);
+            var echoForTheory = baselineRef ?? snapshot.AvgEchoNs;
+            decimal? theoreticalKl = null;
+            if (echoForTheory is { } echo && elasticGpa is > 0m && areaMm2 is > 0m)
+                theoreticalKl = Math.Round(2.5m * echo / (elasticGpa.Value * 1000m * areaMm2.Value), 9);
+
+            return Results.Ok(new
+            {
+                channelId,
+                boltId,
+                nominalDiam,
+                installTorqueNm,
+                targetPreloadN,
+                peerKL = peerKl,
+                peerCount,
+                theoreticalKL = theoreticalKl,
+                currentAvgEchoNs = snapshot.AvgEchoNs,
+                sampleCount = snapshot.SampleCount,
+                note = "peerKL=同组同规格已标螺栓中位数（推荐）；theoreticalKL=理论估算（±40%，仅参考，须人工确认）。",
+            });
+        })
+        .WithName("AnchorDefaults")
+        .WithSummary("在役锚定预填：档案扭矩 + 同批 K_L + 理论 K_L 参考");
 
         // 稳定性预检（只读）：把采点/标定用的同一套判据暴露给前端当指示灯。
         // 向导/阶梯页轮询它，灯绿了再放开"采点"按钮——前后端一个标准，
@@ -803,19 +1054,26 @@ public static class CalibrationEndpoints
         // 注册在 app 级而不是 grp：grp 的 ReviewerAccess 会与 endpoint 策略叠加，
         // 而这个只读指示灯值班（operator）也要能看。
         app.MapGet("/api/channels/{channelId:long}/echo-stability", async (
-            long channelId, int? seconds, NpgsqlDataSource ds, CancellationToken ct) =>
+            long channelId, int? seconds, string? purpose, NpgsqlDataSource ds, CancellationToken ct) =>
         {
+            // purpose=inservice → 在役置零阈值（3/5ns）。现场探头自然抖动 sd 常态 1~2.5ns，
+            // 按实验室 0.6ns 判会把在役向导的指示灯永远压红；而后端 recalibrate 护栏
+            // 在役路径本来就按 3/5ns 放行——预检灯必须与实际拦截口径一致，否则又是"前端红、后端放"的双标。
+            var inService = string.Equals(purpose, "inservice", StringComparison.OrdinalIgnoreCase);
+            var stddevMax = inService ? CalibrationThresholds.InServiceEchoStddevMaxNs : CalibrationThresholds.EchoStddevMaxNs;
+            var driftMax = inService ? CalibrationThresholds.InServiceEchoHalfWindowDriftMaxNs : CalibrationThresholds.EchoHalfWindowDriftMaxNs;
             var s = await EchoStabilityGuard.MeasureAsync(ds, channelId, seconds ?? 180, ct);
             return Results.Ok(new
             {
                 channelId,
-                stable = s.Stable,
+                purpose = inService ? "inservice" : "lab",
+                stable = s.IsStableWithin(stddevMax, driftMax),
                 sampleCount = s.SampleCount,
                 avgEchoNs = s.AvgEchoNs,
                 stddevNs = s.StddevNs,
                 halfWindowDriftNs = s.HalfWindowDriftNs,
-                stddevMaxNs = CalibrationThresholds.EchoStddevMaxNs,
-                halfWindowDriftMaxNs = CalibrationThresholds.EchoHalfWindowDriftMaxNs,
+                stddevMaxNs = stddevMax,
+                halfWindowDriftMaxNs = driftMax,
                 windowSeconds = s.WindowSeconds,
             });
         })
@@ -925,18 +1183,30 @@ public static class CalibrationEndpoints
 
         grp.MapGet("/torque-test-points/summary", async (long channelId, NpgsqlDataSource ds, CancellationToken ct) =>
         {
+            // 拟合只认【当前基线下】采的点（ref_time_ns 与通道当前值一致）。
+            // 基线重设后旧点的 Δt 参考系整体平移，与新点混拟合时截距吸收不了
+            // （§0.5 的"截距免疫"只对所有点共用同一基线成立），斜率必然被带偏。
+            // 旧点不删也不动 excluded 标志（仍是历史证据），只是不参与拟合，数量以 stalePointCount 报出。
             const string sql = @"
                 SELECT
-                    COUNT(*) AS n,
-                    regr_slope(delta_tof_ns::double precision, estimated_preload_n::double precision) AS kl_slope,
-                    regr_intercept(delta_tof_ns::double precision, estimated_preload_n::double precision) AS intercept_ns,
-                    regr_r2(delta_tof_ns::double precision, estimated_preload_n::double precision) AS r_squared,
-                    MIN(torque_nm) AS min_torque,
-                    MAX(torque_nm) AS max_torque,
-                    MIN(delta_tof_ns) AS min_delta,
-                    MAX(delta_tof_ns) AS max_delta
-                FROM torque_test_points
-                WHERE channel_id = @channel_id AND excluded = false";
+                    COUNT(*) FILTER (WHERE s.matched) AS n,
+                    regr_slope(s.delta_tof_d, s.preload_d) FILTER (WHERE s.matched) AS kl_slope,
+                    regr_intercept(s.delta_tof_d, s.preload_d) FILTER (WHERE s.matched) AS intercept_ns,
+                    regr_r2(s.delta_tof_d, s.preload_d) FILTER (WHERE s.matched) AS r_squared,
+                    MIN(s.torque_nm) FILTER (WHERE s.matched) AS min_torque,
+                    MAX(s.torque_nm) FILTER (WHERE s.matched) AS max_torque,
+                    MIN(s.delta_tof_ns) FILTER (WHERE s.matched) AS min_delta,
+                    MAX(s.delta_tof_ns) FILTER (WHERE s.matched) AS max_delta,
+                    COUNT(*) FILTER (WHERE NOT s.matched) AS stale_count
+                FROM (
+                    SELECT t.torque_nm, t.delta_tof_ns,
+                           t.delta_tof_ns::double precision AS delta_tof_d,
+                           t.estimated_preload_n::double precision AS preload_d,
+                           (c.ref_time_ns IS NOT NULL AND t.ref_time_ns = c.ref_time_ns) AS matched
+                    FROM torque_test_points t
+                    JOIN channels c ON c.id = t.channel_id
+                    WHERE t.channel_id = @channel_id AND t.excluded = false
+                ) s";
 
             await using var cmd = ds.CreateCommand(sql);
             cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
@@ -944,6 +1214,7 @@ public static class CalibrationEndpoints
             await using var r = await cmd.ExecuteReaderAsync(ct);
             await r.ReadAsync(ct);
             var n = r.GetInt64(0);
+            var stale = r.GetInt64(8);
 
             return Results.Ok(new
             {
@@ -956,13 +1227,16 @@ public static class CalibrationEndpoints
                 maxTorqueNm = r.IsDBNull(5) ? null : (decimal?)r.GetDecimal(5),
                 minDeltaTofNs = r.IsDBNull(6) ? null : (decimal?)r.GetDecimal(6),
                 maxDeltaTofNs = r.IsDBNull(7) ? null : (decimal?)r.GetDecimal(7),
+                stalePointCount = stale,
                 note = n < 3
-                    ? "少于 3 个点，只能记录，不能判断线性。建议采 50/100/150/200 N·m。"
+                    ? (stale > 0
+                        ? $"当前基线下的有效点少于 3 个（另有 {stale} 个旧基线点不参与拟合）。基线重设后需重新逐档采点。"
+                        : "少于 3 个点，只能记录，不能判断线性。建议采 50/100/150/200 N·m。")
                     : "rSquared 越接近 1，扭矩-超声响应越线性；正式标定仍需已知载荷。"
             });
         })
         .WithName("TorqueTestPointSummary")
-        .WithSummary("扭矩实验点线性拟合摘要");
+        .WithSummary("扭矩实验点线性拟合摘要（仅当前基线下的点参与拟合）");
 
         grp.MapPost("/apply-torque-fit", async (
             long channelId, ApplyTorqueFitRequest? req,
@@ -1029,13 +1303,23 @@ public static class CalibrationEndpoints
                 var refTemp = refTempRaw.Value;
 
                 decimal slope = 0, intercept = 0, rSquared = 0;
-                long pointCount;
+                long pointCount, stalePointCount;
                 string? pointsJson = null;
+                // valid 只取【当前基线下】的点（ref_time_ns = 通道当前基线）：基线重设后旧点的
+                // Δt 参考系整体平移，与新点混拟合会把斜率带偏、截距吸收不了（§0.5 免疫性仅对
+                // 单一基线成立）。这也保证激活时写入的 (K_L, 截距, RefTime) 三元组与点集自洽。
                 await using (var cmd = new NpgsqlCommand(@"
                     WITH valid AS (
                         SELECT *
                         FROM torque_test_points
                         WHERE channel_id = @channel_id AND excluded = false
+                          AND ref_time_ns = @cur_ref
+                    ),
+                    stale AS (
+                        SELECT COUNT(*) AS n
+                        FROM torque_test_points
+                        WHERE channel_id = @channel_id AND excluded = false
+                          AND ref_time_ns <> @cur_ref
                     ),
                     fit AS (
                         SELECT
@@ -1058,14 +1342,16 @@ public static class CalibrationEndpoints
                         ) ORDER BY torque_nm, id) AS points_jsonb
                         FROM valid
                     )
-                    SELECT fit.n, fit.slope, fit.intercept, fit.r2, pts.points_jsonb
-                    FROM fit CROSS JOIN pts", conn, tx))
+                    SELECT fit.n, fit.slope, fit.intercept, fit.r2, pts.points_jsonb, stale.n
+                    FROM fit CROSS JOIN pts CROSS JOIN stale", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                    cmd.Parameters.AddWithValue("cur_ref", NpgsqlDbType.Numeric, refTime);
                     await using var r = await cmd.ExecuteReaderAsync(ct);
                     await r.ReadAsync(ct);
 
                     pointCount = r.GetInt64(0);
+                    stalePointCount = r.GetInt64(5);
                     if (pointCount >= minPoints && !r.IsDBNull(1) && !r.IsDBNull(2) && !r.IsDBNull(3))
                     {
                         slope = Convert.ToDecimal(r.GetDouble(1));
@@ -1077,7 +1363,17 @@ public static class CalibrationEndpoints
                 if (pointsJson is null)
                 {
                     await tx.RollbackAsync(ct);
-                    return Results.BadRequest(new { error = "有效扭矩实验点不足，无法应用拟合", pointCount, minPoints });
+                    return Results.BadRequest(new
+                    {
+                        error = stalePointCount > 0
+                            ? $"当前基线下的有效实验点不足（{pointCount} 个，至少需 {minPoints} 个）。"
+                              + $"另有 {stalePointCount} 个点是在旧基线下采的——基线重设后参考系已失效，"
+                              + "这些点不参与拟合，请在当前基线下重新逐档采点。"
+                            : "有效扭矩实验点不足，无法应用拟合",
+                        pointCount,
+                        minPoints,
+                        stalePointCount
+                    });
                 }
 
                 if (slope <= 0)
@@ -1232,7 +1528,7 @@ public static class CalibrationEndpoints
         // 且必须"操作人提交 → 另一名 reviewer 会签"才激活（不允许自签自用）。
         grp.MapPost("/load-calibrate", async (
             long channelId, LoadCalibrateRequest req,
-            NpgsqlDataSource ds, HttpContext http,
+            NpgsqlDataSource ds, HttpContext http, IChannelResolver resolver,
             ILoggerFactory lf, CancellationToken ct) =>
         {
             var logger = lf.CreateLogger("Calibration");
@@ -1247,11 +1543,13 @@ public static class CalibrationEndpoints
             if (req.RefTimeNs <= 0m)
                 return Results.BadRequest(new { error = "refTimeNs（基线声时 t₀）必须 > 0。" });
 
-            // 提交阶段不激活、不失效缓存（会签时才失效），只需 bolt id + 护栏所需物性
-            long boltId;
+            // 2026-08-19 取消审批环节：提交即自签生效（review_state='self_signed'），不再等异人会签。
+            // 预检拿 bolt id + 护栏物性 + 激活失效缓存要用的 device/channel_no
+            long boltId, deviceId;
+            short channelNo;
             decimal? rp02Mpa, crossSectionMm2, targetPreloadN;
             await using (var cmd = ds.CreateCommand(@"
-                SELECT b.id, b.rp02_mpa, b.cross_section_mm2, b.target_preload_n
+                SELECT b.id, b.rp02_mpa, b.cross_section_mm2, b.target_preload_n, c.device_id, c.channel_no
                 FROM channels c
                 JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
                 WHERE c.id = @cid AND c.deleted_at IS NULL"))
@@ -1264,6 +1562,8 @@ public static class CalibrationEndpoints
                 rp02Mpa = r.IsDBNull(1) ? null : r.GetDecimal(1);
                 crossSectionMm2 = r.IsDBNull(2) ? null : r.GetDecimal(2);
                 targetPreloadN = r.IsDBNull(3) ? null : r.GetDecimal(3);
+                deviceId = r.GetInt64(4);
+                channelNo = r.GetInt16(5);
             }
 
             // 1. 最小二乘拟合（Δt = K_L·F + b，K_L 单位 ns/N）
@@ -1326,6 +1626,14 @@ public static class CalibrationEndpoints
             await using var tx = await conn.BeginTransactionAsync(ct);
             try
             {
+                // 激活与 quick/torque/拟合/会签同一把锁：锁通道行串行化并发标定激活
+                await using (var lockCmd = new NpgsqlCommand(
+                    "SELECT 1 FROM channels WHERE id = @cid FOR UPDATE", conn, tx))
+                {
+                    lockCmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                    await lockCmd.ExecuteScalarAsync(ct);
+                }
+
                 await using (var cmd = new NpgsqlCommand(@"
                     INSERT INTO calibration_records (
                         id, bolt_id, method, operator_user_id, reviewer_user_id,
@@ -1335,12 +1643,12 @@ public static class CalibrationEndpoints
                         ref_time_ns, ref_temp_c, passed, notes, review_state,
                         operator_signature_at, reviewer_signature_at, expires_at, created_at, sdk_version
                     ) VALUES (
-                        @id, @bolt_id, 'load_calibrated', @op, NULL,
+                        @id, @bolt_id, 'load_calibrated', @op, @op,
                         @ld, @ldc, @et, @eh,
                         @pts::jsonb, @kl, @klu, @intercept,
                         @r2, @outliers, @unc::jsonb, 'lsq:v1',
-                        @rt, @rtemp, true, @note, 'pending',
-                        now(), NULL, @exp, now(), @sdkver
+                        @rt, @rtemp, true, @note, 'self_signed',
+                        now(), now(), @exp, now(), @sdkver
                     )", conn, tx))
                 {
                     cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
@@ -1365,9 +1673,27 @@ public static class CalibrationEndpoints
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
 
+                // 立即激活（原会签才做的三步，收进提交事务）：supersede 旧标定 → 写通道 → 回写螺栓状态
+                await SupersedeActiveCalibrationsAsync(conn, tx, boltId, newCalibId, ct);
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE channels SET k_l=@kl, k_l_uncertainty=@klu, k_l_intercept_ns=@intercept,
+                           ref_time_ns=@rt, ref_temp_c=@rtemp, active_calibration_id=@id, updated_at=now()
+                     WHERE id=@channel_id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("kl", NpgsqlDbType.Numeric, (decimal)fit.KL);
+                    cmd.Parameters.AddWithValue("klu", NpgsqlDbType.Numeric, (decimal)budget.ExpandedUncertainty);
+                    cmd.Parameters.AddWithValue("intercept", NpgsqlDbType.Numeric, (decimal)fit.InterceptNs);
+                    cmd.Parameters.AddWithValue("rt", NpgsqlDbType.Numeric, req.RefTimeNs);
+                    cmd.Parameters.AddWithValue("rtemp", NpgsqlDbType.Numeric, req.RefTempC);
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, newCalibId);
+                    cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+                await MarkBoltCalibratedAsync(conn, tx, boltId, ct);
+
                 await WriteChannelAuditAsync(conn, tx, userId, "load_calibrate_submit", channelId,
-                    System.Text.Json.JsonSerializer.Serialize(new { calibrationId = newCalibId, kL = fit.KL, rSquared = fit.RSquared, expandedUncertainty = budget.ExpandedUncertainty }),
-                    $"提交正式载荷标定（待会签）bolt={boltId}", ct);
+                    System.Text.Json.JsonSerializer.Serialize(new { calibrationId = newCalibId, kL = fit.KL, rSquared = fit.RSquared, expandedUncertainty = budget.ExpandedUncertainty, selfSigned = true }),
+                    $"提交正式载荷标定并生效（自签）bolt={boltId}", ct);
 
                 await tx.CommitAsync(ct);
             }
@@ -1378,24 +1704,27 @@ public static class CalibrationEndpoints
                 return Results.Problem(detail: "服务器内部错误，请稍后重试；详情见系统日志。", statusCode: 500);
             }
 
-            logger.LogWarning("提交正式载荷标定 channel={Ch} calibId={Id} KL={KL} R²={R2} U={U}（待会签）",
+            resolver.Invalidate(deviceId, (ushort)channelNo);
+            logger.LogWarning("正式载荷标定提交即生效 channel={Ch} calibId={Id} KL={KL} R²={R2} U={U}（免审批自签）",
                 channelId, newCalibId, fit.KL, fit.RSquared, budget.ExpandedUncertainty);
 
             return Results.Ok(new
             {
                 calibrationId = newCalibId,
                 channelId, boltId,
+                activated = true,
                 kL = fit.KL, interceptNs = fit.InterceptNs, rSquared = fit.RSquared,
                 expandedUncertainty = budget.ExpandedUncertainty, coverageFactor = budget.CoverageFactor,
                 pointCount = fit.PointCount, outliersRemoved = fit.RemovedIndices.Count,
-                reviewState = "pending",
-                note = "已提交，待会签。需【另一名】reviewer 调用 countersign 才激活生效（两人复核，不可自签）。"
+                reviewState = "self_signed",
+                note = "已提交并生效，已记入标定档案（签署人与时间自动落档）。"
             });
         })
         .WithName("LoadCalibrate")
-        .WithSummary("正式多点载荷标定（最小二乘+R²≥0.98+JJF 不确定度，提交后待双签）");
+        .WithSummary("正式多点载荷标定（最小二乘+R²≥0.98+JJF 不确定度，提交即自签生效）");
 
-        // 会签：必须由不同于提交人的 reviewer 复核，激活 pending 正式标定
+        // 会签（遗留处理）：2026-08-19 取消审批环节后新标定提交即生效，本端点仅用于激活
+        // 取消前遗留的 pending 记录；异人限制随之取消（单人运维下遗留 pending 永远无法激活）。
         grp.MapPost("/calibrations/{calibrationId:guid}/countersign", async (
             long channelId, Guid calibrationId, HttpContext http,
             NpgsqlDataSource ds, IChannelResolver resolver,
@@ -1474,11 +1803,8 @@ public static class CalibrationEndpoints
                     await tx.RollbackAsync(ct);
                     return Results.Conflict(new { error = $"标定当前状态为 {reviewState}，仅 pending 可会签", calibrationId });
                 }
-                if (reviewerId == operatorId)
-                {
-                    await tx.RollbackAsync(ct);
-                    return Results.BadRequest(new { error = "会签人必须与提交人不同（两人复核底线）。", operatorUserId = operatorId });
-                }
+                // 2026-08-19 取消审批环节：异人限制移除（原"会签人必须与提交人不同"），
+                // 本端点只剩激活遗留 pending 的用途，谁激活都记入 reviewer_user_id 留痕
 
                 await using (var cmd = new NpgsqlCommand(@"
                     UPDATE calibration_records
@@ -1541,7 +1867,7 @@ public static class CalibrationEndpoints
             }
         })
         .WithName("CountersignCalibration")
-        .WithSummary("会签激活正式载荷标定（必须由不同于提交人的 reviewer 执行）");
+        .WithSummary("激活遗留的 pending 正式载荷标定（审批环节已取消，新提交即时生效；异人限制已移除）");
 
         // 驳回：把 pending 正式标定置为 rejected（不激活、不动通道）。补齐"只能会签、无法驳回"导致 pending 堆积的缺口。
         grp.MapPost("/calibrations/{calibrationId:guid}/reject", async (
@@ -1679,7 +2005,8 @@ public static class CalibrationEndpoints
     /// <summary>护栏诊断文案里的可空数值：算不出来（样本不足/半窗断流）显示 —。</summary>
     private static string Fmt(decimal? v) => v?.ToString("0.###") ?? "—";
 
-    private static decimal ParseNominalDiameterMm(string nominalDiam)
+    // internal：CalibrationTrialEndpoints（试验模式出点）复用同一解析，规格口径不能两套
+    internal static decimal ParseNominalDiameterMm(string nominalDiam)
     {
         var chars = nominalDiam.Where(c => char.IsDigit(c) || c == '.').ToArray();
         return decimal.TryParse(new string(chars), System.Globalization.NumberStyles.Any,
@@ -1728,6 +2055,32 @@ public static class CalibrationEndpoints
         => rp02Mpa is > 0m && crossSectionMm2 is > 0m ? rp02Mpa.Value * crossSectionMm2.Value : null;
 
     /// <summary>
+    /// 同组同规格【同有效长度】已标螺栓的 K_L 中位数（在役锚定的自动沿用来源）。
+    /// K_L 是批次属性，但它与声程成正比（K_L ≈ (1+声弹因子)·t₀/(E·A)，t₀ ∝ 长度）——
+    /// 真机实测同为 M20 的两颗螺栓声时 27204 与 32650（差 20%），K_L 也差 20%，
+    /// 只按规格匹配会把不同长度的系数错配过去，所以长度必须同（NULL 视为同 NULL）。
+    /// 个体差异远小于 t₀ 的个体差异，同批外推是行业惯例；取中位数而非均值，
+    /// 避免一颗坏标定把整批带偏。只认【已生效】标定，排除本颗螺栓自己。
+    /// </summary>
+    private static async Task<decimal?> PeerMedianKlAsync(
+        NpgsqlDataSource ds, long groupId, string nominalDiam, decimal? effectiveLengthMm, long selfBoltId, CancellationToken ct)
+    {
+        await using var cmd = ds.CreateCommand(@"
+            SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY c.k_l::double precision)
+            FROM channels c
+            JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+            WHERE b.group_id = @gid AND b.nominal_diam = @diam AND b.id <> @self
+              AND b.effective_length_mm IS NOT DISTINCT FROM @len
+              AND c.deleted_at IS NULL AND c.k_l IS NOT NULL AND c.k_l > 0
+              AND c.active_calibration_id IS NOT NULL");
+        cmd.Parameters.AddWithValue("gid", NpgsqlDbType.Bigint, groupId);
+        cmd.Parameters.AddWithValue("diam", NpgsqlDbType.Varchar, nominalDiam);
+        cmd.Parameters.AddWithValue("len", NpgsqlDbType.Numeric, (object?)effectiveLengthMm ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("self", NpgsqlDbType.Bigint, selfBoltId);
+        return await cmd.ExecuteScalarAsync(ct) is double v and > 0 ? (decimal)v : null;
+    }
+
+    /// <summary>
     /// 统一写 audit_log（target_type='channel'）。CalibrationEndpoints 内多处标定操作复用，
     /// 消除重复的 INSERT 样板；调用方在事务内传入 conn/tx + 具体 action/after/note。
     /// </summary>
@@ -1755,8 +2108,13 @@ public static class CalibrationEndpoints
     private static async Task MarkBoltCalibratedAsync(
         NpgsqlConnection conn, NpgsqlTransaction tx, long boltId, CancellationToken ct)
     {
-        await using var cmd = new NpgsqlCommand(
-            "UPDATE bolts SET state='calibrated', updated_at=now() WHERE id=@id AND state <> 'calibrated'", conn, tx);
+        // confirmed_at：标定是最强的人工确认动作——占位档（自动建档）在此升级为资产档（两级模型盖章点之一）
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE bolts
+               SET state = 'calibrated',
+                   confirmed_at = COALESCE(confirmed_at, now()),
+                   updated_at = now()
+             WHERE id = @id AND (state <> 'calibrated' OR confirmed_at IS NULL)", conn, tx);
         cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, boltId);
         await cmd.ExecuteNonQueryAsync(ct);
     }
@@ -1813,9 +2171,17 @@ public sealed record QuickCalibrateRequest(
 /// <summary>
 /// 扭矩法临时标定请求体。
 /// <paramref name="Force"/>=true 跳过采样稳定性护栏（信号天然抖等特殊现场），跳过记入审计。
+/// <para>
+/// <paramref name="AnchorInService"/>=true 为在役锚定模式（风机现场主路径）：先采集基准、手动置零
+/// （RefTime 保持为当前声时），再认定当前预紧力 = 档案目标 F₀，热路径 F=F₀+Δt/K_L（截距 b=−K_L·F₀）。
+/// F₀ 优先 <paramref name="AnchorPreloadN"/>，否则用螺栓档案 <c>target_preload_n</c>；
+/// 档案也没有时才退回 <paramref name="TorqueNm"/> 换算 T/(K·d)（向导主路径不走这条）。
+/// <paramref name="KL"/> 为外部输入的力-声时系数（同批实验室标定/理论估算），不传则自动取
+/// 同组同规格同长度已标螺栓的中位数；<paramref name="RefTimeNs"/>/<paramref name="RefTempC"/> 被忽略。
+/// </para>
 /// </summary>
 public sealed record TorqueCalibrateRequest(
-    decimal TorqueNm,
+    decimal? TorqueNm = null,
     decimal? NutFactor = null,
     decimal? NominalDiameterMm = null,
     decimal? EffectiveLengthMm = null,
@@ -1829,11 +2195,20 @@ public sealed record TorqueCalibrateRequest(
     string? LoadingDevice = null,
     string? Note = null,
     int? ExpiresDays = null,
-    bool? Force = null);
+    bool? Force = null,
+    bool? AnchorInService = null,
+    decimal? KL = null,
+    decimal? AnchorPreloadN = null);
 
 /// <summary>
 /// 扭矩阶梯实验点采集请求体。
 /// <paramref name="Force"/>=true 跳过采样稳定性护栏（信号天然抖等特殊现场），跳过记入审计。
+/// </summary>
+/// <summary>
+/// 阶梯采点请求。两种力值来源二选一：
+/// ① 扭矩折算（默认）：传 <paramref name="TorqueNm"/>，按 T=K·F·d 估算（±30%，K 靠经验）；
+/// ② 力值直标：传 <paramref name="MeasuredForceN"/>（拉伸机/测力传感器实测），直接入拟合，
+///    不经过扭矩公式——这是消除扭矩法固有误差的正路，有测力条件时永远优先。
 /// </summary>
 public sealed record TorqueTestPointRequest(
     decimal TorqueNm,
@@ -1842,7 +2217,8 @@ public sealed record TorqueTestPointRequest(
     int? SampleWindowSeconds = null,
     int? MinSamples = null,
     string? Note = null,
-    bool? Force = null);
+    bool? Force = null,
+    decimal? MeasuredForceN = null);
 
 /// <summary>
 /// 扭矩阶梯点剔除 / 恢复请求体。<paramref name="Excluded"/>=true 时 <paramref name="Reason"/> 必填，

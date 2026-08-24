@@ -1,5 +1,6 @@
 using BoltPreload.Api.Auth;
 using BoltPreload.Api.Runtime;
+using BoltPreload.Calibration;
 using BoltPreload.Domain;
 using BoltPreload.Fx;
 using BoltPreload.Application.Devices;
@@ -553,12 +554,13 @@ public static class DiagnosticEndpoints
 ```
 仅传需要改的字段。注意 MeasMode/Threshold/RefTime/RefTemp 等 SDK 协议不允许单独写，执行时会失败并引导改用 /recalibrate。");
 
-        // 调试期直发（仅未标定通道）：现场对回波/增益时，逐次审批不现实。
-        // 安全模型：未标定通道（未出具正式预紧力）允许工程师直发非安全基线参数（增益/探头频率/回波窗/回波宽度）；
-        // 已标定（在产）通道一律走 configure-channel 审批工作流。基线类（阈值/测量模式/RefTime/RefTemp）一律走 /recalibrate。
-        // M3 拍板：随组策略走 reviewer+（见组级 ReviewerAccess），不再单独放宽到 WriteAccess——
-        // 初调工程师本来就需要本组其他端点（读参/对波形/set-mode，均 reviewer+）才能完成初调闭环，
-        // 单留一个 operator 可直写设备的口子只剩绕过审批的风险，没有独立价值。
+        // 参数直发（增益/探头频率/回波窗/回波宽度）：reviewer+ 直写设备并审计。
+        // 2026-08-19 用户拍板取消审批环节：原"已标定通道必须走 提交→异人审批→执行→验证"对单人运维
+        // 是死路（审批人不得为提交人），改为全通道直发；变更可追溯性由审计日志 + resolver 失效承担。
+        // 保留的两道硬约束与审批无关，不放松：
+        //   ① 基线类参数（阈值/测量模式/RefTime/RefTemp/温补）仍只能走 /recalibrate——它们动的是标定参考系；
+        //   ② 探头扫描期间互斥——不与扫描器抢设备。
+        // 权限维持 reviewer+（M3 拍板）：改增益会平移声时检出，直接影响在产读数，operator 不放开。
         group.MapPost("/configure-channel/{channel}/commission", async (
             long deviceId, ushort channel,
             ChannelConfigUpdate updates,
@@ -592,8 +594,6 @@ public static class DiagnosticEndpoints
                 channelId = r.GetInt64(0);
                 calibrated = r.GetBoolean(1);
             }
-            if (calibrated)
-                return Results.Conflict(new { error = "通道已标定（在产），参数变更须走审批工作流：configure-channel → approve → execute → verify。", deviceId, channel });
 
             var runtime = deviceManager.Find(deviceId);
             if (runtime is null)
@@ -642,7 +642,8 @@ public static class DiagnosticEndpoints
                     audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
                     audit.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
                     audit.Parameters.AddWithValue("after", NpgsqlDbType.Jsonb, System.Text.Json.JsonSerializer.Serialize(updates));
-                    audit.Parameters.AddWithValue("note", NpgsqlDbType.Text, $"调试直发通道参数 device={deviceId} ch={channel}（未标定）");
+                    audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                        $"直发通道参数 device={deviceId} ch={channel}（{(calibrated ? "已标定在产——声时检出可能平移，注意核对读数" : "未标定")}）");
                     AuditClientIp.Bind(audit.Parameters);
                     await audit.ExecuteNonQueryAsync(ct);
                 }
@@ -653,7 +654,13 @@ public static class DiagnosticEndpoints
 
                 logger.LogWarning("调试直发通道参数 device={Dev} ch={Ch} updates={Updates} by user={User}",
                     deviceId, channel, updates, userId);
-                return Results.Ok(new { commissioned = true, deviceId, channel, applied = updates, note = "已直发设备（未标定通道，调试期）。观察波形/声时确认锁到真实回波后，请执行重标定设置基线。" });
+                return Results.Ok(new
+                {
+                    commissioned = true, deviceId, channel, applied = updates,
+                    note = calibrated
+                        ? "参数已下发设备。增益/回波窗变化可能平移声时检出，请在波形页核对回波与实时读数；漂移明显需重新置零/标定。"
+                        : "参数已下发设备。观察波形/声时确认锁到真实回波后，请执行重标定设置基线。"
+                });
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -669,7 +676,7 @@ public static class DiagnosticEndpoints
             }
         })
         .WithName("CommissionChannel")
-        .WithSummary("调试期直发通道参数（仅未标定通道：增益/探头频率/回波窗；已标定走审批）；随组策略 reviewer+");
+        .WithSummary("直发通道参数（增益/探头频率/回波窗/回波宽度，全通道；审计留痕；基线类走 /recalibrate）；reviewer+");
 
         // 设备工作模式控制（Standby/MultiMeas/...）
         group.MapPost("/set-mode/{mode}", async (
@@ -1088,14 +1095,47 @@ public static class DiagnosticEndpoints
                 {
                     // 基线，窗口取 60s：等待成本要低，5s 一条也有 12 个样本
                     stability = await EchoStabilityGuard.MeasureAsync(ds, chanId, 60, ct);
-                    if (!stability.Stable && body?.Force != true)
+
+                    // 样本数下限（EchoStabilityGuard 只管"稳不稳"，数量下限由调用方把守）：
+                    // 1~2 条样本的 sd/半窗差纯靠运气，统计上撑不起"基线可靠"的结论。
+                    // 与"不稳"分开报——设备停报/通道没在轮询时，现场需要的是查设备，不是傻等。
+                    const int minSamples = 5;
+                    if (stability.SampleCount < minSamples && body?.Force != true)
                         return Results.BadRequest(new
                         {
-                            error = $"声时未达稳定判据（波动 {stability.StddevNs?.ToString("0.###") ?? "—"} ns，"
-                                + $"趋势 {stability.HalfWindowDriftNs?.ToString("0.###") ?? "—"} ns），此刻取的基线不可靠。"
-                                + "请保持螺栓静置等稳后重试；确认要用当前读数可传 force=true（会记入审计）。",
+                            error = $"最近 60 秒窗口内仅 {stability.SampleCount} 条有效声时样本（至少需 {minSamples} 条），"
+                                + "无法评估基线可靠性。请确认设备在线、该通道在轮询中，稍候片刻重试；"
+                                + "确认要用当前读数可传 force=true（会记入审计）。",
                             stability = stability.ToDiagnostics(),
                         });
+
+                    // 实验室零载（expectZeroLoad=true）用 0.6ns；在役置零用 3ns/5ns——
+                    // 现场探头量化 0.625ns、sd 常态 1~2.5ns，0.6 会把向导锁死。
+                    var inServiceZero = body?.ExpectZeroLoad != true;
+                    var sdMax = inServiceZero
+                        ? CalibrationThresholds.InServiceEchoStddevMaxNs
+                        : CalibrationThresholds.EchoStddevMaxNs;
+                    var driftMax = inServiceZero
+                        ? CalibrationThresholds.InServiceEchoHalfWindowDriftMaxNs
+                        : CalibrationThresholds.EchoHalfWindowDriftMaxNs;
+                    var echoStable = stability.IsStableWithin(sdMax, driftMax);
+
+                    if (!echoStable && body?.Force != true)
+                    {
+                        // 半窗差算不出来（=半窗断流）与"有趋势"是两种情况，文案分开说，现场才知道该干什么
+                        var detail = stability.HalfWindowDriftNs is null
+                            ? $"采样在窗口内分布不均（波动 {stability.StddevNs?.ToString("0.###") ?? "—"} ns，前/后半窗有断流），无法判断趋势"
+                            : $"波动 {stability.StddevNs?.ToString("0.###") ?? "—"} ns，"
+                              + $"趋势 {stability.HalfWindowDriftNs?.ToString("0.###") ?? "—"} ns";
+                        return Results.BadRequest(new
+                        {
+                            error = $"声时未达稳定判据（{detail}，限 ±{sdMax} / ±{driftMax} ns），此刻取的基线不可靠。"
+                                + (inServiceZero
+                                    ? "若无人在拧、这是探头自然抖动，可传 force=true 按当前均值置零（记入审计）。"
+                                    : "请保持螺栓静置等稳后重试；确认要用当前读数可传 force=true（会记入审计）。"),
+                            stability = stability.ToDiagnostics(sdMax, driftMax),
+                        });
+                    }
 
                     // 零载声明核对：按现行标定折算当前预紧力，明显带载就拒绝。
                     // 折算口径与采集热路径一致（温补 + 截距），阈值 max(2kN, 5%目标)——

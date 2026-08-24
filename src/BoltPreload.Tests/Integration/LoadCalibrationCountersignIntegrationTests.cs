@@ -9,12 +9,14 @@ using Xunit;
 namespace BoltPreload.Tests.Integration;
 
 /// <summary>
-/// 正式载荷标定的提交—会签两步流程（<c>load-calibrate</c> + <c>countersign</c>，GB/T 43232 路径 B/C）。
+/// 正式载荷标定（<c>load-calibrate</c>）与遗留 pending 处理（<c>countersign</c>/<c>reject</c>）。
 /// <para>
-/// 合规等级最高的一条路径，验收报告上的预紧力数字最后都回溯到这里的 K_L。规矩三条：
-/// R² 必须 ≥0.98（没有临时扭矩法那个 [0.95,0.98) 留档层）、提交本身不生效、生效得由另一个人会签。
-/// 前两条错了会当场出错数；第三条错了什么都不报，一个人自己提交自己签，接口照常 200、标定照常生效，
-/// 只有事后翻审计才看得出双签是假的。这三条以前一条测试都没有。
+/// 2026-08-19 用户拍板取消全部审批环节：提交即自签生效（review_state='self_signed'），
+/// 不再等待异人会签。本套测试锁定的新规矩：
+/// ① R² 必须 ≥0.98（拒收线不因免审批而松动）；
+/// ② 提交即生效——通道基线/K_L、active_calibration_id、bolts.state 三样一个事务内到位；
+/// ③ countersign 只用于激活取消审批前遗留的 pending 记录，异人限制已移除，
+///    且对非 pending 状态一律 409（不能重签/改签，审计不可覆盖）。
 /// </para>
 /// </summary>
 [Collection("postgres")]
@@ -23,13 +25,13 @@ public sealed class LoadCalibrationCountersignIntegrationTests
     private readonly PostgresFixture _fx;
     public LoadCalibrationCountersignIntegrationTests(PostgresFixture fx) => _fx = fx;
 
-    // 刻意与 seed 里通道自带的基线（27200 / 22）取不同值：这样"会签把基线写进通道"才是可证的，
+    // 刻意与 seed 里通道自带的基线（27200 / 22）取不同值：这样"激活把基线写进通道"才是可证的，
     // 否则断言即使在完全没写的情况下也会通过。
     private const decimal RequestRefTimeNs = 26_500m;
     private const decimal RequestRefTempC = 18.5m;
 
     [PostgresFact]
-    public async Task Submit_RecordsPending_ButDoesNotActivateAnything()
+    public async Task Submit_ActivatesImmediately_SelfSigned()
     {
         _fx.EnsureAvailable();
         var s = await _fx.SeedCalibratableChannelAsync("正式载荷标定");
@@ -40,76 +42,18 @@ public sealed class LoadCalibrationCountersignIntegrationTests
 
         resp.StatusCode.Should().Be(HttpStatusCode.OK);
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
-        body.GetProperty("reviewState").GetString().Should().Be("pending");
+        body.GetProperty("reviewState").GetString().Should().Be("self_signed", "免审批：提交即自签生效");
+        body.GetProperty("activated").GetBoolean().Should().BeTrue();
         body.GetProperty("kL").GetDecimal().Should().BeApproximately(CalibrationFitData.Slope, 1e-9m);
         body.GetProperty("rSquared").GetDecimal().Should().BeApproximately(CalibrationFitData.ExpectedR2(0.5m), 0.001m);
 
         var calibId = body.GetProperty("calibrationId").GetGuid();
-        (await ReviewStateOfAsync(calibId)).Should().Be("pending");
-        (await _fx.ScalarAsync<bool>(
-            "SELECT reviewer_user_id IS NULL FROM calibration_records WHERE id = @arg", calibId))
-            .Should().BeTrue("尚未会签，不该有复核人");
-
-        // 一个人单独提交，不能有任何东西进入生产
-        (await _fx.ActiveCalibrationAsync(s.ChannelId)).Should().BeNull("提交只是入队待审，不生效");
-        (await _fx.ScalarAsync<bool>("SELECT k_l IS NULL FROM channels WHERE id = @arg", s.ChannelId))
-            .Should().BeTrue("未会签前不得把 K_L 写进通道");
-        (await _fx.ScalarAsync<string>("SELECT state FROM bolts WHERE id = @arg", s.BoltId))
-            .Should().Be("uncalibrated", "未会签前螺栓不算已标定");
-    }
-
-    [PostgresFact]
-    public async Task Countersign_BySubmitterThemselves_IsRejected_AndStaysPending()
-    {
-        _fx.EnsureAvailable();
-        var s = await _fx.SeedCalibratableChannelAsync("正式载荷标定");
-        var operatorId = await _fx.SeedUserAsync("reviewer");
-
-        using var factory = TestApi.CreateFactory(_fx);
-        var calibId = await SubmitOkAsync(factory, operatorId, s.ChannelId, d: 0.5m);
-
-        // 同一个人回来给自己会签
-        using var self = TestApi.AuthedClient(factory, operatorId, "reviewer");
-        var resp = await self.PostAsync(CountersignUrl(s.ChannelId, calibId), null);
-
-        resp.StatusCode.Should().Be(HttpStatusCode.BadRequest, "两人复核底线：不允许自签自用");
-        (await resp.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("error").GetString()
-            .Should().Contain("会签人必须与提交人不同");
-
-        // 被拒之后整条流程必须原地不动，不能出现"报了错但其实签上了"
-        (await ReviewStateOfAsync(calibId)).Should().Be("pending");
-        (await _fx.ActiveCalibrationAsync(s.ChannelId)).Should().BeNull();
-        (await _fx.ScalarAsync<string>("SELECT state FROM bolts WHERE id = @arg", s.BoltId))
-            .Should().Be("uncalibrated");
-        (await AuditCountAsync(s.ChannelId, "load_calibrate_countersign")).Should().Be(0, "自签失败不该留下会签审计");
-    }
-
-    [PostgresFact]
-    public async Task Countersign_ByAnotherReviewer_ActivatesAndWritesBaselineToChannel()
-    {
-        _fx.EnsureAvailable();
-        var s = await _fx.SeedCalibratableChannelAsync("正式载荷标定");
-        var operatorId = await _fx.SeedUserAsync("reviewer");
-        var reviewerId = await _fx.SeedUserAsync("reviewer");
-
-        using var factory = TestApi.CreateFactory(_fx);
-        var calibId = await SubmitOkAsync(factory, operatorId, s.ChannelId, d: 0.5m);
-
-        using var reviewer = TestApi.AuthedClient(factory, reviewerId, "reviewer");
-        var resp = await reviewer.PostAsync(CountersignUrl(s.ChannelId, calibId), null);
-
-        resp.StatusCode.Should().Be(HttpStatusCode.OK);
-        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
-        body.GetProperty("activated").GetBoolean().Should().BeTrue();
-        body.GetProperty("operatorUserId").GetInt64().Should().Be(operatorId);
-        body.GetProperty("reviewerUserId").GetInt64().Should().Be(reviewerId);
-
-        (await ReviewStateOfAsync(calibId)).Should().Be("approved");
+        (await ReviewStateOfAsync(calibId)).Should().Be("self_signed");
         (await _fx.ScalarAsync<bool>(
             "SELECT reviewer_signature_at IS NOT NULL FROM calibration_records WHERE id = @arg", calibId))
-            .Should().BeTrue("会签时刻要落章，验收时要能出示");
+            .Should().BeTrue("自签也要落章，验收时要能出示签署时刻");
 
-        // 生效意味着这三样一起到位：通道指向它、K_L 与基线写进通道、螺栓转已标定
+        // 生效三件套一个事务内到位：通道指向它、K_L 与基线写进通道、螺栓转已标定
         (await _fx.ActiveCalibrationAsync(s.ChannelId)).Should().Be(calibId);
         var ch = await ChannelBaselineAsync(s.ChannelId);
         ch.KL.Should().BeApproximately(CalibrationFitData.Slope, 1e-9m);
@@ -118,37 +62,53 @@ public sealed class LoadCalibrationCountersignIntegrationTests
         ch.RefTempC.Should().Be(RequestRefTempC);
         (await _fx.ScalarAsync<string>("SELECT state FROM bolts WHERE id = @arg", s.BoltId))
             .Should().Be("calibrated");
-
         (await AuditCountAsync(s.ChannelId, "load_calibrate_submit")).Should().Be(1);
-        (await AuditCountAsync(s.ChannelId, "load_calibrate_countersign")).Should().Be(1);
     }
 
     [PostgresFact]
-    public async Task Countersign_Twice_IsRejectedAsConflict()
+    public async Task Countersign_OnSelfSignedRecord_IsConflict_NoResign()
     {
         _fx.EnsureAvailable();
         var s = await _fx.SeedCalibratableChannelAsync("正式载荷标定");
         var operatorId = await _fx.SeedUserAsync("reviewer");
-        var firstReviewerId = await _fx.SeedUserAsync("reviewer");
-        var secondReviewerId = await _fx.SeedUserAsync("reviewer");
+        var otherId = await _fx.SeedUserAsync("reviewer");
 
         using var factory = TestApi.CreateFactory(_fx);
         var calibId = await SubmitOkAsync(factory, operatorId, s.ChannelId, d: 0.5m);
 
-        using var first = TestApi.AuthedClient(factory, firstReviewerId, "reviewer");
-        (await first.PostAsync(CountersignUrl(s.ChannelId, calibId), null))
-            .StatusCode.Should().Be(HttpStatusCode.OK);
-
-        // 已生效的标定不能被第二个人再签一次：否则审计里的复核人会被后来者覆盖掉
-        using var second = TestApi.AuthedClient(factory, secondReviewerId, "reviewer");
-        var resp = await second.PostAsync(CountersignUrl(s.ChannelId, calibId), null);
+        // 已生效（self_signed）的记录不能被再签：签署人信息是审计的一部分，不许覆盖
+        using var other = TestApi.AuthedClient(factory, otherId, "reviewer");
+        var resp = await other.PostAsync(CountersignUrl(s.ChannelId, calibId), null);
 
         resp.StatusCode.Should().Be(HttpStatusCode.Conflict);
         (await resp.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("error").GetString()
             .Should().Contain("仅 pending 可会签");
         (await _fx.ScalarAsync<long>(
             "SELECT reviewer_user_id FROM calibration_records WHERE id = @arg", calibId))
-            .Should().Be(firstReviewerId, "复核人必须还是第一个签的那位");
+            .Should().Be(operatorId, "自签记录的签署人必须还是提交者");
+    }
+
+    [PostgresFact]
+    public async Task Countersign_LegacyPending_BySubmitterThemselves_NowActivates()
+    {
+        _fx.EnsureAvailable();
+        var s = await _fx.SeedCalibratableChannelAsync("正式载荷标定");
+        var operatorId = await _fx.SeedUserAsync("reviewer");
+
+        using var factory = TestApi.CreateFactory(_fx);
+        var calibId = await SubmitOkAsync(factory, operatorId, s.ChannelId, d: 0.5m);
+        await DemoteToLegacyPendingAsync(calibId, s.ChannelId, s.BoltId);
+
+        // 取消审批环节后：遗留 pending 由任何 reviewer 激活，含提交者本人（原异人限制在单人运维下是死锁）
+        using var self = TestApi.AuthedClient(factory, operatorId, "reviewer");
+        var resp = await self.PostAsync(CountersignUrl(s.ChannelId, calibId), null);
+
+        resp.StatusCode.Should().Be(HttpStatusCode.OK, "异人限制已移除，自己激活自己的遗留 pending 应放行");
+        (await ReviewStateOfAsync(calibId)).Should().Be("approved");
+        (await _fx.ActiveCalibrationAsync(s.ChannelId)).Should().Be(calibId);
+        (await _fx.ScalarAsync<string>("SELECT state FROM bolts WHERE id = @arg", s.BoltId))
+            .Should().Be("calibrated");
+        (await AuditCountAsync(s.ChannelId, "load_calibrate_countersign")).Should().Be(1);
     }
 
     [PostgresFact]
@@ -160,7 +120,7 @@ public sealed class LoadCalibrationCountersignIntegrationTests
 
         using var factory = TestApi.CreateFactory(_fx);
         // d=1.0 → R²≈0.969。同一组数据在临时扭矩法那条路径上是"留档不激活"（200），
-        // 正式载荷标定这里必须直接拒收——两条路径的判定差异就在这一条上。
+        // 正式载荷标定这里必须直接拒收——免审批不等于免判据，R² 线一毫米都不松。
         var resp = await SubmitAsync(factory, operatorId, s.ChannelId, d: 1.0m);
 
         resp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
@@ -171,7 +131,7 @@ public sealed class LoadCalibrationCountersignIntegrationTests
     }
 
     [PostgresFact]
-    public async Task Countersign_RestartsValidityFromActivationDate()
+    public async Task Countersign_LegacyPending_RestartsValidityFromActivationDate()
     {
         _fx.EnsureAvailable();
         var s = await _fx.SeedCalibratableChannelAsync("正式载荷标定");
@@ -181,23 +141,23 @@ public sealed class LoadCalibrationCountersignIntegrationTests
 
         using var factory = TestApi.CreateFactory(_fx);
         var calibId = await SubmitOkAsync(factory, operatorId, s.ChannelId, d: 0.5m, expiresDays: validDays);
+        await DemoteToLegacyPendingAsync(calibId, s.ChannelId, s.BoltId);
 
-        // 模拟"提交后压了 30 天才有人来会签"
+        // 模拟"提交后压了 30 天才被激活"的遗留场景
         await BackdateSubmissionAsync(calibId, days: 30);
 
         using var reviewer = TestApi.AuthedClient(factory, reviewerId, "reviewer");
         (await reviewer.PostAsync(CountersignUrl(s.ChannelId, calibId), null))
             .StatusCode.Should().Be(HttpStatusCode.OK);
 
-        // 有效期从激活起算：审批期间不能偷偷消耗掉。按提交时刻固定的话这里只剩 150 天，
-        // 现场表现是一份刚生效的标定莫名其妙提前到期。
+        // 有效期从激活起算：pending 压着的日子不消耗有效期
         var daysLeft = await _fx.ScalarAsync<int>(
             "SELECT (expires_at - CURRENT_DATE)::int FROM calibration_records WHERE id = @arg", calibId);
-        daysLeft.Should().Be(validDays, "pending 期间不消耗有效期，会签当天重新起算满 180 天");
+        daysLeft.Should().Be(validDays, "pending 期间不消耗有效期，激活当天重新起算满 180 天");
     }
 
     [PostgresFact]
-    public async Task Reject_MarksRejected_AndLeavesChannelUntouched()
+    public async Task Reject_LegacyPending_MarksRejected_AndLeavesChannelUntouched()
     {
         _fx.EnsureAvailable();
         var s = await _fx.SeedCalibratableChannelAsync("正式载荷标定");
@@ -206,6 +166,7 @@ public sealed class LoadCalibrationCountersignIntegrationTests
 
         using var factory = TestApi.CreateFactory(_fx);
         var calibId = await SubmitOkAsync(factory, operatorId, s.ChannelId, d: 0.5m);
+        await DemoteToLegacyPendingAsync(calibId, s.ChannelId, s.BoltId);
 
         const string reason = "加载装置超检";
         using var reviewer = TestApi.AuthedClient(factory, reviewerId, "reviewer");
@@ -255,6 +216,35 @@ public sealed class LoadCalibrationCountersignIntegrationTests
         return (await resp.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("calibrationId").GetGuid();
     }
 
+    /// <summary>
+    /// 把一条（新流程下自签生效的）记录降级回"取消审批前遗留的 pending"形态：
+    /// 记录回 pending、清签署，通道撤激活与基线快照、螺栓回未标定——复原两步流程时代的中间态。
+    /// </summary>
+    private async Task DemoteToLegacyPendingAsync(Guid calibrationId, long channelId, long boltId)
+    {
+        await using (var cmd = _fx.DataSource.CreateCommand(@"
+            UPDATE calibration_records
+               SET review_state='pending', reviewer_user_id=NULL, reviewer_signature_at=NULL, superseded_by=NULL
+             WHERE id=@id"))
+        {
+            cmd.Parameters.AddWithValue("id", NpgsqlDbType.Uuid, calibrationId);
+            (await cmd.ExecuteNonQueryAsync()).Should().Be(1);
+        }
+        await using (var cmd = _fx.DataSource.CreateCommand(@"
+            UPDATE channels SET active_calibration_id=NULL, k_l=NULL, k_l_uncertainty=NULL, k_l_intercept_ns=NULL
+             WHERE id=@cid"))
+        {
+            cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+            (await cmd.ExecuteNonQueryAsync()).Should().Be(1);
+        }
+        await using (var cmd = _fx.DataSource.CreateCommand(
+            "UPDATE bolts SET state='uncalibrated' WHERE id=@bid"))
+        {
+            cmd.Parameters.AddWithValue("bid", NpgsqlDbType.Bigint, boltId);
+            (await cmd.ExecuteNonQueryAsync()).Should().Be(1);
+        }
+    }
+
     private Task<string> ReviewStateOfAsync(Guid calibrationId) =>
         _fx.ScalarAsync<string>("SELECT review_state FROM calibration_records WHERE id = @arg", calibrationId);
 
@@ -279,7 +269,7 @@ public sealed class LoadCalibrationCountersignIntegrationTests
         return (long)(await cmd.ExecuteScalarAsync())!;
     }
 
-    /// <summary>把提交时刻连同当时算出的到期日整体前推，模拟久审后才会签。</summary>
+    /// <summary>把提交时刻连同当时算出的到期日整体前推，模拟久压后才被激活。</summary>
     private async Task BackdateSubmissionAsync(Guid calibrationId, int days)
     {
         // expires_at 是 date 列：减整数得 date，减 interval 会变成 timestamp 而写不回去

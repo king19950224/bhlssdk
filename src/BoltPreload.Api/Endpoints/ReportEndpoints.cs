@@ -528,13 +528,15 @@ public static class ReportEndpoints
 
         var points = new List<TorquePointSnapshot>();
         await using (var cmd = ds.CreateCommand(@"
-            SELECT id, torque_nm, estimated_preload_n, sample_count,
-                   avg_echo_time_ns, stddev_echo_time_ns, avg_temp_c,
-                   normalized_echo_time_ns, delta_tof_ns,
-                   excluded, exclude_reason, note
-            FROM torque_test_points
-            WHERE channel_id=@channel_id
-            ORDER BY torque_nm, id"))
+            SELECT t.id, t.torque_nm, t.estimated_preload_n, t.sample_count,
+                   t.avg_echo_time_ns, t.stddev_echo_time_ns, t.avg_temp_c,
+                   t.normalized_echo_time_ns, t.delta_tof_ns,
+                   t.excluded, t.exclude_reason, t.note,
+                   (c.ref_time_ns IS NOT NULL AND t.ref_time_ns = c.ref_time_ns) AS baseline_matched
+            FROM torque_test_points t
+            JOIN channels c ON c.id = t.channel_id
+            WHERE t.channel_id=@channel_id
+            ORDER BY t.torque_nm, t.id"))
         {
             cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -552,18 +554,23 @@ public static class ReportEndpoints
                     DeltaTofNs: r.GetDecimal(8),
                     Excluded: r.GetBoolean(9),
                     ExcludeReason: r.IsDBNull(10) ? null : r.GetString(10),
-                    Note: r.IsDBNull(11) ? null : r.GetString(11)));
+                    Note: r.IsDBNull(11) ? null : r.GetString(11),
+                    BaselineMatched: r.GetBoolean(12)));
             }
         }
 
+        // 拟合口径与 apply-torque-fit / summary 一致：只用【当前基线下】未剔除的点。
+        // 旧基线点的 Δt 参考系已随基线重设失效，混进拟合会把斜率带偏，报告必须与实际可应用的拟合同源。
         TorqueFitSnapshot? fit = null;
         await using (var cmd = ds.CreateCommand(@"
             SELECT COUNT(*),
-                   regr_slope(delta_tof_ns::double precision, estimated_preload_n::double precision),
-                   regr_intercept(delta_tof_ns::double precision, estimated_preload_n::double precision),
-                   regr_r2(delta_tof_ns::double precision, estimated_preload_n::double precision)
-            FROM torque_test_points
-            WHERE channel_id=@channel_id AND excluded=false"))
+                   regr_slope(t.delta_tof_ns::double precision, t.estimated_preload_n::double precision),
+                   regr_intercept(t.delta_tof_ns::double precision, t.estimated_preload_n::double precision),
+                   regr_r2(t.delta_tof_ns::double precision, t.estimated_preload_n::double precision)
+            FROM torque_test_points t
+            JOIN channels c ON c.id = t.channel_id
+            WHERE t.channel_id=@channel_id AND t.excluded=false
+              AND c.ref_time_ns IS NOT NULL AND t.ref_time_ns = c.ref_time_ns"))
         {
             cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, channelId);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -579,11 +586,15 @@ public static class ReportEndpoints
         }
 
         // 结论按实际数据生成（扭矩范围、R² 分档），不写死——报告结论必须与数据一致
-        var valid = points.Where(p => !p.Excluded).ToList();
+        var valid = points.Where(p => !p.Excluded && p.BaselineMatched).ToList();
+        var staleCount = points.Count(p => !p.Excluded && !p.BaselineMatched);
         string conclusion;
         if (fit is null || valid.Count < 2)
         {
-            conclusion = "有效实验点不足，无法给出线性度结论；请补采扭矩阶梯点后重新生成。本报告为工程验证，非正式载荷标定。";
+            conclusion = staleCount > 0
+                ? $"当前基线下的有效实验点不足（另有 {staleCount} 个点采于旧基线、参考系已失效，不参与拟合），"
+                  + "无法给出线性度结论；请在当前基线下重新逐档采点后再生成。本报告为工程验证，非正式载荷标定。"
+                : "有效实验点不足，无法给出线性度结论；请补采扭矩阶梯点后重新生成。本报告为工程验证，非正式载荷标定。";
         }
         else
         {
@@ -629,11 +640,11 @@ public static class ReportEndpoints
     {
         static string H(string? value) => WebUtility.HtmlEncode(value ?? "");
         var rows = string.Join("\n", snapshot.Points.Select(p => $"""
-            <tr class="{(p.Excluded ? "excluded" : "")}">
+            <tr class="{(p.Excluded || !p.BaselineMatched ? "excluded" : "")}">
               <td>{p.Id}</td><td>{p.TorqueNm:F0}</td><td>{p.EstimatedPreloadN:F0}</td>
               <td>{p.SampleCount}</td><td>{p.AvgEchoTimeNs:F4}</td><td>{p.StddevEchoTimeNs:F4}</td>
-              <td>{p.AvgTempC:F3}</td><td>{p.DeltaTofNs:F4}</td><td>{(p.Excluded ? "排除" : "有效")}</td>
-              <td>{H(p.ExcludeReason ?? p.Note)}</td>
+              <td>{p.AvgTempC:F3}</td><td>{p.DeltaTofNs:F4}</td><td>{(p.Excluded ? "排除" : p.BaselineMatched ? "有效" : "旧基线")}</td>
+              <td>{H(p.ExcludeReason ?? (!p.Excluded && !p.BaselineMatched ? "采于旧基线，参考系失效，不参与拟合" : p.Note))}</td>
             </tr>
             """));
 
@@ -784,7 +795,11 @@ public sealed record ChannelSnapshot(long ChannelId, long DeviceId, short Channe
 /// <summary>快照里的螺栓信息，记的是出报告当时的规格和目标值，后来改了也不影响这份报告。</summary>
 public sealed record BoltSnapshot(long BoltId, string Code, string NominalDiameter, decimal? TargetPreloadN, decimal? InstallTorqueNm);
 
-/// <summary>快照里的一个扭矩档位测量点。被剔除的点也留着，连同剔除原因一起——拟合过程要能复核。</summary>
+/// <summary>
+/// 快照里的一个扭矩档位测量点。被剔除的点也留着，连同剔除原因一起——拟合过程要能复核。
+/// <paramref name="BaselineMatched"/>=false 表示该点采于旧基线（之后通道基线被重设），
+/// Δt 参考系已失效，不参与拟合，报告中以"旧基线"状态列出备查。
+/// </summary>
 public sealed record TorquePointSnapshot(
     long Id,
     decimal TorqueNm,
@@ -797,6 +812,7 @@ public sealed record TorquePointSnapshot(
     decimal DeltaTofNs,
     bool Excluded,
     string? ExcludeReason,
-    string? Note);
+    string? Note,
+    bool BaselineMatched = true);
 /// <summary>快照里的线性拟合结果。K_L 按全系统的 ns/N 口径存。</summary>
 public sealed record TorqueFitSnapshot(long PointCount, double KL, double InterceptNs, double RSquared);

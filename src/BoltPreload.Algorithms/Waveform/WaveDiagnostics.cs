@@ -101,6 +101,8 @@ public static class WaveDiagnostics
 
         double best = 0, zeroLag = 0;
         int bestLag = 0;
+        // 保留全部 lag 的 NCC：峰值亚采样点精化要用相邻两点（下方抛物线插值）
+        var nccByLag = new double[2 * maxLag + 1];
         for (int lag = -maxLag; lag <= maxLag; lag++)
         {
             // a[i] 对齐 b[i - lag]；只在两序列都有效的重叠区间累加
@@ -119,8 +121,27 @@ public static class WaveDiagnostics
             }
             double denom = Math.Sqrt(sumA2) * Math.Sqrt(sumB2);
             double ncc = denom > 1e-12 ? dot / denom : 0;
+            nccByLag[lag + maxLag] = ncc;
             if (lag == 0) zeroLag = ncc;
             if (ncc > best) { best = ncc; bestLag = lag; }
+        }
+
+        // 相关峰抛物线插值（亚采样点精化，与 MainFrequencyMhz 的谱峰精化同一手法）：
+        // 整数 lag 的分辨率 = 采样间隔（真机 25ns/点），而真实声时抖动只有 1~3ns——不精化的话
+        // 所有微小平移都被量化到同一个整数 lag，相关法看起来"波动为零"，是假精度（2026-08-18 真机实证）。
+        // 峰值两侧邻点拟合抛物线取顶点，分辨率进到采样间隔的几十分之一。
+        double refinedLag = bestLag;
+        if (bestLag > -maxLag && bestLag < maxLag)
+        {
+            double m0 = nccByLag[bestLag - 1 + maxLag];
+            double m1 = nccByLag[bestLag + maxLag];
+            double m2 = nccByLag[bestLag + 1 + maxLag];
+            double denomP = m0 - 2 * m1 + m2;
+            if (Math.Abs(denomP) > 1e-12)
+            {
+                double d = 0.5 * (m0 - m2) / denomP;
+                if (Math.Abs(d) <= 1) refinedLag = bestLag + d;   // 顶点跑出邻区间=邻点被跳过/畸形，放弃精化
+            }
         }
 
         // 衰减比用原始（未去均值）峰峰值算，反映真实幅度变化
@@ -143,8 +164,8 @@ public static class WaveDiagnostics
 
         return new WaveComparison(
             Similarity: best,
-            // ΔTOF = 采样内平移(bestLag×clk) + 两波窗口起点之差；漏掉后者会在 EchoStart 变化时给出假平移。
-            BestLagNs: bestLag * clk + (current.EchoStartNs - reference.EchoStartNs),
+            // ΔTOF = 采样内平移(精化后 lag×clk) + 两波窗口起点之差；漏掉后者会在 EchoStart 变化时给出假平移。
+            BestLagNs: refinedLag * clk + (current.EchoStartNs - reference.EchoStartNs),
             ZeroLagCorrelation: zeroLag,
             AttenuationRatio: atten,
             SnrDb: snrDb,

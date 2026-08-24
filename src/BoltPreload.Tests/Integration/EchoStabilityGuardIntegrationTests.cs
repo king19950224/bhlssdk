@@ -140,6 +140,11 @@ public sealed class EchoStabilityGuardIntegrationTests
         trending.GetProperty("stable").GetBoolean().Should().BeFalse();
         trending.GetProperty("halfWindowDriftNs").GetDecimal().Should().BeApproximately(1.0m, 0.15m);
 
+        var inService = await client.GetFromJsonAsync<JsonElement>(url + "&purpose=inservice");
+        inService.GetProperty("stable").GetBoolean().Should().BeTrue(
+            "1ns 半窗差是现场探头抖动，在役置零必须放行");
+        inService.GetProperty("stddevMaxNs").GetDecimal().Should().Be(3.0m);
+
         await ClearMeasurementsAsync(s.ChannelId);
         await SeedEchoWindowAsync(s, firstHalfNs: 27250m, secondHalfNs: 27250m);
         var stable = await client.GetFromJsonAsync<JsonElement>(url);
@@ -198,8 +203,8 @@ public sealed class EchoStabilityGuardIntegrationTests
         _fx.EnsureAvailable();
         var s = await _fx.SeedCalibratableChannelAsync("防呆-趋势");
         var reviewerId = await _fx.SeedUserAsync("reviewer");
-        // 未标定通道也一样拦：稳定性检查不依赖 K_L（recalibrate 固定 60s 窗）
-        await SeedEchoWindowAsync(s, firstHalfNs: 27250m, secondHalfNs: 27253m);
+        // 在役置零放宽到 5ns 趋势；这里用 20ns 单调爬升，仍应视为有人在扳动
+        await SeedEchoWindowAsync(s, firstHalfNs: 27250m, secondHalfNs: 27270m);
 
         using var factory = CreateFactoryWithDevice(s.DeviceId);
         using var client = TestApi.AuthedClient(factory, reviewerId, "reviewer");
@@ -210,6 +215,51 @@ public sealed class EchoStabilityGuardIntegrationTests
         resp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
         (await resp.Content.ReadFromJsonAsync<JsonElement>())
             .GetProperty("error").GetString().Should().Contain("稳定判据");
+    }
+
+    [PostgresFact]
+    public async Task Recalibrate_InService_AllowsFieldJitter()
+    {
+        _fx.EnsureAvailable();
+        var s = await _fx.SeedCalibratableChannelAsync("在役-现场抖动");
+        var reviewerId = await _fx.SeedUserAsync("reviewer");
+        // 真机常态：sd≈1ns、半窗差 2ns（量化 0.625ns）。实验室 0.6 会拒，在役置零必须放行
+        await SeedEchoWindowAsync(s, firstHalfNs: 27200m, secondHalfNs: 27202m);
+
+        using var factory = CreateFactoryWithDevice(s.DeviceId);
+        using var client = TestApi.AuthedClient(factory, reviewerId, "reviewer");
+
+        var resp = await client.PostAsJsonAsync(
+            $"/api/devices/{s.DeviceId}/channels/5/recalibrate", new { expectZeroLoad = false });
+
+        resp.StatusCode.Should().Be(HttpStatusCode.OK, await resp.Content.ReadAsStringAsync());
+    }
+
+    [PostgresFact]
+    public async Task Recalibrate_InsufficientSamples_Returns400_WithDistinctMessage()
+    {
+        _fx.EnsureAvailable();
+        var s = await _fx.SeedCalibratableChannelAsync("防呆-样本不足");
+        var reviewerId = await _fx.SeedUserAsync("reviewer");
+        // 只有 4 条样本（<5 下限）：数值完全平稳也不许当基线——1~2 条样本的 sd/半窗差纯靠运气。
+        // 文案必须与"不稳"区分开：设备停报时现场需要的是查设备，不是原地傻等
+        await SeedEchoWindowAsync(s, firstHalfNs: 27250m, secondHalfNs: 27250m, perHalf: 2);
+
+        using var factory = CreateFactoryWithDevice(s.DeviceId);
+        using var client = TestApi.AuthedClient(factory, reviewerId, "reviewer");
+
+        var resp = await client.PostAsJsonAsync(
+            $"/api/devices/{s.DeviceId}/channels/5/recalibrate", new { });
+
+        resp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        body.GetProperty("error").GetString().Should().Contain("样本");
+        // 铺 4 条,但最老的一条贴着 60s 窗口边缘,铺数与请求的间隙里可能掉出窗口——
+        // 断言意图是"低于 5 条下限被拦",不锁死具体条数
+        body.GetProperty("stability").GetProperty("sampleCount").GetInt64().Should().BeInRange(1, 4);
+        (await _fx.ScalarAsync<decimal>(
+            "SELECT ref_time_ns FROM channels WHERE id = @arg", s.ChannelId))
+            .Should().Be(27200m, "被拦的重设不许动库里的基线");
     }
 
     // ---- helpers ----

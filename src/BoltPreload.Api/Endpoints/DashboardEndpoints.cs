@@ -148,8 +148,8 @@ public static class DashboardEndpoints
             await using var cmd = ds.CreateCommand(sql);
             await using var r = await cmd.ExecuteReaderAsync(ct);
 
-            // 兜底对象字段必须与 Health() 投影完全一致（含 high）——少一个键，前端拿 undefined 算百分比全是 NaN
-            object global = new { total = 0L, normal = 0L, warn = 0L, loose = 0L, uncalibrated = 0L, nodata = 0L, high = 0L };
+            // 兜底对象字段必须与 Health() 投影完全一致（含 high/outofrange）——少一个键，前端拿 undefined 算百分比全是 NaN
+            object global = new { total = 0L, normal = 0L, warn = 0L, loose = 0L, uncalibrated = 0L, nodata = 0L, high = 0L, outofrange = 0L };
             if (await r.ReadAsync(ct)) global = AssetEndpoints.Health(r, 0);
 
             var byGroup = new List<object>();
@@ -276,17 +276,30 @@ public static class DashboardEndpoints
             var h = Math.Clamp(hours ?? 24, 1, 168);
             var bucketMin = h <= 24 ? 30 : h <= 72 ? 60 : 180;
             // JOIN bolts 排除已软删螺栓的历史测点/告警：否则删螺栓后趋势线仍统计它，
-            // avg_ratio / active_bolts 与当前在测资产对不上（软删口径与 bolt_status CTE 一致）
+            // avg_ratio / active_bolts 与当前在测资产对不上（软删口径与 bolt_status CTE 一致）。
+            // generate_series 补齐空桶：采集停机时段没有测量行，只按 GROUP BY 出桶会整段缺行，
+            // 前端连线画过去，"没数据"和"数据很稳"在图上无法区分（2026-08-18 实证：整机停 20 小时，
+            // 趋势仍是一条平线，值班无从发现监测自身失效）。空桶 avg/min 为 NULL、count=0，前端断线显示。
             var sql = $@"
-                SELECT time_bucket(make_interval(mins => {bucketMin}), m.ts) AS bucket,
-                       (avg(m.preload_ratio) FILTER (WHERE m.preload_ratio IS NOT NULL))::double precision AS avg_ratio,
-                       (min(m.preload_ratio) FILTER (WHERE m.preload_ratio IS NOT NULL))::double precision AS min_ratio,
-                       count(*) AS meas_count,
-                       count(DISTINCT m.bolt_id) FILTER (WHERE m.preload_ratio IS NOT NULL) AS active_bolts
-                FROM measurements m
-                JOIN bolts b ON b.id = m.bolt_id AND b.deleted_at IS NULL
-                WHERE m.ts > now() - make_interval(hours => {h})
-                GROUP BY bucket ORDER BY bucket;
+                WITH agg AS (
+                    SELECT time_bucket(make_interval(mins => {bucketMin}), m.ts) AS bucket,
+                           (avg(m.preload_ratio) FILTER (WHERE m.preload_ratio IS NOT NULL))::double precision AS avg_ratio,
+                           (min(m.preload_ratio) FILTER (WHERE m.preload_ratio IS NOT NULL))::double precision AS min_ratio,
+                           count(*) AS meas_count,
+                           count(DISTINCT m.bolt_id) FILTER (WHERE m.preload_ratio IS NOT NULL) AS active_bolts
+                    FROM measurements m
+                    JOIN bolts b ON b.id = m.bolt_id AND b.deleted_at IS NULL
+                    WHERE m.ts > now() - make_interval(hours => {h})
+                    GROUP BY 1
+                )
+                SELECT gs.bucket, a.avg_ratio, a.min_ratio,
+                       COALESCE(a.meas_count, 0) AS meas_count,
+                       COALESCE(a.active_bolts, 0) AS active_bolts
+                FROM generate_series(
+                        time_bucket(make_interval(mins => {bucketMin}), now() - make_interval(hours => {h})),
+                        now(), make_interval(mins => {bucketMin})) AS gs(bucket)
+                LEFT JOIN agg a ON a.bucket = gs.bucket
+                ORDER BY gs.bucket;
 
                 SELECT time_bucket(make_interval(mins => {bucketMin}), a.triggered_at) AS bucket, count(*)
                 FROM alarms a
@@ -321,7 +334,10 @@ public static class DashboardEndpoints
                 alarms = alarmMap.TryGetValue(p.Ts, out var a) ? a : 0L,
             });
 
-            return Results.Ok(new { bucketMinutes = bucketMin, hours = h, points });
+            // 数据覆盖率 = 有测量的桶 / 全部桶。停机空窗直接压低该值，是"监测自身是否在线"的最直观指标
+            var coverage = rows.Count == 0 ? 0.0 : Math.Round(rows.Count(x => x.Count > 0) / (double)rows.Count, 4);
+
+            return Results.Ok(new { bucketMinutes = bucketMin, hours = h, coverage, points });
         })
         .RequireAuthorization(AuthPolicies.LoggedIn)
         .WithTags("Dashboard")

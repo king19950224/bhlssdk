@@ -499,6 +499,138 @@ public static class MeasurementEndpoints
         .WithName("CompareWave")
         .WithSummary("波形对比诊断：当前波形 vs 通道参考波形（相似度/衰减/健康度，§8.6）");
 
+        // 相关法声时稳定性诊断：窗口内逐条波形与参考波形做窗口化归一化互相关取最佳平移（相关法 ΔTOF），
+        // 与设备阈值法 EchoTime 的波动并排对比。
+        // 动机：阈值法对幅度敏感——耦合稍变、回波幅度一变，过阈时刻就漂，看起来像声时变了；
+        // 相关法对齐的是整段波形形态，对幅度变化天然免疫，这是成熟竞品声时更稳的核心手段。
+        // 本端点只做旁路诊断（证据收集），不改任何在产计算——相关法要不要替代阈值法，先拿这里的数据说话。
+        waveGroup.MapGet("/xcorr-tof/{channelId:long}", async (
+            long channelId, int? minutes, int? maxWaves,
+            NpgsqlDataSource ds, IWaveStore store, ILoggerFactory lf, CancellationToken ct) =>
+        {
+            var win = Math.Clamp(minutes ?? 60, 5, 24 * 60);
+            var cap = Math.Clamp(maxWaves ?? 40, 5, 100);
+
+            string? refUrl = null;
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT wf.wave_blob_url
+                FROM reference_waves rw JOIN wave_features wf ON wf.id = rw.wave_feature_id
+                WHERE rw.channel_id=@cid AND rw.active=true
+                ORDER BY rw.created_at DESC LIMIT 1"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                refUrl = await cmd.ExecuteScalarAsync(ct) as string;
+            }
+            if (refUrl is null)
+                return Results.BadRequest(new { error = "该通道未设置参考波形——相关法需要对齐基准，请先在波形诊断页【设为参考】", channelId });
+
+            var log = lf.CreateLogger("Waves");
+            var refWave = await LoadWaveAsync(store, refUrl, log, ct);
+            if (!refWave.Ok)
+                return Results.BadRequest(new { error = "参考波形文件缺失或损坏，请重新设定参考波形", channelId });
+
+            // 带波形的测量按 (channel_id, ts) 配对设备声时；LEchoWave 主动补读没有对应测量行，echo 为 null
+            var rows = new List<(DateTime Ts, string Url, decimal? EchoNs)>();
+            await using (var cmd = ds.CreateCommand(@"
+                SELECT wf.ts, wf.wave_blob_url, m.echo_time_ns
+                FROM wave_features wf
+                LEFT JOIN measurements m ON m.channel_id = wf.channel_id AND m.ts = wf.ts
+                WHERE wf.channel_id=@cid AND wf.wave_blob_url IS NOT NULL
+                  AND wf.ts > now() - make_interval(mins => @win)
+                ORDER BY wf.ts DESC LIMIT @cap"))
+            {
+                cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, channelId);
+                cmd.Parameters.AddWithValue("win", NpgsqlDbType.Integer, win);
+                cmd.Parameters.AddWithValue("cap", NpgsqlDbType.Integer, cap);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct))
+                    rows.Add((r.GetDateTime(0), r.GetString(1), r.IsDBNull(2) ? null : r.GetDecimal(2)));
+            }
+            if (rows.Count < 5)
+                return Results.BadRequest(new
+                {
+                    error = $"窗口内带波形的测量不足（{rows.Count} 条，至少 5 条）——增大 minutes 或确认该通道波形采集在跑",
+                    channelId, windowMinutes = win
+                });
+
+            rows.Reverse();
+
+            // maxLagPoints=200：预紧力量级的声时变化只有几十 ns，±200 点已宽裕覆盖，不扫全长白耗 CPU
+            var series = new List<object>(rows.Count);
+            var xcorrLags = new List<double>();
+            var deviceEchoes = new List<double>();
+            int corrupt = 0, lowSim = 0;
+            foreach (var row in rows)
+            {
+                ct.ThrowIfCancellationRequested();
+                var w = await LoadWaveAsync(store, row.Url, log, ct);
+                if (!w.Ok) { corrupt++; continue; }
+                var cmp = WaveDiagnostics.Compare(
+                    new WaveSeries(w.Wave, w.EchoStart, w.ClockInt),
+                    new WaveSeries(refWave.Wave, refWave.EchoStart, refWave.ClockInt),
+                    maxLagPoints: 200);
+                // 相似度过低时 bestLag 是噪声对齐噪声，计入会污染稳定性统计——标记剔除
+                var usable = cmp.Similarity >= 0.6;
+                if (!usable) lowSim++;
+                else
+                {
+                    xcorrLags.Add(cmp.BestLagNs);
+                    if (row.EchoNs is { } e) deviceEchoes.Add((double)e);
+                }
+                series.Add(new
+                {
+                    ts = row.Ts,
+                    deviceEchoNs = row.EchoNs,
+                    xcorrLagNs = Math.Round(cmp.BestLagNs, 2),
+                    similarity = Math.Round(cmp.Similarity, 4),
+                    usable,
+                });
+            }
+            if (xcorrLags.Count < 5)
+                return Results.BadRequest(new
+                {
+                    error = $"可用波形不足（相似度达标 {xcorrLags.Count} 条 / 文件损坏 {corrupt} / 低相似 {lowSim}）——参考波形可能已过时（拧动过/耦合变过），请重设参考后复测",
+                    channelId
+                });
+
+            static double Stddev(List<double> xs)
+            {
+                var mean = xs.Average();
+                return Math.Sqrt(xs.Sum(x => (x - mean) * (x - mean)) / xs.Count);
+            }
+            var xcorrStd = Stddev(xcorrLags);
+            var deviceStd = deviceEchoes.Count >= 5 ? Stddev(deviceEchoes) : (double?)null;
+            // ratio 为空的两种成因要分开说：配对不足（说不了话）与相关法波动逼近零（好到测不出下限）
+            var ratio = deviceStd is { } dstd && xcorrStd > 1e-9 ? dstd / xcorrStd : (double?)null;
+            var verdict = deviceStd is null
+                ? "窗口内配对的阈值法声时不足，仅给出相关法波动"
+                : xcorrStd <= 1e-9
+                    ? "相关法波动低于分辨下限（本窗口内形态零漂移）——阈值法的波动全部来自幅度/噪声，本通道值得切相关法跟踪"
+                    : ratio switch
+                    {
+                        >= 1.5 => $"相关法波动比阈值法低 {ratio:0.0} 倍——阈值法漂移主要来自幅度变化，本通道值得切相关法跟踪",
+                        >= 0.8 => "两种方法波动相当——当前信号幅度稳定，阈值法未见劣势",
+                        _ => "阈值法反而更稳——参考波形可能已过时（拧动过/耦合变过），请重设参考后复测",
+                    };
+
+            return Results.Ok(new
+            {
+                channelId,
+                windowMinutes = win,
+                waveCount = rows.Count,
+                usableCount = xcorrLags.Count,
+                corruptCount = corrupt,
+                lowSimilarityCount = lowSim,
+                deviceEchoStddevNs = deviceStd is { } d1 ? Math.Round(d1, 3) : (double?)null,
+                xcorrLagStddevNs = Math.Round(xcorrStd, 3),
+                improvementRatio = ratio is { } r1 ? Math.Round(r1, 2) : (double?)null,
+                verdict,
+                series,
+            });
+        })
+        .WithName("XcorrTofDiagnostic")
+        .WithSummary("相关法声时稳定性诊断：逐波形互相关 ΔTOF vs 设备阈值法 EchoTime（旁路证据，不改在产计算）");
+
         // 从 WaveStore 读回并解析一条波形 JSON（LocalFileWaveStore 存的 camelCase 结构）。
         // 解析失败和"文件不存在"分开报，原因见 WaveLoad。
         static async Task<WaveLoad> LoadWaveAsync(

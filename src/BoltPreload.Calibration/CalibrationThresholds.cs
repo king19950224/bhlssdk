@@ -49,4 +49,14 @@ public static class CalibrationThresholds
 
     /// <summary>前半窗与后半窗平均声时之差上限（ns）：超过说明窗口内有单调趋势（还没稳），拒绝。</summary>
     public const decimal EchoHalfWindowDriftMaxNs = 0.6m;
+
+    // 在役置零（expectZeroLoad=false）：不拧螺栓、只记当前为相对原点。
+    // 0.6ns 是实验室拧松/拧紧窗口用的——比设备量化步长（IotR24 回波声时 0.625ns）还紧，
+    // 真机现场 sd 常态 1~2.5ns（CH1 实测），0.6 会把向导永远锁在"请保持静置等稳"。
+    // 3ns / 5ns 仍能拦住有人正在扳动（约数 kN 的单调变化），放过探头自然抖动。
+    /// <summary>在役置零允许的窗口标准差上限（ns）。</summary>
+    public const decimal InServiceEchoStddevMaxNs = 3.0m;
+
+    /// <summary>在役置零允许的半窗趋势上限（ns）。</summary>
+    public const decimal InServiceEchoHalfWindowDriftMaxNs = 5.0m;
 }
