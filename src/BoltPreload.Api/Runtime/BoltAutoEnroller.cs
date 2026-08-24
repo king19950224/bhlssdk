@@ -163,17 +163,21 @@ public sealed class BoltAutoEnroller
         string? positionLabel;
         double? snrAvgDb;
         long snrSamples;
+        // SNR 证据取【最近 5 条】而非窗口全量均值：现场插探头后按压/补耦合剂是渐进过程，
+        // 全窗均值会被耦合前的低 SNR 样本拖累——耦合已达标系统却还要等窗口滚动才放行，
+        // "插了没反应"的观感就是这么来的。最近 5 条 ≈ 达标后一个对账周期（≤1 分钟）内建档。
         await using (var cmd = new NpgsqlCommand(@"
             SELECT c.id, c.name, c.hardware_state, b.id, c.auto_enroll_hold,
                    snr.avg_db, snr.n
             FROM channels c
             LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
             LEFT JOIN LATERAL (
-                SELECT avg(wf.snr_db)::float8 AS avg_db, count(*) AS n
-                FROM wave_features wf
-                WHERE wf.channel_id = c.id
-                  AND wf.ts > now() - interval '10 minutes'
-                  AND wf.snr_db IS NOT NULL) snr ON true
+                SELECT avg(x.snr_db)::float8 AS avg_db, count(*) AS n
+                FROM (SELECT wf.snr_db FROM wave_features wf
+                      WHERE wf.channel_id = c.id
+                        AND wf.ts > now() - interval '10 minutes'
+                        AND wf.snr_db IS NOT NULL
+                      ORDER BY wf.ts DESC LIMIT 5) x) snr ON true
             WHERE c.device_id = @d AND c.channel_no = @ch AND c.deleted_at IS NULL
             FOR UPDATE OF c", conn, tx))
         {

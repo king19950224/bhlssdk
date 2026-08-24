@@ -108,6 +108,14 @@ public sealed class BoltAutoEnrollerTests
         var offEnroller = MakeEnroller(new ChannelPresenceOptions { AutoEnrollMinSnrDb = 0 });
         (await offEnroller.TryEnrollAsync(gateOff.DeviceId, gateOff.ChannelNo, CancellationToken.None))
             .Should().NotBeNull("门关闭时保持旧行为");
+
+        // 耦合渐进改善：先 5 条低（按压前）再 5 条高（按压后）——证据取【最近 5 条】而非窗口全量均值，
+        // 耦合达标后立即放行，不被历史低 SNR 样本拖累（"插了没反应"的根治点）
+        var improved = await SeedAsync(setDefaultGroup: true, hardwareState: "healthy");
+        await SeedWaveSnrAsync(improved.ChannelId, snrDb: 6.0m, rows: 5, ageOffsetSeconds: 120);
+        await SeedWaveSnrAsync(improved.ChannelId, snrDb: 28.0m, rows: 5);
+        (await enroller.TryEnrollAsync(improved.DeviceId, improved.ChannelNo, CancellationToken.None))
+            .Should().NotBeNull("最近 5 条已达标（28dB），历史低 SNR 不再拖累");
     }
 
     [PostgresFact]
@@ -333,14 +341,15 @@ public sealed class BoltAutoEnrollerTests
         await cmd.ExecuteNonQueryAsync();
     }
 
-    /// <summary>铺近期波形 SNR 证据（SNR 门用：门只看近 10 分钟、样本 ≥3 的 snr_db 均值）。</summary>
-    private async Task SeedWaveSnrAsync(long channelId, decimal snrDb, int rows)
+    /// <summary>铺近期波形 SNR 证据（SNR 门用：门只看近 10 分钟内【最近 5 条】的 snr_db 均值）。</summary>
+    private async Task SeedWaveSnrAsync(long channelId, decimal snrDb, int rows, int ageOffsetSeconds = 0)
     {
         await using var cmd = _fx.DataSource.CreateCommand(@"
             INSERT INTO wave_features (channel_id, ts, wave_blob_url, point_count, snr_db)
-            SELECT @c, now() - (i || ' seconds')::interval, 'test://wave', 500, @snr
+            SELECT @c, now() - ((@off + i) || ' seconds')::interval, 'test://wave', 500, @snr
             FROM generate_series(1, @n) i");
         cmd.Parameters.AddWithValue("c", NpgsqlDbType.Bigint, channelId);
+        cmd.Parameters.AddWithValue("off", NpgsqlDbType.Integer, ageOffsetSeconds);
         cmd.Parameters.AddWithValue("snr", NpgsqlDbType.Numeric, snrDb);
         cmd.Parameters.AddWithValue("n", NpgsqlDbType.Integer, rows);
         await cmd.ExecuteNonQueryAsync();

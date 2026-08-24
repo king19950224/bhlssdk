@@ -359,11 +359,12 @@ public sealed class ChannelPresenceService : BackgroundService
             FROM channels c
             LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
             LEFT JOIN LATERAL (
-                SELECT avg(wf.snr_db)::float8 AS avg_db, count(*) AS n
-                FROM wave_features wf
-                WHERE wf.channel_id = c.id
-                  AND wf.ts > now() - interval '10 minutes'
-                  AND wf.snr_db IS NOT NULL) snr ON true
+                SELECT avg(x.snr_db)::float8 AS avg_db, count(*) AS n
+                FROM (SELECT wf.snr_db FROM wave_features wf
+                      WHERE wf.channel_id = c.id
+                        AND wf.ts > now() - interval '10 minutes'
+                        AND wf.snr_db IS NOT NULL
+                      ORDER BY wf.ts DESC LIMIT 5) x) snr ON true
             WHERE c.device_id = ANY(@ids) AND c.deleted_at IS NULL"))
         {
             cmd.Parameters.AddWithValue("ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint, eligible.ToArray());
@@ -385,21 +386,23 @@ public sealed class ChannelPresenceService : BackgroundService
                 if (!s.EvidenceFresh) continue;
                 if (!db.TryGetValue((s.DeviceId, s.ChannelNo), out var row)) continue;
 
-                // 质量降级：healthy 但近 10 分钟 SNR 证据（样本 ≥3）持续贴噪声 → suspect。
-                // 插入时的 SNR 分级只在翻转瞬间生效，长期在位的杂波通道（或保留条款延续的旧 healthy）
-                // 没有翻转就永远不被重判——08-24 CH7/CH10 实证。只降不升：升级交给 probe-scan 或
-                // 重新耦合后的拔插翻转，避免对账和扫描的细分判定（noisy）互相拉扯。
-                if (row.Hw == "healthy" && _opt.AutoEnrollMinSnrDb > 0
-                    && row.SnrN >= 3 && row.SnrAvg is { } snrAvg && snrAvg < _opt.AutoEnrollMinSnrDb)
+                // 质量分级校正（对账周期，最近 5 条 SNR 证据、样本 ≥3）：
+                // 降级：healthy 但持续贴噪声 → suspect——插入时的分级只在翻转瞬间生效，长期在位的
+                //   杂波通道（或保留条款延续的旧 healthy）没有翻转就永远不被重判（08-24 CH7/CH10 实证）；
+                // 升级：suspect 但信号已达标 → healthy——现场按压/补耦合剂后一个对账周期（≤1 分钟）内
+                //   灯变绿、建档放行，不用等下次扫描。只动 healthy↔suspect，不碰扫描细分的 noisy。
+                if (_opt.AutoEnrollMinSnrDb > 0 && row.SnrN >= 3 && row.SnrAvg is { } snrAvg
+                    && ((row.Hw == "healthy" && snrAvg < _opt.AutoEnrollMinSnrDb)
+                        || (row.Hw == "suspect" && snrAvg >= _opt.AutoEnrollMinSnrDb)))
                 {
                     try
                     {
-                        await DemoteToSuspectAsync(s.DeviceId, s.ChannelNo, snrAvg, ct);
+                        await RegradePresenceAsync(s.DeviceId, s.ChannelNo, row.Hw, snrAvg, ct);
                     }
                     catch (OperationCanceledException) { throw; }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "在位质量降级失败 device={DeviceId} ch={Ch}（下轮重试）", s.DeviceId, s.ChannelNo);
+                        _logger.LogWarning(ex, "在位质量分级校正失败 device={DeviceId} ch={Ch}（下轮重试）", s.DeviceId, s.ChannelNo);
                     }
                 }
 
@@ -433,20 +436,23 @@ public sealed class ChannelPresenceService : BackgroundService
         }
     }
 
-    /// <summary>质量降级：healthy → suspect（SNR 证据持续贴噪声）。条件更新防并发覆盖扫描判定。</summary>
-    private async Task DemoteToSuspectAsync(long deviceId, ushort channelNo, double snrAvg, CancellationToken ct)
+    /// <summary>质量分级校正：healthy↔suspect 双向（按最近 SNR 证据）。条件更新防并发覆盖扫描判定。</summary>
+    private async Task RegradePresenceAsync(long deviceId, ushort channelNo, string fromState, double snrAvg, CancellationToken ct)
     {
+        var toState = fromState == "healthy" ? "suspect" : "healthy";
         await using var cmd = _ds.CreateCommand(@"
-            UPDATE channels SET hardware_state = 'suspect', updated_at = now()
-            WHERE device_id = @d AND channel_no = @ch AND hardware_state = 'healthy' AND deleted_at IS NULL");
+            UPDATE channels SET hardware_state = @to, updated_at = now()
+            WHERE device_id = @d AND channel_no = @ch AND hardware_state = @from AND deleted_at IS NULL");
+        cmd.Parameters.AddWithValue("to", NpgsqlDbType.Varchar, toState);
         cmd.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
         cmd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channelNo);
+        cmd.Parameters.AddWithValue("from", NpgsqlDbType.Varchar, fromState);
         var n = await cmd.ExecuteNonQueryAsync(ct);
         if (n > 0)
             _logger.LogInformation(
-                "在位质量降级 device={DeviceId} ch={Ch}：healthy → suspect（近 10 分钟 SNR 均值 {Snr:0.0}dB < {Min:0.0}dB）——" +
-                "信号贴着噪声，疑似串扰/未耦合；处理耦合或经通道检测确认后自动恢复",
-                deviceId, channelNo, snrAvg, _opt.AutoEnrollMinSnrDb);
+                "在位质量分级 device={DeviceId} ch={Ch}：{From} → {To}（最近 5 条 SNR 均值 {Snr:0.0}dB，门 {Min:0.0}dB）{Hint}",
+                deviceId, channelNo, fromState, toState, snrAvg, _opt.AutoEnrollMinSnrDb,
+                toState == "suspect" ? "——信号贴着噪声，疑似串扰/未耦合，请按压探头或补耦合剂" : "——信号已达标");
     }
 
     /// <summary>
@@ -472,10 +478,12 @@ public sealed class ChannelPresenceService : BackgroundService
                            WHEN @present AND hardware_state IN ('healthy','noisy','suspect') THEN hardware_state
                            WHEN @present THEN CASE
                                WHEN @min_snr > 0 AND (
-                                   SELECT avg(wf.snr_db) FROM wave_features wf
-                                   WHERE wf.channel_id = channels.id
-                                     AND wf.ts > now() - interval '10 minutes'
-                                     AND wf.snr_db IS NOT NULL
+                                   SELECT avg(x.snr_db)
+                                   FROM (SELECT wf.snr_db FROM wave_features wf
+                                         WHERE wf.channel_id = channels.id
+                                           AND wf.ts > now() - interval '10 minutes'
+                                           AND wf.snr_db IS NOT NULL
+                                         ORDER BY wf.ts DESC LIMIT 5) x
                                    HAVING count(*) >= 3) < @min_snr
                                THEN 'suspect' ELSE 'healthy' END
                            ELSE 'no_data' END,

@@ -623,7 +623,13 @@ async function unbind(it: ChannelLive) {
         <template v-else>
           <div class="ch-bind">
             <el-button size="small" type="primary" plain @click="openCreate(it)">建档绑定</el-button>
-            <span v-if="hasSignal(it)" class="bind-hint">
+            <!-- suspect = 信号贴噪声，质量门挡着不自动建档——必须把"为什么没反应、该做什么"说破，
+                 否则现场以为系统坏了（08-24 实际反馈）。耦合达标后 1 分钟内自动放行 -->
+            <span v-if="it.hardwareState === 'suspect'" class="bind-hint warn">
+              信号贴噪声（SNR {{ it.snrDb != null ? Number(it.snrDb).toFixed(0) : '?' }}dB，需 ≥12dB），不自动建档——
+              请按压探头 / 补耦合剂 / 核查接线，信号达标后约 1 分钟内自动建档；确认无误也可手工建档
+            </span>
+            <span v-else-if="hasSignal(it)" class="bind-hint">
               {{ defaultGroupId ? '检测到探头，自动建档中…也可手工建档' : '检测到探头——请先设置设备默认监测组，或手工建档' }}
             </span>
             <span v-else class="bind-hint dim">{{ it.channelName ? `位置：${it.channelName}` : '未检测到探头' }}</span>
@@ -768,6 +774,7 @@ async function unbind(it: ChannelLive) {
 .ch-bind { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .bind-hint { font-size: 11px; color: var(--ok); }
 .bind-hint.dim { color: var(--text-3); }
+.bind-hint.warn { color: #fb923c; }
 .empty { grid-column: 1 / -1; text-align: center; color: var(--text-3); padding: 40px; }
 .empty--err { color: var(--warn); }
 
