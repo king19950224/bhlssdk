@@ -175,16 +175,22 @@ public sealed class PostgresProbeScanRepository : IProbeScanRepository
         var state = ProbeScanResultJudge.ToHardwareState(verdict);
         if (state is null) return;       // inconclusive 不更新
 
+        // last_seen_at 全库语义是"最后一次真的收到该通道数据"（CachedChannelResolver / ChannelPresenceService
+        // 都只在有数据/在位时刷）。not_reporting = 窗口内一条数据都没有，刷了会让死通道在
+        // UI"最后上报时间"里显得刚活过，误导排障——只有窗口内确实有样本才刷新。
+        var sawData = verdict != ProbeScanVerdict.NotReporting;
+
         const string sql = @"
             UPDATE channels
                SET hardware_state = @state,
-                   last_seen_at = @at,
+                   last_seen_at = CASE WHEN @saw_data THEN @at ELSE last_seen_at END,
                    updated_at = now()
              WHERE device_id = @device_id
                AND channel_no = @ch
                AND deleted_at IS NULL";
         await using var cmd = _dataSource.CreateCommand(sql);
         cmd.Parameters.AddWithValue("state", NpgsqlDbType.Varchar, state);
+        cmd.Parameters.AddWithValue("saw_data", NpgsqlDbType.Boolean, sawData);
         cmd.Parameters.AddWithValue("at", NpgsqlDbType.TimestampTz, at);
         cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, deviceId);
         cmd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channelNo);
@@ -194,8 +200,11 @@ public sealed class PostgresProbeScanRepository : IProbeScanRepository
     public async Task<ProbeScanWindowStats> LoadWindowStatsAsync(
         long deviceId, ushort channelNo, DateTimeOffset windowStart, DateTimeOffset windowEnd, CancellationToken ct)
     {
-        // 测量行可能在 measurements（已绑 bolt）或 unbound_measurements（未绑）；
-        // 用 UNION ALL 把两边合起来再聚合，避免漏数。
+        // 测量行可能在 measurements（已绑 bolt）、unbound_measurements（未绑）或
+        // measurement_anomalies（已绑但 StatusCode<0，信号过小/阈值异常等）；三处 UNION ALL 合起来聚合。
+        // 异常帧按"有上报、无回波"计入（echo 记 NULL）——真机实测过：绑定通道探头接触不良时
+        // 全部样本走 anomalies 表，不算进去会被误判 not_reporting（"没上报"），
+        // 而真实情况是"在上报但测不出回波"（应判 active_no_echo → suspect，运维去查探头耦合）。
         const string sqlMeas = @"
             WITH meas AS (
                 SELECT m.echo_time_ns, b.code AS bolt_code
@@ -211,6 +220,13 @@ public sealed class PostgresProbeScanRepository : IProbeScanRepository
                 WHERE device_id = @device_id
                   AND channel_no = @ch
                   AND ts >= @start AND ts <= @end
+                UNION ALL
+                SELECT NULL::numeric, NULL::varchar
+                FROM measurement_anomalies ma
+                JOIN channels ca ON ca.id = ma.channel_id
+                WHERE ca.device_id = @device_id
+                  AND ca.channel_no = @ch
+                  AND ma.ts >= @start AND ma.ts <= @end
             ),
             wave AS (
                 SELECT wf.peak_to_peak, wf.snr_db

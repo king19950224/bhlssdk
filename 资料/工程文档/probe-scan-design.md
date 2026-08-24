@@ -1,6 +1,6 @@
 # 通道自动检测（Probe Scan）设计
 
-> 状态：**已实现并真机验证**（2026-05-27）。代码见 `src/BoltPreload.Application/Devices/ProbeScan/`、`src/BoltPreload.Infrastructure/Devices/ProbeScan/`、`src/BoltPreload.Api/Endpoints/ProbeScanEndpoints.cs`；页面入口在 `web/src/views/Devices.vue`（当年的 wwwroot 演示页已随 UI 并入 Vue 后删除）。  
+> 状态：**已实现并真机验证**（2026-05-27）；**2026-08-17 链路审查加固**（判定退化、窗口内补读波形、入库宽限、竞态防御、墓碑/降级防误判，见 §14）。代码见 `src/BoltPreload.Application/Devices/ProbeScan/`、`src/BoltPreload.Infrastructure/Devices/ProbeScan/`、`src/BoltPreload.Api/Endpoints/ProbeScanEndpoints.cs`；页面入口在 `web/src/views/Devices.vue`（当年的 wwwroot 演示页已随 UI 并入 Vue 后删除）。  
 > 目的：在现场不知道探头插在哪几个物理通道的情况下，由系统自动识别“哪些通道接了探头、信号质量如何”，输出供运维人工绑定的清单。**不自动绑定 bolt**。
 
 ---
@@ -84,6 +84,7 @@ flowchart TD
 | `settleSeconds` | 3 | 切换 MCR 单通道后第一两包数据可能是上一个通道的尾包；3 秒经验值 |
 | `sampleSeconds` | 8 | 设备 `SingleCount=1` 时多通道上报频率约 10 Hz，8 秒 ≈ 80 个 ChannelResult，够算 SNR 和 EchoTime 标准差 |
 | `minSamples` | 20 | 少于 20 条不足以分辨 `active_weak` 与 `active_no_echo`，直接判 `inconclusive` |
+| `dbFlushGraceMs` | 800 | 窗口结束后、聚合查询前的入库宽限：窗口尾部样本可能还在 Ingestion 管道里（逐条 INSERT + 波形文件 I/O），立刻查会少数几条。样本 ts 是接收时刻，等一拍不会把窗口外数据算进来。仅 appsettings 可配，不进请求体 |
 | `defaultStrategy` | `mcr_single` | model=3 真机上 `SingleMeas` 不连续（见 F2）；`mcr_single` 是该型号唯一可用策略 |
 | 单通道总耗时 | ~11 s | 3 + 8 |
 | 扫 1–40 总耗时 | ~7.5 min | 40 × 11 s |
@@ -108,13 +109,20 @@ flowchart TD
 
 | verdict | 条件 |
 |---|---|
-| `inconclusive` | `n < minSamples` |
+| `inconclusive` | `n < minSamples`；或窗口内查无样本但采集入库正处于降级态（"查不到"≠"没上报"，见 §14.5） |
 | `not_reporting` | `n == 0` |
 | `active_no_echo` | `n ≥ minSamples` 且 `echoRate < 0.5` |
 | `active_weak` | `echoRate ≥ 0.5` 且 (`snrAvgDb < snrGoodDb` 或 `echoStdNs > echoStdGoodNs` 或 `peakToPeakAvg < peakToPeakMin`) |
 | `active_good` | `echoRate ≥ 0.95` 且 `snrAvgDb ≥ 20 dB` 且 `echoStdNs ≤ 5 ns` 且 `peakToPeakAvg ≥ 600` |
 
 > 阈值 20 dB / 5 ns / 600 来自 `资料/工程文档/lab-torque-step-report-2026-05-22.md` 实验室验证的“健康通道”基线，不是拍脑袋。
+
+**波形指标缺失时的退化判定（2026-08-17）**：窗口内一条 `wave_features` 都没有时（`snrAvgDb` 与
+`peakToPeakAvg` 双双为 NULL——两者来自同一批 wave 行，双空 = 窗口内无波形特征），SNR/峰峰值属
+"指标缺失"而非"指标不达标"，按不达标处理会把健康通道系统性压成 `active_weak`（noisy）。此时退化为
+**纯回波判定**：`echoRate ≥ 0.95` 且 `echoStdNs ≤ 5 ns` → `active_good`，否则 `active_weak`。
+窗口内有任意波形（`peakToPeakAvg` 非空）仍走上表严格判定，个别缺 SNR 按不达标处理。
+配合 §14.2 的窗口内主动补读 LEchoWave，常态下退化路径不应触发；触发即说明波形链路有问题。
 
 `hardware_state` 同步映射规则：
 
@@ -125,6 +133,10 @@ flowchart TD
 | `active_no_echo` | `suspect` |
 | `not_reporting` | `no_data` |
 | `inconclusive` | 不更新（保留旧值） |
+
+> `last_seen_at` 仅在窗口内确实收到过样本（verdict ≠ `not_reporting`）时刷新。全库该字段的语义是
+> "最后一次真的收到该通道数据"（CachedChannelResolver / ChannelPresenceService 同一口径），
+> `no_data` 的通道不能伪造"最后上报时间"（2026-08-17 修复，此前 not_reporting 也会刷）。
 
 ---
 
@@ -241,9 +253,12 @@ Content-Type: application/json
 
 错误：
 
-- `400` — 设备未连接 / channels 为空 / 通道号超出 device.channel_count
+- `400` — 设备未连接 / channels 为空 / 通道号超出 device.channel_count / 请求的通道全为墓碑（软删）通道 / 采集入库处于降级态（扫描判定会全部失真，拒绝启动）
 - `409` — 该设备已有进行中的扫描（`status IN ('pending','running')`）
 - `503` — 当前没有 IFxConnector 可用
+
+成功响应还带 `skippedTombstoneChannels`：请求中被剔除的墓碑通道号（其数据在入库路径被丢弃，
+扫出来必为 `not_reporting`，与"真没探头"无法区分，所以不扫、明说，见 §14.6）。
 
 ### 6.2 查询扫描状态/报告
 
@@ -575,6 +590,44 @@ stateDiagram-v2
 
 ## 13. 后续追查项
 
+- **通道串扰识别（2026-08-17 现场实证,高优先级）**:CH4 物理空口却周期性出现 27.6μs"螺栓量级"回波
+  （幅值 ~95,仅真实信号的 1/10;伴随海量"信号过小"异常帧,有效率 4.4%),现场核实无任何探头——
+  设备通道间串扰/漏耦。它骗过了在位判定两道门（声时下限 2000ns、稳定带宽 2000ns——串扰回波又长又稳),
+  8-13 误建档、8-17 单日刷 117 条 signal_lost。当日处置:解绑 + 通道墓碑化。
+  系统性防御（待实现,两条互补):
+  ①**抖动闩锁**:通道短窗口内在位翻转 ≥N 次 → 闩锁"接触不良"态,只发一条需人工闭合的告警,
+  抑制后续插拔事件与 signal_lost 重复触发;
+  ②**串扰启发式**:回波声时 ≈ 某邻近活跃通道（±容差）且幅值 < 该通道的 15% 且异常帧占比高 →
+  标"疑似串扰",不自动建档、识别页提示人工核实。设备侧串扰问题一并反馈厂家。
+
 - **3 号通道异常**：scanRunId=7 显示已绑定 M16-003 但 `not_reporting`。可能那次扫描时探头连接松了、或被前一次扫描的 SetWorkMode 残留状态影响。单独 `POST /probe-scan {"channels":[3]}` 复测确认。
 - ~~dashboard 集成~~ 已随 UI 并入 Vue：扫描入口在 Devices 页，独立演示页已删。
 - **`bolts.position_label` vs `channels.name` 关系**：现有 `bolts` 表已有 `position_label`（"塔筒-北 #3"），新加的 `channels.name` 也是位置标签。两者语义有重叠 — 建议长期 `channels.name = 物理插口的固定标签`、`bolts.position_label = 螺栓本身的逻辑位置`（同一插口换装不同螺栓时 position_label 可变）。当前没有强一致约束，靠人工。
+- ~~**真机 MultiMeas 是否随测量带波形**~~ **已裁决（2026-08-17 真机实测）**：model=3 在 MultiMeas 下**每条测量都随帧带波形**（2 分钟窗口 93 条测量对 93 条 wave_features），`sdk-api-facts.md` §268 正确；`WaveSamplingService` 的旧注释（引用了不存在的 `DecodeMultiMeasResults`）已更正，该服务降级为"波形缺失时的补采后备"。§14.1/§14.2 的两层防御保留作固件行为差异的保险。
+
+---
+
+## 14. 2026-08-17 链路审查加固
+
+一次全链路审查（判定器 → 编排器 → 入库路径 → 周边后台服务）发现的六类问题与修复。测试基线 403/403 全绿。
+
+| # | 问题 | 修复 | 代码位置 |
+|---|---|---|---|
+| 14.1 | 判定器把"SNR/峰峰值缺失"当"不达标"：窗口内无 `wave_features` 时（真机 MultiMeas 可能不随测量带波形、WaveSamplingService 默认关且扫描期跳过本设备），健康通道最多判 `active_weak` → `noisy`，报告看不出原因 | 双空退化为纯回波判定（见 §4 新表注） | `ProbeScanResultJudge.Judge` |
+| 14.2 | 扫描窗口内无人补波形：唯一的真机波形来源 WaveSamplingService 在扫描期刻意跳过本设备，恰好是最需要波形指标的时刻 | `mcr_single` 每通道窗口内主动 `ReadChannelParam("LEchoWave")` 1~2 次（≥4s 窗口半程补一次），与 WaveSamplingService 同一手法、不切工作模式；失败仅记 Debug，退化路径兜底 | `ProbeScanOrchestrator.TriggerWaveReadsAsync` |
+| 14.3 | `not_reporting` 也刷 `channels.last_seen_at`：窗口内一条数据都没有的通道被写上"刚见过"，与全库"有数据才刷"的语义冲突，误导排障 | 仅 verdict ≠ `not_reporting` 时刷新 | `PostgresProbeScanRepository.UpdateChannelHardwareStateAsync` |
+| 14.4 | 扫描启动与热插拔全通道收敛竞态：`EnsureFullChannelPollingAsync` 在途的全通道下发若落在扫描器单通道 MCR 之后，窗口被稀释成全通道轮询（48 通道下目标通道样本 ~80 → ~2），误判 inconclusive/not_reporting。触发条件：`_mcrConfigured` 恰好为空时启动扫描（刚重连 / 刚结束上次扫描或验收后立刻重扫） | 双保险：收敛侧下发前紧邻处二次确认 `ProbeScanState.IsRunning`；扫描器侧 settle 后核对会话 MCR == `[ch]`，不对就重发并重新 settle（会话视图为空 = 测试桩，跳过核对） | `ChannelPresenceService.EnsureFullChannelPollingAsync`、`ProbeScanOrchestrator.ScanOneChannelAsync` |
+| 14.5 | 窗口查询无入库宽限 + 降级窗口误判：窗口尾部样本可能还在管道里；DB 写入降级期样本走 WAL 不落库，窗口查询是空集 → 全部误判 `not_reporting`（比没有结果更糟，运维会去拔查好探头） | ① 查询前等 `dbFlushGraceMs`（默认 800ms，见 §3）；② 启动时降级态直接 400 拒绝；③ 扫描中途才降级的，`not_reporting` 降判 `inconclusive` 并 WARN | `ProbeScanOrchestrator`（注入 `IngestDegradeState`，可空） |
+| 14.6 | 墓碑（软删）通道扫描必 `not_reporting`：其数据在 `PostgresMeasurementSink` 路由处被丢弃（按设计不自动复活），报告与"真没探头"无法区分；另外显式传入的 channels 只校验全局 48 上限，不校验设备实际通道数 | 启动前查墓碑集合并从扫描集剔除，响应带 `skippedTombstoneChannels` + warning 明示；全为墓碑时 400。channels 超出设备 `channel_count` 时 400（能拿到运行时通道数才校验） | `ProbeScanEndpoints`（`LoadTombstonedChannelsAsync`） |
+| 14.7 | 运行中途自动发现的通道行不在 SDK 会话装载清单里（要等进程重启），扫这类通道 EchoTime 恒为 null → 健康探头误判 `active_no_echo` | 扫描启动前按 channels 表现状"只补缺"补配会话（复用 `FxInitialChannelConfigLoader` + `ProvisionSessionChannelsAsync`，sendCommand=false 不写设备参数）；失败不挡扫描 | `ProbeScanEndpoints` POST 处理器 |
+| 14.8 | **扫描后"假拔出"冲掉扫描判定**（2026-08-17 真机实测）：mcr_single 扫完恢复业务轮询集后，设备重新跑起全通道轮转需要时间（实测 ch3 扫后 36s 才回首条回波），超过 24s 自适应拔出阈值 → 在位状态机误报拔出（noisy 被冲成 no_data），回波回来又翻 healthy + 一对假拔插通知。根因：扫描挂起分支短路了"不在轮询集就抬通道地板"的保护，扫后又无宽限 | `ProbeScanState` 记录每设备 `LastEndedAt`；`ChannelPresenceService.IsDeviceSuspended` 在扫描结束后的一个自适应拔出窗口内继续按"挂起"处理（地板继续抬），宽限后每通道还有完整拔出窗口，总容忍 ≈ 2×24s | `ProbeScanState.End/LastEndedAt`、`ChannelPresenceService.IsDeviceSuspended` |
+| 14.9 | **绑定通道全异常帧被误判 `not_reporting`**（2026-08-17 真机实测 ch6）：探头接触不良时样本全走 `measurement_anomalies`（StatusCode<0），窗口聚合只查 measurements+unbound → 0 样本 → "没上报"；真实情况是"在上报但测不出回波" | 窗口聚合 UNION 进 `measurement_anomalies`（echo 记 NULL，计样本不计回波）→ 判 `active_no_echo`（suspect），运维去查探头耦合而不是查链路。**真机附注**：ch6 这类弱信号通道在 mcr_single 专属窗口内可能一帧都退不出来（常规 48 通道轮询下它每 ~5s 一条"信号过小"异常帧，单通道模式下 8s 窗口两次实测均为 0 帧）——此时仍判 not_reporting 是按数据说话；怀疑这种口子时用更长 `sampleSeconds`（如 30~60s）单独重扫 | `PostgresProbeScanRepository.LoadWindowStatsAsync` |
+
+新增/更新测试：判定器退化路径 3 条（双空→good/weak、部分缺失仍严判）、编排器降级门禁与中途降级降判 2 条、
+mcr_single 用例断言窗口内 LEchoWave 补读、端点集成测试墓碑拒绝 1 条、ProbeScanState 的 LastEndedAt 1 条。
+
+**真机验证记录（2026-08-17，DEV_LAB_001，scanRunId=10，扫 1..10 耗时 118s = 预估值）**：
+active_good=3（ch1/5/8，SNR 35~36dB、PP 720~1118）、active_weak=2（ch2/3，回波满格但 PP 360/481 低于 600 线）、
+active_no_echo=2（ch7/10，空口噪声 PP≈15）、not_reporting=2（ch6/9）、inconclusive=1（ch4，窗口内仅 5 样本，接触不良）。
+SNR/峰峰值全程非空（波形随测量上报，判定退化路径未触发）；扫描后 MCR 恢复 48 通道、业务监测即刻续流；
+not_reporting 通道的 last_seen_at 未被伪造（14.3 生效）。ch6 属 14.9 场景、ch3 暴露 14.8——两项已随本次修复。

@@ -1,4 +1,5 @@
 using BoltPreload.Application.Devices.Acceptance;
+using BoltPreload.Application.Ingestion;
 using BoltPreload.Fx;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -22,6 +23,7 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
     private readonly AcceptanceSessionState _acceptance;
     private readonly ProbeScanOptions _options;
     private readonly ILogger<ProbeScanOrchestrator> _logger;
+    private readonly IngestDegradeState? _degrade;
 
     public ProbeScanOrchestrator(
         IDeviceConnectorManager deviceManager,
@@ -29,7 +31,9 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
         ProbeScanState state,
         AcceptanceSessionState acceptance,
         IOptions<ProbeScanOptions> options,
-        ILogger<ProbeScanOrchestrator> logger)
+        ILogger<ProbeScanOrchestrator> logger,
+        // 可空：判定依赖"窗口内数据已落库"，降级期查库是空的、结果必错——有降级态可看就用（单测可不传）
+        IngestDegradeState? degrade = null)
     {
         _deviceManager = deviceManager;
         _repo = repo;
@@ -37,6 +41,7 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
         _acceptance = acceptance;
         _options = options.Value;
         _logger = logger;
+        _degrade = degrade;
     }
 
     public async Task<ProbeScanRunView> StartAsync(ProbeScanRequest req, long? requestedByUserId, CancellationToken ct)
@@ -46,6 +51,12 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
 
         if (runtime.Connector.State != FxConnectorState.Connected)
             throw new InvalidOperationException($"设备未连接，无法启动扫描：state={runtime.Connector.State}");
+
+        // 判定完全依赖"窗口内样本已落库"：DB 写入降级期样本进的是 WAL、要等恢复后才重放，
+        // 窗口查询查到的是空集，全部通道会被误判 not_reporting——这种结果比没有更糟，直接拒绝
+        if (_degrade is { DbWriteDegraded: true })
+            throw new InvalidOperationException(
+                "采集入库处于降级状态（DB 连续写入失败，样本走 WAL 兜底暂不可查），扫描判定会全部失真；请先恢复数据库再扫描");
 
         // 与接入验收会话互斥：两者都要独占改写 MCR 轮询集，并发会把对方的通道集踩掉
         if (_acceptance.IsActive(req.DeviceId))
@@ -235,13 +246,54 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
         // 稳定期（避免抓到上一个通道的尾巴）
         await Task.Delay(TimeSpan.FromSeconds(req.SettleSeconds), ct);
 
-        // 采样窗口：仅记录起止时间，数据由 IngestionService 正常路径落库
+        // 竞态防御：热插拔收敛（ChannelPresenceService.EnsureFullChannelPollingAsync）在扫描占位前一刻
+        // 在途的全通道下发可能落在上面的单通道 MCR 之后——窗口会被稀释成全通道轮询，
+        // 目标通道样本数掉一个数量级、误判 inconclusive/not_reporting。核对会话 MCR，不对就重发再稳定一次。
+        // 会话视图为空 = 该实现无 MCR 概念（测试桩），跳过核对。
+        if (req.Strategy == "mcr_single")
+        {
+            var liveMcr = connector.GetSessionMcrChannels();
+            if (liveMcr.Count > 0 && (liveMcr.Count != 1 || liveMcr[0] != channel))
+            {
+                _logger.LogWarning(
+                    "扫描单通道 MCR 被并发改写为 {Count} 通道（热插拔全通道收敛的在途下发？），重发 [{Ch}] 并重新等稳定期 device={DeviceId}",
+                    liveMcr.Count, channel, req.DeviceId);
+                await connector.ConfigureMultiChannelPollingAsync(
+                    enabledChannels: new[] { channel },
+                    singleCount: 1, dailyCount: 0, startSeconds: null, cancellationToken: ct);
+                await connector.SetWorkModeAsync(FxWorkMode.MultiMeas, channel: 0, address: address, ct);
+                await Task.Delay(TimeSpan.FromSeconds(req.SettleSeconds), ct);
+            }
+        }
+
+        // 采样窗口：仅记录起止时间，数据由 IngestionService 正常路径落库。
+        // 窗口内主动补读 1~2 次 LEchoWave（真机 MultiMeas 可能不随测量带波形，而 active_good 的
+        // SNR/峰峰值判据依赖 wave_features；WaveSamplingService 扫描期又刻意跳过本设备）。
         var sampleStart = DateTimeOffset.UtcNow;
+        var waveReads = req.Strategy == "mcr_single"
+            ? TriggerWaveReadsAsync(connector, address, channel, req.SampleSeconds, ct)
+            : Task.CompletedTask;
         await Task.Delay(TimeSpan.FromSeconds(req.SampleSeconds), ct);
         var sampleEnd = DateTimeOffset.UtcNow;
+        await waveReads;
+
+        // 入库宽限：窗口尾部的样本可能还在 Ingestion 管道里（逐条 INSERT + 波形文件 I/O），
+        // 等一拍再查；样本 ts 是接收时刻，不会把窗口外的数据算进来
+        if (_options.DbFlushGraceMs > 0)
+            await Task.Delay(TimeSpan.FromMilliseconds(_options.DbFlushGraceMs), ct);
 
         var stats = await _repo.LoadWindowStatsAsync(req.DeviceId, channel, sampleStart, sampleEnd, ct);
         var verdict = ProbeScanResultJudge.Judge(stats, req.Thresholds);
+
+        // 扫描中途进入 DB 写入降级（启动时的门禁只挡得住开始前就降级的情况）：
+        // 样本在 WAL 里没落库，"查不到"≠"没上报"，not_reporting 会误导运维拔查好探头——降为 inconclusive
+        if (verdict == ProbeScanVerdict.NotReporting && _degrade is { DbWriteDegraded: true })
+        {
+            _logger.LogWarning(
+                "通道 {Ch} 窗口内查无样本且采集入库正处于降级态，not_reporting 不可信，降判为 inconclusive device={DeviceId}",
+                channel, req.DeviceId);
+            verdict = ProbeScanVerdict.Inconclusive;
+        }
 
         _logger.LogInformation(
             "通道扫描结果 device={DeviceId} ch={Ch} verdict={Verdict} samples={N} echoRate={Echo} snr={Snr} pp={PP}",
@@ -251,6 +303,32 @@ public sealed class ProbeScanOrchestrator : IProbeScanOrchestrator
             stats.SnrAvgDb, stats.PeakToPeakAvg);
 
         return new ProbeScanResultSlot(channel, verdict, stats, sampleStart, sampleEnd);
+    }
+
+    /// <summary>
+    /// 采样窗口内主动读 LEchoWave 补 wave_features（与 WaveSamplingService 同一手法：不切工作模式）。
+    /// 响应经 IngestionService → PostgresMeasurementSink.PersistActiveEchoWaveAsync 落库，
+    /// ts 为接收时刻，只要在窗口内回来就会被聚合查询算进去。
+    /// 窗口 ≥4s 时在半程再补一次。失败只记 Debug——判定端对"波形指标整体缺失"已有纯回波退化路径兜底。
+    /// </summary>
+    private async Task TriggerWaveReadsAsync(
+        IFxConnector connector, ushort address, ushort channel, int sampleSeconds, CancellationToken ct)
+    {
+        try
+        {
+            await connector.ReadChannelParamAsync("LEchoWave", channel, address, ct);
+            if (sampleSeconds >= 4)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(sampleSeconds / 2.0), ct);
+                await connector.ReadChannelParamAsync("LEchoWave", channel, address, ct);
+            }
+        }
+        catch (OperationCanceledException) { /* 扫描被中止 */ }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "扫描窗口内主动读 LEchoWave 失败 ch={Channel}（波形指标可能缺失，判定将退化为纯回波）", channel);
+        }
     }
 
     private sealed class SummaryAccumulator

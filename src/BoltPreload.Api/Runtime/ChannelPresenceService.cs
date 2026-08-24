@@ -158,6 +158,14 @@ public sealed class ChannelPresenceService : BackgroundService
 
             try
             {
+                // 竞态收窄：从循环开头的检查走到这里之间，probe-scan 可能刚占位成功——
+                // 全通道下发若落在扫描器的单通道 MCR 之后，会把它的采样窗口稀释成全通道轮询。
+                // 下发前紧邻处再确认一次；残余的极窄窗口由扫描器侧的 MCR 核对重发兜底（双保险）。
+                if (_probeScan.IsRunning(rt.DeviceId))
+                {
+                    _mcrConfigured.Remove(rt.DeviceId);
+                    continue;
+                }
                 // SingleCount=1：每通道单次采样后轮转，让全通道遍历周期最短（与 probe-scan 恢复用参数一致）
                 await rt.Connector.ConfigureMultiChannelPollingAsync(target, singleCount: 1, dailyCount: 0, cancellationToken: ct);
                 await rt.Connector.SetWorkModeAsync(FxWorkMode.MultiMeas, channel: 0, address: rt.Options.Address, ct);
@@ -243,6 +251,20 @@ public sealed class ChannelPresenceService : BackgroundService
         if (_probeScan.IsRunning(deviceId)) return true;
         var rt = _deviceManager.Find(deviceId);
         if (rt is null || rt.Connector.State != FxConnectorState.Connected) return true;
+
+        // 扫描后宽限：mcr_single 扫完恢复业务轮询集后，设备重新跑起全通道轮转需要时间，
+        // 最后被轮到的通道可能超过拔出静默阈值仍没有新回波（真机实测 ch3 扫后 36s 才回首条回波，
+        // 阈值 24s → 误判拔出 → 扫描刚写的 noisy 被冲成 no_data，回波回来又翻成 healthy）。
+        // 宽限期按"仍挂起"处理：静默地板继续抬，宽限结束后每通道还有完整的一个拔出窗口。
+        // 取 2× 自适应窗口：1× 时总容忍 = 2×24s=48s，对实测 36s 的恢复只剩 12s 余量——
+        // 设备恢复轮转受 CRC 重传/固件状态影响有波动，薄余量迟早再触发假拔出（08-18 审查确认）。
+        // 2× 后总容忍 72s（余量 2 倍）；代价只是扫描期间真拔掉的探头晚 ~24s 显示离位，
+        // UI 在位灯而已，signal_lost 安全告警（120s）不受影响。
+        if (_probeScan.LastEndedAt(deviceId) is { } endedAt)
+        {
+            var grace = 2 * _opt.EffectiveUnplugSilenceSeconds((int)rt.Options.ChannelCount);
+            if ((DateTimeOffset.UtcNow - endedAt).TotalSeconds < grace) return true;
+        }
 
         // 设备级静默窗：超过 max(10s, 2×扫描周期) 整机无任何 ChannelResult → 挂起单通道判定
         var deviceSilenceWindow = Math.Max(10, _opt.SweepIntervalSeconds * 2);

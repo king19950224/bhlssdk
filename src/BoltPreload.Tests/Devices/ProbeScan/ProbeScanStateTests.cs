@@ -37,6 +37,27 @@ public class ProbeScanStateTests
     }
 
     [Fact]
+    public void LastEndedAt_SetOnEnd_UsedForPostScanGrace()
+    {
+        // 在位判定的"扫描后宽限"依赖它：扫完设备重新跑起全通道轮转前，误报拔出会冲掉扫描判定
+        var state = new ProbeScanState();
+        state.LastEndedAt(1).Should().BeNull("从未扫描过");
+
+        state.TryBegin(1, 42).Should().NotBeNull();
+        state.LastEndedAt(1).Should().BeNull("扫描进行中还没结束");
+
+        var before = DateTimeOffset.UtcNow;
+        state.End(1);
+        state.LastEndedAt(1).Should().NotBeNull()
+            .And.BeOnOrAfter(before);
+
+        // 未占位的 End（如重复调用）不应刷新结束时刻
+        var first = state.LastEndedAt(1);
+        state.End(1);
+        state.LastEndedAt(1).Should().Be(first);
+    }
+
+    [Fact]
     public void End_RemovesHandle()
     {
         var state = new ProbeScanState();

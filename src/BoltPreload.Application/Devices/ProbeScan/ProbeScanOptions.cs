@@ -34,6 +34,13 @@ public sealed class ProbeScanOptions
     public bool CleanStaleRunsOnStartup { get; set; } = true;
 
     /// <summary>
+    /// 采样窗口结束后、聚合查询前的入库宽限（毫秒）。
+    /// 窗口尾部收到的样本此刻可能还在 Ingestion 管道里（逐条 INSERT + 波形文件 I/O 有滞后），
+    /// 立刻查库会少数几条；样本时间戳是接收时刻，等一拍再查不会把窗口外的数据算进来。≤0 关闭。
+    /// </summary>
+    public int DbFlushGraceMs { get; set; } = 800;
+
+    /// <summary>
     /// 默认扫描策略。
     /// <para>"mcr_single" — 推荐。每次把单通道写进 MCRConfig.EnabledChannels，设备在 MultiMeas 下连续上报。</para>
     /// <para>"single_meas" — 仅供特定型号使用；现场实测 model=3 多通道设备的 SingleMeas 是单次测量、不会循环上报，扫描会全 inconclusive。</para>

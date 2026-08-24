@@ -91,6 +91,31 @@ public sealed class ProbeScanEndpointsIntegrationTests
     }
 
     [PostgresFact]
+    public async Task Start_AllRequestedChannelsTombstoned_IsRefusedWithExplicitReason()
+    {
+        _fx.EnsureAvailable();
+        var seed = await _fx.SeedCalibratableChannelAsync("墓碑通道");
+        // 软删该设备唯一的通道（seed 固定建在 channel_no=5）。墓碑通道的数据在入库路径被直接丢弃，
+        // 扫出来必为 not_reporting，与"口子上真没探头"无法区分——请求里只剩墓碑通道时要明确拒绝，
+        // 不能默默扫完给出一排误导性的结果行
+        await using (var cmd = _fx.DataSource.CreateCommand(
+            "UPDATE channels SET deleted_at = now() WHERE device_id = @d AND channel_no = 5"))
+        {
+            cmd.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, seed.DeviceId);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        using var factory = TestApi.CreateFactory(_fx);
+        using var client = TestApi.AuthedClient(factory, await _fx.SeedUserAsync("operator"), "operator");
+
+        var resp = await StartAsync(client, seed.DeviceId, new { channels = new[] { 5 } });
+
+        resp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        (await resp.Content.ReadAsStringAsync()).Should().Contain("墓碑");
+        (await RunCountAsync(seed.DeviceId)).Should().Be(0, "校验没过就不该留下扫描记录");
+    }
+
+    [PostgresFact]
     public async Task Latest_Is404BeforeTheFirstScan_AndReturnsItAfterwards()
     {
         _fx.EnsureAvailable();

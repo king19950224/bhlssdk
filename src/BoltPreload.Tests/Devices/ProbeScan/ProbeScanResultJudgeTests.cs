@@ -86,13 +86,42 @@ public class ProbeScanResultJudgeTests
     }
 
     [Fact]
-    public void HighRate_NullSnr_ActiveWeak()
+    public void WaveMetricsAbsent_GoodEcho_FallsBackToEchoOnly_ActiveGood()
     {
-        // 有 ChannelResult 但没拿到 wave_features —— 不能判 good
+        // 窗口内一条 wave_features 都没有（真机 MultiMeas 可能不随测量带波形）：
+        // SNR/峰峰值是"指标缺失"不是"指标不达标"——退化为纯回波判定，
+        // 回波率与抖动都达标就该判 good，否则真机上健康通道会被系统性压成 noisy
         var stats = new ProbeScanWindowStats(
             Samples: 80, SamplesWithEcho: 80,
             EchoAvgNs: 32200m, EchoStdNs: 1m,
             PeakToPeakAvg: null, SnrAvgDb: null,
+            BoundBoltCode: null);
+        ProbeScanResultJudge.Judge(stats, Default)
+            .Should().Be(ProbeScanVerdict.ActiveGood);
+    }
+
+    [Fact]
+    public void WaveMetricsAbsent_JitteryEcho_ActiveWeak()
+    {
+        // 纯回波退化路径仍要过抖动门：EchoStd 超标 → weak
+        var stats = new ProbeScanWindowStats(
+            Samples: 80, SamplesWithEcho: 80,
+            EchoAvgNs: 32200m, EchoStdNs: 12m,
+            PeakToPeakAvg: null, SnrAvgDb: null,
+            BoundBoltCode: null);
+        ProbeScanResultJudge.Judge(stats, Default)
+            .Should().Be(ProbeScanVerdict.ActiveWeak);
+    }
+
+    [Fact]
+    public void PartialWaveMetrics_StillJudgedStrictly_ActiveWeak()
+    {
+        // 窗口内有波形（PP 非空）但 SNR 为空（噪声段 RMS 为 0 之类）：
+        // 有波形就走严格判定，缺 SNR 按不达标处理，不进纯回波退化路径
+        var stats = new ProbeScanWindowStats(
+            Samples: 80, SamplesWithEcho: 80,
+            EchoAvgNs: 32200m, EchoStdNs: 1m,
+            PeakToPeakAvg: 1280m, SnrAvgDb: null,
             BoundBoltCode: null);
         ProbeScanResultJudge.Judge(stats, Default)
             .Should().Be(ProbeScanVerdict.ActiveWeak);

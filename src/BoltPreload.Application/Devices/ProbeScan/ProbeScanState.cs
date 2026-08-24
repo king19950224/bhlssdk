@@ -11,6 +11,10 @@ namespace BoltPreload.Application.Devices.ProbeScan;
 public sealed class ProbeScanState
 {
     private readonly ConcurrentDictionary<long, ScanRunHandle> _running = new();
+    // 每设备最近一次扫描结束时刻：mcr_single 恢复业务轮询集后设备要重新跑起全通道轮转，
+    // 最后被轮到的通道可能几十秒没有新回波——在位判定需要据此给"扫描后宽限"，
+    // 否则会误报拔出、把扫描刚写的 noisy/suspect 细分判定冲成 no_data→healthy（真机实测过）
+    private readonly ConcurrentDictionary<long, DateTimeOffset> _lastEnded = new();
 
     /// <summary>尝试占位。已存在返回 null（API 应回 409）。</summary>
     public ScanRunHandle? TryBegin(long deviceId, long scanRunId)
@@ -27,11 +31,18 @@ public sealed class ProbeScanState
     public ScanRunHandle? Get(long deviceId)
         => _running.TryGetValue(deviceId, out var h) ? h : null;
 
+    /// <summary>该设备最近一次扫描结束的时刻（从未扫描过为 null）。在位判定的扫描后宽限用。</summary>
+    public DateTimeOffset? LastEndedAt(long deviceId)
+        => _lastEnded.TryGetValue(deviceId, out var t) ? t : null;
+
     /// <summary>扫描结束后释放占位（无论 completed/failed/aborted）。</summary>
     public void End(long deviceId)
     {
         if (_running.TryRemove(deviceId, out var handle))
+        {
             handle.Cts.Dispose();
+            _lastEnded[deviceId] = DateTimeOffset.UtcNow;
+        }
     }
 
     /// <summary>用户/系统请求中止当前扫描；返回是否真的存在该扫描。</summary>

@@ -78,8 +78,9 @@ public interface IProbeScanRepository
     Task SaveResultAsync(long scanRunId, long deviceId, ProbeScanResultSlot slot, CancellationToken ct);
 
     /// <summary>
-    /// 把 verdict 映射到 channels.hardware_state，并刷 last_seen_at（仅当 verdict != inconclusive）。
-    /// 找不到对应 channel 行直接跳过，不抛错。
+    /// 把 verdict 映射到 channels.hardware_state（inconclusive 不更新）。
+    /// last_seen_at 仅在窗口内确实收到过数据（verdict != not_reporting）时刷新——
+    /// no_data 的通道不能伪造"最后上报时间"。找不到对应 channel 行直接跳过，不抛错。
     /// </summary>
     Task UpdateChannelHardwareStateAsync(
         long deviceId,

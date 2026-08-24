@@ -11,7 +11,11 @@ namespace BoltPreload.Api.Runtime;
 /// <summary>波形定时抽样配置（appsettings 的 Ingestion:WaveSampling 节）。</summary>
 public sealed class WaveSamplingOptions
 {
-    /// <summary>是否启用周期性波形采集。默认关（bool 默认 false）——仅真机现场需要（真机 MultiMeas 模式不随测量带波形）。</summary>
+    /// <summary>
+    /// 是否启用周期性波形采集。默认关（bool 默认 false）。
+    /// 2026-08-17 真机实测：model=3 在 MultiMeas 下【每条测量都随帧带波形】（93 条测量对 93 条 wave_features），
+    /// wave_features 的主数据源是常规测量链路，本服务只是固件行为不同/波形缺失时的补采后备。
+    /// </summary>
     public bool Enabled { get; set; }
     /// <summary>采集周期（秒）。波形诊断是辅助指标，低频即可，避免刷爆设备上行。</summary>
     public int IntervalSeconds { get; set; } = 120;
@@ -22,16 +26,17 @@ public sealed class WaveSamplingOptions
 }
 
 /// <summary>
-/// 波形采集服务（§8.6 波形诊断在真机上的数据源）。
+/// 波形定时补采服务（§8.6 波形诊断的<b>后备</b>数据源）。
 /// <para>
-/// 真机在常规 <c>MultiMeas</c> 监测模式下【不随测量上报波形】（SDK 带宽考量，见
-/// <c>external/FxSDK/Codec/MultiChIotProtocolHandler.cs</c> 的 DecodeMultiMeasResults 注释）。
-/// 本服务低频、<b>不切工作模式</b>地对各采样通道主动 <c>ReadChannelParam("LEchoWave")</c>，
-/// 回波经 PostgresMeasurementSink 落 <c>wave_features</c>，让 A-Scan / 相似度 / 主频诊断在真机上也有数据。
+/// 注意：本类曾记载"真机 MultiMeas 不随测量上报波形"，且引用的 DecodeMultiMeasResults 方法并不存在——
+/// <b>2026-08-17 真机实测证伪</b>：model=3 在 MultiMeas 下每条测量都带波形（与 sdk-api-facts.md §268
+/// "设备只传波形、EchoTime 主机算"一致），wave_features 由常规测量链路持续产生。
+/// 本服务保留为后备：固件行为不同、或个别通道波形缺失时，低频、<b>不切工作模式</b>地对采样通道
+/// 主动 <c>ReadChannelParam("LEchoWave")</c> 补 <c>wave_features</c>（落库幂等，与随测量波形共存无害）。
 /// </para>
 /// <para>
-/// 不打断 MultiMeas 监测（不切模式）；与探头扫描互斥（扫描中的设备跳过）；只对已连接的设备采。
-/// <b>默认关闭</b>，现场接真机后按需开启
+/// 不打断 MultiMeas 监测（不切模式）；与探头扫描互斥（扫描中的设备跳过，扫描窗口内的补读由
+/// ProbeScanOrchestrator 自行触发）；只对已连接的设备采。<b>默认关闭</b>，按需开启
 /// <c>Ingestion:WaveSampling:Enabled</c>。
 /// </para>
 /// </summary>

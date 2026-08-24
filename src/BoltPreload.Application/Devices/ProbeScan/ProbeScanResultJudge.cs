@@ -79,10 +79,22 @@ public static class ProbeScanResultJudge
         if (echoRate < t.EchoRateNoEcho)
             return ProbeScanVerdict.ActiveNoEcho;
 
-        bool good =
+        var echoOk =
             echoRate >= t.EchoRateGood
+            && stats.EchoStdNs is not null && (double)stats.EchoStdNs.Value <= t.EchoStdGoodNs;
+
+        // 窗口内一条 wave_features 都没有（真机 MultiMeas 可能不随测量带波形，主动补读也可能失败）：
+        // SNR/峰峰值是"指标缺失"而不是"指标不达标"，二者必须区分——按不达标处理会把健康通道
+        // 系统性压成 active_weak（hardware_state=noisy），报告完全看不出原因。退化为纯回波判定。
+        // 两个字段都来自同一批 wave 行，只要窗口内有任意波形，PeakToPeakAvg 必非空，
+        // 所以"双双为空"是"窗口内无波形特征"的可靠信号。
+        var waveMetricsAvailable = stats.SnrAvgDb is not null || stats.PeakToPeakAvg is not null;
+        if (!waveMetricsAvailable)
+            return echoOk ? ProbeScanVerdict.ActiveGood : ProbeScanVerdict.ActiveWeak;
+
+        bool good =
+            echoOk
             && stats.SnrAvgDb is not null && (double)stats.SnrAvgDb.Value >= t.SnrGoodDb
-            && stats.EchoStdNs is not null && (double)stats.EchoStdNs.Value <= t.EchoStdGoodNs
             && stats.PeakToPeakAvg is not null && (double)stats.PeakToPeakAvg.Value >= t.PeakToPeakMin;
 
         return good ? ProbeScanVerdict.ActiveGood : ProbeScanVerdict.ActiveWeak;

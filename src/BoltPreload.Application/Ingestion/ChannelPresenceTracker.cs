@@ -21,6 +21,13 @@ public sealed class ChannelPresenceOptions
     public bool AutoEnroll { get; set; } = true;
 
     /// <summary>
+    /// 占位档自动回收天数（两级模型 R2，AutoEnroll 的对称规则，见 bolt-lifecycle-design.md）。
+    /// 自动建档且无任何人工痕迹（confirmed_at IS NULL）的档案，探头离位满 N 天自动软删（审计留痕）——
+    /// 误插误建的 ghost 不再永存。被人碰过（标定/验收/改规格/绑定迁移）的资产档永不自动删。≤0 关闭。
+    /// </summary>
+    public int AutoRetireDays { get; set; } = 7;
+
+    /// <summary>
     /// 回波声时下限（ns）：低于此值按"无回波"处理，不参与插入判定、不刷新在位。
     /// 物理依据：声时下限对应螺栓最短声程，2000ns 约合十几毫米钢件——不存在这么短的监测螺栓；
     /// 真机空通道/悬空探头会偶发 1..2000ns 的杂散触发，不挡会把空口点亮成"在位"。≤0 关闭此门。

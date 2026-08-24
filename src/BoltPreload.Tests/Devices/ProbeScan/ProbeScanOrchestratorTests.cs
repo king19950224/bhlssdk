@@ -33,7 +33,8 @@ public class ProbeScanOrchestratorTests
         {
             DefaultSampleSeconds = 1,
             DefaultSettleSeconds = 0,
-            DefaultMinSamples = 1
+            DefaultMinSamples = 1,
+            DbFlushGraceMs = 0
         });
 
         var orchestrator = new ProbeScanOrchestrator(
@@ -80,7 +81,8 @@ public class ProbeScanOrchestratorTests
         {
             DefaultSampleSeconds = 1,
             DefaultSettleSeconds = 0,
-            DefaultMinSamples = 1
+            DefaultMinSamples = 1,
+            DbFlushGraceMs = 0
         });
 
         var orchestrator = new ProbeScanOrchestrator(
@@ -125,7 +127,8 @@ public class ProbeScanOrchestratorTests
         {
             DefaultSampleSeconds = 1,
             DefaultSettleSeconds = 0,
-            DefaultMinSamples = 1
+            DefaultMinSamples = 1,
+            DbFlushGraceMs = 0
         });
 
         var orchestrator = new ProbeScanOrchestrator(
@@ -153,6 +156,11 @@ public class ProbeScanOrchestratorTests
 
         connector.McrConfigCalls.Last().Should().BeEquivalentTo(Enumerable.Range(1, 40).Select(i => (ushort)i));
         connector.WorkModeCalls.Last().Mode.Should().Be(FxWorkMode.MultiMeas);
+
+        // 采样窗口内应对每个通道主动补读过 LEchoWave（真机 MultiMeas 可能不随测量带波形，
+        // active_good 的 SNR/峰峰值判据依赖 wave_features）
+        connector.ChannelParamReads.Should().Contain(r => r.Property == "LEchoWave" && r.Channel == 3);
+        connector.ChannelParamReads.Should().Contain(r => r.Property == "LEchoWave" && r.Channel == 5);
     }
 
     [Fact]
@@ -192,7 +200,7 @@ public class ProbeScanOrchestratorTests
         var state = new ProbeScanState();
         var options = Options.Create(new ProbeScanOptions
         {
-            DefaultSampleSeconds = 1, DefaultSettleSeconds = 0, DefaultMinSamples = 1
+            DefaultSampleSeconds = 1, DefaultSettleSeconds = 0, DefaultMinSamples = 1, DbFlushGraceMs = 0
         });
 
         var orchestrator = new ProbeScanOrchestrator(
@@ -222,7 +230,7 @@ public class ProbeScanOrchestratorTests
         var state = new ProbeScanState();
         var options = Options.Create(new ProbeScanOptions
         {
-            DefaultSampleSeconds = 2, DefaultSettleSeconds = 0, DefaultMinSamples = 1
+            DefaultSampleSeconds = 2, DefaultSettleSeconds = 0, DefaultMinSamples = 1, DbFlushGraceMs = 0
         });
 
         var orchestrator = new ProbeScanOrchestrator(
@@ -242,6 +250,78 @@ public class ProbeScanOrchestratorTests
 
         state.IsRunning(1).Should().BeFalse();
         connector.WorkModeCalls.Last().Mode.Should().Be(FxWorkMode.MultiMeas);
+    }
+
+    [Fact]
+    public async Task StartAsync_WhileIngestDegraded_Throws()
+    {
+        var connector = new FakeConnector(deviceId: 1);
+        var deviceManager = new FakeDeviceManager(connector);
+        var repo = new FakeRepository();
+        var state = new ProbeScanState();
+        var options = Options.Create(new ProbeScanOptions
+        {
+            DefaultSampleSeconds = 1, DefaultSettleSeconds = 0, DefaultMinSamples = 1, DbFlushGraceMs = 0
+        });
+
+        // 连续 3 次失败进入降级态：窗口内样本进 WAL 不落库，扫描查库必为空，判定全失真
+        var degrade = new IngestDegradeState();
+        degrade.ReportDbWriteFailure();
+        degrade.ReportDbWriteFailure();
+        degrade.ReportDbWriteFailure();
+
+        var orchestrator = new ProbeScanOrchestrator(
+            deviceManager, repo, state, new BoltPreload.Application.Devices.Acceptance.AcceptanceSessionState(), options,
+            NullLogger<ProbeScanOrchestrator>.Instance, degrade);
+
+        var req = new ProbeScanRequest(
+            DeviceId: 1, Channels: new ushort[] { 1 },
+            SettleSeconds: 0, SampleSeconds: 1, Strategy: "mcr_single",
+            Thresholds: new ProbeScanThresholds(1, 20, 5, 600));
+
+        var act = async () => await orchestrator.StartAsync(req, null, CancellationToken.None);
+        (await act.Should().ThrowAsync<InvalidOperationException>())
+            .WithMessage("*降级*");
+        state.IsRunning(1).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task RunAsync_DegradeBeginsMidScan_DemotesNotReportingToInconclusive()
+    {
+        var connector = new FakeConnector(deviceId: 1);
+        var deviceManager = new FakeDeviceManager(connector);
+        var repo = new FakeRepository();   // 窗口查询恒返回 0 样本 → 常态下判 not_reporting
+        var state = new ProbeScanState();
+        var options = Options.Create(new ProbeScanOptions
+        {
+            DefaultSampleSeconds = 2, DefaultSettleSeconds = 0, DefaultMinSamples = 1, DbFlushGraceMs = 0
+        });
+        var degrade = new IngestDegradeState();
+
+        var orchestrator = new ProbeScanOrchestrator(
+            deviceManager, repo, state, new BoltPreload.Application.Devices.Acceptance.AcceptanceSessionState(), options,
+            NullLogger<ProbeScanOrchestrator>.Instance, degrade);
+
+        var req = new ProbeScanRequest(
+            DeviceId: 1, Channels: new ushort[] { 1 },
+            SettleSeconds: 0, SampleSeconds: 2, Strategy: "mcr_single",
+            Thresholds: new ProbeScanThresholds(1, 20, 5, 600));
+
+        var view = await orchestrator.StartAsync(req, null, CancellationToken.None);
+        // 扫描已启动（门禁已过），此刻才进入降级——2 秒窗口结束后判定时必须识别出降级态
+        degrade.ReportDbWriteFailure();
+        degrade.ReportDbWriteFailure();
+        degrade.ReportDbWriteFailure();
+
+        await WaitForAsync(() => repo.GetStatus(view.ScanRunId) is "completed" or "failed" or "aborted",
+            TimeSpan.FromSeconds(8));
+
+        repo.GetStatus(view.ScanRunId).Should().Be("completed");
+        // "查不到样本"≠"探头没上报"：降级期把 not_reporting 降为 inconclusive，不误导运维拔查好探头
+        repo.SavedSlots.Should().ContainSingle()
+            .Which.Verdict.Should().Be(ProbeScanVerdict.Inconclusive);
+        repo.HardwareStateUpdates.Should().ContainSingle()
+            .Which.V.Should().Be(ProbeScanVerdict.Inconclusive);
     }
 
     private static async Task WaitForAsync(Func<bool> predicate, TimeSpan timeout)
