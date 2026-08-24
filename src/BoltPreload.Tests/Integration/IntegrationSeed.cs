@@ -82,6 +82,8 @@ internal static class IntegrationSeed
             ElasticModulusGpa = 206, EffectiveLengthMm = 200, TotalLengthMm = 220,
             CrossSectionMm2 = 157, SoundVelocityMs = 5890, TargetPreloadN = 100_000,
             State = "uncalibrated", Enabled = true, GbCompliant = true,
+            // 种子螺栓语义 = 人工建档的资产档（两级模型）：不盖章会被当占位档参与自动回收/迁移吸收
+            ConfirmedAt = now,
             CreatedAt = now, UpdatedAt = now,
         };
         db.Bolts.Add(bolt);

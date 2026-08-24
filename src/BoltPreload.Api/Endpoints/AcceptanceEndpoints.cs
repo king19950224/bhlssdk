@@ -313,6 +313,17 @@ public static class AcceptanceEndpoints
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 
+            // confirmed_at：验收 = 人工声明"这个点位就是这颗螺栓"，占位档在此升级为资产档（两级模型盖章点之一）
+            if (boltId is not null)
+            {
+                await using var confirmCmd = new NpgsqlCommand(@"
+                    UPDATE bolts
+                       SET confirmed_at = COALESCE(confirmed_at, now()), updated_at = now()
+                     WHERE id = @bid AND confirmed_at IS NULL", conn, tx);
+                confirmCmd.Parameters.AddWithValue("bid", NpgsqlDbType.Bigint, boltId.Value);
+                await confirmCmd.ExecuteNonQueryAsync(ct);
+            }
+
             await using (var audit = new NpgsqlCommand(@"
                 INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
                 VALUES (@uid, 'channel_accept', 'channel', @cid, NULL, @after::jsonb, @note, now(), @ip)", conn, tx))

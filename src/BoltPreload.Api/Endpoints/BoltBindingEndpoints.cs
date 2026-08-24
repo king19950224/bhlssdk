@@ -276,13 +276,15 @@ public static class BoltBindingEndpoints
 
             long existingBoltId = 0;
             string? existingBoltCode = null;
+            var existingIsPlaceholder = false;
             await using (var cmd = new NpgsqlCommand(@"
-                SELECT id, code
+                SELECT id, code, (confirmed_at IS NULL AND state = 'uncalibrated')
                 FROM bolts
                 WHERE channel_id = @channel_id
                   AND id <> @bolt_id
                   AND deleted_at IS NULL
-                LIMIT 1", conn, tx))
+                LIMIT 1
+                FOR UPDATE", conn, tx))
             {
                 cmd.Parameters.AddWithValue("channel_id", NpgsqlDbType.Bigint, toChannelId);
                 cmd.Parameters.AddWithValue("bolt_id", NpgsqlDbType.Bigint, boltId);
@@ -291,10 +293,13 @@ public static class BoltBindingEndpoints
                 {
                     existingBoltId = r.GetInt64(0);
                     existingBoltCode = r.GetString(1);
+                    existingIsPlaceholder = r.GetBoolean(2);
                 }
             }
-            if (existingBoltCode is not null)
+            string? absorbedBoltCode = null;
+            if (existingBoltCode is not null && !existingIsPlaceholder)
             {
+                // 资产档占位：不吸收——绑定是人工声明，覆盖别人的声明必须先显式解绑
                 await tx.RollbackAsync(ct);
                 return Results.Conflict(new
                 {
@@ -303,6 +308,45 @@ public static class BoltBindingEndpoints
                     existingBoltId,
                     existingBoltCode
                 });
+            }
+            if (existingBoltCode is not null)
+            {
+                // 占位档吸收（两级模型 R3）：目标通道上是自动建档且无人工痕迹的占位档
+                // （典型场景：探头挪线后 auto-enroll 抢先建档），迁移时同事务软删占位档并接管，
+                // 免去"先手工删 ghost 再迁移"的两步操作。审计与绑定轨迹双留痕。
+                absorbedBoltCode = existingBoltCode;
+                await using (var cmd = new NpgsqlCommand(@"
+                    UPDATE bolts
+                       SET deleted_at = now(), enabled = false, updated_at = now()
+                     WHERE id = @id", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, existingBoltId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+                await using (var cmd = new NpgsqlCommand(@"
+                    INSERT INTO channel_binding_history (
+                        bolt_id, from_channel_id, to_channel_id, action, calibration_action,
+                        moved_by, before_jsonb, note)
+                    VALUES (@id, @cid, NULL, 'unbind', 'keep_uncomputed', @uid, NULL, @note)", conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, existingBoltId);
+                    cmd.Parameters.AddWithValue("cid", NpgsqlDbType.Bigint, toChannelId);
+                    cmd.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
+                    cmd.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                        $"[占位档吸收] 迁移螺栓 #{boltId} 至本通道时吸收自动建档的占位档 {existingBoltCode}（未标定、无人工痕迹）");
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+                await using (var audit = new NpgsqlCommand(@"
+                    INSERT INTO audit_log (user_id, action, target_type, target_id, before_jsonb, after_jsonb, note, at, ip_addr)
+                    VALUES (@uid, 'bolt_absorb_placeholder', 'bolt', @id, NULL, NULL, @note, now(), @ip)", conn, tx))
+                {
+                    audit.Parameters.AddWithValue("uid", NpgsqlDbType.Bigint, userId);
+                    audit.Parameters.AddWithValue("id", NpgsqlDbType.Bigint, existingBoltId);
+                    audit.Parameters.AddWithValue("note", NpgsqlDbType.Text,
+                        $"迁移吸收占位档 {existingBoltCode}（通道 {toChannelId}）：由螺栓 #{boltId} 接管该通道");
+                    AuditClientIp.Bind(audit.Parameters);
+                    await audit.ExecuteNonQueryAsync(ct);
+                }
             }
 
             // 安全：禁止跨设备绑定/迁移——通道与螺栓必须在同一物理设备，否则测量/标定上下文错乱
@@ -328,6 +372,8 @@ public static class BoltBindingEndpoints
                    SET channel_id = @channel_id,
                        enabled = true,
                        deleted_at = NULL,
+                       -- confirmed_at：人工绑定/迁移 = 人工声明归属，占位档升级为资产档（两级模型盖章点之一）
+                       confirmed_at = COALESCE(confirmed_at, now()),
                        updated_at = now()
                  WHERE id = @bolt_id", conn, tx))
             {
@@ -450,7 +496,9 @@ public static class BoltBindingEndpoints
                 fromChannelId = bolt.ChannelId,
                 toChannelId,
                 calibrationAction = normalizedAction,
-                backfilled
+                backfilled,
+                // 非空 = 目标通道上自动建档的占位档已被本次迁移吸收（软删 + 审计留痕）
+                absorbedBoltCode
             });
         }
         catch

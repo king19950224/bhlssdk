@@ -1,5 +1,6 @@
 using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Diagnostics;
+using BoltPreload.Application.Ingestion;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -82,8 +83,21 @@ public sealed class UnboundRetentionIntegrationTests
         {
             RetentionDays = retentionDays, BatchSize = batchSize,
         }),
+        // 这些用例只直调 SweepAsync（清 unbound_measurements）；presence 配置与路由缓存
+        // 只有占位档回收（RetirePlaceholderBoltsAsync）才用，给默认值/空实现即可
+        Options.Create(new ChannelPresenceOptions()),
+        new NoopResolver(),
         new BackgroundServiceHealth(),
         NullLogger<UnboundRetentionService>.Instance);
+
+    private sealed class NoopResolver : IChannelResolver
+    {
+        public Task<ChannelRoute> ResolveAsync(long deviceId, ushort channelNo, DateTimeOffset firstSeenAt, CancellationToken ct = default)
+            => Task.FromResult(new ChannelRoute(0, 0));
+        public void Invalidate(long deviceId, ushort channelNo) { }
+        public void InvalidateDevice(long deviceId) { }
+        public void InvalidateAll() { }
+    }
 
     private async Task<long> InsertAsync(IntegrationSeed.CalibratableChannel seed, int daysAgo)
     {

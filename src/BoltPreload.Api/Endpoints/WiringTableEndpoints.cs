@@ -258,10 +258,10 @@ public static class WiringTableEndpoints
                         group_id, channel_id, code, nominal_diam, grade, rp02_mpa, material,
                         elastic_modulus_gpa, effective_length_mm, total_length_mm, cross_section_mm2,
                         sound_velocity_ms, target_preload_n, min_preload_n, position_label,
-                        install_date, gb_compliant, state, enabled)
+                        install_date, gb_compliant, state, enabled, confirmed_at)
                     VALUES (@gid, @cid, @code, @nd, @grade, @rp02, @material,
                             @e, @eff_len, @total_len, @csa, @v, @target, @min, @pos,
-                            CURRENT_DATE, true, 'uncalibrated', true)
+                            CURRENT_DATE, true, 'uncalibrated', true, now())
                     ON CONFLICT (group_id, code) DO NOTHING
                     RETURNING id", conn, tx))
                 {

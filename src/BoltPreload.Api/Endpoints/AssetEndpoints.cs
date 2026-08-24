@@ -1,4 +1,5 @@
 using BoltPreload.Api.Auth;
+using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Ingestion;
 using Npgsql;
@@ -33,9 +34,23 @@ public static class AssetEndpoints
                      -- passed=false（如扭矩拟合 R² 已应用未达标）：热路径拒算预紧力，该通道读数恒为空——
                      -- 不归 uncalibrated 的话会落进 nodata，现场往探头/信号方向白排障（与 /api/bolts 口径一致）
                      WHEN acr.passed IS NOT TRUE THEN 'uncalibrated'
+                     -- 超范围(拒算)与真无数据分开：通道有测量在报、但预紧力被 GB 应力门拒算
+                     -- （algo_version 尾缀 out_of_gb_range：换算应力超出 Rp0.2 的 30%~90% 可信区间，
+                     -- 如实测 153kN 超出 M20 8.8 上限 141kN）。二者混叫'无数据'会把值班引去查探头/链路，
+                     -- 而真正要动的是螺栓规格或现场载荷（2026-08-18 实证 ch2/ch5/ch8）。
+                     WHEN l.preload_n IS NULL AND l.ts >= now() - interval '10 minutes'
+                          AND l.algo_version LIKE '%out_of_gb_range' THEN 'outofrange'
                      WHEN l.preload_n IS NULL OR l.ts < now() - interval '10 minutes' THEN 'nodata'
-                     WHEN b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n THEN 'loose'
-                     WHEN b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n * 1.1 THEN 'warn'
+                     -- 松动/预警双判据：绝对下限 min_preload_n（现场显式配置）之外，还看保持率
+                     -- （loose < 0.70 与告警 Alarm:StaticThreshold:TriggerLowRatio 默认对齐；warn < 0.90 为预警缓冲带，
+                     -- 与保持率分布 b90 档同界）。此前只看 min_preload_n——该值未配时无论保持率多低都判 normal，
+                     -- 2026-08-18 实测出现'在测健康率 100%'与 5 条 preload_low critical 同屏（目标被改成 300 kN、
+                     -- 保持率 0.33，告警在响、状态却绿）。评估器阈值可被 alarm_rules 按级覆盖，这里与默认值对齐
+                     -- （同 high 档 1.10 的既有约定）；ratio 为 NULL（未配目标）时两个比较均为 NULL，自然落过。
+                     WHEN (b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n)
+                       OR l.preload_ratio < 0.70 THEN 'loose'
+                     WHEN (b.min_preload_n IS NOT NULL AND l.preload_n < b.min_preload_n * 1.1)
+                       OR l.preload_ratio < 0.90 THEN 'warn'
                      -- 偏高/超张力：保持率 > 1.10（与告警 Alarm:StaticThreshold:TriggerHighRatio 默认对齐）。
                      -- 预紧力远超目标同样是风险（可能接近屈服 / 标定目标配错），不能一律算 normal。
                      WHEN l.preload_ratio > 1.10 THEN 'high'
@@ -49,7 +64,7 @@ public static class AssetEndpoints
             LEFT JOIN turbines t ON t.id = mg.turbine_id AND t.deleted_at IS NULL
             LEFT JOIN calibration_records acr ON acr.id = c.active_calibration_id
             LEFT JOIN LATERAL (
-                SELECT preload_n, preload_ratio, ts FROM measurements m
+                SELECT preload_n, preload_ratio, ts, algo_version FROM measurements m
                 WHERE m.bolt_id = b.id ORDER BY ts DESC LIMIT 1
             ) l ON true
             WHERE b.deleted_at IS NULL
@@ -62,7 +77,8 @@ public static class AssetEndpoints
         count(*) FILTER (WHERE status='loose') AS loose,
         count(*) FILTER (WHERE status='uncalibrated') AS uncalibrated,
         count(*) FILTER (WHERE status='nodata') AS nodata,
-        count(*) FILTER (WHERE status='high') AS high";
+        count(*) FILTER (WHERE status='high') AS high,
+        count(*) FILTER (WHERE status='outofrange') AS outofrange";
 
     public static IEndpointRouteBuilder MapAssetEndpoints(this IEndpointRouteBuilder app)
     {
@@ -76,7 +92,7 @@ public static class AssetEndpoints
                 SELECT p.id, p.code, p.name, p.industry, p.location,
                        (SELECT count(*) FROM turbines t WHERE t.project_id=p.id AND t.deleted_at IS NULL) AS turbines,
                        COALESCE(bs.total,0), COALESCE(bs.normal,0), COALESCE(bs.warn,0), COALESCE(bs.loose,0),
-                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0),
+                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0), COALESCE(bs.outofrange,0),
                        (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id AND b2.deleted_at IS NULL
                           JOIN monitor_groups mg2 ON mg2.id=b2.group_id AND mg2.deleted_at IS NULL
                           JOIN turbines t2 ON t2.id=mg2.turbine_id AND t2.deleted_at IS NULL
@@ -94,7 +110,7 @@ public static class AssetEndpoints
                     industry = r.GetString(3), location = r.IsDBNull(4) ? null : r.GetString(4),
                     turbines = r.GetInt64(5),
                     health = Health(r, 6),
-                    openAlarms = r.GetInt64(13),
+                    openAlarms = r.GetInt64(14),
                 });
             return Results.Ok(new { count = items.Count, items });
         }).WithName("ListProjects");
@@ -107,7 +123,7 @@ public static class AssetEndpoints
                 SELECT t.id, t.code, t.name, t.model, t.capacity_kw, t.location, t.state,
                        (SELECT count(*) FROM monitor_groups mg WHERE mg.turbine_id=t.id AND mg.deleted_at IS NULL) AS groups,
                        COALESCE(bs.total,0), COALESCE(bs.normal,0), COALESCE(bs.warn,0), COALESCE(bs.loose,0),
-                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0),
+                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0), COALESCE(bs.outofrange,0),
                        (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id AND b2.deleted_at IS NULL
                           JOIN monitor_groups mg2 ON mg2.id=b2.group_id AND mg2.deleted_at IS NULL
                         WHERE mg2.turbine_id=t.id AND a.cleared_at IS NULL) AS open_alarms
@@ -128,7 +144,7 @@ public static class AssetEndpoints
                     state = r.GetString(6),
                     groups = r.GetInt64(7),
                     health = Health(r, 8),
-                    openAlarms = r.GetInt64(15),
+                    openAlarms = r.GetInt64(16),
                 });
             return Results.Ok(new { count = items.Count, items });
         }).WithName("ListTurbines");
@@ -140,7 +156,7 @@ public static class AssetEndpoints
                 WITH {BoltStatusCte}
                 SELECT mg.id, mg.code, mg.name, mg.structure_type, mg.expected_bolt_count, mg.target_preload_n,
                        COALESCE(bs.total,0), COALESCE(bs.normal,0), COALESCE(bs.warn,0), COALESCE(bs.loose,0),
-                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0),
+                       COALESCE(bs.uncalibrated,0), COALESCE(bs.nodata,0), COALESCE(bs.high,0), COALESCE(bs.outofrange,0),
                        (SELECT count(*) FROM alarms a JOIN bolts b2 ON b2.id=a.bolt_id AND b2.deleted_at IS NULL
                         WHERE b2.group_id=mg.id AND a.cleared_at IS NULL) AS open_alarms
                 FROM monitor_groups mg
@@ -158,7 +174,7 @@ public static class AssetEndpoints
                     expectedBoltCount = r.IsDBNull(4) ? (int?)null : r.GetInt16(4),
                     targetPreloadN = r.IsDBNull(5) ? (decimal?)null : r.GetDecimal(5),
                     health = Health(r, 6),
-                    openAlarms = r.GetInt64(13),
+                    openAlarms = r.GetInt64(14),
                 });
             return Results.Ok(new { count = items.Count, items });
         }).WithName("ListGroups");
@@ -172,7 +188,8 @@ public static class AssetEndpoints
                        b.target_preload_n, b.min_preload_n,
                        bs.preload_n, bs.preload_ratio, bs.last_ts, bs.status,
                        ch.id, ch.channel_no, d.id, d.code,
-                       (SELECT count(*) FROM alarms a WHERE a.bolt_id=b.id AND a.cleared_at IS NULL) AS open_alarms
+                       (SELECT count(*) FROM alarms a WHERE a.bolt_id=b.id AND a.cleared_at IS NULL) AS open_alarms,
+                       ch.hardware_state, ch.last_present_at
                 FROM bolts b
                 JOIN bolt_status bs ON bs.id=b.id
                 JOIN channels ch ON ch.id=b.channel_id
@@ -198,6 +215,10 @@ public static class AssetEndpoints
                     channelId = r.GetInt64(12), channelNo = r.GetInt16(13),
                     deviceId = r.GetInt64(14), deviceCode = r.GetString(15),
                     openAlarms = r.GetInt64(16),
+                    // 探头在位（"真正在线"）：与标定/预紧力状态解耦。此前未标定的螺栓在这里
+                    // 一律显示"未标定"，在位与离位完全无法区分（现场 8 档案 vs 5 探头的对账痛点）
+                    online = !r.IsDBNull(17) && BoltAutoEnroller.PresentStates.Contains(r.GetString(17)),
+                    lastPresentAt = r.IsDBNull(18) ? (DateTime?)null : r.GetDateTime(18),
                 });
             return Results.Ok(new { count = items.Count, items });
         }).WithName("ListGroupBolts");
@@ -356,12 +377,12 @@ public static class AssetEndpoints
                 INSERT INTO bolts (
                     group_id, channel_id, code, nominal_diam, grade, rp02_mpa, material,
                     elastic_modulus_gpa, effective_length_mm, total_length_mm, cross_section_mm2,
-                    sound_velocity_ms, target_preload_n, min_preload_n, position_label,
-                    install_date, gb_compliant, state, enabled)
+                    sound_velocity_ms, temp_coefficient_per_c, target_preload_n, min_preload_n, position_label,
+                    install_date, gb_compliant, state, enabled, confirmed_at)
                 VALUES (@gid, @cid, @code, @nd, @grade, @rp02, @material,
                         @e, @eff_len, @total_len, @csa,
-                        @v, @target, @min, @pos,
-                        CURRENT_DATE, true, 'uncalibrated', true)
+                        @v, @tc, @target, @min, @pos,
+                        CURRENT_DATE, true, 'uncalibrated', true, now())
                 ON CONFLICT (group_id, code) DO NOTHING
                 RETURNING id", conn, tx))
             {
@@ -377,6 +398,8 @@ public static class AssetEndpoints
                 cmd.Parameters.AddWithValue("total_len", NpgsqlDbType.Numeric, body.TotalLengthMm ?? BoltSpecPresets.DefaultTotalLengthMm);
                 cmd.Parameters.AddWithValue("csa", NpgsqlDbType.Numeric, csa.Value);
                 cmd.Parameters.AddWithValue("v", NpgsqlDbType.Numeric, body.SoundVelocityMs ?? BoltSpecPresets.DefaultSoundVelocityMs);
+                // 温度系数从材料库带出（参数字典联动传入）；不传保持 NULL → 热路径回退 SDK 默认值，与历史行为一致
+                cmd.Parameters.AddWithValue("tc", NpgsqlDbType.Numeric, (object?)body.TempCoefficientPerC ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, (object?)body.TargetPreloadN ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("min", NpgsqlDbType.Numeric, (object?)body.MinPreloadN ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("pos", NpgsqlDbType.Varchar, (object?)(string.IsNullOrWhiteSpace(body.PositionLabel) ? null : body.PositionLabel.Trim()) ?? DBNull.Value);
@@ -618,7 +641,8 @@ public static class AssetEndpoints
         return app;
     }
 
-    // 读取连续 7 列 total/normal/warn/loose/uncalibrated/nodata/high 为 health 对象
+    // 读取连续 8 列 total/normal/warn/loose/uncalibrated/nodata/high/outofrange 为 health 对象
+    // （列序与 StatusAgg 严格一致；加列时所有按偏移读后续列的调用点都要跟着挪）
     internal static object Health(NpgsqlDataReader r, int offset) => new
     {
         total = r.GetInt64(offset),
@@ -628,6 +652,7 @@ public static class AssetEndpoints
         uncalibrated = r.GetInt64(offset + 4),
         nodata = r.GetInt64(offset + 5),
         high = r.GetInt64(offset + 6),
+        outofrange = r.GetInt64(offset + 7),
     };
 }
 
@@ -699,6 +724,7 @@ public sealed record BoltCreateRequest(
     decimal? TotalLengthMm = null,
     decimal? CrossSectionMm2 = null,
     decimal? SoundVelocityMs = null,
+    decimal? TempCoefficientPerC = null,
     decimal? TargetPreloadN = null,
     decimal? MinPreloadN = null,
     string? PositionLabel = null,

@@ -1,5 +1,6 @@
 using System.Text;
 using BoltPreload.Api.Auth;
+using BoltPreload.Api.Runtime;
 using BoltPreload.Application.Ingestion;
 using BoltPreload.Domain;
 using Npgsql;
@@ -12,6 +13,9 @@ namespace BoltPreload.Api.Endpoints;
 /// </summary>
 public static class BoltEndpoints
 {
+    /// <summary>探头在位词表（与 <see cref="BoltAutoEnroller.PresentStates"/> 同一份，单一口径）。</summary>
+    private static readonly string[] PresentStates = BoltAutoEnroller.PresentStates;
+
     public static IEndpointRouteBuilder MapBoltEndpoints(this IEndpointRouteBuilder app)
     {
         var grp = app.MapGroup("/api/bolts")
@@ -41,7 +45,8 @@ public static class BoltEndpoints
                        (c.k_l IS NOT NULL AND acr.expires_at IS NOT NULL
                           AND (now() AT TIME ZONE 'UTC')::date > acr.expires_at) AS calibration_expired,
                        acr.expires_at AS calibration_expires_at,
-                       c.k_l_intercept_ns, c.device_id, b.temp_coefficient_per_c
+                       c.k_l_intercept_ns, c.device_id, b.temp_coefficient_per_c, b.confirmed_at,
+                       c.hardware_state, c.last_present_at
                 FROM bolts b
                 JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
                 LEFT JOIN calibration_records acr ON acr.id = c.active_calibration_id
@@ -97,7 +102,14 @@ public static class BoltEndpoints
                     // 客户端实时换算与热路径同口径所需（温补 + 截距）；deviceId 供多设备页面按设备隔离通道
                     kLInterceptNs = r.IsDBNull(28) ? null : (decimal?)r.GetDecimal(28),
                     deviceId = r.GetInt64(29),
-                    tempCoefficientPerC = r.IsDBNull(30) ? BoltPhysicsDefaults.SdkTempCoefficientPerC : r.GetDecimal(30)
+                    tempCoefficientPerC = r.IsDBNull(30) ? BoltPhysicsDefaults.SdkTempCoefficientPerC : r.GetDecimal(30),
+                    // 两级模型：null = 占位档（自动建档待确认，离位满 N 天自动回收）；非 null = 资产档
+                    confirmedAt = r.IsDBNull(31) ? null : (DateTime?)r.GetDateTime(31),
+                    // 探头在位（"真正在线"）：来自在位状态机的 channels.hardware_state。
+                    // 与标定状态解耦——未标定的螺栓此前在列表里看不出探头是否在线（8 档案 vs 5 探头的现场对账痛点）
+                    online = !r.IsDBNull(32) && PresentStates.Contains(r.GetString(32)),
+                    channelHardwareState = r.IsDBNull(32) ? null : r.GetString(32),
+                    lastPresentAt = r.IsDBNull(33) ? null : (DateTime?)r.GetDateTime(33)
                 });
             }
             return Results.Ok(new { count = items.Count, hasMore = items.Count >= lim, items });
@@ -121,7 +133,8 @@ public static class BoltEndpoints
                        (c.k_l IS NOT NULL AND acr.expires_at IS NOT NULL
                           AND (now() AT TIME ZONE 'UTC')::date > acr.expires_at) AS calibration_expired,
                        acr.expires_at AS calibration_expires_at,
-                       c.k_l_intercept_ns, c.device_id, b.temp_coefficient_per_c
+                       c.k_l_intercept_ns, c.device_id, b.temp_coefficient_per_c, b.confirmed_at,
+                       c.hardware_state, c.last_present_at
                 FROM bolts b
                 JOIN channels c ON c.id = b.channel_id AND c.deleted_at IS NULL
                 LEFT JOIN calibration_records acr ON acr.id = c.active_calibration_id
@@ -172,7 +185,13 @@ public static class BoltEndpoints
                 calibrationExpiresAt = r.IsDBNull(27) ? null : DateOnly.FromDateTime(r.GetDateTime(27)).ToString("yyyy-MM-dd"),
                 kLInterceptNs = r.IsDBNull(28) ? null : (decimal?)r.GetDecimal(28),
                 deviceId = r.GetInt64(29),
-                tempCoefficientPerC = r.IsDBNull(30) ? BoltPhysicsDefaults.SdkTempCoefficientPerC : r.GetDecimal(30)
+                tempCoefficientPerC = r.IsDBNull(30) ? BoltPhysicsDefaults.SdkTempCoefficientPerC : r.GetDecimal(30),
+                // 两级模型：null = 占位档（自动建档待确认，离位满 N 天自动回收）；非 null = 资产档
+                confirmedAt = r.IsDBNull(31) ? null : (DateTime?)r.GetDateTime(31),
+                // 探头在位（"真正在线"）：与标定状态解耦，见列表端点同名字段说明
+                online = !r.IsDBNull(32) && PresentStates.Contains(r.GetString(32)),
+                channelHardwareState = r.IsDBNull(32) ? null : r.GetString(32),
+                lastPresentAt = r.IsDBNull(33) ? null : (DateTime?)r.GetDateTime(33)
             });
         })
         .WithName("GetBolt")
@@ -499,8 +518,11 @@ public static class BoltEndpoints
                     target_preload_n   = COALESCE(@target, target_preload_n),
                     min_preload_n      = COALESCE(@min, min_preload_n),
                     material           = COALESCE(@material, material),
+                    -- rp02 随等级/规格联动传入（GB 应力门的分母，配错直接变 outofrange 误拒）
+                    rp02_mpa           = COALESCE(@rp02, rp02_mpa),
                     elastic_modulus_gpa= COALESCE(@e, elastic_modulus_gpa),
                     sound_velocity_ms  = COALESCE(@v, sound_velocity_ms),
+                    temp_coefficient_per_c = COALESCE(@tc, temp_coefficient_per_c),
                     effective_length_mm= COALESCE(@len, effective_length_mm),
                     cross_section_mm2  = COALESCE(@area, cross_section_mm2),
                     install_torque_nm  = COALESCE(@torque, install_torque_nm),
@@ -508,6 +530,8 @@ public static class BoltEndpoints
                     position_label     = CASE WHEN @pos IS NULL THEN position_label ELSE NULLIF(@pos, '') END,
                     nominal_diam       = COALESCE(@nd, nominal_diam),
                     grade              = COALESCE(@grade, grade),
+                    -- confirmed_at：人工改规格/目标 = 认领了这颗螺栓，占位档升级为资产档（两级模型盖章点之一）
+                    confirmed_at       = COALESCE(confirmed_at, now()),
                     updated_at = now()
                 WHERE id=@id AND deleted_at IS NULL
                 RETURNING code", conn, tx))
@@ -516,8 +540,10 @@ public static class BoltEndpoints
                 cmd.Parameters.AddWithValue("target", NpgsqlDbType.Numeric, (object?)req.TargetPreloadN ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("min", NpgsqlDbType.Numeric, (object?)req.MinPreloadN ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("material", NpgsqlDbType.Varchar, (object?)req.Material ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("rp02", NpgsqlDbType.Numeric, (object?)req.Rp02Mpa ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("e", NpgsqlDbType.Numeric, (object?)req.ElasticModulusGpa ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("v", NpgsqlDbType.Numeric, (object?)req.SoundVelocityMs ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("tc", NpgsqlDbType.Numeric, (object?)req.TempCoefficientPerC ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("len", NpgsqlDbType.Numeric, (object?)req.EffectiveLengthMm ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("area", NpgsqlDbType.Numeric, (object?)req.CrossSectionMm2 ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("torque", NpgsqlDbType.Numeric, (object?)req.InstallTorqueNm ?? DBNull.Value);
@@ -580,8 +606,10 @@ public sealed record BoltSettingsRequest(
     decimal? TargetPreloadN = null,
     decimal? MinPreloadN = null,
     string? Material = null,
+    decimal? Rp02Mpa = null,
     decimal? ElasticModulusGpa = null,
     decimal? SoundVelocityMs = null,
+    decimal? TempCoefficientPerC = null,
     decimal? EffectiveLengthMm = null,
     decimal? CrossSectionMm2 = null,
     decimal? InstallTorqueNm = null,

@@ -149,6 +149,7 @@ public sealed class BoltPreloadDbContext : DbContext
             e.Property(x => x.InstallDate).HasColumnName("install_date");
             e.Property(x => x.GbCompliant).HasColumnName("gb_compliant");
             e.Property(x => x.State).HasColumnName("state").IsRequired().HasMaxLength(16);
+            e.Property(x => x.ConfirmedAt).HasColumnName("confirmed_at");
             e.Property(x => x.Enabled).HasColumnName("enabled");
             e.HasIndex(x => new { x.GroupId, x.Code }).IsUnique();
             e.HasQueryFilter(x => x.DeletedAt == null);

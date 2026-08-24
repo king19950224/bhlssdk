@@ -61,6 +61,14 @@ public class Bolt
     /// <summary>uncalibrated / calibrated / expired / disabled</summary>
     public string State { get; set; } = "uncalibrated";
 
+    /// <summary>
+    /// 人工确认时间（两级档案模型，见 bolt-lifecycle-design.md）。
+    /// NULL = 占位档：自动建档且无人工痕迹，探头离位满 N 天自动回收、迁移时可被吸收；
+    /// 非 NULL = 资产档：永久留存，拔探头走失联告警。
+    /// 盖章点：标定激活 / 通道验收 / 人工改规格 / 人工绑定迁移 / 人工建档。
+    /// </summary>
+    public DateTimeOffset? ConfirmedAt { get; set; }
+
     public bool Enabled { get; set; } = true;
 
     public DateTimeOffset CreatedAt { get; set; }
