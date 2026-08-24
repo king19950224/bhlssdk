@@ -44,6 +44,15 @@ public sealed class ChannelPresenceOptions
     public int MinPlausibleEchoNs { get; set; } = 2000;
 
     /// <summary>
+    /// 贴门假过零守卫（ns）：声时距采集门起点（EchoWave.EchoStart）小于本值按"无回波"处理。
+    /// 依据 SDK 1.6 源码研读（2026-08-24）：EchoWin 是采集门【起点】、EchoWidth 是门宽；门内只有噪声时，
+    /// 自动法会在门起点后 ~300ns 处误检出"合格过零"并报 Normal（NoiseBase=50 极易被滤波边缘/噪声满足），
+    /// 表现为【声时恒等于门起点+零点几微秒】且随门起点平移——CH7 实证（门 30/50/100µs 时声时 30.3/50.3/100.3µs）。
+    /// 真回波不会贴着门起点（按长度设门的惯例都留余量）。无波形帧（EchoStart 不可得）不判。≤0 关闭。
+    /// </summary>
+    public int EchoEdgeGuardNs { get; set; } = 1000;
+
+    /// <summary>
     /// 插入判定的稳定性门（ns）：连续 PlugConsecutiveEchoes 条回波的最大-最小差不超过本值才判"插入"。
     /// 物理依据：探头真实耦合在螺栓上时声时短期抖动仅几十 ns；空通道杂散回波是 µs~几十 µs 级乱跳，
     /// 连不成稳定序列。跳出带宽即以最新值为锚重新累计（回波稳定到新值=真实接入了另一根螺栓，照常识别）。
@@ -170,15 +179,18 @@ public sealed class ChannelPresenceTracker
     public ChannelReader<ChannelPresenceChange> Events => _events.Reader;
 
     /// <summary>
-    /// 采集热路径喂入一条测量观察。echoNs = 该条 ChannelResult 的 EchoTime（null=设备没算出声时）。
+    /// 采集热路径喂入一条测量观察。echoNs = 该条 ChannelResult 的 EchoTime（null=设备没算出声时）；
+    /// echoStartNs = 波形采集门起点（EchoWave.EchoStart，无波形帧为 null）。
     /// <para>
-    /// 插入判定过两道物理门（"有回波"≠"有螺栓"）：
+    /// 插入判定过三道物理门（"有回波"≠"有螺栓"）：
     /// ① 下限门：echoNs ≥ MinPlausibleEchoNs，杂散短触发按无回波处理；
-    /// ② 稳定性门：连续 PlugConsecutiveEchoes 条回波彼此差 ≤ PlugStabilityBandNs 才判插入——
+    /// ② 贴门守卫：echoNs − echoStartNs ≥ EchoEdgeGuardNs——门内纯噪声时 SDK 自动法会在门起点
+    ///    后 ~300ns 误检"合格过零"并报 Normal，贴着门起点的声时按无回波处理（SDK 1.6 源码结论）；
+    /// ③ 稳定性门：连续 PlugConsecutiveEchoes 条回波彼此差 ≤ PlugStabilityBandNs 才判插入——
     ///    真实耦合的回波短期稳定（几十 ns），空口噪声 µs 级乱跳连不成序列。
     /// </para>
     /// </summary>
-    public void Observe(long deviceId, ushort channelNo, double? echoNs, DateTimeOffset at)
+    public void Observe(long deviceId, ushort channelNo, double? echoNs, DateTimeOffset at, double? echoStartNs = null)
     {
         if (!_options.Enabled) return;
 
@@ -188,7 +200,9 @@ public sealed class ChannelPresenceTracker
             static ((long, ushort) _, DateTimeOffset a) => new ChannelState { SilenceFloor = a }, at);
         ChannelPresenceChange? change = null;
         var plausible = echoNs is not null
-            && (_options.MinPlausibleEchoNs <= 0 || echoNs.Value >= _options.MinPlausibleEchoNs);
+            && (_options.MinPlausibleEchoNs <= 0 || echoNs.Value >= _options.MinPlausibleEchoNs)
+            && (_options.EchoEdgeGuardNs <= 0 || echoStartNs is null
+                || echoNs.Value - echoStartNs.Value >= _options.EchoEdgeGuardNs);
         lock (state)
         {
             if (plausible)

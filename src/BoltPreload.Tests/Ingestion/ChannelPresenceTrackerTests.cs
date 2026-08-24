@@ -57,6 +57,33 @@ public class ChannelPresenceTrackerTests
     }
 
     [Fact]
+    public void Plug_EdgeGuard_RejectsEchoNearGateStart()
+    {
+        // 贴门假过零（SDK 1.6 源码结论）：门内纯噪声时自动法在门起点后 ~300ns 误检 Normal 过零，
+        // 声时恒 = 门起点 + 零点几微秒且随门平移（08-24 CH7 实证：门 30/50/100µs → 声时 30.3/50.3/100.3µs）。
+        // 这种"稳定的假回波"能过下限门+稳定门，必须按门起点距离拦下。
+        var t = Make(plugConsecutive: 3);
+        const double gateStart = 50000;
+        t.Observe(1, 7, gateStart + 300, T0, echoStartNs: gateStart);
+        t.Observe(1, 7, gateStart + 310, T0.AddSeconds(1), echoStartNs: gateStart);
+        t.Observe(1, 7, gateStart + 305, T0.AddSeconds(2), echoStartNs: gateStart);
+        t.Observe(1, 7, gateStart + 308, T0.AddSeconds(3), echoStartNs: gateStart);
+        Drain(t).Should().BeEmpty("贴门起点 +300ns 的假过零不算合理回波，不判在位");
+
+        // 真回波（距门起点 2.6µs）正常判入
+        t.Observe(1, 8, gateStart + 2600, T0, echoStartNs: gateStart);
+        t.Observe(1, 8, gateStart + 2620, T0.AddSeconds(1), echoStartNs: gateStart);
+        t.Observe(1, 8, gateStart + 2610, T0.AddSeconds(2), echoStartNs: gateStart);
+        Drain(t).Should().ContainSingle("距门起点足够远的真回波正常触发在位");
+
+        // 无波形帧（echoStart 不可得）不判贴门，按旧行为放行
+        t.Observe(1, 9, Echo, T0);
+        t.Observe(1, 9, Echo + 10, T0.AddSeconds(1));
+        t.Observe(1, 9, Echo + 20, T0.AddSeconds(2));
+        Drain(t).Should().ContainSingle("无 EchoStart 证据时守卫不生效，兼容无波形链路");
+    }
+
+    [Fact]
     public void Plug_NoEchoBreaksStreak()
     {
         var t = Make(plugConsecutive: 3);

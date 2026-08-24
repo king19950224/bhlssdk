@@ -353,11 +353,13 @@ public sealed class IngestionService : BackgroundService
         {
             case FxResultType.ChannelResult when envelope.ChannelResult is not null:
                 _presence.Observe(envelope.DeviceId, envelope.ChannelResult.Channel,
-                    (double?)envelope.ChannelResult.EchoTimeNs, envelope.ReceiveTime);
+                    (double?)envelope.ChannelResult.EchoTimeNs, envelope.ReceiveTime,
+                    envelope.ChannelResult.EchoWave?.EchoStart);
                 break;
             case FxResultType.MultiChannelResult when envelope.MultiChannelResult is not null:
                 foreach (var (chNo, cr) in envelope.MultiChannelResult.Channels)
-                    _presence.Observe(envelope.DeviceId, chNo, (double?)cr.EchoTimeNs, envelope.ReceiveTime);
+                    _presence.Observe(envelope.DeviceId, chNo, (double?)cr.EchoTimeNs, envelope.ReceiveTime,
+                        cr.EchoWave?.EchoStart);
                 break;
         }
     }
