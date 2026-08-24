@@ -80,6 +80,9 @@ const devicesTotal = computed(() => runtime.total)
 const runtimeError = computed(() => runtime.error)
 const walPending = computed(() => runtime.walPending)
 const licenseValid = computed(() => runtime.license?.valid ?? true)
+// 扫描期该设备业务监测整机停摆（设计行为）：全站横幅把断流的原因说破，
+// 否则实时/总览页曲线停走、状态变陈旧，看起来就是"系统坏了"（2026-08-24 现场实际反馈）
+const scanningDevices = computed(() => runtime.scanningDevices)
 const openAlarms = ref(0)
 // 角标拿不到就明说未知：保留旧数字会让值班把过期的 0 当成"无告警"——顶栏这一格最不能骗人
 const alarmsUnknown = ref(false)
@@ -321,6 +324,17 @@ function onUserCommand(c: string) {
         <router-link :to="{ name: 'systemHealth' }" class="sys-degrade-link">查看系统自检</router-link>
       </div>
 
+      <!-- 通道自动检测横幅：扫描期设备业务监测整机停摆是设计行为（probe-scan-design F7），
+           不说破的话实时/总览页数据断流看起来就是故障。信息色区别于红色降级横幅 -->
+      <div v-if="scanningDevices.length" class="sys-scanning" role="status">
+        <span class="led led--scan" />
+        <span class="sys-degrade-msg">
+          通道自动检测进行中（{{ scanningDevices.map((d) => d.name || `设备${d.deviceId}`).join('、') }}）——
+          该设备业务监测暂停，检测完成后自动恢复，期间实时数据断流属正常现象
+        </span>
+        <router-link :to="{ name: 'devices' }" class="sys-scanning-link">查看检测进度</router-link>
+      </div>
+
       <header class="topbar">
         <div class="topbar-title">
           <h1>{{ pageTitle }}</h1>
@@ -470,6 +484,14 @@ function onUserCommand(c: string) {
 .sys-degrade-msg { flex: 1; min-width: 0; }
 .sys-degrade-link { color: #fda4af; text-decoration: underline; white-space: nowrap; }
 .sys-degrade-link:hover { color: #fecdd3; }
+/* 通道自动检测横幅：青色信息态（设计行为的告知，不是故障），与红色降级横幅视觉区分 */
+.sys-scanning {
+  flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 9px 28px;
+  background: rgba(34, 211, 238, 0.10); border-bottom: 1px solid rgba(34, 211, 238, 0.35);
+  color: #67e8f9; font-size: 13px; font-weight: 600;
+}
+.sys-scanning-link { color: #67e8f9; text-decoration: underline; white-space: nowrap; }
+.sys-scanning-link:hover { color: #a5f3fc; }
 .topbar {
   min-height: 72px; flex-shrink: 0; display: flex; align-items: center; gap: 16px; padding: 10px 28px;
   border-bottom: 1px solid var(--panel-border); background: rgba(8, 11, 20, 0.5); backdrop-filter: blur(10px);

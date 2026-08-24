@@ -30,6 +30,8 @@ export interface RuntimeDevice {
   envelopeCount: number
   channelResultCount: number
   writeFailureCount: number
+  // 通道自动检测进行中：该设备业务监测整机停摆（数据断流是设计行为，不是故障），全局横幅据此把话说破
+  probeScanRunning: boolean
   sessionChannels: { address: number; channel: number; probeFreqMhz: number; measMode: number }[]
 }
 export interface RuntimeResponse {

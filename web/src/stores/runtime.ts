@@ -47,6 +47,11 @@ export const useRuntime = defineStore('runtime', {
     loaded: false,
     error: null as string | null,
   }),
+  getters: {
+    // 正在跑通道自动检测的设备：扫描期该设备业务监测整机停摆（设计行为），
+    // 全局横幅与各监测页据此解释数据断流的原因，而不是让曲线默默变陈旧
+    scanningDevices: (s) => s.items.filter((x) => x.probeScanRunning),
+  },
   actions: {
     async refresh() {
       if (inFlight) return

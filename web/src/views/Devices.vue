@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 采集设备：连没连上、哪些通道在位、绑没绑螺栓。探头插拔会在这弹提示，默认监测组也在这设。
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import {
@@ -11,6 +11,7 @@ import {
 import { onRealtime, startRealtime, type OnChannelPresence } from '../api/realtime'
 import { ApiError } from '../api/client'
 import { useAuth } from '../stores/auth'
+import { useRuntime } from '../stores/runtime'
 import EmptyState from '../components/EmptyState.vue'
 import BoltCreateDialog from '../components/BoltCreateDialog.vue'
 import CalibrationWizard from '../components/CalibrationWizard.vue'
@@ -35,6 +36,26 @@ const busyMode = ref('')
 const scan = ref<ProbeScanView | null>(null)
 const scanning = ref(false)
 let scanTimer: number | undefined
+// 全局横幅的数据源（runtime store 轮询 30s 一次）：扫描发起/结束时主动刷一把，
+// 让"检测进行中，业务监测暂停"的横幅立即出现/消失，而不是最多滞后 30 秒
+const globalRuntime = useRuntime()
+// 扫描进度：47 通道 × (稳定 3s + 采样 8s) ≈ 9 分钟——不给进度和预计时长，
+// 现场就会以为卡死了（2026-08-24 实际反馈"通道自动检测有问题"即此）
+const scanProgress = computed(() => {
+  const s = scan.value
+  if (!s || !scanning.value) return null
+  const total = s.requestedChannels?.length ?? 0
+  if (!total) return null
+  const done = s.results?.length ?? 0
+  const perChannelSec = (s.settleSeconds ?? 3) + (s.sampleSeconds ?? 8)
+  const etaSec = Math.max(0, (total - done) * perChannelSec)
+  return {
+    done,
+    total,
+    pct: Math.round((done / total) * 100),
+    etaText: etaSec >= 60 ? `约 ${Math.ceil(etaSec / 60)} 分钟` : `约 ${etaSec} 秒`,
+  }
+})
 
 // 通道与绑定
 const chanRows = ref<ChannelRow[]>([])
@@ -84,7 +105,10 @@ async function loadScan() {
     if (selected.value?.deviceId !== did) return
     scan.value = v
     scanError.value = null
+    const wasScanning = scanning.value
     scanning.value = scan.value?.status === 'running' || scan.value?.status === 'pending'
+    // 扫描刚结束：立刻刷运行时快照，让全局"检测进行中"横幅马上撤掉（不等 30s 轮询）
+    if (wasScanning && !scanning.value) void globalRuntime.refresh()
     // 页面刷新/切换设备时若有扫描在跑,自动恢复轮询(否则进度卡住不动)
     if (scanning.value && !scanTimer) pollScan()
   } catch (e) {
@@ -265,6 +289,8 @@ async function startScan() {
         `已跳过 ${r.skippedTombstoneChannels.length} 个已删除通道（CH${r.skippedTombstoneChannels.join('、CH')}），如需扫描请先在通道目录中恢复`)
     }
     scanning.value = true
+    // 立刻把全局"检测进行中"横幅挂出来：其它页面（实时/总览）的断流从第一秒起就有解释
+    void globalRuntime.refresh()
     pollScan()
   } catch (e) {
     ElMessage.error((e as Error)?.message || '发起扫描失败')
@@ -483,9 +509,15 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
             <el-button v-if="scanning" type="danger" @click="abortScan">中止</el-button>
             <span v-if="scan" class="scan-st">
               状态 <b :class="scanning ? 'st-run' : ''">{{ SCAN_STATUS[scan.status] || scan.status }}</b>
-              <template v-if="scan.results?.length"> · 已判定 {{ scan.results.length }} 通道</template>
+              <template v-if="!scanning && scan.results?.length"> · 已判定 {{ scan.results.length }} 通道</template>
             </span>
-            <span class="mb-hint">扫描期间设备业务监测会短暂中断</span>
+            <span class="mb-hint">全通道检测约需 9 分钟（每通道约 11 秒），期间该设备业务监测暂停、完成后自动恢复</span>
+          </div>
+          <!-- 扫描进度：逐通道推进的长任务必须给进度和预计剩余，否则观感就是"卡死了" -->
+          <div v-if="scanProgress" class="scan-progress">
+            <el-progress :percentage="scanProgress.pct" :stroke-width="10" striped striped-flow
+              :format="() => `${scanProgress!.done}/${scanProgress!.total}`" />
+            <span class="scan-progress-eta">已判定 {{ scanProgress.done }}/{{ scanProgress.total }} 通道 · 预计还需 {{ scanProgress.etaText }}</span>
           </div>
           <div v-if="scanError" class="load-error">
             <el-icon><WarningFilled /></el-icon> 扫描状态获取失败（下方是最后一次已知进度，设备可能仍在扫）：{{ scanError }}
@@ -594,6 +626,9 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
 .scan-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 6px 0 14px; }
 .scan-st { font-size: 13px; color: var(--text-2); }
 .scan-st .st-run { color: var(--accent); }
+.scan-progress { display: flex; align-items: center; gap: 14px; padding: 0 0 14px; }
+.scan-progress :deep(.el-progress) { flex: 1; max-width: 420px; }
+.scan-progress-eta { font-size: 12.5px; color: var(--accent); white-space: nowrap; }
 .unbound-note { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--warn); padding: 4px 0 12px; flex-wrap: wrap; }
 .unbound-note .un-text { flex: 1; min-width: 200px; }
 .dlg-note { font-size: 12.5px; color: var(--text-2); line-height: 1.7; margin: 0 0 14px; }

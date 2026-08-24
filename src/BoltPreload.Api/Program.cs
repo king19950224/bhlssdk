@@ -499,7 +499,7 @@ app.MapGet("/api/health/ready", async (
 .AllowAnonymous()
 .WithTags("Health");
 
-app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseService licenseService, LicenseEnforcementState enforcement, IMeasurementWal wal) =>
+app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseService licenseService, LicenseEnforcementState enforcement, IMeasurementWal wal, ProbeScanState probeScan) =>
 {
     var license = licenseService.GetStatus();
     var channelCount = manager.CountActiveChannels();
@@ -540,6 +540,9 @@ app.MapGet("/api/runtime/devices", (IDeviceConnectorManager manager, ILicenseSer
             runtime.RuntimeStatus.WriteFailureCount,
             // H3：背压丢弃计数（消费跟不上时通道满丢弃最旧，已落 WAL 兜底；持续 >0 需排查 DB/消费瓶颈）
             droppedCount = runtime.Connector.DroppedCount,
+            // 扫描期业务监测整机停摆（probe-scan-design F7：必须告知）。这里随运行时快照带出，
+            // 让全局横幅/各监测页能解释"为什么这台设备的数据断流了"，而不是默默变陈旧
+            probeScanRunning = probeScan.IsRunning(runtime.DeviceId),
             sessionChannels = runtime.Connector.GetSessionChannelConfigs()
                 .Select(c => new { c.Address, c.Channel, c.ProbeFreqMhz, c.MeasMode, c.Threshold, c.RefTimeNs, c.RefTempC })
                 .ToArray()

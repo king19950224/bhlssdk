@@ -180,6 +180,9 @@ body {
 .led--crit { background: var(--crit); box-shadow: 0 0 8px var(--crit-glow); }
 .led--high { background: #a78bfa; box-shadow: 0 0 8px rgba(167, 139, 250, 0.5); }
 .led--off { background: var(--text-3); }
+/* 通道自动检测进行中：青色呼吸灯（信息态，非故障） */
+.led--scan { background: var(--accent, #22d3ee); box-shadow: 0 0 8px rgba(34, 211, 238, 0.5); }
+.led--scan::after { display: block; animation: led-pulse 2s ease-out infinite; }
 @keyframes led-pulse {
   0% { transform: scale(0.8); opacity: 0.6; }
   100% { transform: scale(2.4); opacity: 0; }
