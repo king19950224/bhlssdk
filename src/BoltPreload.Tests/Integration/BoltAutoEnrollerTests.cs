@@ -1,8 +1,10 @@
 using BoltPreload.Api.Runtime;
+using BoltPreload.Application.Ingestion;
 using BoltPreload.Infrastructure.Ingestion;
 using FluentAssertions;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using NpgsqlTypes;
 using Xunit;
 
@@ -66,6 +68,46 @@ public sealed class BoltAutoEnrollerTests
         (await ScalarAsync<long>(
             "SELECT count(*) FROM bolts WHERE channel_id = @p0 AND deleted_at IS NULL", s.ChannelId))
             .Should().Be(0);
+    }
+
+    [PostgresFact]
+    public async Task TryEnroll_RejectsWhenSnrBelowGate_AllowsWhenGoodOrNoEvidence()
+    {
+        _fx.EnsureAvailable();
+
+        // 低 SNR（6dB × 5 条，样本 ≥3）→ 拒绝建档：有信号 ≠ 有螺栓（08-24 CH7/CH10 串扰杂波实证）
+        var low = await SeedAsync(setDefaultGroup: true, hardwareState: "healthy");
+        await SeedWaveSnrAsync(low.ChannelId, snrDb: 6.0m, rows: 5);
+        var enroller = MakeEnroller();
+        (await enroller.TryEnrollAsync(low.DeviceId, low.ChannelNo, CancellationToken.None))
+            .Should().BeNull("近 10 分钟 SNR 均值 6dB < 12dB 门，贴噪声的杂波不建档");
+        (await ScalarAsync<long>(
+            "SELECT count(*) FROM bolts WHERE channel_id = @p0 AND deleted_at IS NULL", low.ChannelId))
+            .Should().Be(0);
+
+        // SNR 达标 → 正常建档
+        var good = await SeedAsync(setDefaultGroup: true, hardwareState: "healthy");
+        await SeedWaveSnrAsync(good.ChannelId, snrDb: 30.0m, rows: 5);
+        (await enroller.TryEnrollAsync(good.DeviceId, good.ChannelNo, CancellationToken.None))
+            .Should().NotBeNull("SNR 30dB 达标，正常建档");
+
+        // 查无 SNR 证据（无波形固件）→ 不拦（门只在有证据时说话）
+        var noEvidence = await SeedAsync(setDefaultGroup: true, hardwareState: "healthy");
+        (await enroller.TryEnrollAsync(noEvidence.DeviceId, noEvidence.ChannelNo, CancellationToken.None))
+            .Should().NotBeNull("无 SNR 数据不拦，兼容无波形链路");
+
+        // 样本不足（2 条 < 3）→ 不拦
+        var few = await SeedAsync(setDefaultGroup: true, hardwareState: "healthy");
+        await SeedWaveSnrAsync(few.ChannelId, snrDb: 5.0m, rows: 2);
+        (await enroller.TryEnrollAsync(few.DeviceId, few.ChannelNo, CancellationToken.None))
+            .Should().NotBeNull("样本不足不定罪");
+
+        // 门关闭（≤0）→ 低 SNR 也放行
+        var gateOff = await SeedAsync(setDefaultGroup: true, hardwareState: "healthy");
+        await SeedWaveSnrAsync(gateOff.ChannelId, snrDb: 5.0m, rows: 5);
+        var offEnroller = MakeEnroller(new ChannelPresenceOptions { AutoEnrollMinSnrDb = 0 });
+        (await offEnroller.TryEnrollAsync(gateOff.DeviceId, gateOff.ChannelNo, CancellationToken.None))
+            .Should().NotBeNull("门关闭时保持旧行为");
     }
 
     [PostgresFact]
@@ -193,11 +235,12 @@ public sealed class BoltAutoEnrollerTests
 
     // ===================== helpers =====================
 
-    private BoltAutoEnroller MakeEnroller()
+    private BoltAutoEnroller MakeEnroller(ChannelPresenceOptions? options = null)
     {
         var cache = new MemoryCache(new MemoryCacheOptions());
         var resolver = new CachedChannelResolver(_fx.DataSource, cache, NullLogger<CachedChannelResolver>.Instance);
-        return new BoltAutoEnroller(_fx.DataSource, resolver, NullLogger<BoltAutoEnroller>.Instance);
+        return new BoltAutoEnroller(_fx.DataSource, resolver,
+            Options.Create(options ?? new ChannelPresenceOptions()), NullLogger<BoltAutoEnroller>.Instance);
     }
 
     private sealed record Seed(long GroupId, long DeviceId, long ChannelId, ushort ChannelNo);
@@ -287,6 +330,19 @@ public sealed class BoltAutoEnrollerTests
     {
         await using var cmd = _fx.DataSource.CreateCommand(sql.Replace("@p0", "@arg"));
         cmd.Parameters.AddWithValue("arg", NpgsqlDbType.Bigint, p0);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>铺近期波形 SNR 证据（SNR 门用：门只看近 10 分钟、样本 ≥3 的 snr_db 均值）。</summary>
+    private async Task SeedWaveSnrAsync(long channelId, decimal snrDb, int rows)
+    {
+        await using var cmd = _fx.DataSource.CreateCommand(@"
+            INSERT INTO wave_features (channel_id, ts, wave_blob_url, point_count, snr_db)
+            SELECT @c, now() - (i || ' seconds')::interval, 'test://wave', 500, @snr
+            FROM generate_series(1, @n) i");
+        cmd.Parameters.AddWithValue("c", NpgsqlDbType.Bigint, channelId);
+        cmd.Parameters.AddWithValue("snr", NpgsqlDbType.Numeric, snrDb);
+        cmd.Parameters.AddWithValue("n", NpgsqlDbType.Integer, rows);
         await cmd.ExecuteNonQueryAsync();
     }
 

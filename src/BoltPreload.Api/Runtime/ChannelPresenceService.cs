@@ -351,19 +351,27 @@ public sealed class ChannelPresenceService : BackgroundService
             .ToHashSet();
         if (eligible.Count == 0) return;
 
-        // 一次批量取全部候选通道的库侧状态
-        var db = new Dictionary<(long DeviceId, ushort ChannelNo), (string Hw, bool Hold, bool HasBolt)>();
+        // 一次批量取全部候选通道的库侧状态（含近 10 分钟 SNR 证据，质量降级用）
+        var db = new Dictionary<(long DeviceId, ushort ChannelNo), (string Hw, bool Hold, bool HasBolt, double? SnrAvg, long SnrN)>();
         await using (var cmd = _ds.CreateCommand(@"
-            SELECT c.device_id, c.channel_no, c.hardware_state, c.auto_enroll_hold, (b.id IS NOT NULL)
+            SELECT c.device_id, c.channel_no, c.hardware_state, c.auto_enroll_hold, (b.id IS NOT NULL),
+                   snr.avg_db, COALESCE(snr.n, 0)
             FROM channels c
             LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+            LEFT JOIN LATERAL (
+                SELECT avg(wf.snr_db)::float8 AS avg_db, count(*) AS n
+                FROM wave_features wf
+                WHERE wf.channel_id = c.id
+                  AND wf.ts > now() - interval '10 minutes'
+                  AND wf.snr_db IS NOT NULL) snr ON true
             WHERE c.device_id = ANY(@ids) AND c.deleted_at IS NULL"))
         {
             cmd.Parameters.AddWithValue("ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint, eligible.ToArray());
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
                 db[(r.GetInt64(0), (ushort)r.GetInt16(1))] =
-                    (r.IsDBNull(2) ? "unknown" : r.GetString(2), r.GetBoolean(3), r.GetBoolean(4));
+                    (r.IsDBNull(2) ? "unknown" : r.GetString(2), r.GetBoolean(3), r.GetBoolean(4),
+                     r.IsDBNull(5) ? null : r.GetDouble(5), r.GetInt64(6));
         }
 
         foreach (var s in snapshot)
@@ -376,6 +384,25 @@ public sealed class ChannelPresenceService : BackgroundService
                 // 冻结的旧"在位"不外推；行还没被首测自动发现建出来的这轮修不了，行出现后下轮自然补上
                 if (!s.EvidenceFresh) continue;
                 if (!db.TryGetValue((s.DeviceId, s.ChannelNo), out var row)) continue;
+
+                // 质量降级：healthy 但近 10 分钟 SNR 证据（样本 ≥3）持续贴噪声 → suspect。
+                // 插入时的 SNR 分级只在翻转瞬间生效，长期在位的杂波通道（或保留条款延续的旧 healthy）
+                // 没有翻转就永远不被重判——08-24 CH7/CH10 实证。只降不升：升级交给 probe-scan 或
+                // 重新耦合后的拔插翻转，避免对账和扫描的细分判定（noisy）互相拉扯。
+                if (row.Hw == "healthy" && _opt.AutoEnrollMinSnrDb > 0
+                    && row.SnrN >= 3 && row.SnrAvg is { } snrAvg && snrAvg < _opt.AutoEnrollMinSnrDb)
+                {
+                    try
+                    {
+                        await DemoteToSuspectAsync(s.DeviceId, s.ChannelNo, snrAvg, ct);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "在位质量降级失败 device={DeviceId} ch={Ch}（下轮重试）", s.DeviceId, s.ChannelNo);
+                    }
+                }
+
                 // 在位但库不在在位词表 → 补状态；状态对但没建档（channelId=null 竞态的后遗症）→ 补建档。
                 // hold 挂着的不算 mismatch：人工删除抑制优先于对账
                 mismatch = !BoltAutoEnroller.PresentStates.Contains(row.Hw)
@@ -406,10 +433,28 @@ public sealed class ChannelPresenceService : BackgroundService
         }
     }
 
+    /// <summary>质量降级：healthy → suspect（SNR 证据持续贴噪声）。条件更新防并发覆盖扫描判定。</summary>
+    private async Task DemoteToSuspectAsync(long deviceId, ushort channelNo, double snrAvg, CancellationToken ct)
+    {
+        await using var cmd = _ds.CreateCommand(@"
+            UPDATE channels SET hardware_state = 'suspect', updated_at = now()
+            WHERE device_id = @d AND channel_no = @ch AND hardware_state = 'healthy' AND deleted_at IS NULL");
+        cmd.Parameters.AddWithValue("d", NpgsqlDbType.Bigint, deviceId);
+        cmd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)channelNo);
+        var n = await cmd.ExecuteNonQueryAsync(ct);
+        if (n > 0)
+            _logger.LogInformation(
+                "在位质量降级 device={DeviceId} ch={Ch}：healthy → suspect（近 10 分钟 SNR 均值 {Snr:0.0}dB < {Min:0.0}dB）——" +
+                "信号贴着噪声，疑似串扰/未耦合；处理耦合或经通道检测确认后自动恢复",
+                deviceId, channelNo, snrAvg, _opt.AutoEnrollMinSnrDb);
+    }
+
     /// <summary>
     /// 更新 channels.hardware_state / last_seen_at / last_present_at 并带回绑定信息。
-    /// 插入 → healthy，但已是在位词表态（healthy/noisy/suspect）时保留原值——
-    /// noisy/suspect 是 probe-scan 的细分判定，在位确认不该把它抹成 healthy（重启确认/对账修复尤其如此）。
+    /// 插入 → 按近 10 分钟波形 SNR 分级：达标 healthy，贴噪声（均值 &lt; AutoEnrollMinSnrDb 且样本 ≥3）suspect——
+    /// 杂波信号断续翻转（no_data↔在位）曾把扫描判的 noisy 洗成 healthy（08-24 CH7/CH10 实证），
+    /// 分级后垃圾信号最多亮 suspect 灯，不会冒充健康探头。已是在位词表态（healthy/noisy/suspect）时保留原值——
+    /// noisy/suspect 是 probe-scan 的细分判定，在位确认不该把它抹掉（重启确认/对账修复尤其如此）。
     /// 拔出 → no_data（与 probe-scan verdict→hardware_state 映射同一词表）。
     /// last_present_at 是“曾在位”的专用标记（识别页据此区分"失联"与"待接入"）——
     /// 只在 Present=true 时写，别的写入方没有（last_seen_at 会被任意上报刷新，语义不同）。
@@ -418,12 +463,21 @@ public sealed class ChannelPresenceService : BackgroundService
     /// </summary>
     private async Task<(long? ChannelId, long? BoltId, string? BoltCode)> PersistAsync(ChannelPresenceChange change, CancellationToken ct)
     {
+        // SNR 分级在同一条 UPDATE 里算（LATERAL 不能用在 UPDATE 目标上，用相关子查询）：
+        // 样本 <3 或查无 SNR（无波形固件）→ 子查询无行 → NULL < @min_snr 为 NULL → 走 ELSE healthy，不误伤
         const string sql = @"
             WITH updated AS (
                 UPDATE channels
                    SET hardware_state = CASE
                            WHEN @present AND hardware_state IN ('healthy','noisy','suspect') THEN hardware_state
-                           WHEN @present THEN 'healthy'
+                           WHEN @present THEN CASE
+                               WHEN @min_snr > 0 AND (
+                                   SELECT avg(wf.snr_db) FROM wave_features wf
+                                   WHERE wf.channel_id = channels.id
+                                     AND wf.ts > now() - interval '10 minutes'
+                                     AND wf.snr_db IS NOT NULL
+                                   HAVING count(*) >= 3) < @min_snr
+                               THEN 'suspect' ELSE 'healthy' END
                            ELSE 'no_data' END,
                        last_seen_at = CASE WHEN @present THEN @at ELSE last_seen_at END,
                        last_present_at = CASE WHEN @present THEN @at ELSE last_present_at END,
@@ -438,6 +492,7 @@ public sealed class ChannelPresenceService : BackgroundService
 
         await using var cmd = _ds.CreateCommand(sql);
         cmd.Parameters.AddWithValue("present", NpgsqlDbType.Boolean, change.Present);
+        cmd.Parameters.AddWithValue("min_snr", NpgsqlDbType.Double, _opt.AutoEnrollMinSnrDb);
         cmd.Parameters.AddWithValue("at", NpgsqlDbType.TimestampTz, change.At);
         cmd.Parameters.AddWithValue("device_id", NpgsqlDbType.Bigint, change.DeviceId);
         cmd.Parameters.AddWithValue("ch", NpgsqlDbType.Smallint, (short)change.ChannelNo);

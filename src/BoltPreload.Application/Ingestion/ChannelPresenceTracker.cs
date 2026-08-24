@@ -28,6 +28,15 @@ public sealed class ChannelPresenceOptions
     public int AutoRetireDays { get; set; } = 7;
 
     /// <summary>
+    /// 自动建档与在位质量分级的 SNR 门（dB）：通道近 10 分钟波形 SNR 均值（样本 ≥3）低于本值时，
+    /// ①不自动建档（有信号 ≠ 有螺栓——串扰/悬空杂波能骗过声时下限门+稳定性门：08-24 实证 CH7/CH10
+    /// 以 193µs/6dB 的杂波连续稳定上报，被建成两颗假螺栓档）；②在位落库写 suspect 而非 healthy。
+    /// 12dB 与标定向导 SNR 前置守卫、告警诊断的信号质量门同值同依据（closed-loop-design §2.1）。
+    /// 查无 SNR 数据（无波形固件/波形补采关闭）不拦——此门只在有证据时说话。≤0 关闭。
+    /// </summary>
+    public double AutoEnrollMinSnrDb { get; set; } = 12;
+
+    /// <summary>
     /// 回波声时下限（ns）：低于此值按"无回波"处理，不参与插入判定、不刷新在位。
     /// 物理依据：声时下限对应螺栓最短声程，2000ns 约合十几毫米钢件——不存在这么短的监测螺栓；
     /// 真机空通道/悬空探头会偶发 1..2000ns 的杂散触发，不挡会把空口点亮成"在位"。≤0 关闭此门。

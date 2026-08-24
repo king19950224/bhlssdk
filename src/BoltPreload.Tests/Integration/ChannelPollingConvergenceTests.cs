@@ -225,6 +225,7 @@ public sealed class ChannelPollingConvergenceTests
             new CachedChannelResolver(
                 _fx.DataSource, new MemoryCache(new MemoryCacheOptions()),
                 NullLogger<CachedChannelResolver>.Instance),
+            Options.Create(new ChannelPresenceOptions()),
             NullLogger<BoltAutoEnroller>.Instance);
         return new ChannelPresenceService(
             manager,

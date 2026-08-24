@@ -3,6 +3,7 @@ using BoltPreload.Api.Auth;
 using BoltPreload.Api.Endpoints;
 using BoltPreload.Application.Devices;
 using BoltPreload.Application.Ingestion;
+using Microsoft.Extensions.Options;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -33,6 +34,7 @@ public sealed class BoltAutoEnroller
 
     private readonly NpgsqlDataSource _ds;
     private readonly IChannelResolver _resolver;
+    private readonly ChannelPresenceOptions _opt;
     private readonly ILogger<BoltAutoEnroller> _logger;
 
     // 建档失败（DB 瞬断等）的通道 → ChannelPresenceService 的 sweep 周期驱动重试；
@@ -41,12 +43,17 @@ public sealed class BoltAutoEnroller
 
     // 无归属组跳过的节流日志：每设备最多 10 分钟提示一次（在位事件在启动确认时是一大批）
     private readonly ConcurrentDictionary<long, DateTimeOffset> _noGroupLoggedAt = new();
+    // 低 SNR 拒绝建档的节流日志：杂波通道每分钟都会被对账（在位+未建档=mismatch）重试一次，
+    // 不节流的话垃圾信号一直在就一直刷（08-24 CH7/CH10 实证）
+    private readonly ConcurrentDictionary<(long, ushort), DateTimeOffset> _lowSnrLoggedAt = new();
     private static readonly TimeSpan NoGroupLogInterval = TimeSpan.FromMinutes(10);
 
-    public BoltAutoEnroller(NpgsqlDataSource ds, IChannelResolver resolver, ILogger<BoltAutoEnroller> logger)
+    public BoltAutoEnroller(NpgsqlDataSource ds, IChannelResolver resolver,
+        IOptions<ChannelPresenceOptions> options, ILogger<BoltAutoEnroller> logger)
     {
         _ds = ds;
         _resolver = resolver;
+        _opt = options.Value;
         _logger = logger;
     }
 
@@ -154,10 +161,19 @@ public sealed class BoltAutoEnroller
         // ---------- 通道行锁 + 前置复核（与建档/换绑同一把锁语义） ----------
         long channelId;
         string? positionLabel;
+        double? snrAvgDb;
+        long snrSamples;
         await using (var cmd = new NpgsqlCommand(@"
-            SELECT c.id, c.name, c.hardware_state, b.id, c.auto_enroll_hold
+            SELECT c.id, c.name, c.hardware_state, b.id, c.auto_enroll_hold,
+                   snr.avg_db, snr.n
             FROM channels c
             LEFT JOIN bolts b ON b.channel_id = c.id AND b.deleted_at IS NULL
+            LEFT JOIN LATERAL (
+                SELECT avg(wf.snr_db)::float8 AS avg_db, count(*) AS n
+                FROM wave_features wf
+                WHERE wf.channel_id = c.id
+                  AND wf.ts > now() - interval '10 minutes'
+                  AND wf.snr_db IS NOT NULL) snr ON true
             WHERE c.device_id = @d AND c.channel_no = @ch AND c.deleted_at IS NULL
             FOR UPDATE OF c", conn, tx))
         {
@@ -171,6 +187,28 @@ public sealed class BoltAutoEnroller
             if (!PresentStates.Contains(hw)) return null;          // 事件到建档之间探头又被拔了，不建
             channelId = r.GetInt64(0);
             positionLabel = r.IsDBNull(1) ? null : r.GetString(1);
+            snrAvgDb = r.IsDBNull(5) ? null : r.GetDouble(5);
+            snrSamples = r.IsDBNull(6) ? 0 : r.GetInt64(6);
+        }
+
+        // ---------- 信号质量门：有信号 ≠ 有螺栓 ----------
+        // 声时下限门+稳定性门挡不住"稳定的垃圾"：08-24 实证 CH7/CH10 的串扰/悬空杂波以
+        // 193µs/6dB 连续稳定上报，被建成两颗假螺栓档，探头数/螺栓数从此对不上现场。
+        // 真螺栓回波 SNR 高（实证 CH3/CH5 达 35dB），耦合差的真探头也在 8dB 以上且会被
+        // 扫描判 noisy 提示处理——12dB 门（与标定/诊断同值）专挡贴着噪声的杂波。
+        // 样本不足或查无 SNR（无波形固件）不拦：此门只在有证据时说话。
+        if (_opt.AutoEnrollMinSnrDb > 0 && snrSamples >= 3 && snrAvgDb is { } snr && snr < _opt.AutoEnrollMinSnrDb)
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (now - _lowSnrLoggedAt.GetValueOrDefault((deviceId, channelNo)) >= NoGroupLogInterval)
+            {
+                _lowSnrLoggedAt[(deviceId, channelNo)] = now;
+                _logger.LogWarning(
+                    "自动建档拒绝 device={DeviceId} ch={Ch}：近 10 分钟波形 SNR 均值 {Snr:0.0}dB < {Min:0.0}dB（样本 {N} 条）——" +
+                    "信号贴着噪声，疑似串扰/探头未耦合，不替人声明螺栓资产。若确为真实螺栓请先处理耦合，信号达标后自动建档",
+                    deviceId, channelNo, snr, _opt.AutoEnrollMinSnrDb, snrSamples);
+            }
+            return null;
         }
 
         // ---------- 编号：中文“通道X-Y号螺栓”，与既有（含软删）冲突时追加 -2/-3… ----------

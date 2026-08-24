@@ -189,6 +189,7 @@ public sealed class ChannelPresenceReconcileTests
             new CachedChannelResolver(
                 _fx.DataSource, new MemoryCache(new MemoryCacheOptions()),
                 NullLogger<CachedChannelResolver>.Instance),
+            Options.Create(new ChannelPresenceOptions()),
             NullLogger<BoltAutoEnroller>.Instance);
         var svc = new ChannelPresenceService(
             manager,
