@@ -16,7 +16,7 @@ const ROLE: Record<string, { label: string; color: string }> = {
 }
 const ROLE_OPTS = [
   { value: 'operator', label: '操作员 · 采集/提交/处置' },
-  { value: 'reviewer', label: '复核员 · 审批/会签/签发' },
+  { value: 'reviewer', label: '复核员 · 参数下发/标定/签发' },
   { value: 'admin', label: '管理员 · 全部 + 用户管理' },
 ]
 

@@ -133,7 +133,7 @@ function pickBolt(id: number) {
 }
 
 const counts = computed(() => {
-  const c: Record<string, number> = { normal: 0, warn: 0, loose: 0, high: 0, uncalibrated: 0, nodata: 0 }
+  const c: Record<string, number> = { normal: 0, warn: 0, loose: 0, high: 0, outofrange: 0, uncalibrated: 0, nodata: 0 }
   for (const b of props.bolts) c[b.status] = (c[b.status] ?? 0) + 1
   return c
 })
@@ -199,6 +199,7 @@ const ticks = [-90, 0, 90, 180].map((a) => {
       <span v-for="k in ['normal', 'warn', 'loose', 'high']" :key="k" class="lg"><i :style="`background:${STATUS[k].color}`" /> {{ STATUS[k].label }} {{ counts[k] }}</span>
       <span v-if="counts.uncalibrated" class="lg"><i :style="`background:${STATUS.uncalibrated.color}`" /> 未标定 {{ counts.uncalibrated }}</span>
       <span v-if="counts.nodata" class="lg"><i :style="`background:${STATUS.nodata.color}`" /> 无数据 {{ counts.nodata }}</span>
+      <span v-if="counts.outofrange" class="lg"><i :style="`background:${STATUS.outofrange.color}`" /> 超范围 {{ counts.outofrange }}</span>
       <span v-if="unmonitored" class="lg"><i class="hole-c" /> 未监测孔位 {{ unmonitored }}</span>
       <span v-if="conflictHoles.length" class="lg lg-conflict"><i class="conflict-c" /> 位号冲突 {{ conflictHoles.length }}</span>
     </div>

@@ -5,13 +5,14 @@ import type { PreloadHealthCounts } from '../api'
 
 const props = defineProps<{ health: PreloadHealthCounts }>()
 
-// 与 utils/preload STATUS_META 顺序/配色一致；high(偏高/超张力)=紫
-const ORDER = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata'] as const
+// 与 utils/preload STATUS_META 顺序/配色一致；high(偏高/超张力)=紫，outofrange(超范围拒算)=橙
+const ORDER = ['normal', 'warn', 'loose', 'high', 'outofrange', 'uncalibrated', 'nodata'] as const
 const COLOR: Record<string, string> = {
   normal: '#10b981',
   warn: '#f59e0b',
   loose: '#f43f5e',
   high: '#a78bfa',
+  outofrange: '#fb923c',
   uncalibrated: '#61748f',
   nodata: '#3b4659',
 }

@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { alarmApi, type AlarmItem, type AlarmSummaryRow, type AlarmShelving } from '../api'
+import { alarmApi, type AlarmItem, type AlarmSummaryRow, type AlarmShelving, type AlarmDiagnosis } from '../api'
 import { onRealtime } from '../api/realtime'
 import { useNow } from '../utils/useNow'
 import { alarmTypeLabel } from '../utils/labels'
@@ -157,26 +157,71 @@ async function ack(a: AlarmItem) {
   }
   load()
 }
-async function clear(a: AlarmItem) {
-  let reason: string
+// 闭合改为结构化归因对话框：真实告警 vs 四类误报根因，归因分布反哺报警合理化评审（KPI 页）
+const RESOLUTIONS: { value: string; label: string }[] = [
+  { value: 'real_loosening', label: '真实松动（已处理）' },
+  { value: 'real_overload', label: '真实过载（已处理）' },
+  { value: 'baseline_error', label: '基线错误（已重标）' },
+  { value: 'sensor_issue', label: '探头/信号问题（已处理）' },
+  { value: 'config_error', label: '目标/规格配置错误（已修正）' },
+  { value: 'external_operation', label: '试验/检修操作（预期内）' },
+  { value: 'other', label: '其他' },
+]
+const clearDlg = reactive({
+  visible: false, saving: false,
+  target: null as AlarmItem | null,
+  resolution: '', reason: '',
+})
+function clear(a: AlarmItem) {
+  clearDlg.target = a
+  clearDlg.resolution = ''
+  clearDlg.reason = ''
+  clearDlg.visible = true
+}
+async function submitClear() {
+  const a = clearDlg.target
+  if (!a) return
+  if (!clearDlg.resolution) return ElMessage.warning('请选择处置归因')
+  const reason = clearDlg.reason.trim()
+  if (!reason) return ElMessage.warning('请填写处置说明')
+  if (reason.length > 500) return ElMessage.warning(`处置说明最多 500 字（当前 ${reason.length}）`)
+  clearDlg.saving = true
   try {
-    const { value } = await ElMessageBox.prompt('闭合表示"已恢复/处置完成"。请填写闭合原因（记入审计）。若测点仍越限，闭合后会立即重新触发。', `闭合告警 · ${a.boltCode}`, {
-      confirmButtonText: '闭合', cancelButtonText: '取消', inputType: 'textarea',
-      inputValidator: (v) => {
-        if (!v || !v.trim()) return '请填写闭合原因'
-        if (v.trim().length > 500) return `闭合原因最多 500 字（当前 ${v.trim().length}）`
-        return true
-      },
-    })
-    reason = value
-  } catch { return /* 用户取消 */ }
-  try {
-    await alarmApi.clear(a.id, reason)
-    ElMessage.success('已闭合')
+    await alarmApi.clear(a.id, reason, clearDlg.resolution)
+    ElMessage.success('已闭合并记录归因')
+    clearDlg.visible = false
   } catch (e) {
     ElMessage.error((e as Error)?.message || '闭合失败（告警可能已被他人闭合）')
+  } finally {
+    clearDlg.saving = false
   }
   load()
+}
+
+// 诊断：五项规则检查 + 处置建议（闭环的"下一步做什么"）
+const diagDlg = reactive({
+  visible: false, loading: false,
+  data: null as AlarmDiagnosis | null,
+})
+const VERDICT: Record<string, { label: string; cls: string }> = {
+  link_down: { label: '链路中断', cls: 'vd-crit' },
+  baseline_suspect: { label: '基线嫌疑', cls: 'vd-warn' },
+  sensor_issue: { label: '探头/信号问题', cls: 'vd-warn' },
+  common_mode: { label: '同组共模', cls: 'vd-info' },
+  likely_real: { label: '大概率真实越限', cls: 'vd-crit' },
+}
+async function diagnose(a: AlarmItem) {
+  diagDlg.visible = true
+  diagDlg.loading = true
+  diagDlg.data = null
+  try {
+    diagDlg.data = await alarmApi.diagnosis(a.id)
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '诊断失败')
+    diagDlg.visible = false
+  } finally {
+    diagDlg.loading = false
+  }
 }
 const bulkAcking = ref(false)
 async function bulkAck() {
@@ -395,6 +440,7 @@ function limitOf(a: AlarmItem) {
             <span v-else class="st st-open">待确认</span>
           </span>
           <span class="ops" v-if="a.isOpen">
+            <el-button size="small" text type="warning" @click="diagnose(a)">诊断</el-button>
             <el-button v-if="!a.isAcked" size="small" text @click="ack(a)">确认</el-button>
             <el-button size="small" text @click="openShelve(a)">抑制</el-button>
             <el-button size="small" type="primary" text @click="clear(a)">闭合</el-button>
@@ -448,6 +494,49 @@ function limitOf(a: AlarmItem) {
       <template #footer>
         <el-button @click="shelve.visible = false">取消</el-button>
         <el-button type="primary" :loading="shelve.saving" @click="confirmShelve">确认抑制</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 闭合归因：真实告警 vs 误报根因，归因分布进 KPI 报警合理化统计 -->
+    <el-dialog v-model="clearDlg.visible" :title="clearDlg.target ? `闭合告警 · ${clearDlg.target.boltCode}` : '闭合告警'" width="480px">
+      <p class="dlg-sub">闭合表示"已恢复/处置完成"。归因用于误报率统计与报警合理化评审；若测点仍越限，闭合后会立即重新触发。</p>
+      <el-form label-width="90px" label-position="left">
+        <el-form-item label="处置归因" required>
+          <el-select v-model="clearDlg.resolution" placeholder="这条告警最终是什么" style="width: 100%">
+            <el-option v-for="r in RESOLUTIONS" :key="r.value" :label="r.label" :value="r.value" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="处置说明" required>
+          <el-input v-model="clearDlg.reason" type="textarea" :rows="3" maxlength="500" show-word-limit
+            placeholder="做了什么、依据是什么（记入审计与告警档案）" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="clearDlg.visible = false">取消</el-button>
+        <el-button type="primary" :loading="clearDlg.saving" @click="submitClear">闭合并记录</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 诊断：五项检查 + 根因结论 + 下一步建议 -->
+    <el-dialog v-model="diagDlg.visible" :title="diagDlg.data ? `告警诊断 · ${diagDlg.data.boltCode}（CH${diagDlg.data.channelNo}）` : '告警诊断'" width="560px">
+      <div v-loading="diagDlg.loading" style="min-height: 120px">
+        <template v-if="diagDlg.data">
+          <div class="diag-verdict" :class="VERDICT[diagDlg.data.verdict]?.cls">
+            <b>{{ VERDICT[diagDlg.data.verdict]?.label || diagDlg.data.verdict }}</b>
+            <span>{{ diagDlg.data.recommendation }}</span>
+          </div>
+          <div class="diag-checks">
+            <div v-for="c in diagDlg.data.checks" :key="c.key" class="diag-row">
+              <span class="led" :class="c.ok ? 'led--ok' : 'led--warn'" />
+              <span class="diag-label">{{ c.label }}</span>
+              <span class="diag-detail mono">{{ c.detail }}</span>
+            </div>
+          </div>
+        </template>
+      </div>
+      <template #footer>
+        <el-button v-if="diagDlg.data" text type="primary" @click="router.push({ name: 'boltDetail', params: { boltId: diagDlg.data.boltId } })">打开螺栓详情</el-button>
+        <el-button @click="diagDlg.visible = false">关闭</el-button>
       </template>
     </el-dialog>
     </template>
@@ -506,6 +595,21 @@ function limitOf(a: AlarmItem) {
 .ops { display: flex; gap: 2px; }
 .tbl-empty { display: flex; align-items: center; gap: 8px; justify-content: center; padding: 30px; color: var(--text-3); }
 .dlg-sub { font-size: 13px; color: var(--text-2); margin: 0 0 14px; }
+
+/* 诊断对话框 */
+.diag-verdict { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--hairline); margin-bottom: 14px; font-size: 13px; line-height: 1.6; }
+.diag-verdict b { font-size: 14px; }
+.diag-verdict.vd-crit { border-color: rgba(244, 63, 94, 0.45); background: rgba(244, 63, 94, 0.07); }
+.diag-verdict.vd-crit b { color: var(--crit); }
+.diag-verdict.vd-warn { border-color: rgba(245, 158, 11, 0.45); background: rgba(245, 158, 11, 0.07); }
+.diag-verdict.vd-warn b { color: var(--warn); }
+.diag-verdict.vd-info { border-color: rgba(56, 189, 248, 0.45); background: rgba(56, 189, 248, 0.07); }
+.diag-verdict.vd-info b { color: var(--info); }
+.diag-checks { display: flex; flex-direction: column; }
+.diag-row { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--hairline); font-size: 13px; }
+.diag-row:last-child { border-bottom: none; }
+.diag-label { width: 96px; flex-shrink: 0; color: var(--text-2); }
+.diag-detail { color: var(--text-3); font-size: 12px; }
 
 @media (max-width: 1280px) {
   .tr { grid-template-columns: 30px 70px 92px 96px 96px 1fr 130px 84px 116px 140px; font-size: 12.5px; }

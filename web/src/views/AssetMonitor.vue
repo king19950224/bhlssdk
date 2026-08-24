@@ -197,9 +197,9 @@ async function editGroupTarget() {
 }
 
 // 部位级工程摘要：状态计数 + 目标/下限参考值（工程视图先给统计与基准，再看单根）
-const STATUS_SUMMARY = ['loose', 'warn', 'high', 'normal', 'uncalibrated', 'nodata'] as const
+const STATUS_SUMMARY = ['loose', 'warn', 'high', 'outofrange', 'normal', 'uncalibrated', 'nodata'] as const
 const boltSummary = computed(() => {
-  const c: Record<string, number> = { total: bolts.value.length, normal: 0, warn: 0, loose: 0, high: 0, uncalibrated: 0, nodata: 0 }
+  const c: Record<string, number> = { total: bolts.value.length, normal: 0, warn: 0, loose: 0, high: 0, outofrange: 0, uncalibrated: 0, nodata: 0 }
   for (const b of bolts.value) c[b.status] = (c[b.status] ?? 0) + 1
   return c
 })
@@ -487,28 +487,32 @@ function onProjectChange() {
       </div>
 
       <div v-else class="grid grid--bolts">
-        <div v-for="{ b, h } in sortedBoltCells" :key="b.id" class="bolt panel" :class="`bolt--${b.status}`" :title="h.reason" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
+        <div v-for="{ b, h } in sortedBoltCells" :key="b.id" class="bolt panel" :class="[`bolt--${b.status}`, { 'bolt--offline': !b.online }]" :title="h.reason" @click="router.push({ name: 'boltDetail', params: { boltId: b.id } })">
           <div class="bolt-hd">
             <span class="led" :class="STATUS[b.status]?.cls" />
             <span class="bolt-code">{{ b.code }}</span>
+            <!-- 在线/离线与标定状态解耦：探头不在位时无论标定与否都要一眼可辨——
+                 "8 份档案 vs 5 支探头"的现场对账不能靠人去数 -->
+            <span v-if="!b.online" class="bolt-offline-tag">离线</span>
             <span class="bolt-tag" :style="`color:${STATUS[b.status]?.color}`">{{ STATUS[b.status]?.label }}</span>
             <!-- 安全状态正常但松弛显著（损失≥10%，风电常见复拧阈）时加一枚次级提示，调和"绿灯却在掉力"的观感 -->
             <span v-if="b.status === 'normal' && h.relax && h.relax.band === 'significant'" class="bolt-subtag" :style="`color:${h.relax.color}`">松弛</span>
           </div>
-          <!-- 未标定/无数据不显示保持率数字:回填的历史 ratio 会造成"待标定却显示 85%"的口径打架 -->
+          <!-- 未标定/无数据/超范围不显示保持率数字:回填的历史 ratio 会造成"待标定却显示 85%"的口径打架 -->
           <div class="bolt-ratio metric" :style="`color:${STATUS[b.status]?.color}`">
-            <template v-if="b.status === 'uncalibrated' || b.status === 'nodata'">—</template>
+            <template v-if="b.status === 'uncalibrated' || b.status === 'nodata' || b.status === 'outofrange'">—</template>
             <template v-else>{{ ratioStr(b.preloadRatio) }}<span class="bolt-ratio-cap">保持</span></template>
           </div>
           <PreloadScale :current="num(b.preloadN)" :target="num(b.targetPreloadN)" :min="num(b.minPreloadN)" :height="6" compact />
           <div class="bolt-margin">
-            <!-- 状态以服务端 b.status 为准：未标定/无数据时不展示裕度损失，避免"标签未标定、却算出 85% 裕度"的口径打架 -->
-            <span v-if="b.status === 'uncalibrated' || b.status === 'nodata'" class="mono">{{ b.status === 'uncalibrated' ? '待标定' : '无近期数据' }}</span>
+            <!-- 状态以服务端 b.status 为准：未标定/无数据/超范围时不展示裕度损失，避免"标签未标定、却算出 85% 裕度"的口径打架 -->
+            <span v-if="b.status === 'uncalibrated' || b.status === 'nodata' || b.status === 'outofrange'" class="mono">{{
+              b.status === 'uncalibrated' ? '待标定' : b.status === 'nodata' ? '无近期数据' : '超出规格可信范围' }}</span>
             <!-- 偏高/超张力：主指标改显"超目标 +X%"，避免"裕度 240%"这种看着很安全实则过张力的误导 -->
             <span v-else-if="b.status === 'high'">超目标 <b style="color:#a78bfa">+{{ pct((h.residualRatio ?? 1) - 1) }}</b></span>
             <span v-else>裕度 <b :style="marginStyle(h.safetyMargin)">{{ pct(h.safetyMargin) }}</b></span>
-            <span v-if="h.relax && h.relax.band !== 'good' && b.status !== 'high' && b.status !== 'uncalibrated' && b.status !== 'nodata'" :style="`color:${h.relax.color}`">损失 {{ pct(h.lossPct) }}</span>
-            <span v-else-if="b.status !== 'uncalibrated' && b.status !== 'nodata'" class="mono">{{ b.preloadN ? (Number(b.preloadN) / 1000).toFixed(1) + 'kN' : '—' }}</span>
+            <span v-if="h.relax && h.relax.band !== 'good' && b.status !== 'high' && b.status !== 'uncalibrated' && b.status !== 'nodata' && b.status !== 'outofrange'" :style="`color:${h.relax.color}`">损失 {{ pct(h.lossPct) }}</span>
+            <span v-else-if="b.status !== 'uncalibrated' && b.status !== 'nodata' && b.status !== 'outofrange'" class="mono">{{ b.preloadN ? (Number(b.preloadN) / 1000).toFixed(1) + 'kN' : '—' }}</span>
           </div>
           <div class="bolt-foot mono">{{ b.nominalDiam }}·{{ b.grade }} · CH{{ b.channelNo }}</div>
         </div>
@@ -557,10 +561,17 @@ function onProjectChange() {
 .bolt--loose { border-color: var(--crit); }
 .bolt--warn { border-color: var(--warn); }
 .bolt--high { border-color: #a78bfa; }
+.bolt--outofrange { border-color: #fb923c; }
 .bolt-subtag { font-size: 10px; padding: 0 5px; border-radius: 4px; background: rgba(167, 139, 250, 0.12); }
 .bolt-hd { display: flex; align-items: center; gap: 8px; }
 .bolt-code { font-size: 13px; font-weight: 600; flex: 1; }
 .bolt-tag { font-size: 11px; }
+/* 离线（探头不在位）：整卡置灰 + 显式标签，与"未标定/无数据"这类监测状态严格区分 */
+.bolt--offline { opacity: 0.55; }
+.bolt-offline-tag {
+  font-size: 11px; padding: 0 7px; border-radius: 8px; flex-shrink: 0;
+  color: var(--text-3); border: 1px solid var(--hairline); background: rgba(120, 120, 128, 0.08);
+}
 .bolt-ratio { font-size: 30px; font-weight: 700; margin: 10px 0; line-height: 1; display: flex; align-items: baseline; gap: 6px; }
 .bolt-ratio-cap { font-size: 11px; font-weight: 500; color: var(--text-3); }
 .bolt-margin { display: flex; justify-content: space-between; align-items: center; font-size: 11.5px; color: var(--text-3); margin-top: 10px; }

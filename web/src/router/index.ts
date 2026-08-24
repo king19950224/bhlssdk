@@ -22,6 +22,8 @@ const routes: RouteRecordRaw[] = [
       { path: 'alarm-kpi', name: 'alarmKpi', component: () => import('../views/AlarmKpi.vue') },
       { path: 'calibration', name: 'calibration', component: () => import('../views/Calibration.vue'), meta: { roles: ['reviewer', 'admin'] } },
       { path: 'config-changes', name: 'configChanges', component: () => import('../views/ConfigChanges.vue') },
+      // 参数字典：材料声学库（admin 可改）+ 规格预设（reviewer+ 可改），全员可读
+      { path: 'spec-library', name: 'specLibrary', component: () => import('../views/SpecLibrary.vue') },
       { path: 'audit', name: 'audit', component: () => import('../views/Audit.vue'), meta: { roles: ['reviewer', 'admin'] } },
       { path: 'devices', name: 'devices', component: () => import('../views/Devices.vue') },
       { path: 'identify', name: 'identify', component: () => import('../views/ChannelIdentify.vue') },

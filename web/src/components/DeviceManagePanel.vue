@@ -188,7 +188,7 @@ async function remove(d: AdminDevice) {
 </script>
 
 <template>
-  <el-dialog :model-value="modelValue" title="设备管理" width="980px" @update:model-value="close" @close="close">
+  <el-dialog :model-value="modelValue" title="设备管理" width="980px" append-to-body @update:model-value="close" @close="close">
     <div class="bar">
       <el-button type="primary" size="small" @click="openCreate">新增设备</el-button>
       <el-checkbox v-model="showDeleted" size="small" @change="load">显示已删除</el-checkbox>

@@ -172,13 +172,36 @@ export interface AlarmKpi {
   avgClearMinutes: number | null
   avgPerHour: number
   topFrequent: AlarmKpiTopRule[]
+  // 归因闭环（0035）：窗口内带归因的人工闭合统计。real_* 为真实告警，其余是误报根因
+  resolutionStats: {
+    resolvedTotal: number
+    falseAlarmCount: number
+    falseAlarmRatio: number | null
+    items: { code: string; label: string; count: number }[]
+  }
+}
+/** 告警诊断结果：五项规则检查 + 根因结论 + 处置建议。 */
+export interface AlarmDiagnosis {
+  alarmId: number
+  boltId: number
+  boltCode: string
+  channelNo: number
+  type: string
+  cleared: boolean
+  ratioAtTrigger: number | null
+  verdict: 'link_down' | 'baseline_suspect' | 'sensor_issue' | 'common_mode' | 'likely_real'
+  recommendation: string
+  checks: { key: string; label: string; ok: boolean; detail: string }[]
 }
 export const alarmApi = {
   list: (params = '') => http.get<{ count: number; items: AlarmItem[] }>(`/api/alarms/${params}`),
   summary: () => http.get<{ items: AlarmSummaryRow[] }>('/api/alarms/summary'),
   kpi: (windowHours = 24) => http.get<AlarmKpi>(`/api/alarms/kpi?windowHours=${windowHours}`),
   ack: (id: number, note?: string) => http.post(`/api/alarms/${id}/ack`, { note }),
-  clear: (id: number, reason?: string) => http.post(`/api/alarms/${id}/clear`, { reason }),
+  // resolution：结构化归因（真实松动/过载 或 基线/探头/配置/操作 四类误报根因），供误报率统计
+  clear: (id: number, reason?: string, resolution?: string) => http.post(`/api/alarms/${id}/clear`, { reason, resolution }),
+  // 告警诊断：五项规则检查（链路/信号/基线/拒算率/共模）给根因结论与处置建议
+  diagnosis: (id: number) => http.get<AlarmDiagnosis>(`/api/alarms/${id}/diagnosis`),
   // 维护时段抑制某 bolt+type 的告警（hours 1..168，reason ≥5 字）。
   // boltId 后端必填（bolt/type 双空会成为"全站静音键"，被禁止）——类型上也标必填，别再误标可选
   shelve: (body: { boltId: number; alarmType?: string; hours: number; reason: string }) =>
@@ -337,7 +360,7 @@ export const notificationApi = {
   retryOutbox: (id: number) => http.post<{ id: number; requeued: boolean }>(`/api/notification-outbox/${id}/retry`),
 }
 
-// ---- 参数变更审批 ----
+// ---- 参数变更（直发 + 历史记录；approve/execute/verify 仅服务存量历史行）----
 export interface ConfigChange {
   id: number
   deviceId: number
@@ -375,10 +398,15 @@ export const configChangeApi = {
   reject: (id: number, reason: string) => http.post(`/api/config-changes/${id}/reject`, { reason }),
   execute: (id: number) => http.post(`/api/config-changes/${id}/execute`),
   verify: (id: number) => http.post<ConfigVerifyResult>(`/api/config-changes/${id}/verify`),
-  // 提交通道超声参数变更（落审批队列：requested → approved → executed → verified）
+  // 提交通道超声参数变更请求（落记录：requested → approved → executed → verified；现仅历史兼容）
   submit: (deviceId: number, channel: number, updates: Record<string, number | undefined>) =>
     http.post<{ submitted: boolean; requestId: number; status: string }>(
       `/api/devices/${deviceId}/diagnostic/configure-channel/${channel}`, updates),
+  // 参数直发（reviewer+，全通道）：增益/探头频率/回波窗/回波宽度直写设备并留档，
+  // 与波形页联动构成"看着波形调参"的闭环
+  commission: (deviceId: number, channelNo: number, updates: { gain?: number; probeFreqMhz?: number; echoWinNs?: number; echoWidthUs?: number }) =>
+    http.post<{ commissioned: boolean; applied: Record<string, unknown>; note: string }>(
+      `/api/devices/${deviceId}/diagnostic/configure-channel/${channelNo}/commission`, updates),
 }
 
 // ---- 用户管理 ----
@@ -403,6 +431,8 @@ export interface PreloadHealthCounts {
   uncalibrated: number
   nodata: number
   high: number
+  /** 有测量在报但预紧力被 GB 应力门拒算（超出规格可信区间），与"无数据"是两种故障 */
+  outofrange: number
 }
 export interface LooseBolt {
   boltCode: string
@@ -461,7 +491,8 @@ export const dashboardApi = {
       noTargetPreload: NoTargetPreload
     }>('/api/dashboard/preload-health'),
   trend: (hours = 24) =>
-    http.get<{ bucketMinutes: number; hours: number; points: DashboardTrendPoint[] }>(`/api/dashboard/trend?hours=${hours}`),
+    // coverage = 有测量的桶/全部桶；停机空窗（点里 avgRatio 为 null）直接压低它
+    http.get<{ bucketMinutes: number; hours: number; coverage: number; points: DashboardTrendPoint[] }>(`/api/dashboard/trend?hours=${hours}`),
 }
 
 // ---- 资产层级 ----
@@ -495,6 +526,12 @@ export interface BoltCreateBody {
   crossSectionMm2?: number
   effectiveLengthMm?: number
   totalLengthMm?: number
+  // 材料库联动字段（specLibraryApi.resolve 带出；不传走后端缺省）
+  material?: string
+  rp02Mpa?: number
+  elasticModulusGpa?: number
+  soundVelocityMs?: number
+  tempCoefficientPerC?: number
   backfillUnbound?: boolean
   note?: string
 }
@@ -548,19 +585,27 @@ export interface BoltListItem {
   kLInterceptNs: number | null; tempCoefficientPerC: number
   // 所属设备：多设备部署时前端必须按 (deviceId, channelNo) 组合键索引通道，单用 channelNo 会跨设备串数据
   deviceId: number
+  // 两级档案模型：null = 占位档（自动建档待人工确认，探头离位满 N 天自动回收）；非 null = 资产档
+  confirmedAt: string | null
+  // 探头在位（"真正在线"）：与标定/预紧力状态解耦，来自 channels.hardware_state 在位词表
+  online: boolean
+  channelHardwareState: string | null
+  lastPresentAt: string | null
 }
 export interface BoltSettings {
   targetPreloadN?: number | null; minPreloadN?: number | null; material?: string | null
-  elasticModulusGpa?: number | null; soundVelocityMs?: number | null; effectiveLengthMm?: number | null
+  rp02Mpa?: number | null; elasticModulusGpa?: number | null; soundVelocityMs?: number | null
+  tempCoefficientPerC?: number | null; effectiveLengthMm?: number | null
   crossSectionMm2?: number | null; installTorqueNm?: number | null; positionLabel?: string | null
+  nominalDiam?: string | null; grade?: string | null
 }
 export interface CalibRecord {
   id: string; method: string; kL: number; kLUncertainty: number; kLInterceptNs: number | null
   rSquared: number; refTimeNs: number; refTempC: number; passed: boolean
   createdAt: string; expiresAt: string; supersededBy: string | null; isActive: boolean; notes: string | null
-  // 复核状态：pending=待会签 / self_signed=自签临时 / approved=两人会签 / rejected
+  // 签署状态（历史记录展示用）：self_signed/approved=已签署生效 / pending=未生效（历史）/ rejected=已作废
   reviewState: string; countersigned: boolean
-  // 提交人（会签必须异人,前端据此禁用本人会签按钮）
+  // 提交人
   operatorUserId: number | null
 }
 export const boltApi = {
@@ -807,6 +852,17 @@ export const waveApi = {
   compare: (channelId: number) => http.get<WaveCompareResult>(`/api/waves/compare/${channelId}`),
   setReference: (featureId: number, note?: string) =>
     http.post<{ referenceWaveId: number; channelId: number; active: boolean }>(`/api/waves/features/${featureId}/set-reference`, { note }),
+  // 相关法声时稳定性诊断（旁路证据，不改在产计算）：窗口内逐波形互相关 ΔTOF vs 设备阈值法 EchoTime。
+  // 阈值法对回波幅度敏感（耦合稍变、过阈时刻就漂），相关法对齐整段形态、对幅度免疫——竞品声时更稳的核心手段
+  xcorrTof: (channelId: number, minutes = 60, maxWaves = 40) =>
+    http.get<XcorrTofResult>(`/api/waves/xcorr-tof/${channelId}?minutes=${minutes}&maxWaves=${maxWaves}`),
+}
+export interface XcorrTofResult {
+  channelId: number; windowMinutes: number
+  waveCount: number; usableCount: number; corruptCount: number; lowSimilarityCount: number
+  deviceEchoStddevNs: number | null; xcorrLagStddevNs: number; improvementRatio: number | null
+  verdict: string
+  series: { ts: string; deviceEchoNs: number | null; xcorrLagNs: number; similarity: number; usable: boolean }[]
 }
 
 // ---- 报告 ----
@@ -831,6 +887,8 @@ export interface TorquePointSnapshot {
   id: number; torqueNm: number; estimatedPreloadN: number; sampleCount: number
   avgEchoTimeNs: number; stddevEchoTimeNs: number | null; avgTempC: number
   normalizedEchoTimeNs: number; deltaTofNs: number; excluded: boolean; excludeReason: string | null; note: string | null
+  // false=采于旧基线（此后通道基线被重设），不参与拟合，仅留档。旧报告快照没有该字段（undefined 按 true 处理）
+  baselineMatched?: boolean
 }
 export interface TorqueStepSnapshot {
   generatedAt: string
@@ -877,10 +935,15 @@ export interface TorqueTestPoint {
   sampleCount: number; avgEchoTimeNs: number; stddevEchoTimeNs: number | null; avgTempC: number
   normalizedEchoTimeNs: number; deltaTofNs: number; note: string | null; createdAt: string
   excluded: boolean; excludeReason: string | null
+  // 采点时的通道基线快照 + 与当前基线的匹配标志：基线重设（recalibrate）后旧点参考系失效，
+  // baselineMatched=false 的点不参与拟合/摘要，仅留档备查
+  refTimeNs: number; baselineMatched: boolean
 }
 export interface TorqueFitSummary {
   channelId: number; pointCount: number; kLByLinearFitNsPerN: number | null; interceptNs: number | null
   rSquared: number | null; minTorqueNm: number | null; maxTorqueNm: number | null
+  // 因基线不匹配被排除在拟合外的未剔除点数（>0 时前端应提示"旧基线点不参与拟合"）
+  stalePointCount: number
 }
 export interface LoadCalibratePoint { forceN: number; deltaTofNs: number }
 export const calibrationApi = {
@@ -891,37 +954,129 @@ export const calibrationApi = {
     http.post<{ channelId: number; calibrationId: string }>(`/api/channels/${channelId}/quick-calibrate`, body),
   // sampleWindowSeconds：声时取样窗口。热插拔全通道轮询下单通道刷新率被稀释（40 通道约 0.25Hz），
   // 默认 60s 窗口攒不够 20 条样本，调用方应按实际采样时长传窗口（后端 clamp 5..600）。
-  torqueCalibrate: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; sampleWindowSeconds?: number; note?: string }) =>
-    http.post<{ channelId: number; calibrationId: string; activeCalibration: { kL: number } }>(`/api/channels/${channelId}/torque-calibrate`, body),
+  // force=true 跳过采样稳定性护栏（信号天然抖的现场人工确认后用，后端记审计）。
+  // anchorInService=true 在役锚定：置零后认定当前=档案目标预紧力，热路径 F=F₀+Δt/K_L（不改写置零基线）。
+  // F₀ 优先 anchorPreloadN，否则用档案 target_preload_n。kL 为力-声时系数（同批标定/理论，
+  // 不传则后端自动取同组同规格同长度中位数）。
+  torqueCalibrate: (channelId: number, body: {
+    torqueNm?: number; nutFactor?: number; nominalDiameterMm?: number; sampleWindowSeconds?: number
+    note?: string; force?: boolean; anchorInService?: boolean; kL?: number; anchorPreloadN?: number
+  }) =>
+    http.post<{
+      channelId: number; calibrationId: string; activeCalibration: { kL: number; interceptNs?: number | null }
+      anchor: { anchoredPreloadN: number; kLSource: string; interceptNs: number } | null
+      warning: string
+    }>(`/api/channels/${channelId}/torque-calibrate`, body),
+  // 在役预填：档案目标预紧力 + 同组同规格可沿用的 K_L（中位数/样本数）+ 理论 K_L 参考（±40%，须人工确认）
+  anchorDefaults: (channelId: number) =>
+    http.get<{
+      channelId: number; boltId: number; nominalDiam: string
+      installTorqueNm: number | null; targetPreloadN: number | null
+      peerKL: number | null; peerCount: number; theoreticalKL: number | null
+      currentAvgEchoNs: number | null; sampleCount: number
+    }>(`/api/channels/${channelId}/anchor-defaults`),
   // 扭矩阶梯实验点：采集 / 列表 / 线性拟合摘要 / 应用拟合（含截距）为当前标定
-  torquePoints: (channelId: number) => http.get<{ channelId: number; count: number; items: TorqueTestPoint[] }>(`/api/channels/${channelId}/torque-test-points`),
-  captureTorquePoint: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; sampleWindowSeconds?: number; note?: string }) =>
-    http.post<{ id: number; channelId: number; estimatedPreloadN: number }>(`/api/channels/${channelId}/torque-test-points`, body),
+  torquePoints: (channelId: number) =>
+    http.get<{ channelId: number; count: number; currentRefTimeNs: number | null; items: TorqueTestPoint[] }>(
+      `/api/channels/${channelId}/torque-test-points`),
+  // measuredForceN：力值直标（拉伸机/测力传感器实测，单位 N）。传了它，力值直接入拟合，
+  // 不经 T=K·F·d 折算——扭矩法 ±30% 误差全部来自摩擦系数 K 靠猜，有测力条件时永远优先
+  captureTorquePoint: (channelId: number, body: { torqueNm: number; nutFactor?: number; nominalDiameterMm?: number; sampleWindowSeconds?: number; note?: string; force?: boolean; measuredForceN?: number }) =>
+    http.post<{ id: number; channelId: number; estimatedPreloadN: number; forceMode?: boolean }>(`/api/channels/${channelId}/torque-test-points`, body),
   torquePointSummary: (channelId: number) => http.get<TorqueFitSummary>(`/api/channels/${channelId}/torque-test-points/summary`),
   // 稳定性预检：与采点/标定后端护栏同一套判据（stddev + 前后半窗趋势）。
   // 向导轮询它当指示灯，stable=true 才放开采点——灯绿了就一定采得进去，不会前后端两套口径。
-  echoStability: (channelId: number, seconds = 180) =>
+  // purpose='inservice' 用在役阈值（3/5ns）：现场探头自然抖动 1~2.5ns，在役置零按实验室 0.6ns
+  // 判会把灯永远压红；不透传这个参数曾导致"前端红灯、后端放行"的双标（2026-08-18 Bugbot 抓出）
+  echoStability: (channelId: number, seconds = 180, purpose?: 'inservice') =>
     http.get<{
       channelId: number; stable: boolean; sampleCount: number
       avgEchoNs: number | null; stddevNs: number | null; halfWindowDriftNs: number | null
       stddevMaxNs: number; halfWindowDriftMaxNs: number; windowSeconds: number
-    }>(`/api/channels/${channelId}/echo-stability?seconds=${seconds}`),
+    }>(`/api/channels/${channelId}/echo-stability?seconds=${seconds}${purpose ? `&purpose=${purpose}` : ''}`),
+  // ---- 标定试验模式（force-sync-calibration-design）：连续加载、力值平台自动分档出点 ----
+  trialStart: (channelId: number, body: { forceSource?: 'manual' | 'serial'; note?: string } = {}) =>
+    http.post<{ trialId: number; channelId: number; forceSource: string; status: string }>(
+      `/api/channels/${channelId}/calibration-trials/`, body),
+  trialRunning: (channelId: number) =>
+    http.get<{ trialId: number; forceSource: string; startedAt: string }>(
+      `/api/channels/${channelId}/calibration-trials/running`),
+  // 力值进样（manual 源=前端定时上报当前表读数）；响应带平台状态与是否自动出点
+  trialForceSample: (channelId: number, trialId: number, forceN: number) =>
+    http.post<{ trialId: number; paired: boolean; plateau: TrialPlateau | null; echoCount: number; pointCreated: boolean; pointId: number | null; hint: string }>(
+      `/api/channels/${channelId}/calibration-trials/${trialId}/force-samples`, { forceN }),
+  trialLive: (channelId: number, trialId: number) =>
+    http.get<TrialLive>(`/api/channels/${channelId}/calibration-trials/${trialId}/live`),
+  trialFinish: (channelId: number, trialId: number) =>
+    http.post<{ trialId: number; status: string; pointCount: number; note: string }>(
+      `/api/channels/${channelId}/calibration-trials/${trialId}/finish`),
+  trialAbort: (channelId: number, trialId: number) =>
+    http.post<{ trialId: number; status: string; excludedPoints: number }>(
+      `/api/channels/${channelId}/calibration-trials/${trialId}/abort`),
   // 剔除/恢复一个阶梯点（只打标志不删行，剔除必须给原因）。已生效标定不受影响，下次拟合才按新点集算。
   patchTorquePoint: (channelId: number, pointId: number, body: { excluded: boolean; reason?: string }) =>
     http.patch<{ channelId: number; pointId: number; excluded: boolean; remainingValidPoints: number }>(
       `/api/channels/${channelId}/torque-test-points/${pointId}`, body),
   applyTorqueFit: (channelId: number, body: { minPoints?: number; note?: string } = {}) =>
     http.post<{ channelId: number; calibrationId: string; kL: number; rSquared: number; passed: boolean }>(`/api/channels/${channelId}/apply-torque-fit`, body),
-  // 正式多点载荷标定（提交后 pending，需异人会签 countersign 才激活，review_state=approved）
+  // 正式多点载荷标定：提交即自签生效（review_state=approved），签署与依据自动落档
   loadCalibrate: (channelId: number, body: { points: LoadCalibratePoint[]; refTimeNs: number; refTempC: number; systematicRelativeUncertainty?: number; loadingDevice?: string; loadingDeviceCert?: string; note?: string }) =>
     http.post<{ calibrationId: string; channelId: number; kL: number; rSquared: number; reviewState: string }>(`/api/channels/${channelId}/load-calibrate`, body),
+  // 以下两个端点仅服务存量历史 pending 记录（新提交不产生 pending），UI 已无入口
   countersign: (channelId: number, calibrationId: string) =>
     http.post<{ activated: boolean; calibrationId: string; reviewState: string }>(`/api/channels/${channelId}/calibrations/${calibrationId}/countersign`),
-  // 驳回 pending 正式标定（reviewer）：置 rejected，不激活、不动通道
   reject: (channelId: number, calibrationId: string, reason?: string) =>
     http.post<{ rejected: boolean; calibrationId: string; reviewState: string; reason: string }>(
       `/api/channels/${channelId}/calibrations/${calibrationId}/reject${reason ? `?reason=${encodeURIComponent(reason)}` : ''}`,
     ),
+}
+export interface TrialPlateau {
+  start: string; end: string; meanForceN: number; sampleCount: number; durationSeconds: number
+}
+export interface TrialLive {
+  trialId: number; status: string; forceSource: string; startedAt: string
+  samples: { ts: string; forceN: number; echoTimeNs: number | null }[]
+  points: { id: number; forceN: number; avgEchoTimeNs: number; deltaTofNs: number; sampleCount: number; at: string; excluded: boolean }[]
+  currentPlateau: TrialPlateau | null
+  echoCountInPlateau: number
+  hint: string
+}
+
+// ---- 参数字典（材料声学库 + 规格预设 + 展开器，material-library-design） ----
+export interface MaterialSpec {
+  id: number; code: string; name: string
+  soundVelocityMs: number; tempCoefficientPerC: number
+  acousticElasticFactor: number; elasticModulusGpa: number
+  note: string | null; enabled: boolean
+}
+export interface BoltSpecPreset {
+  id: number; name: string; nominalDiam: string; grade: string; materialCode: string
+  crossSectionMm2: number | null; rp02Mpa: number | null
+  effectiveLengthMm: number; totalLengthMm: number
+  targetPreloadN: number | null; minPreloadN: number | null
+  note: string | null; enabled: boolean
+}
+export interface SpecResolveResult {
+  nominalDiamMm: number | null
+  stressAreaMm2: number | null   // null = 不在 GB/T 16823.1 粗牙表，需手填
+  rp02Mpa: number | null         // null = 等级未收录（GB/T 3098.1），需手填
+  material: { code: string; name: string; soundVelocityMs: number; tempCoefficientPerC: number; acousticElasticFactor: number; elasticModulusGpa: number } | null
+}
+export const specLibraryApi = {
+  materials: () => http.get<{ count: number; items: MaterialSpec[] }>('/api/spec-library/materials'),
+  createMaterial: (body: Partial<MaterialSpec>) => http.post<{ id: number; code: string }>('/api/spec-library/materials', body),
+  updateMaterial: (id: number, body: Partial<MaterialSpec>) => http.patch<{ id: number; updated: boolean }>(`/api/spec-library/materials/${id}`, body),
+  presets: () => http.get<{ count: number; items: BoltSpecPreset[] }>('/api/spec-library/presets'),
+  createPreset: (body: Partial<BoltSpecPreset>) => http.post<{ id: number; name: string }>('/api/spec-library/presets', body),
+  updatePreset: (id: number, body: Partial<BoltSpecPreset>) => http.patch<{ id: number; updated: boolean }>(`/api/spec-library/presets/${id}`, body),
+  // 展开器：建档/改规格共用的唯一推导入口（国标代码表 + 材料库）
+  resolve: (q: { nominalDiam?: string; grade?: string; materialCode?: string }) => {
+    const qs = new URLSearchParams()
+    if (q.nominalDiam) qs.set('nominalDiam', q.nominalDiam)
+    if (q.grade) qs.set('grade', q.grade)
+    if (q.materialCode) qs.set('materialCode', q.materialCode)
+    return http.get<SpecResolveResult>(`/api/spec-library/resolve?${qs.toString()}`)
+  },
 }
 
 // ---- 通道自动检测（probe-scan） ----
@@ -942,7 +1097,11 @@ export interface ProbeScanView {
 }
 export const probeScanApi = {
   start: (deviceId: number, body: { channels?: number[]; settleSeconds?: number; sampleSeconds?: number; strategy?: string } = {}) =>
-    http.post<{ scanRunId: number; deviceId: number; status: string; estimatedSeconds: number; warning: string }>(
+    http.post<{
+      scanRunId: number; deviceId: number; status: string; estimatedSeconds: number; warning: string
+      // 请求中被剔除的墓碑（软删）通道号：其数据在入库路径被丢弃，扫出来必为 not_reporting，后端不扫并在此明示
+      skippedTombstoneChannels: number[]
+    }>(
       `/api/devices/${deviceId}/channels/probe-scan/`, body),
   latest: (deviceId: number) => http.get<ProbeScanView>(`/api/devices/${deviceId}/channels/probe-scan/latest`),
   abort: (deviceId: number, scanRunId: number) =>

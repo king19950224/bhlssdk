@@ -1,8 +1,12 @@
 // 螺栓状态 + 预紧力变化程度的统一模型。
-// 状态口径与服务端 bolt_status CTE 一致（仅看安全下限 min_preload_n），
+// 状态口径与服务端 bolt_status CTE 一致：安全下限 min_preload_n 之外还看保持率
+// （<70% 松动、<90% 预警，与告警评估器 TriggerLowRatio 默认对齐），
 // 在此之上补充"变化程度"的量化指标：保持率 / 损失 / 安全裕度 / 松弛分级。
+// outofrange 两个来源：服务端按 algo_version 拒算；本地对荒谬换算值（>300% / <5%）兜底——
+// 客户端实时换算不过范围门，基线(RefTime)锁错回波时会算出目标几十倍的值，
+// 不兜底就会顶着"偏高 4769%"的字面状态上屏（详情页头部与趋势图口径分裂的事故来源）。
 
-export type PreloadStatus = 'normal' | 'warn' | 'loose' | 'high' | 'uncalibrated' | 'nodata'
+export type PreloadStatus = 'normal' | 'warn' | 'loose' | 'high' | 'uncalibrated' | 'nodata' | 'outofrange'
 
 // 螺栓状态元数据（颜色/文案/LED 类）。AssetMonitor / FlangeLayout / HealthBar 等一律引用此表，
 // 不再各自复制（历史上三处各写一份、颜色文案还不一致）。
@@ -16,6 +20,9 @@ export const STATUS_META: Record<PreloadStatus, { label: string; color: string; 
   high: { label: '偏高', color: '#a78bfa', cls: 'led--high' },
   uncalibrated: { label: '未标定', color: '#61748f', cls: 'led--off' },
   nodata: { label: '无数据', color: '#3b4659', cls: 'led--off' },
+  // 超范围：回波正常、预紧力换算超出规格可信区间被拒算——要处理的是规格/目标配置或现场载荷，
+  // 不是探头链路。橙色与 warn 的琥珀区分开
+  outofrange: { label: '超范围', color: '#fb923c', cls: 'led--warn' },
 }
 
 export interface PreloadInput {
@@ -120,12 +127,22 @@ export function computePreloadHealth(inp: PreloadInput, nowMs: number = Date.now
   } else if (current == null || stale) {
     status = 'nodata'
     reason = '无近期测量数据'
+  } else if (residualRatio != null && (residualRatio > 3 || residualRatio < 0.05)) {
+    status = 'outofrange'
+    reason = `换算读数为目标的 ${pct(residualRatio)}，超出可信范围——参考基线或规格配置异常，读数按无效处理`
   } else if (min != null && current < min) {
     status = 'loose'
     reason = `低于安全下限(当前 ${fmtN(current)} < 下限 ${fmtN(min)})`
+  } else if (residualRatio != null && residualRatio < 0.7) {
+    // 保持率退路(与服务端 CTE / 告警 TriggerLowRatio 0.70 对齐)：min 未配时不能一路判 normal
+    status = 'loose'
+    reason = `保持率 ${pct(residualRatio)} 低于 70%`
   } else if (min != null && current < min * 1.1) {
     status = 'warn'
     reason = `接近下限,安全裕度仅 ${pct(safetyMargin)}`
+  } else if (residualRatio != null && residualRatio < 0.9) {
+    status = 'warn'
+    reason = `保持率 ${pct(residualRatio)} 低于 90%`
   } else if (residualRatio != null && residualRatio > 1.1) {
     // 偏高/超张力：保持率 > 110%（与服务端 bolt_status CTE 和告警 TriggerHighRatio 口径一致）。
     // 已知的口径时点差异：服务端用测量入库时存的 preload_ratio（按当时目标算），这里用
@@ -140,7 +157,7 @@ export function computePreloadHealth(inp: PreloadInput, nowMs: number = Date.now
 
   // 松弛程度：变化程度的定性分级（独立于安全状态）。风电螺栓常以损失 10% 作为复拧阈。
   let relax: RelaxBand | null = null
-  if (lossPct != null && status !== 'uncalibrated' && status !== 'nodata') {
+  if (lossPct != null && status !== 'uncalibrated' && status !== 'nodata' && status !== 'outofrange') {
     if (lossPct < 0.05) relax = { band: 'good', label: '松弛轻微', color: '#10b981' }
     else if (lossPct < 0.1) relax = { band: 'watch', label: '松弛关注', color: '#f59e0b' }
     else relax = { band: 'significant', label: '松弛显著', color: '#f43f5e' }

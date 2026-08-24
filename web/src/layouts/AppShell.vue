@@ -17,7 +17,7 @@ const navGroups = [
     title: '监测运营',
     items: [
       { name: 'dashboard', label: '总览', icon: 'Odometer' },
-      { name: 'live', label: '实时波形', icon: 'TrendCharts' },
+      { name: 'live', label: '实时监测', icon: 'TrendCharts' },
       { name: 'assets', label: '资产监测', icon: 'Histogram' },
       { name: 'alarms', label: '告警中心', icon: 'BellFilled' },
       { name: 'alarmKpi', label: '报警 KPI', icon: 'DataLine' },
@@ -28,7 +28,9 @@ const navGroups = [
     items: [
       // 标定中心路由 meta.roles=reviewer/admin：与路由守卫一致，operator 不显示（否则点了被弹回首页）
       { name: 'calibration', label: '标定中心', icon: 'Aim', reviewerOnly: true },
-      { name: 'configChanges', label: '参数审批', icon: 'DocumentChecked' },
+      // 2026-08-19 取消审批环节：改为直发+审计，本页只剩历史记录（菜单名同步改）
+      { name: 'configChanges', label: '变更记录', icon: 'DocumentChecked' },
+      { name: 'specLibrary', label: '参数字典', icon: 'Collection' },
     ],
   },
   {
@@ -60,7 +62,9 @@ const titleMap: Record<string, string> = Object.fromEntries(
 )
 const pageTitle = computed(() =>
   titleMap[route.name as string]
-  ?? (route.name === 'boltDetail' ? '螺栓详情' : route.name === 'reportDetail' ? '报告详情' : '总览'))
+  ?? (route.name === 'boltDetail' ? '螺栓详情'
+    : route.name === 'reportDetail' ? '报告详情'
+    : route.name === 'notFound' ? '页面不存在' : '总览'))
 
 function isActive(name: string) {
   if (route.name === name) return true
@@ -402,13 +406,14 @@ function onUserCommand(c: string) {
 </template>
 
 <style scoped>
-.shell { display: flex; height: 100%; }
+.shell { display: flex; height: 100%; overflow: hidden; }
 
 .sidebar {
   width: 236px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  min-height: 0;
   padding: 20px 14px;
   background: linear-gradient(180deg, rgba(13, 19, 32, 0.92), rgba(8, 11, 20, 0.72));
   border-right: 1px solid var(--panel-border);
@@ -455,7 +460,7 @@ function onUserCommand(c: string) {
 .sidebar-foot { border-top: 1px solid var(--hairline); padding-top: 14px; margin-top: 10px; display: flex; flex-direction: column; gap: 7px; }
 .sys-line { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-3); }
 
-.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 /* 全局降级横幅：红底常亮，不做自动消失——降级没解除它就不该走 */
 .sys-degrade {
   flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 9px 28px;
@@ -466,14 +471,15 @@ function onUserCommand(c: string) {
 .sys-degrade-link { color: #fda4af; text-decoration: underline; white-space: nowrap; }
 .sys-degrade-link:hover { color: #fecdd3; }
 .topbar {
-  height: 72px; flex-shrink: 0; display: flex; align-items: center; gap: 20px; padding: 0 28px;
+  min-height: 72px; flex-shrink: 0; display: flex; align-items: center; gap: 16px; padding: 10px 28px;
   border-bottom: 1px solid var(--panel-border); background: rgba(8, 11, 20, 0.5); backdrop-filter: blur(10px);
+  flex-wrap: wrap;
 }
 /* 标题列允许收缩并省略，防止窄窗口把面包屑挤成竖排字 */
 .topbar-title { min-width: 0; flex-shrink: 1; overflow: hidden; }
 .topbar-title h1 { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: 0.01em; white-space: nowrap; }
 .crumb { font-size: 11px; color: var(--text-3); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.topbar-stats { display: flex; gap: 12px; margin-left: auto; flex-shrink: 0; }
+.topbar-stats { display: flex; gap: 12px; margin-left: auto; flex-shrink: 1; flex-wrap: wrap; }
 .stat-chip {
   display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 14px; border-radius: 10px;
   background: var(--panel); border: 1px solid var(--panel-border); font-size: 13px; color: var(--text-2);
@@ -497,7 +503,7 @@ function onUserCommand(c: string) {
 .user-name { font-size: 13px; font-weight: 600; line-height: 1.1; }
 .user-role { font-size: 11px; color: var(--text-3); }
 
-.content { flex: 1; overflow-y: auto; padding: 24px 28px 40px; }
+.content { flex: 1; min-height: 0; overflow: auto; padding: 24px 28px 40px; }
 
 .fade-up-enter-active { transition: all 0.32s cubic-bezier(0.22, 1, 0.36, 1); }
 .fade-up-enter-from { opacity: 0; transform: translateY(10px); }

@@ -32,6 +32,8 @@ const lastOkText = computed(() => {
 })
 // 趋势单独失败态：容错不拖垮整页，但"取不到"不能显示成"没有数据"
 const trendError = ref<string | null>(null)
+// 数据覆盖率（有测量的桶/全部桶）：停机空窗直接压低它，是"监测自身是否在线"的最直观指标
+const trendCoverage = ref<number | null>(null)
 
 const SEV_LABEL: Record<string, string> = { critical: '严重', crit: '严重', warn: '预警', warning: '预警', info: '提示' }
 const alarmBreakdown = computed(() =>
@@ -51,13 +53,15 @@ const STATUS: Record<string, { label: string; color: string; cls: string }> = {
   high: { label: '偏高', color: '#a78bfa', cls: 'led--high' },
   uncalibrated: { label: '未标定/过期', color: '#61748f', cls: 'led--off' },
   nodata: { label: '无近期数据', color: '#3b4659', cls: 'led--off' },
+  outofrange: { label: '超范围拒算', color: '#fb923c', cls: 'led--warn' },
 }
-const ORDER = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata'] as const
+const ORDER = ['normal', 'warn', 'loose', 'high', 'outofrange', 'uncalibrated', 'nodata'] as const
 
 // ── 核心口径：把"在测（已标定且有近期数据）"与"待接入（未标定/无数据）"分开 ──
 // 修掉旧总览"健康率 25%(=normal/total)"被大量未标定螺栓拖低、与"平均保持率 103.7%"自相矛盾的问题。
 const measured = computed(() => health.value.normal + health.value.warn + health.value.loose + health.value.high)
-const pendingSetup = computed(() => health.value.uncalibrated + health.value.nodata)
+// 待接入 = 未标定 + 无数据 + 超范围拒算（三者都没有可信预紧力输出，但成因和处置动作各不相同）
+const pendingSetup = computed(() => health.value.uncalibrated + health.value.nodata + (health.value.outofrange || 0))
 // 超张力/偏高：与资产页、告警 TriggerHighRatio 口径统一——保持率 > 110% 的在测螺栓（health.high）。
 const overTension = computed(() => health.value.high)
 // 在测健康率 = 正常 / 在测（比 normal/total 有意义，不被未标定拖低）
@@ -84,6 +88,8 @@ const verdict = computed<{ level: 'ok' | 'warn' | 'crit' | 'off'; text: string }
   if (openBySev.value.info > 0) return { level: 'warn', text: `${openBySev.value.info} 条提示级告警未闭合` }
   if (h.warn > 0) return { level: 'warn', text: `${h.warn} 颗预警，预紧力接近下限` }
   if (h.high > 0) return { level: 'warn', text: `${h.high} 颗预紧力偏高（超目标 110%），关注超张力风险` }
+  // 超范围拒算：回波正常但预紧力换算超出规格可信区间，不出数=监测缺位，不能压成绿灯
+  if ((h.outofrange || 0) > 0) return { level: 'warn', text: `${h.outofrange} 颗预紧力超出规格可信范围被拒算，请核对螺栓规格或现场载荷` }
   if (approaching.value.length > 0) return { level: 'warn', text: `${approaching.value.length} 颗预紧力持续下降，关注到限` }
   // 标定到期不走告警通道（P2 延期），但结论条仍要提示——否则值班会当成一切正常
   const expiring = calibrationExpiry.value.expired + calibrationExpiry.value.within30Days
@@ -127,7 +133,15 @@ const actionTiles = computed(() => [
     to: 'assets',
     level: noTargetPreload.value.count > 0 ? 'warn' : 'muted',
   },
-  { key: 'nodata', label: '无数据', count: health.value.nodata, sub: '无近期回波', to: 'devices', level: 'muted' },
+  {
+    key: 'nodata',
+    label: '无数据 / 超范围',
+    count: health.value.nodata + (health.value.outofrange || 0),
+    // 两种成因处置方向相反：无数据查探头/链路（设备页），超范围查规格/目标配置（资产页）
+    sub: `无信号 ${health.value.nodata} · 超范围拒算 ${health.value.outofrange || 0}`,
+    to: (health.value.outofrange || 0) > 0 ? 'assets' : 'devices',
+    level: (health.value.outofrange || 0) > 0 ? 'warn' : 'muted',
+  },
 ])
 function goTile(to: string, query?: Record<string, string>) {
   router.push(query ? { name: to, query } : { name: to })
@@ -158,7 +172,7 @@ async function refresh() {
     noTargetPreload.value = d.noTargetPreload ?? { count: 0, items: [] }
     openAlarms.value = d.openAlarms
     alarmsBySeverity.value = d.alarmsBySeverity ?? []
-    if (t) { trend.value = t.points; trendError.value = null }
+    if (t) { trend.value = t.points; trendCoverage.value = t.coverage ?? null; trendError.value = null }
     error.value = null
     lastOkAt.value = Date.now()
   } catch (e) {
@@ -234,13 +248,15 @@ const trendOption = computed<Record<string, unknown>>(() => {
     },
     series: [
       {
-        name: '平均保持率', type: 'line', data: avg, smooth: true, symbol: 'none', connectNulls: true,
+        // connectNulls 必须为 false：停机空窗（补齐的 null 桶）要断线显示，
+        // 连起来会把"没数据"画成"数据很稳"（2026-08-18 整机停 20 小时实证）
+        name: '平均保持率', type: 'line', data: avg, smooth: true, symbol: 'none', connectNulls: false,
         lineStyle: { color: '#22d3ee', width: 2 },
         areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(34,211,238,0.22)' }, { offset: 1, color: 'rgba(34,211,238,0.01)' }] } },
         z: 3,
       },
       {
-        name: '最低保持率', type: 'line', data: min, smooth: true, symbol: 'none', connectNulls: true,
+        name: '最低保持率', type: 'line', data: min, smooth: true, symbol: 'none', connectNulls: false,
         lineStyle: { color: '#f59e0b', width: 1.5 }, z: 2,
         markLine: {
           silent: true, symbol: 'none',
@@ -310,7 +326,7 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
         <span class="vd-dot" :style="`background:${verdictColor}`" />
         <div class="vd-text">
           <div class="vd-headline" :style="`color:${verdictColor}`">{{ verdict.text }}</div>
-          <div class="vd-sub">共 {{ health.total }} 颗 · 在测 {{ measured }} · 待接入 {{ pendingSetup }}（未标定 {{ health.uncalibrated }} / 无数据 {{ health.nodata }}）</div>
+          <div class="vd-sub">共 {{ health.total }} 颗 · 在测 {{ measured }} · 待处理 {{ pendingSetup }}（未标定 {{ health.uncalibrated }} / 无数据 {{ health.nodata }} / 超范围 {{ health.outofrange || 0 }}）</div>
         </div>
       </div>
       <div class="vd-chips">
@@ -343,7 +359,8 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
     <div class="panel panel--glow trend">
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />预紧力保持率趋势</span>
-        <span class="hd-sub">近 24 小时 · 平均 / 最低</span>
+        <span class="hd-sub">近 24 小时 · 平均 / 最低<template v-if="trendCoverage != null"> · 数据覆盖率
+          <b class="mono" :style="trendCoverage < 0.95 ? 'color:var(--warn)' : 'color:var(--text-2)'">{{ Math.round(trendCoverage * 100) }}%</b></template></span>
       </div>
       <div class="trend-body">
         <EChart v-if="hasTrend" :option="trendOption" height="260px" />
@@ -506,8 +523,8 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
 .vd-chip b i { font-size: 15px; font-style: normal; margin-left: 2px; opacity: 0.7; }
 .vd-chip span { font-size: 11px; color: var(--text-3); letter-spacing: 0.06em; }
 
-/* ② 待处置 */
-.actions { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+/* ② 待处置：auto-fit 让卡片数量变化（5~7 张）时始终排满整行，不留 5+2 的断行空洞 */
+.actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .act { padding: 13px 16px 12px; display: flex; flex-direction: column; gap: 6px; cursor: pointer; transition: border-color 0.16s, transform 0.16s; min-width: 0; }
 .act:hover { transform: translateY(-1px); border-color: var(--panel-border-strong); }
 .act:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -605,7 +622,5 @@ function openBolt(b: { boltId: number }) { router.push({ name: 'boltDetail', par
 .sys-chip b { color: var(--text-1); }
 .sys-chip.warn b { color: var(--warn); }
 
-@media (max-width: 1200px) { .actions { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 1100px) { .more-row { grid-template-columns: 1fr; } .verdict { flex-direction: column; align-items: flex-start; gap: 12px; } .vd-chips { align-self: stretch; justify-content: space-between; } }
-@media (max-width: 760px) { .actions { grid-template-columns: repeat(2, 1fr); } }
 </style>

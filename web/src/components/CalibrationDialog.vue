@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 标定对话框：快速标定直接录 K_L，扭矩分步标定逐档加扭矩取样再拟合。
-// 这两种都只算自签的临时标定，正式载荷标定得另一个人会签才生效。
+// 全部路径提交即自签生效（2026-08-19 取消审批环节）；正式载荷标定与临时标定的差异只在判据与档案等级。
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { calibrationApi, boltApi, reportApi, type CalibRecord, type TorqueTestPoint, type TorqueFitSummary } from '../api'
@@ -45,11 +45,12 @@ const loadPoints = ref<{ forceN: number | undefined; deltaTofNs: number | undefi
 
 const busy = ref('')
 
+// 历史记录的签署状态（过去的事实性展示）
 const REVIEW: Record<string, { label: string; cls: string }> = {
-  approved: { label: '两人会签', cls: 'rv-ok' },
-  self_signed: { label: '自签', cls: 'rv-self' },
-  pending: { label: '待会签', cls: 'rv-pending' },
-  rejected: { label: '驳回', cls: 'rv-rej' },
+  approved: { label: '已签署', cls: 'rv-ok' },
+  self_signed: { label: '已签署', cls: 'rv-ok' },
+  pending: { label: '未生效', cls: 'rv-pending' },
+  rejected: { label: '已作废', cls: 'rv-rej' },
 }
 
 function resetForms() {
@@ -162,9 +163,12 @@ function stddevLevel(v: number | null): 'ok' | 'warn' | 'bad' | 'na' {
   if (v >= STDDEV_WARN_NS) return 'warn'
   return 'ok'
 }
+// "有效"=未剔除且基线匹配：基线重设后旧点参考系失效，后端拟合/摘要已不认它们，
+// 这里的计数口径必须跟上，否则按钮提示"点够了"而后端说"点不足"
 const unstablePoints = computed(() =>
-  points.value.filter((p) => !p.excluded && stddevLevel(num(p.stddevEchoTimeNs)) === 'bad').length)
-const validPointCount = computed(() => points.value.filter((p) => !p.excluded).length)
+  points.value.filter((p) => !p.excluded && p.baselineMatched && stddevLevel(num(p.stddevEchoTimeNs)) === 'bad').length)
+const validPointCount = computed(() => points.value.filter((p) => !p.excluded && p.baselineMatched).length)
+const stalePointCount = computed(() => points.value.filter((p) => !p.excluded && !p.baselineMatched).length)
 
 async function toggleExclude(p: TorqueTestPoint) {
   const cid = guard(); if (cid == null) return
@@ -199,28 +203,7 @@ function submitLoad() {
     loadingDevice: load.loadingDevice.trim() || undefined,
     loadingDeviceCert: load.loadingDeviceCert.trim() || undefined,
     note: load.note || undefined,
-  }), '正式载荷标定已提交，待【另一名】复核员会签后生效')
-}
-async function countersign(c: CalibRecord) {
-  const cid = guard(); if (cid == null) return
-  try {
-    await ElMessageBox.confirm(
-      `会签激活该正式载荷标定（K_L=${Number(c.kL).toExponential(3)}，R²=${Number(c.rSquared).toFixed(3)}）。会签人须与提交人不同。`,
-      '会签激活', { confirmButtonText: '会签激活', cancelButtonText: '取消', type: 'warning' })
-  } catch { return }
-  await run('cs' + c.id, () => calibrationApi.countersign(cid, c.id), '已会签激活')
-}
-async function reject(c: CalibRecord) {
-  const cid = guard(); if (cid == null) return
-  let reason = ''
-  try {
-    const r = await ElMessageBox.prompt(
-      '请填写驳回原因（记入审计与档案备注）。驳回后该标定置为 rejected，不激活、不影响当前生效标定。',
-      '驳回正式标定',
-      { confirmButtonText: '确认驳回', cancelButtonText: '取消', inputType: 'textarea', inputPlaceholder: '例如：载荷点分布不合理 / R² 偏低 / 加载设备证书缺失' })
-    reason = (r.value || '').trim()
-  } catch { return }
-  await run('rj' + c.id, () => calibrationApi.reject(cid, c.id, reason || undefined), '已驳回该 pending 标定')
+  }), '正式载荷标定已生效，并记入标定档案')
 }
 function addLoadRow() { loadPoints.value.push({ forceN: undefined, deltaTofNs: undefined }) }
 function delLoadRow(i: number) { loadPoints.value.splice(i, 1) }
@@ -249,9 +232,9 @@ async function downloadReport(id: number) {
 </script>
 
 <template>
-  <el-dialog v-model="visible" :title="`标定工作台 · ${boltCode || '通道 ' + channelId}`" width="760px" top="6vh" destroy-on-close>
+  <el-dialog v-model="visible" :title="`标定工作台 · ${boltCode || '通道 ' + channelId}`" width="760px" append-to-body destroy-on-close>
     <el-alert type="info" :closable="false" show-icon style="margin-bottom: 14px">
-      K_L 量纲约定 <b>ns/N（量级约 1e-4）</b>；勿照标定证书的 1/N（约 1e-11）填。快速/扭矩/拟合为<b>自签临时标定</b>，正式载荷标定须<b>异人会签</b>方可生效。
+      K_L 量纲约定 <b>ns/N（量级约 1e-4）</b>；勿照标定证书的 1/N（约 1e-11）填。各标定路径<b>提交即生效</b>，签署人与时间自动记入档案。
     </el-alert>
 
     <el-tabs v-model="tab">
@@ -294,7 +277,7 @@ async function downloadReport(id: number) {
         </div>
         <div class="tbl step-tbl">
           <div class="tr th"><span>扭矩</span><span>估算预紧力</span><span>Δt (ns)</span><span>声时波动</span><span>样本</span><span>状态</span><span></span></div>
-          <div v-for="p in points" :key="p.id" class="tr" :class="{ ex: p.excluded }">
+          <div v-for="p in points" :key="p.id" class="tr" :class="{ ex: p.excluded || !p.baselineMatched }">
             <span class="mono">{{ p.torqueNm }}</span>
             <span class="mono">{{ Math.round(p.estimatedPreloadN) }}</span>
             <span class="mono">{{ Number(p.deltaTofNs).toFixed(1) }}</span>
@@ -303,7 +286,9 @@ async function downloadReport(id: number) {
               {{ p.stddevEchoTimeNs != null ? '±' + Number(p.stddevEchoTimeNs).toFixed(2) : '—' }}
             </span>
             <span class="mono">{{ p.sampleCount }}</span>
-            <span :title="p.excludeReason || ''">{{ p.excluded ? '剔除' : '纳入' }}</span>
+            <span :title="p.excluded ? (p.excludeReason || '') : (!p.baselineMatched ? '采于旧基线（此后基线被重设），参考系失效，不参与拟合' : '')">
+              {{ p.excluded ? '剔除' : p.baselineMatched ? '纳入' : '旧基线' }}
+            </span>
             <span>
               <el-button size="small" text :type="p.excluded ? 'primary' : 'danger'"
                 :loading="busy === 'ex' + p.id" @click="toggleExclude(p)">
@@ -315,6 +300,9 @@ async function downloadReport(id: number) {
         </div>
         <div v-if="unstablePoints" class="warn-line">
           有 {{ unstablePoints }} 个点的声时波动偏大（≥{{ STDDEV_BAD_NS }} ns），很可能是拧的过程中采的，建议剔除后重采。
+        </div>
+        <div v-if="stalePointCount" class="warn-line">
+          有 {{ stalePointCount }} 个点采于旧基线（此后基线被重设，Δt 参考系已失效），不参与拟合，仅留档备查。
         </div>
         <div v-if="fitSummary" class="fit">
           有效点 <b>{{ fitSummary.pointCount }}</b> · K_L <b class="mono">{{ fitSummary.kLByLinearFitNsPerN != null ? fitSummary.kLByLinearFitNsPerN.toExponential(3) : '—' }}</b>
@@ -346,15 +334,15 @@ async function downloadReport(id: number) {
           <el-form-item label="加载装置"><el-input v-model="load.loadingDevice" placeholder="如 200kN 液压拉伸器 / 万能试验机（记入档案，供计量追溯）" maxlength="128" /></el-form-item>
           <el-form-item label="装置检定证书号"><el-input v-model="load.loadingDeviceCert" placeholder="加载装置的检定/校准证书编号" maxlength="128" /></el-form-item>
           <el-form-item label="备注"><el-input v-model="load.note" type="textarea" :rows="2" /></el-form-item>
-          <el-button type="primary" :loading="busy === 'load'" @click="submitLoad">提交正式标定（待会签）</el-button>
-          <p class="hint">≥4 点最小二乘，强制 R²≥0.98 + JJF 不确定度评定；提交后须另一名复核员到“标定档案”会签激活。</p>
+          <el-button type="primary" :loading="busy === 'load'" @click="submitLoad">提交正式标定（立即生效）</el-button>
+          <p class="hint">≥4 点最小二乘，强制 R²≥0.98 + JJF 不确定度评定；提交后立即生效并记入标定档案。</p>
         </el-form>
       </el-tab-pane>
 
       <!-- 标定档案 -->
       <el-tab-pane label="标定档案" name="history">
         <div v-loading="loadingData" class="tbl hist">
-          <div class="tr th"><span>方法</span><span>K_L</span><span>R²</span><span>状态</span><span>到期</span><span>操作</span></div>
+          <div class="tr th"><span>方法</span><span>K_L</span><span>R²</span><span>状态</span><span>到期</span></div>
           <div v-for="c in history" :key="c.id" class="tr">
             <span>{{ calibrationMethodLabel(c.method) }} <i v-if="c.isActive" class="active">生效</i></span>
             <span class="mono">{{ Number(c.kL).toExponential(2) }}</span>
@@ -362,13 +350,6 @@ async function downloadReport(id: number) {
             <span class="mono">{{ ['quick', 'torque_estimate', 'sim_baseline'].includes(c.method) && Number(c.rSquared) === 0 ? '—' : Number(c.rSquared).toFixed(3) }}</span>
             <span><i class="rv" :class="REVIEW[c.reviewState]?.cls">{{ REVIEW[c.reviewState]?.label || c.reviewState }}</i></span>
             <span class="mono dim">{{ new Date(c.expiresAt).toLocaleDateString('zh-CN') }}</span>
-            <span>
-              <el-button v-if="c.reviewState === 'pending'" size="small" type="primary" text :loading="busy === 'cs' + c.id"
-                :disabled="c.operatorUserId === auth.userId"
-                :title="c.operatorUserId === auth.userId ? '不能会签自己提交的标定（两人四眼）' : ''"
-                @click="countersign(c)">会签</el-button>
-              <el-button v-if="c.reviewState === 'pending'" size="small" type="danger" text :loading="busy === 'rj' + c.id" @click="reject(c)">驳回</el-button>
-            </span>
           </div>
           <div v-if="!loadingData && !history.length" class="tbl-empty">该通道暂无标定档案</div>
         </div>
@@ -386,7 +367,7 @@ async function downloadReport(id: number) {
 .tbl { border: 1px solid var(--hairline); border-radius: 8px; overflow: hidden; }
 .tbl.lp .tr, .tbl.lp .tr.th { grid-template-columns: 1fr 1fr 50px; }
 .tr { display: grid; grid-template-columns: 1fr 1.2fr 1fr 0.7fr 1fr; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--hairline); font-size: 13px; }
-.tbl.hist .tr { grid-template-columns: 1.3fr 1fr 0.8fr 1fr 1fr 0.8fr; }
+.tbl.hist .tr { grid-template-columns: 1.3fr 1fr 0.8fr 1fr 1fr; }
 .tbl.step-tbl .tr { grid-template-columns: 0.7fr 1fr 0.8fr 0.9fr 0.6fr 0.7fr 0.7fr; }
 .tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.06em; background: rgba(148,163,184,0.04); }
 .tr.ex { opacity: 0.5; }

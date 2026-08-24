@@ -12,7 +12,7 @@ import { alarmTypeLabel } from '../utils/labels'
 const router = useRouter()
 const runtime = useRuntime()
 
-const health = ref<PreloadHealthCounts>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0, high: 0 })
+const health = ref<PreloadHealthCounts>({ total: 0, normal: 0, warn: 0, loose: 0, uncalibrated: 0, nodata: 0, high: 0, outofrange: 0 })
 const byGroup = ref<{ turbine: string; group: string; health: PreloadHealthCounts }[]>([])
 const topLoose = ref<LooseBolt[]>([])
 const approaching = ref<ApproachingBolt[]>([])
@@ -31,8 +31,9 @@ const STATUS: Record<string, { label: string; color: string; cls: string }> = {
   high: { label: '偏高', color: '#a78bfa', cls: 'led--high' },
   uncalibrated: { label: '未标定/过期', color: '#61748f', cls: 'led--off' },
   nodata: { label: '无近期数据', color: '#3b4659', cls: 'led--off' },
+  outofrange: { label: '超范围拒算', color: '#fb923c', cls: 'led--warn' },
 }
-const ORDER = ['normal', 'warn', 'loose', 'high', 'uncalibrated', 'nodata'] as const
+const ORDER = ['normal', 'warn', 'loose', 'high', 'outofrange', 'uncalibrated', 'nodata'] as const
 const SEV: Record<string, string> = { critical: '#f43f5e', crit: '#f43f5e', warn: '#f59e0b', warning: '#f59e0b', info: '#38bdf8' }
 // 各状态整数百分比（最大余数法，合计恰为 100%）
 const healthPct = computed<Record<string, number>>(() => {

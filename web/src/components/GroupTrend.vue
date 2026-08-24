@@ -19,6 +19,7 @@ const STATUS_COLOR: Record<string, string> = {
   high: '#a78bfa',
   uncalibrated: 'rgba(97,116,143,0.5)',
   nodata: 'rgba(97,116,143,0.5)',
+  outofrange: '#fb923c',
 }
 
 const limitRatio = computed(() => {
@@ -83,7 +84,7 @@ watch(range, load)
 const hasData = computed(() => seriesData.value.some((s) => s.pts.some((p) => p[1] != null)))
 
 const option = computed(() => {
-  const order: Record<string, number> = { loose: 3, high: 3, warn: 2, normal: 1, uncalibrated: 0, nodata: 0 }
+  const order: Record<string, number> = { loose: 3, high: 3, warn: 2, outofrange: 2, normal: 1, uncalibrated: 0, nodata: 0 }
   const sorted = [...seriesData.value].sort((a, b) => (order[a.bolt.status] ?? 0) - (order[b.bolt.status] ?? 0))
   const series: Record<string, unknown>[] = sorted.map((s) => {
     const st = s.bolt.status

@@ -300,7 +300,7 @@ async function download() {
           <tr><th>#</th><th>扭矩 N·m</th><th>估算预紧力 N</th><th>样本数</th><th>平均声时 ns</th><th>声时差 Δt ns</th><th>平均温度 ℃</th><th>纳入拟合</th></tr>
         </thead>
         <tbody>
-          <tr v-for="(p, i) in torque.points" :key="p.id" :class="{ excluded: p.excluded }">
+          <tr v-for="(p, i) in torque.points" :key="p.id" :class="{ excluded: p.excluded || p.baselineMatched === false }">
             <td>{{ i + 1 }}</td>
             <td class="mono">{{ p.torqueNm }}</td>
             <td class="mono">{{ n(p.estimatedPreloadN) }}</td>
@@ -308,7 +308,8 @@ async function download() {
             <td class="mono">{{ Number(p.avgEchoTimeNs).toFixed(2) }}</td>
             <td class="mono">{{ Number(p.deltaTofNs).toFixed(2) }}</td>
             <td class="mono">{{ Number(p.avgTempC).toFixed(1) }}</td>
-            <td><span class="res" :style="`color:${p.excluded ? RESULT['不合格'] : RESULT['合格']}`">{{ p.excluded ? '剔除' : '是' }}</span></td>
+            <td><span class="res" :style="`color:${p.excluded || p.baselineMatched === false ? RESULT['不合格'] : RESULT['合格']}`">
+              {{ p.excluded ? '剔除' : p.baselineMatched === false ? '旧基线' : '是' }}</span></td>
           </tr>
         </tbody>
       </table>
@@ -326,7 +327,7 @@ async function download() {
           {{ status === 'signed' && signedAt ? '签发日期：' + new Date(signedAt).toLocaleDateString('zh-CN') : '日期：__________' }}
         </div>
       </footer>
-      <div class="rd-note">本报告为扭矩法临时拟合的线性度验证，<b>非正式载荷标定</b>，不作为安全验收依据；正式验收须用已知载荷多点标定（load-calibrate + 双人会签）。数据快照已归档，可追溯复现。</div>
+      <div class="rd-note">本报告为扭矩法临时拟合的线性度验证，<b>非正式载荷标定</b>，不作为安全验收依据；正式验收须用已知载荷多点标定。数据快照已归档，可追溯复现。</div>
     </div>
 
     <div v-else-if="!loading && !loadError" class="empty panel">报告不存在或快照为空</div>

@@ -16,9 +16,14 @@ export function setUnauthorizedHandler(fn: () => void) {
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  // 后端错误响应的完整 body：除 error 文案外常带结构化诊断字段
+  // （如 recalibrate 带载拒绝的 estimatedPreloadN、护栏拒绝的 stability），
+  // 调用方按字段判别错误类型比解析中文文案可靠
+  body?: Record<string, unknown>
+  constructor(status: number, message: string, body?: Record<string, unknown>) {
     super(message)
     this.status = status
+    this.body = body
   }
 }
 
@@ -42,13 +47,15 @@ async function request<T>(path: string, opts: RequestInit = {}): Promise<T> {
       res.status === 423 ? '连续失败次数过多，账号已临时锁定，请稍后再试'
       : res.status === 429 ? '操作过于频繁，请稍后再试'
       : `请求失败（${res.status}）`
+    let body: Record<string, unknown> | undefined
     try {
       const j = await res.json()
       msg = j.error || j.message || msg
+      body = j
     } catch {
       /* 非 JSON 错误体 */
     }
-    throw new ApiError(res.status, msg)
+    throw new ApiError(res.status, msg, body)
   }
   if (res.status === 204) return undefined as T
   const ct = res.headers.get('content-type') || ''

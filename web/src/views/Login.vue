@@ -145,6 +145,7 @@ async function submit() {
 <style scoped>
 .login {
   height: 100%;
+  overflow: auto;
   display: grid;
   grid-template-columns: 1.15fr 0.85fr;
 }

@@ -82,7 +82,7 @@ onBeforeUnmount(() => {
     <div class="head panel" :class="`head--${overall.level}`">
       <div>
         <div class="h-title">系统自检 · BITE</div>
-        <div class="h-sub">plan §9.23：开机与运行中均可核对就绪状态。阈值告警由运维侧配置，本页只展示事实。</div>
+        <div class="h-sub">开机与运行中均可核对系统就绪状态。阈值告警由运维侧配置，本页只展示事实。</div>
       </div>
       <div class="verdict">{{ overall.text }}</div>
     </div>

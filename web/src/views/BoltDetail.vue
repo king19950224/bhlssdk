@@ -11,7 +11,7 @@ import { alarmTypeLabel, calibrationMethodLabel } from '../utils/labels'
 import { useNow } from '../utils/useNow'
 import { analyzeAscan } from '../utils/ascan'
 import { downloadFile } from '../utils/download'
-import { boltApi, alarmApi, alarmRuleApi, auditApi, waveApi, configChangeApi, deviceApi, calibrationApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction, type EffectiveAlarmRule } from '../api'
+import { boltApi, alarmApi, alarmRuleApi, auditApi, waveApi, configChangeApi, deviceApi, specLibraryApi, type BoltListItem, type TrendPoint, type CalibRecord, type WaveFile, type WaveFeature, type BoltChannelConfig, type BoltPrediction, type EffectiveAlarmRule, type MaterialSpec } from '../api'
 import { ApiError } from '../api/client'
 import { onRealtime } from '../api/realtime'
 import { useAuth } from '../stores/auth'
@@ -86,7 +86,39 @@ const form = reactive({
   soundVelocityMs: null as number | null,
   effectiveLengthMm: null as number | null,
   crossSectionMm2: null as number | null,
+  // 参数字典带出的隐藏字段：点"按材料库带出"才赋值随保存下发，否则不动原值
+  tempCoefficientPerC: null as number | null,
+  rp02Mpa: null as number | null,
 })
+
+// ---- 参数字典联动（改材料后一键带出 E/声速/温补/Rp0.2/As，可再手改）----
+const materialsList = ref<MaterialSpec[]>([])
+async function loadMaterials() {
+  try { materialsList.value = (await specLibraryApi.materials()).items.filter((m) => m.enabled) }
+  catch { /* 字典不可用时退化为自由输入 */ }
+}
+async function applyFromLibrary() {
+  const b = bolt.value
+  if (!b) return
+  try {
+    const r = await specLibraryApi.resolve({
+      nominalDiam: b.nominalDiam, grade: b.grade, materialCode: form.material || undefined,
+    })
+    const m = r.material
+    if (!m) return ElMessage.warning(`材料「${form.material}」不在材料库（或已停用）——请先在参数字典登记，或手填参数`)
+    form.elasticModulusGpa = Number(m.elasticModulusGpa)
+    form.soundVelocityMs = Number(m.soundVelocityMs)
+    form.tempCoefficientPerC = Number(m.tempCoefficientPerC)
+    if (r.stressAreaMm2 != null) form.crossSectionMm2 = Number(r.stressAreaMm2)
+    if (r.rp02Mpa != null) form.rp02Mpa = Number(r.rp02Mpa)
+    ElMessage.success(
+      `已带出：E ${m.elasticModulusGpa} GPa · 声速 ${m.soundVelocityMs} m/s · 温补 ${Number(m.tempCoefficientPerC).toExponential(2)}`
+      + (r.stressAreaMm2 != null ? ` · As ${r.stressAreaMm2} mm²` : '')
+      + (r.rp02Mpa != null ? ` · Rp0.2 ${r.rp02Mpa} MPa` : ''))
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '带出失败')
+  }
+}
 
 // 状态元数据用全局共享表（含 high/偏高——本地副本曾缺 high，凡偏高螺栓详情页渲染即崩、卡死在加载遮罩）
 const STATUS = STATUS_META
@@ -101,7 +133,7 @@ const calibStateLabel = computed(() => {
 const RANGE_LABEL: Record<string, string> = { '1h': '1 小时', '24h': '24 小时', '7d': '7 天' }
 // 通道配置来源枚举的中文映射
 const CONFIG_SOURCE: Record<string, string> = {
-  device_readback: '设备读回', config_change: '参数审批下发', database: '数据库配置', manual: '人工录入',
+  device_readback: '设备读回', config_change: '参数下发', database: '数据库配置', manual: '人工录入',
 }
 const num = (v: number | string | null | undefined) => {
   if (v == null) return null
@@ -353,32 +385,6 @@ async function setBaseline() {
   }
 }
 
-// 会签激活待复核的正式载荷标定（必须由不同于提交人的复核员执行 → 两人四眼）
-const countersigning = ref<string | null>(null)
-async function countersign(c: CalibRecord) {
-  if (!bolt.value) return
-  try {
-    await ElMessageBox.confirm(
-      `会签激活该正式载荷标定（K_L=${Number(c.kL).toExponential(3)}，R²=${Number(c.rSquared).toFixed(3)}）。会签人须与提交人不同（两人四眼）。`,
-      '会签激活标定', { confirmButtonText: '会签激活', cancelButtonText: '取消', type: 'warning' })
-  } catch { return }
-  countersigning.value = c.id
-  try {
-    await calibrationApi.countersign(bolt.value.channelId, c.id)
-    ElMessage.success('已会签激活，标定生效')
-    // 会签是"首次进入已标定"的关键路径：bolt.calibrated/state 变了，不重载会让 KPI 仍显示
-    // "未标定"直到手动刷新；顺带重载预测与标定档案
-    calibrations.value = (await boltApi.calibrations(bolt.value.channelId)).items
-    chCfg.value = await boltApi.channelConfig(boltId)
-    bolt.value = await boltApi.get(boltId)
-    try { pred.value = await boltApi.prediction(boltId) } catch { /* 预测不可用 */ }
-  } catch (e) {
-    ElMessage.error((e as Error)?.message || '会签失败（需复核员权限，且不能与提交人相同）')
-  } finally {
-    countersigning.value = null
-  }
-}
-
 // 接口失败 ≠ 螺栓不存在：网络/服务异常时要给"加载失败+重试",不能误报"已删除"
 const loadErr = ref<string | null>(null)
 async function init() {
@@ -586,8 +592,24 @@ function openSettings() {
   form.soundVelocityMs = b.soundVelocityMs != null ? Number(b.soundVelocityMs) : null
   form.effectiveLengthMm = b.effectiveLengthMm != null ? Number(b.effectiveLengthMm) : null
   form.crossSectionMm2 = b.crossSectionMm2 != null ? Number(b.crossSectionMm2) : null
+  form.tempCoefficientPerC = null
+  form.rp02Mpa = null
   settings.visible = true
+  void loadMaterials()
 }
+// 扭矩→目标联动（与建档对话框同一公式 F = T/(K·d)）：目标值必须能追溯到实际拧紧扭矩
+const settingsNutFactor = ref(0.20)
+function applyTorqueToTarget() {
+  const t = form.installTorqueNm
+  if (!t || t <= 0) return
+  const dm = Number(((bolt.value?.nominalDiam ?? '').match(/(\d+(?:\.\d+)?)/) || [])[1])
+  if (!dm) return ElMessage.warning('无法从规格解析公称直径（如 M20），请先补规格')
+  const f = Math.round(t / (settingsNutFactor.value * (dm / 1000)))
+  form.targetPreloadN = f
+  form.minPreloadN = Math.round(f * 0.7)
+  ElMessage.success(`已按 ${t} N·m / K=${settingsNutFactor.value} 换算：目标 ${f.toLocaleString()} N，下限 ${Math.round(f * 0.7).toLocaleString()} N`)
+}
+
 async function saveSettings() {
   if (form.minPreloadN != null && form.targetPreloadN != null && form.minPreloadN > form.targetPreloadN)
     return ElMessage.warning('告警下限不能大于目标预紧力')
@@ -597,6 +619,8 @@ async function saveSettings() {
       targetPreloadN: form.targetPreloadN, minPreloadN: form.minPreloadN, positionLabel: form.positionLabel,
       installTorqueNm: form.installTorqueNm, material: form.material || null, elasticModulusGpa: form.elasticModulusGpa,
       soundVelocityMs: form.soundVelocityMs, effectiveLengthMm: form.effectiveLengthMm, crossSectionMm2: form.crossSectionMm2,
+      // 只有"按材料库带出"过才有值（null=不改），避免每次保存都无谓覆盖温补/Rp0.2
+      tempCoefficientPerC: form.tempCoefficientPerC, rp02Mpa: form.rp02Mpa,
     })
     ElMessage.success('预紧力设置已保存')
     settings.visible = false
@@ -623,7 +647,8 @@ function openAdjust() {
 async function submitAdjust() {
   const c = chCfg.value
   if (!c) return
-  // 仅提交相对当前有改动的可写字段（增益/探头频率/回波窗）
+  // 仅下发相对当前有改动的可写字段（增益/探头频率/回波窗）。
+  // 2026-08-19 取消审批环节：直发设备 + 审计留痕（configChangeApi.commission），不再进审批队列
   const updates: Record<string, number | undefined> = {}
   if (adjForm.gain != null && adjForm.gain !== Number(c.gain)) updates.gain = adjForm.gain
   if (adjForm.probeFreqMhz != null && adjForm.probeFreqMhz !== Number(c.probeFreqMhz)) updates.probeFreqMhz = adjForm.probeFreqMhz
@@ -631,19 +656,16 @@ async function submitAdjust() {
   if (Object.keys(updates).length === 0) return ElMessage.warning('未检测到参数改动')
   adjust.saving = true
   try {
-    const res = await configChangeApi.submit(c.deviceId, c.channelNo, updates)
+    const res = await configChangeApi.commission(c.deviceId, c.channelNo, updates)
     adjust.visible = false
-    ElMessage.success(`已提交变更请求 #${res.requestId}，待审批下发`)
-    ElMessageBox.confirm('参数变更已进入审批队列（需另一名复核人审批→执行→读回验证）。是否前往参数审批页面？', '已提交待审批', {
-      confirmButtonText: '前往审批', cancelButtonText: '留在本页', type: 'info',
-    }).then(() => router.push({ name: 'configChanges' })).catch(() => {})
+    ElMessage.success(res.note || '参数已下发设备')
+    chCfg.value = await boltApi.channelConfig(boltId).catch(() => chCfg.value)
   } catch (e) {
-    ElMessage.error((e as Error)?.message || '提交失败')
+    ElMessage.error((e as Error)?.message || '下发失败')
   } finally {
     adjust.saving = false
   }
 }
-
 function setRange(k: '1h' | '24h' | '7d') {
   rangeKey.value = k
   loadTrend()
@@ -776,8 +798,21 @@ async function exportTrendCsv() {
           <span class="led" :class="STATUS[status].cls" />
           <h2>{{ bolt.code }}</h2>
           <span class="status-tag" :style="`color:${STATUS[status].color};border-color:${STATUS[status].color}`">{{ STATUS[status].label }}</span>
+          <!-- 在线/离线与标定状态解耦：探头不在位必须显式可见，不能被"未标定"标签吞掉 -->
+          <el-tooltip v-if="!bolt.online" placement="bottom"
+            :content="'探头不在位（最后在位 ' + (bolt.lastPresentAt ? new Date(bolt.lastPresentAt).toLocaleString() : '未知') + '）。请检查探头连接或在通道识别页核对'">
+            <span class="offline-tag">探头离线</span>
+          </el-tooltip>
         </div>
-        <div class="head-sub">{{ bolt.nominalDiam }} · {{ bolt.grade }} 级 · CH{{ bolt.channelNo }} · {{ calibStateLabel }}</div>
+        <div class="head-sub">
+          {{ bolt.nominalDiam }} · {{ bolt.grade }} 级 · CH{{ bolt.channelNo }} · {{ calibStateLabel }}
+          <!-- 两级档案模型：占位档 = 自动建档且无人工痕迹，离位满 N 天会被自动回收;
+               标定/验收/改规格/绑定迁移任一动作即转为资产档,此标签消失 -->
+          <el-tooltip v-if="!bolt.confirmedAt" placement="bottom"
+            content="探头在位时自动建档、尚无人工确认。确认方式:标定、验收、编辑规格或人工绑定任一操作;长期离位将被自动回收">
+            <span class="provisional-tag">待确认·自动建档</span>
+          </el-tooltip>
+        </div>
       </div>
     </div>
 
@@ -785,13 +820,17 @@ async function exportTrendCsv() {
     <div class="kpi-row" v-if="bolt">
       <div class="stat panel" :class="status === 'loose' ? 'stat--crit' : status === 'normal' ? 'stat--ok' : ''">
         <div class="stat-hd"><span class="stat-label">{{ liveLabel }}预紧力</span><span class="led" :class="STATUS[status].cls" /></div>
-        <div class="stat-val metric" :style="`color:${STATUS[status].color}`">{{ fmtN(displayPreloadN) }}<i>N</i></div>
-        <!-- 测量值必须带不确定度交付（plan §9.15.4）：只给中心值会让业主以为这是精确值 -->
-        <div v-if="uncertaintyText" class="stat-foot">{{ uncertaintyText }}</div>
+        <!-- 超可信范围的换算值不上大字（4769% 这种数字上屏只会制造恐慌或麻木），原始值移到下方横幅说明 -->
+        <div class="stat-val metric" :style="`color:${STATUS[status].color}`">
+          <template v-if="status === 'outofrange'">—</template>
+          <template v-else>{{ fmtN(displayPreloadN) }}<i>N</i></template>
+        </div>
+        <div v-if="status === 'outofrange'" class="stat-foot">读数异常，见下方说明</div>
+        <div v-else-if="uncertaintyText" class="stat-foot">{{ uncertaintyText }}</div>
       </div>
       <div class="stat panel">
         <div class="stat-hd"><span class="stat-label">{{ liveLabel }}比值</span><el-icon class="stat-ic"><Odometer /></el-icon></div>
-        <div class="stat-val metric">{{ ratioStr(displayRatio) }}</div>
+        <div class="stat-val metric">{{ status === 'outofrange' ? '—' : ratioStr(displayRatio) }}</div>
       </div>
       <div class="stat panel">
         <div class="stat-hd"><span class="stat-label">目标 / 下限</span><el-icon class="stat-ic"><Aim /></el-icon></div>
@@ -804,6 +843,16 @@ async function exportTrendCsv() {
         <div class="stat-hd"><span class="stat-label">温度</span><el-icon class="stat-ic"><Sunny /></el-icon></div>
         <div class="stat-val metric stat-val--sm">{{ displayTempC != null ? displayTempC.toFixed(1) + '°C' : '—' }}</div>
       </div>
+    </div>
+
+    <!-- 读数超可信范围：基线锁错回波或规格配置错的典型症状，指去重标而不是让人对着荒谬数字猜 -->
+    <div v-if="bolt && status === 'outofrange'" class="stale-banner">
+      <el-icon><WarningFilled /></el-icon>
+      <span>
+        当前换算读数 <b>{{ fmtN(displayPreloadN) }} N</b>（目标的 {{ displayRatio != null ? (Number(displayRatio) * 100).toFixed(0) : '—' }}%），超出可信范围，已按无效处理。
+        常见原因：<b>参考声时基线锁错回波</b>（标定时信号不佳）或规格/目标预紧力配置错误。
+        请核对波形后在已知预紧状态下<b>重新标定基线</b>。
+      </span>
     </div>
 
     <!-- 失联 / 数据陈旧横幅：明确标出数值为“最后已知”、趋势预测暂不可信，避免误读为实时 -->
@@ -824,15 +873,16 @@ async function exportTrendCsv() {
       </div>
       <div class="chg-body">
         <div class="chg-metrics">
+          <!-- outofrange：换算值不可信，比率/损失一律不出数（避免"4764% 超目标 233 万 N"这类字面灾难） -->
           <div class="cm">
             <span class="cm-k">预紧力保持率</span>
-            <b class="cm-v" :style="`color:${health.meta.color}`">{{ pct(health.residualRatio) }}</b>
+            <b class="cm-v" :style="`color:${health.meta.color}`">{{ status === 'outofrange' ? '—' : pct(health.residualRatio) }}</b>
             <span class="cm-i">当前 / 目标</span>
           </div>
           <div class="cm">
             <span class="cm-k">预紧力损失</span>
-            <b class="cm-v" :style="health.relax ? `color:${health.relax.color}` : ''">{{ lossText }}</b>
-            <span class="cm-i">较目标 {{ health.lossPct != null ? pct(Math.abs(health.lossPct)) : '—' }}</span>
+            <b class="cm-v" :style="health.relax ? `color:${health.relax.color}` : ''">{{ status === 'outofrange' ? '—' : lossText }}</b>
+            <span class="cm-i">较目标 {{ status !== 'outofrange' && health.lossPct != null ? pct(Math.abs(health.lossPct)) : '—' }}</span>
           </div>
           <div class="cm">
             <span class="cm-k">安全裕度</span>
@@ -852,7 +902,7 @@ async function exportTrendCsv() {
             </span>
           </div>
         </div>
-        <PreloadScale :current="displayPreloadN" :target="num(bolt.targetPreloadN)" :min="num(bolt.minPreloadN)" :height="14" />
+        <PreloadScale :current="status === 'outofrange' ? null : displayPreloadN" :target="num(bolt.targetPreloadN)" :min="num(bolt.minPreloadN)" :height="14" />
       </div>
     </div>
 
@@ -954,8 +1004,8 @@ async function exportTrendCsv() {
     <div class="panel panel--glow" v-if="chCfg">
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />通道超声参数 · 标定基线</span>
-        <!-- 提交参数变更请求走 diagnostic 组，后端要求 reviewer+：非复核员隐藏 -->
-        <el-button v-if="auth.isReviewer" size="small" @click="openAdjust"><el-icon><MagicStick /></el-icon> 调整参数（提交审批）</el-button>
+        <!-- 参数下发要求 reviewer+：非复核员隐藏 -->
+        <el-button v-if="auth.isReviewer" size="small" @click="openAdjust"><el-icon><MagicStick /></el-icon> 调整参数</el-button>
       </div>
       <div class="cfg-grid">
         <div class="cfg-cell"><span class="cfg-k">设备 / 通道</span><b class="mono">#{{ chCfg.deviceId }} · CH{{ chCfg.channelNo }}</b></div>
@@ -972,7 +1022,7 @@ async function exportTrendCsv() {
       </div>
       <div class="cfg-note">
         <el-icon><InfoFilled /></el-icon>
-        增益 / 探头频率 / 回波窗可在线调整（经审批下发）；<b>阈值、测量模式、RefTime/RefTemp/K_L 为标定基线，须经重标定流程变更</b>。配置来源：{{ CONFIG_SOURCE[chCfg.configSource || ''] || chCfg.configSource || '—' }}
+        增益 / 探头频率 / 回波窗可在线调整（下发即生效，自动留档）；<b>阈值、测量模式、RefTime/RefTemp/K_L 为标定基线，须经重标定流程变更</b>。配置来源：{{ CONFIG_SOURCE[chCfg.configSource || ''] || chCfg.configSource || '—' }}
       </div>
     </div>
 
@@ -1002,18 +1052,13 @@ async function exportTrendCsv() {
                 <div class="cl-method">
                   {{ calibrationMethodLabel(c.method) }}
                   <span v-if="c.isActive" class="cl-active">生效中</span>
-                  <span v-if="c.reviewState === 'pending'" class="cl-pending">待会签</span>
-                  <span v-else-if="c.countersigned" class="cl-signed">两人会签</span>
-                  <span v-else-if="c.reviewState === 'self_signed'" class="cl-self">自签</span>
+                  <span v-if="c.reviewState === 'pending'" class="cl-pending">未生效</span>
+                  <span v-else-if="c.countersigned || c.reviewState === 'self_signed'" class="cl-signed">已签署</span>
                 </div>
                 <div class="cl-meta mono">K_L={{ Number(c.kL).toExponential(3) }} · R²={{ Number(c.rSquared).toFixed(3) }}</div>
               </div>
             </div>
             <div class="cl-right">
-              <el-button v-if="c.reviewState === 'pending' && auth.isReviewer" size="small" type="primary" text
-                :disabled="c.operatorUserId === auth.userId"
-                :title="c.operatorUserId === auth.userId ? '不能会签自己提交的标定（两人四眼）' : ''"
-                :loading="countersigning === c.id" @click="countersign(c)">会签</el-button>
               <span class="cl-pass" :class="c.passed ? 'ok' : 'no'">{{ c.passed ? '通过' : '未过' }}</span>
               <span class="cl-date mono">{{ new Date(c.createdAt).toLocaleDateString('zh-CN') }}</span>
             </div>
@@ -1049,13 +1094,31 @@ async function exportTrendCsv() {
       </el-alert>
       <el-form label-width="110px" label-position="left">
         <div class="form-sec">预紧力阈值（驱动状态判定与告警）</div>
+        <el-form-item label="安装扭矩 N·m">
+          <div style="display: flex; gap: 8px; align-items: center; width: 100%">
+            <el-input-number v-model="form.installTorqueNm" :step="10" :min="0" controls-position="right" style="flex: 1" />
+            <el-select v-model="settingsNutFactor" style="width: 128px">
+              <el-option label="干燥 K=0.20" :value="0.20" />
+              <el-option label="轻润滑 K=0.15" :value="0.15" />
+              <el-option label="润滑 K=0.13" :value="0.13" />
+            </el-select>
+            <el-button size="small" type="primary" plain :disabled="!form.installTorqueNm" @click="applyTorqueToTarget">换算目标</el-button>
+          </div>
+        </el-form-item>
         <el-form-item label="目标预紧力 N"><el-input-number v-model="form.targetPreloadN" :step="1000" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
         <el-form-item label="告警下限 N"><el-input-number v-model="form.minPreloadN" :step="1000" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
-        <el-form-item label="安装扭矩 N·m"><el-input-number v-model="form.installTorqueNm" :step="10" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
         <el-form-item label="位置标签"><el-input v-model="form.positionLabel" placeholder="如 12点钟方向" /></el-form-item>
 
         <div class="form-sec">材料与几何（简化模型计算用）</div>
-        <el-form-item label="材料"><el-input v-model="form.material" placeholder="如 42CrMo" /></el-form-item>
+        <el-form-item label="材料">
+          <div style="display: flex; gap: 8px; width: 100%">
+            <el-select v-model="form.material" filterable allow-create placeholder="如 42CrMo" style="flex: 1">
+              <el-option v-for="m in materialsList" :key="m.code" :value="m.code" :label="`${m.code}（${m.name}）`" />
+            </el-select>
+            <el-button size="default" @click="applyFromLibrary">按材料库带出</el-button>
+          </div>
+          <div class="fld-hint-sm">带出 = 用材料库的 E/声速/温补 + 国标 Rp0.2/截面积 回填下方字段（可再手改），保存才生效</div>
+        </el-form-item>
         <el-form-item label="弹性模量 GPa"><el-input-number v-model="form.elasticModulusGpa" :step="1" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
         <el-form-item label="纵波声速 m/s"><el-input-number v-model="form.soundVelocityMs" :step="10" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
         <el-form-item label="有效长度 mm"><el-input-number v-model="form.effectiveLengthMm" :step="1" :min="0" controls-position="right" style="width: 100%" /></el-form-item>
@@ -1067,10 +1130,10 @@ async function exportTrendCsv() {
       </template>
     </el-dialog>
 
-    <!-- 调整通道超声参数（提交审批） -->
+    <!-- 调整通道超声参数（直发设备，审计留痕；2026-08-19 取消审批环节） -->
     <el-dialog v-model="adjust.visible" title="调整通道超声参数" width="480px">
       <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 16px">
-        提交后进入<b>参数变更审批队列</b>，须经另一名复核人审批→下发→读回验证方可生效，不会立即改变设备。
+        确定后<b>立即下发设备</b>（审计留痕）。增益/回波窗变化可能平移声时检出——已标定通道下发后请核对波形与实时读数，漂移明显需重新置零/标定。
       </el-alert>
       <el-form label-width="120px" label-position="left">
         <!-- 范围钉死 1~47：SDK/设备的增益档位范围，之前 0~100 会放进设备拒收的值 -->
@@ -1080,7 +1143,7 @@ async function exportTrendCsv() {
       </el-form>
       <template #footer>
         <el-button @click="adjust.visible = false">取消</el-button>
-        <el-button type="primary" :loading="adjust.saving" @click="submitAdjust">提交变更请求</el-button>
+        <el-button type="primary" :loading="adjust.saving" @click="submitAdjust">下发设备</el-button>
       </template>
     </el-dialog>
 
@@ -1113,6 +1176,7 @@ async function exportTrendCsv() {
 .calib-cta--expired .el-icon { color: var(--warn); }
 .calib-cta--expired b { color: var(--warn); }
 .form-sec { font-size: 12px; color: var(--accent-2); letter-spacing: 0.06em; margin: 2px 0 14px; padding-bottom: 7px; border-bottom: 1px solid var(--hairline); }
+.fld-hint-sm { font-size: 11px; color: var(--text-3); line-height: 1.5; margin-top: 4px; }
 
 .stale-banner {
   display: flex; align-items: center; gap: 10px;
@@ -1128,6 +1192,17 @@ async function exportTrendCsv() {
 .head-top h2 { margin: 0; font-size: 24px; font-weight: 700; }
 .status-tag { font-size: 12px; padding: 2px 10px; border: 1px solid; border-radius: 12px; }
 .head-sub { color: var(--text-3); font-size: 13px; margin-top: 8px; }
+/* 探头离线标签：灰底醒目块——离线是硬件事实,不能被"未标定"等监测状态标签掩盖 */
+.offline-tag {
+  font-size: 12px; padding: 2px 10px; border-radius: 9px; cursor: help;
+  color: var(--text-2); border: 1px solid var(--hairline); background: rgba(120, 120, 128, 0.12);
+}
+/* 占位档角标（两级模型）：自动建档待人工确认，用琥珀虚线框与正式资产档区分 */
+.provisional-tag {
+  display: inline-block; margin-left: 8px; padding: 1px 8px; font-size: 12px;
+  color: var(--warn, #f59e0b); border: 1px dashed rgba(245, 158, 11, 0.55);
+  border-radius: 10px; cursor: help; vertical-align: middle;
+}
 
 /* 关键指标卡：套用全局 .stat（.stat-val--sm 用于较长的双值/温度） */
 .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }

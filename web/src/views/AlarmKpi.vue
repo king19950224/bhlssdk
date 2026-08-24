@@ -95,8 +95,9 @@ onBeforeUnmount(() => {
         <div class="c-basis">限值 ≤ {{ kpi.metrics.overdueCount.limit }}　·　{{ kpi.metrics.overdueCount.basis }}</div>
       </div>
 
-      <div class="c panel" :class="kpi.metrics.highFrequencyRatio.pass ? 'ok' : 'bad'">
-        <div class="c-top"><span class="c-name">高频报警率</span><span class="verdict">{{ kpi.metrics.highFrequencyRatio.pass ? '达标' : '超限' }}</span></div>
+      <!-- 高频报警率对样本量敏感：窗口内总触发太少时单条占比必然虚高，判"超限"没有统计意义 -->
+      <div class="c panel" :class="(kpi.totalTriggered ?? 0) < 20 ? '' : kpi.metrics.highFrequencyRatio.pass ? 'ok' : 'bad'">
+        <div class="c-top"><span class="c-name">高频报警率</span><span class="verdict">{{ (kpi.totalTriggered ?? 0) < 20 ? '样本不足' : kpi.metrics.highFrequencyRatio.pass ? '达标' : '超限' }}</span></div>
         <div class="c-val">{{ pct(kpi.metrics.highFrequencyRatio.value) }}<span class="unit">单条规则占比</span></div>
         <div class="c-basis">限值 &lt; {{ pct(kpi.metrics.highFrequencyRatio.limit) }}　·　{{ kpi.metrics.highFrequencyRatio.basis }}</div>
       </div>
@@ -110,7 +111,7 @@ onBeforeUnmount(() => {
           <div class="row"><span>平均处理时间（触发到闭合）</span><b>{{ minutes(kpi.avgClearMinutes) }}</b></div>
           <div class="row"><span>窗口内平均报警率</span><b>{{ num(kpi.avgPerHour, 3) }} 条/小时</b></div>
         </div>
-        <div class="note">国标未对这两项给限值，§9.1 要求作为报警系统健康度持续跟踪，只报数不判定。</div>
+        <div class="note">国标未对这两项给限值，作为报警系统健康度指标持续跟踪，只报数不判定。</div>
       </div>
 
       <div class="panel blk">
@@ -127,7 +128,29 @@ onBeforeUnmount(() => {
           </tbody>
         </table>
         <div v-else class="note">窗口内没有告警。</div>
-        <div class="note">一条规则＝一个（螺栓，告警类型）。占比超 5% 说明该点位在刷屏，应做报警合理化评审而不是直接调高阈值（§9.15.3）。</div>
+        <div class="note">一条规则＝一个（螺栓，告警类型）。占比超 5% 说明该点位在刷屏，应做报警合理化评审而不是直接调高阈值。</div>
+      </div>
+
+      <div class="panel blk">
+        <div class="blk-title">处置归因分布</div>
+        <template v-if="kpi.resolutionStats?.resolvedTotal">
+          <div class="rows">
+            <div class="row">
+              <span>已归因闭合</span><b>{{ kpi.resolutionStats.resolvedTotal }} 条</b>
+            </div>
+            <div class="row">
+              <span>误报占比（非真实告警）</span>
+              <b :style="kpi.resolutionStats.falseAlarmRatio != null && kpi.resolutionStats.falseAlarmRatio > 0.3 ? 'color:var(--warn)' : ''">
+                {{ pct(kpi.resolutionStats.falseAlarmRatio) }}
+              </b>
+            </div>
+            <div v-for="it in kpi.resolutionStats.items" :key="it.code" class="row">
+              <span>{{ it.label }}</span><b class="mono">{{ it.count }}</b>
+            </div>
+          </div>
+          <div class="note">误报根因（基线/探头/配置/操作）指向的是要修的系统性问题；误报占比高先治根因，不要调松阈值。</div>
+        </template>
+        <div v-else class="note">窗口内暂无带归因的人工闭合。闭合告警时选择处置归因，这里会给出真实告警与误报根因的分布。</div>
       </div>
     </div>
 
@@ -166,7 +189,7 @@ onBeforeUnmount(() => {
 .unit { font-size: 11.5px; font-weight: 400; color: var(--text-3); margin-left: 7px; }
 .c-basis { font-size: 11px; color: var(--text-3); margin-top: 9px; line-height: 1.5; }
 
-.two { display: grid; grid-template-columns: 1fr 1.3fr; gap: 12px; }
+.two { display: grid; grid-template-columns: 1fr 1.3fr 1fr; gap: 12px; }
 @media (max-width: 1100px) { .two { grid-template-columns: 1fr; } }
 .blk { padding: 15px 16px; }
 .blk-title { font-size: 13px; font-weight: 600; color: var(--text-1); margin-bottom: 12px; }

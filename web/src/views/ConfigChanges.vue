@@ -1,14 +1,10 @@
 <script setup lang="ts">
-// 配置变更：谁想改通道参数都得先挂在这等审，复核或驳回都在这做。
-// 改完还要从设备读回来核对，对没对上一并显示。
+// 变更记录（纯历史查阅）：参数调整在螺栓详情/波形诊断页直接下发，本页只读不操作。
+// 2026-08-19 审批工作流下线；历史记录的状态/处理人照旧展示（过去的事实）。
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
 import { configChangeApi, type ConfigChange } from '../api'
-import { useAuth } from '../stores/auth'
 
-const auth = useAuth()
 const items = ref<ConfigChange[]>([])
-const statusFilter = ref<'pending' | 'all'>('pending')
 const loading = ref(false)
 let timer: number | undefined
 
@@ -27,12 +23,13 @@ function paramPairs(c: ConfigChange | null): [string, unknown][] {
   }
 }
 
+// 历史记录状态（过去完成的事实，非待办）
 const ST: Record<string, { label: string; color: string }> = {
-  requested: { label: '待审批', color: '#f59e0b' },
-  approved: { label: '待执行', color: '#38bdf8' },
-  executed: { label: '待验证', color: '#818cf8' },
+  requested: { label: '未处理', color: '#61748f' },
+  approved: { label: '未执行', color: '#61748f' },
+  executed: { label: '已下发', color: '#818cf8' },
   verified: { label: '已验证', color: '#10b981' },
-  rejected: { label: '已驳回', color: '#61748f' },
+  rejected: { label: '已作废', color: '#61748f' },
   failed: { label: '执行失败', color: '#f43f5e' },
 }
 // 通道超声参数的中文名（与后端 ChannelConfigUpdate 字段一一对应；历史数据可能存 PascalCase,统一小写匹配）
@@ -43,20 +40,19 @@ const PARAM_LABEL: Record<string, string> = {
 }
 const paramName = (k: string) => PARAM_LABEL[k.toLowerCase()] || k
 
-// 拉取失败绝不能显示成"无待办变更"：这一页的空态是绿灯，值班照着它会得出
-// "没有待审批的下发"的结论，而实际可能是一队参数变更正卡在那儿没人看。
+// 拉取失败要显示错误，不能和"无记录"混淆
 const loadError = ref<string | null>(null)
-// 达到后端单次上限（500）即视为截断：查"全部"页签时历史变更可能超页，须提示
+// 达到后端单次上限（500）即视为截断，须提示
 const truncated = ref(false)
 async function load() {
   loading.value = true
   try {
-    const r = await configChangeApi.list(statusFilter.value)
+    const r = await configChangeApi.list('all')
     items.value = r.items
     truncated.value = r.items.length >= 500
     loadError.value = null
   } catch (e) {
-    loadError.value = e instanceof Error ? e.message : '变更队列加载失败'
+    loadError.value = e instanceof Error ? e.message : '变更记录加载失败'
   } finally {
     loading.value = false
   }
@@ -66,65 +62,6 @@ onMounted(() => {
   timer = window.setInterval(() => { if (!document.hidden) load() }, 8000)
 })
 onUnmounted(() => timer && clearInterval(timer))
-
-// 行级操作锁：审批/执行是有副作用的动作,双击不能重复发
-const actingId = ref<number | null>(null)
-async function act(id: number, fn: () => Promise<unknown>, ok: string) {
-  if (actingId.value != null) return
-  actingId.value = id
-  try {
-    await fn()
-    ElMessage.success(ok)
-    load()
-  } catch (e) {
-    ElMessage.error((e as Error)?.message || '操作失败')
-  } finally {
-    actingId.value = null
-  }
-}
-async function approve(c: ConfigChange) {
-  try {
-    await ElMessageBox.confirm(`审批通过变更 #${c.id}?(须与提交人不同)`, '审批', { type: 'warning', confirmButtonText: '审批通过', cancelButtonText: '取消' })
-  } catch { return }
-  act(c.id, () => configChangeApi.approve(c.id), '已审批')
-}
-async function reject(c: ConfigChange) {
-  let value: string
-  try {
-    ;({ value } = await ElMessageBox.prompt(`驳回变更 #${c.id}，请填写原因：`, '驳回', {
-      inputType: 'textarea', confirmButtonText: '驳回', cancelButtonText: '取消',
-      inputValidator: (v) => (v && v.trim() ? true : '请填写驳回原因'),
-    }))
-  } catch { return }
-  act(c.id, () => configChangeApi.reject(c.id, value), '已驳回')
-}
-async function execute(c: ConfigChange) {
-  try {
-    await ElMessageBox.confirm(`执行下发变更 #${c.id} 到设备？`, '执行', { type: 'warning', confirmButtonText: '执行下发', cancelButtonText: '取消' })
-  } catch { return }
-  act(c.id, () => configChangeApi.execute(c.id), '已下发')
-}
-async function verify(c: ConfigChange) {
-  // 读回比对是同步返回结果的：必须区分"验证通过"与"读回未到位/不一致"，不能一律报成功
-  if (actingId.value != null) return
-  actingId.value = c.id
-  try {
-    const r = await configChangeApi.verify(c.id)
-    if (r.status === 'verified') {
-      ElMessage.success('读回验证通过，参数已确认生效')
-    } else {
-      const bad = r.comparisons?.filter((x) => !x.match) ?? []
-      ElMessage.warning(bad.length
-        ? `读回尚未一致（${bad.map((x) => x.param).join('、')}），设备读回可能未到位，请稍后重试`
-        : '读回数据未到位，请稍后重试验证')
-    }
-    load()
-  } catch (e) {
-    ElMessage.error((e as Error)?.message || '验证失败')
-  } finally {
-    actingId.value = null
-  }
-}
 function params(c: ConfigChange) {
   if (!c.requested) return '—'
   try {
@@ -141,28 +78,25 @@ function fmt(iso: string | null) {
 
 <template>
   <div class="cc rise">
-    <div class="cc-head">
-      <div class="seg">
-        <span class="seg-tab" :class="{ active: statusFilter === 'pending' }" @click="statusFilter = 'pending'; load()">待办队列</span>
-        <span class="seg-tab" :class="{ active: statusFilter === 'all' }" @click="statusFilter = 'all'; load()">全部</span>
-      </div>
-      <div class="hint" v-if="!auth.isReviewer"><el-icon><InfoFilled /></el-icon> 审批/驳回需复核员权限</div>
-    </div>
-
+    <!-- 2026-08-19 起参数变更直发设备（螺栓详情/波形诊断页），不再进入本队列；
+         本页职责收敛为变更历史查阅 + 存量待办处理。文案只描述现状，不叙述产品变更史（商用文案纪律）。 -->
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom: 12px">
+      通道参数在<b>螺栓详情</b>与<b>波形诊断</b>页调整，下发即生效并自动记录。本页用于查阅历史变更记录。
+    </el-alert>
     <div class="panel panel--glow">
       <div class="panel-hd">
-        <span class="panel-title"><i class="hd-mark hd-mark--warn" />变更队列</span>
-        <span class="hd-sub mono">{{ items.length }} 条{{ statusFilter === 'pending' ? '待办' : '' }}</span>
+        <span class="panel-title"><i class="hd-mark" />变更记录</span>
+        <span class="hd-sub mono">{{ items.length }} 条</span>
       </div>
       <div v-if="loadError" class="load-error">
-        <el-icon><WarningFilled /></el-icon> 变更队列加载失败（下方可能是旧数据，不代表没有待办）：{{ loadError }}
+        <el-icon><WarningFilled /></el-icon> 变更记录加载失败：{{ loadError }}
         <el-button size="small" text type="primary" @click="load">重试</el-button>
       </div>
       <div v-if="truncated" class="load-error">
-        <el-icon><WarningFilled /></el-icon> 仅显示最近 500 条变更记录，更早的历史未列出（可按状态筛选缩小范围）。
+        <el-icon><WarningFilled /></el-icon> 仅显示最近 500 条变更记录，更早的历史未列出。
       </div>
       <div class="tbl">
-        <div class="tr th"><span>#</span><span>设备/通道</span><span>变更参数</span><span>状态</span><span>提交</span><span>审批</span><span>操作</span></div>
+        <div class="tr th"><span>#</span><span>设备/通道</span><span>变更参数</span><span>状态</span><span>提交</span><span>处理人</span><span>操作</span></div>
         <div v-for="c in items" :key="c.id" class="tr">
           <span class="mono">{{ c.id }}</span>
           <span class="mono">设备{{ c.deviceId }} · CH{{ c.channelNo }}</span>
@@ -172,30 +106,19 @@ function fmt(iso: string | null) {
           <span class="who">{{ c.approvedByName || (c.approvedBy != null ? `用户#${c.approvedBy}` : '—') }}</span>
           <span class="ops">
             <el-button size="small" text @click="openDetail(c)">详情</el-button>
-            <template v-if="c.status === 'requested'">
-              <!-- 后端强制审批人≠提交人：本人提交的直接禁用,避免点了吃 400 -->
-              <el-button size="small" type="primary" text
-                :disabled="!auth.isReviewer || c.requestedBy === auth.userId"
-                :title="c.requestedBy === auth.userId ? '不能审批自己提交的变更（两人复核）' : ''"
-                :loading="actingId === c.id"
-                @click="approve(c)">审批</el-button>
-              <el-button size="small" type="danger" text :disabled="!auth.isReviewer" :loading="actingId === c.id" @click="reject(c)">驳回</el-button>
-            </template>
-            <el-button v-else-if="c.status === 'approved'" size="small" type="primary" text :loading="actingId === c.id" @click="execute(c)">执行</el-button>
-            <el-button v-else-if="c.status === 'executed'" size="small" text :loading="actingId === c.id" @click="verify(c)">验证</el-button>
           </span>
         </div>
-        <div v-if="!loading && !loadError && !items.length" class="tbl-empty"><span class="led led--ok" /> {{ statusFilter === 'pending' ? '无待办变更' : '无变更记录' }}</div>
+        <div v-if="!loading && !loadError && !items.length" class="tbl-empty"><span class="led led--ok" /> 无变更记录</div>
       </div>
     </div>
 
     <div class="flow-note panel">
       <span class="panel-title"><i class="hd-mark" />变更流程</span>
       <div class="flow">
-        <span class="fl">提交</span><el-icon><ArrowRight /></el-icon>
-        <span class="fl">审批<i>异人复核</i></span><el-icon><ArrowRight /></el-icon>
-        <span class="fl">执行<i>下发设备</i></span><el-icon><ArrowRight /></el-icon>
-        <span class="fl">验证<i>读回比对</i></span>
+        <span class="fl">调整<i>螺栓详情 / 波形诊断</i></span><el-icon><ArrowRight /></el-icon>
+        <span class="fl">下发设备<i>即时生效</i></span><el-icon><ArrowRight /></el-icon>
+        <span class="fl">读回验证<i>参数比对</i></span><el-icon><ArrowRight /></el-icon>
+        <span class="fl">留档<i>变更与审计记录</i></span>
       </div>
     </div>
 
@@ -210,7 +133,7 @@ function fmt(iso: string | null) {
         <div v-else class="dd-empty">无参数</div>
         <div class="dd-sec">流程时间线</div>
         <div class="dd-row"><span class="dd-k">提交</span><span>{{ detail.item.requestedByName || (detail.item.requestedBy != null ? `用户#${detail.item.requestedBy}` : '—') }} · <span class="mono dim">{{ fmt(detail.item.requestedAt) }}</span></span></div>
-        <div class="dd-row"><span class="dd-k">审批</span><span>{{ detail.item.approvedByName || (detail.item.approvedBy != null ? `用户#${detail.item.approvedBy}` : '—') }} · <span class="mono dim">{{ fmt(detail.item.approvedAt) }}</span></span></div>
+        <div class="dd-row"><span class="dd-k">处理</span><span>{{ detail.item.approvedByName || (detail.item.approvedBy != null ? `用户#${detail.item.approvedBy}` : '—') }} · <span class="mono dim">{{ fmt(detail.item.approvedAt) }}</span></span></div>
         <div class="dd-row"><span class="dd-k">执行</span><span>{{ detail.item.executedByName || (detail.item.executedBy != null ? `用户#${detail.item.executedBy}` : '—') }} · <span class="mono dim">{{ fmt(detail.item.executedAt) }}</span></span></div>
         <div class="dd-row"><span class="dd-k">验证</span><span class="mono dim">{{ fmt(detail.item.verifiedAt) }}</span></div>
         <div v-if="detail.item.failureReason" class="dd-row dd-fail"><span class="dd-k">失败原因</span><span>{{ detail.item.failureReason }}</span></div>
@@ -223,11 +146,6 @@ function fmt(iso: string | null) {
 
 <style scoped>
 .cc { display: flex; flex-direction: column; gap: 16px; }
-.cc-head { display: flex; align-items: center; gap: 16px; }
-.seg { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 4px; }
-.seg-tab { font-size: 13px; padding: 6px 16px; border-radius: 7px; cursor: pointer; color: var(--text-3); }
-.seg-tab.active { color: var(--accent); background: rgba(34, 211, 238, 0.1); font-weight: 600; }
-.hint { display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12px; margin-left: auto; }
 
 .panel-hd { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px 9px; }
 .tbl { padding: 4px 12px 14px; overflow-x: auto; }

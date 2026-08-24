@@ -1,10 +1,9 @@
 <script setup lang="ts">
-// 告警阈值规则面板（Alarms 页"阈值规则"标签）：生效规则 + 待审提案 + 历史。
-// 修改走两步异人复核：提案(pending) → 另一人批准(active) / 驳回(rejected)，
-// 新规则生效时同目标旧规则置 superseded。前端禁用"自批"按钮只是体验，后端才是强制。
+// 告警阈值规则面板（Alarms 页"阈值规则"标签）：生效规则 + 历史。
+// 修改提交即生效（后端直接落 active 并置换同目标旧规则），签署与依据自动落档。
 // 生效顺序 bolt > group > global > appsettings 出厂兜底，与后端 IAlarmRuleProvider 同一口径。
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { alarmRuleApi, type AlarmRule, type AlarmRuleTargets } from '../api'
 import { useAuth } from '../stores/auth'
 
@@ -14,7 +13,7 @@ const targets = ref<AlarmRuleTargets>({ groups: [], bolts: [] })
 const loading = ref(false)
 const loadError = ref<string | null>(null)
 const showHistory = ref(false)
-// 历史记录超出后端 500 条上限被截断（待审规则排最前永不丢，截掉的只会是最老的历史）
+// 历史记录超出后端 500 条上限被截断（生效规则排最前永不丢，截掉的只会是最老的历史）
 const truncated = ref(false)
 
 const activeRules = computed(() => rules.value.filter((r) => r.reviewState === 'active'))
@@ -23,7 +22,6 @@ const visibleRules = computed(() =>
     ? rules.value
     : rules.value.filter((r) => r.reviewState === 'pending' || r.reviewState === 'active'),
 )
-const pendingCount = computed(() => rules.value.filter((r) => r.reviewState === 'pending').length)
 
 async function load() {
   loading.value = true
@@ -48,9 +46,9 @@ function targetLabel(r: AlarmRule) {
 }
 const pct = (v: number) => `${(v * 100).toFixed(0)}%`
 const STATE: Record<string, { label: string; cls: string }> = {
-  pending: { label: '待审', cls: 'st-pending' },
+  pending: { label: '未生效', cls: 'st-pending' },
   active: { label: '生效', cls: 'st-active' },
-  rejected: { label: '已驳回', cls: 'st-dim' },
+  rejected: { label: '已作废', cls: 'st-dim' },
   superseded: { label: '已替代', cls: 'st-dim' },
 }
 function fmtTime(iso: string | null) {
@@ -134,7 +132,7 @@ async function submitPropose() {
       preloadLossRatio: form.preloadLossRatio,
       reason: form.reason.trim(),
     })
-    ElMessage.success('已提案，等待另一位复核员批准')
+    ElMessage.success('阈值规则已生效，同目标旧规则已自动置换')
     form.visible = false
     load()
   } catch (e) {
@@ -144,37 +142,6 @@ async function submitPropose() {
   }
 }
 
-async function approve(r: AlarmRule) {
-  try {
-    await ElMessageBox.confirm(
-      `批准【${targetLabel(r)}】的阈值提案？批准后 60 秒内生效，同目标旧规则自动置为已替代。`,
-      '批准阈值规则', { type: 'warning' })
-  } catch { return }
-  try {
-    await alarmRuleApi.approve(r.id)
-    ElMessage.success('已批准并生效')
-    load()
-  } catch (e) {
-    ElMessage.error((e as Error)?.message || '批准失败')
-  }
-}
-
-async function reject(r: AlarmRule) {
-  let note: string | undefined
-  try {
-    const { value } = await ElMessageBox.prompt('驳回理由（可不填，填了记入审计）:', `驳回提案 · ${targetLabel(r)}`, {
-      confirmButtonText: '驳回', cancelButtonText: '取消', inputType: 'textarea', inputValue: '',
-    })
-    note = value || undefined
-  } catch { return }
-  try {
-    await alarmRuleApi.reject(r.id, note)
-    ElMessage.success('已驳回')
-    load()
-  } catch (e) {
-    ElMessage.error((e as Error)?.message || '驳回失败')
-  }
-}
 </script>
 
 <template>
@@ -182,10 +149,10 @@ async function reject(r: AlarmRule) {
     <div class="panel">
       <div class="panel-hd">
         <span class="panel-title"><i class="hd-mark" />阈值规则</span>
-        <span class="hd-sub">生效顺序：螺栓 &gt; 部位 &gt; 全站 &gt; 出厂默认；修改需另一位复核员批准</span>
+        <span class="hd-sub">生效顺序：螺栓 &gt; 部位 &gt; 全站 &gt; 出厂默认；修改提交即生效并记入审计</span>
         <span class="hd-actions">
-          <el-checkbox v-model="showHistory" size="small">显示历史（驳回/替代）</el-checkbox>
-          <el-button v-if="auth.isReviewer" size="small" type="primary" @click="openPropose">提案修改</el-button>
+          <el-checkbox v-model="showHistory" size="small">显示历史（作废/替代）</el-checkbox>
+          <el-button v-if="auth.isReviewer" size="small" type="primary" @click="openPropose">修改阈值</el-button>
         </span>
       </div>
       <div v-if="loadError" class="load-error">
@@ -193,12 +160,12 @@ async function reject(r: AlarmRule) {
         <el-button size="small" text type="primary" @click="load">重试</el-button>
       </div>
       <div v-if="truncated && showHistory" class="load-error">
-        历史规则超出显示上限（500 条），最早的历史记录未列出；待审与生效规则不受影响。
+        历史规则超出显示上限（500 条），最早的历史记录未列出；生效规则不受影响。
       </div>
       <div class="tbl" v-loading="loading">
         <div class="tr th">
           <span>目标</span><span>下限 触发/恢复</span><span>上限 触发/恢复</span><span>连击 触发/恢复</span>
-          <span>脱落档</span><span>严重偏差</span><span>依据</span><span>提案</span><span>复核</span><span>状态</span><span>操作</span>
+          <span>脱落档</span><span>严重偏差</span><span>依据</span><span>提交</span><span>签署</span><span>状态</span>
         </div>
         <div v-for="r in visibleRules" :key="r.id" class="tr" :class="{ dim: r.reviewState === 'rejected' || r.reviewState === 'superseded' }">
           <span class="mono tgt">{{ targetLabel(r) }}</span>
@@ -211,30 +178,14 @@ async function reject(r: AlarmRule) {
           <span class="time"><b>{{ r.createdByName ?? '—' }}</b><i>{{ fmtTime(r.createdAt) }}</i></span>
           <span class="time"><b>{{ r.reviewedByName ?? '—' }}</b><i>{{ fmtTime(r.reviewedAt) }}</i></span>
           <span><span class="st" :class="STATE[r.reviewState]?.cls">{{ STATE[r.reviewState]?.label ?? r.reviewState }}</span></span>
-          <span class="ops">
-            <template v-if="r.reviewState === 'pending' && auth.isReviewer">
-              <el-button
-                size="small" text type="primary"
-                :disabled="r.createdBy === auth.userId"
-                :title="r.createdBy === auth.userId ? '提案人不得批准自己的提案（异人复核）' : ''"
-                @click="approve(r)"
-              >批准</el-button>
-              <el-button size="small" text type="warning" @click="reject(r)">
-                {{ r.createdBy === auth.userId ? '撤回' : '驳回' }}
-              </el-button>
-            </template>
-            <span v-else class="none">—</span>
-          </span>
         </div>
         <div v-if="!loading && !visibleRules.length" class="tbl-empty">
           尚无库内规则：全部螺栓按出厂默认阈值（appsettings）判定
         </div>
       </div>
     </div>
-    <p v-if="pendingCount" class="pending-hint">有 {{ pendingCount }} 条提案待复核；批准生效前旧阈值继续判定。</p>
-
-    <el-dialog v-model="form.visible" title="提案阈值修改" width="560px">
-      <p class="dlg-sub">底稿取所选目标当前实际生效的那套；提交后需另一位复核员批准才生效，全程写审计。</p>
+    <el-dialog v-model="form.visible" title="修改阈值规则" width="560px">
+      <p class="dlg-sub">底稿取所选目标当前实际生效的那套；提交即生效并记入审计，同目标旧规则自动置换。</p>
       <el-form label-width="120px" label-position="left">
         <el-form-item label="适用范围">
           <el-radio-group v-model="form.scope">
@@ -288,7 +239,7 @@ async function reject(r: AlarmRule) {
       </el-form>
       <template #footer>
         <el-button @click="form.visible = false">取消</el-button>
-        <el-button type="primary" :loading="form.saving" @click="submitPropose">提交提案</el-button>
+        <el-button type="primary" :loading="form.saving" @click="submitPropose">提交生效</el-button>
       </template>
     </el-dialog>
   </div>
@@ -299,7 +250,7 @@ async function reject(r: AlarmRule) {
 .panel-hd { display: flex; align-items: center; gap: 12px; }
 .hd-actions { margin-left: auto; display: flex; align-items: center; gap: 12px; }
 .tbl { padding: 4px 12px 14px; overflow-x: auto; }
-.tr { display: grid; grid-template-columns: 130px 110px 110px 96px 66px 66px 1fr 110px 110px 70px 120px; align-items: center; padding: 8px; border-radius: 8px; font-size: 12.5px; gap: 4px; min-width: 1100px; }
+.tr { display: grid; grid-template-columns: 130px 110px 110px 96px 66px 66px 1fr 110px 110px 70px; align-items: center; padding: 8px; border-radius: 8px; font-size: 12.5px; gap: 4px; min-width: 1000px; }
 .tr:not(.th) { box-shadow: inset 0 -1px 0 var(--hairline); }
 .tr:not(.th):hover { background: rgba(56, 189, 248, 0.05); }
 .tr.th { color: var(--text-3); font-size: 11px; letter-spacing: 0.06em; }
@@ -313,8 +264,6 @@ async function reject(r: AlarmRule) {
 .st-pending { color: var(--warn); border: 1px solid var(--warn); }
 .st-active { color: var(--ok, #34d399); border: 1px solid currentColor; }
 .st-dim { color: var(--text-3); border: 1px solid var(--hairline); }
-.ops { display: flex; gap: 2px; }
-.none { color: var(--text-3); }
 .tbl-empty { text-align: center; padding: 26px; color: var(--text-3); }
 .pending-hint { font-size: 12px; color: var(--text-3); margin: 0; padding: 0 4px; }
 .load-error { display: flex; align-items: center; gap: 8px; padding: 10px 18px; color: var(--warn); font-size: 12.5px; }

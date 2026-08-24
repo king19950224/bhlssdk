@@ -84,6 +84,7 @@ body,
 #app {
   height: 100%;
   margin: 0;
+  overflow: hidden; /* 滚动只发生在主内容区 / 弹窗内部，避免整页被裁却滑不动 */
 }
 
 body {
@@ -224,8 +225,40 @@ body {
 
 a { color: var(--accent-2); text-decoration: none; }
 
+/* 弹窗：笔记本/系统缩放下必须完整可见。默认 top=15vh 且不限高，内容一高就被裁在视口外，
+   overlay 滚动条又几乎看不见。限高 + 内部滚动，页脚/按钮始终在对话框里。 */
+.el-overlay-dialog {
+  overflow: auto;
+  display: flex;
+  justify-content: center;
+  padding: 16px;
+}
+.el-dialog {
+  /* margin:auto：矮窗垂直居中，高窗从顶部起算并由 overlay 滚动，不会上下一起裁 */
+  margin: auto !important;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+  display: flex;
+  flex-direction: column;
+}
+.el-dialog__header,
+.el-dialog__footer { flex-shrink: 0; }
+.el-dialog__body {
+  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.el-message-box {
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+}
+
 /* 打印：隐藏外壳，仅留报告内容 */
 @media print {
+  html, body, #app { overflow: visible !important; height: auto !important; }
   .sidebar, .topbar, .no-print { display: none !important; }
   .content { padding: 0 !important; overflow: visible !important; }
   body { background: #fff; color: #000; }

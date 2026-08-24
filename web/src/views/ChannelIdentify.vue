@@ -140,6 +140,11 @@ onUnmounted(() => {
 //   48 通道 → 在位 → 螺栓（在测 + 失联 + 待接入）；在位且未建档 = 有信号未建档（缺默认组时出现）。
 //   失联 = 建档且曾在位、当前无信号（红框）；待接入 = 建档但从未在位（点位表预导入，中性灰）。
 const sorted = computed(() => [...rows.value].sort((a, b) => a.channelNo - b.channelNo))
+// 空通道（无探头、无档案）默认折叠：48 口设备只插几支探头时，一屏灰卡把有效点位淹没
+const showEmpty = ref(false)
+const isEmpty = (it: ChannelLive) => !hasSignal(it) && it.boltId == null
+const visibleRows = computed(() => (showEmpty.value ? sorted.value : sorted.value.filter((r) => !isEmpty(r))))
+const emptyCount = computed(() => rows.value.filter(isEmpty).length)
 const presentCount = computed(() => rows.value.filter(hasSignal).length)
 const boundCount = computed(() => rows.value.filter((r) => r.boltId != null).length)
 const monitoringCount = computed(() => rows.value.filter((r) => r.boltId != null && hasSignal(r)).length)
@@ -548,10 +553,14 @@ async function unbind(it: ChannelLive) {
       </p>
     </div>
 
+    <div v-if="emptyCount" class="empty-toggle">
+      <el-checkbox v-model="showEmpty" size="small">显示空通道（{{ emptyCount }} 个无探头且未建档的接口）</el-checkbox>
+    </div>
+
     <div class="grid">
       <!-- 空通道淡化；失联（曾在位）红框；待接入（从未在位，点位表预导入）中性 -->
       <div
-        v-for="it in sorted" :key="it.channelNo"
+        v-for="it in visibleRows" :key="it.channelNo"
         class="ch panel"
         :class="{
           weak: !hasSignal(it) && it.boltId == null,
@@ -569,8 +578,10 @@ async function unbind(it: ChannelLive) {
           <span class="ch-bolt mono">{{ it.boltCode || '未绑螺栓' }}</span>
         </div>
 
+        <!-- 声时只在探头在位时显示：离位通道的 echoNs 是陈年残留（串扰/上次拔前的值），
+             挂着一个 462ns 之类的数字会让人以为该口有探头 -->
         <div class="ch-echo mono" :class="{ live: isLive(it.channelNo) }">
-          <template v-if="it.echoNs != null">{{ Number(it.echoNs).toFixed(0) }}<i>ns</i></template>
+          <template v-if="hasSignal(it) && it.echoNs != null">{{ Number(it.echoNs).toFixed(0) }}<i>ns</i></template>
           <template v-else><span class="noecho">无声时</span></template>
         </div>
 
@@ -721,6 +732,7 @@ async function unbind(it: ChannelLive) {
 .session-hint { margin: 8px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.7; }
 .session-hint b { color: var(--text-2); }
 
+.empty-toggle { padding: 0 4px; color: var(--text-3); }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
 .ch { padding: 14px 16px; transition: border-color 0.2s, box-shadow 0.2s, opacity 0.2s; }
 .ch.weak { opacity: 0.55; }

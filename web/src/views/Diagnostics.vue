@@ -1,9 +1,11 @@
 <script setup lang="ts">
 // 信号诊断（复核员以上）：看 A-Scan 波形、跟参考波形比一比，顺手把通道参数从设备读回来核对。
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+// 调试调参：全通道可在本页直调增益/回波窗等（直发设备+审计；2026-08-19 取消审批环节），
+// 波形 1.5s 轮询即时反映效果——"看着波形调参"的现场闭环。基线类参数仍走重标定。
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import EChart from '../components/EChart.vue'
-import { waveApi, type WaveFeature, type WaveCompareResult, type WaveCompareWave } from '../api'
+import { waveApi, channelApi, configChangeApi, type ChannelRow, type WaveFeature, type WaveCompareResult, type WaveCompareWave, type XcorrTofResult } from '../api'
 import { analyzeAscan } from '../utils/ascan'
 
 const features = ref<WaveFeature[]>([])
@@ -127,6 +129,69 @@ function onVisibility() {
   else { startLive(); tick() }
 }
 
+// ---- 调试调参（看着波形调，仅未标定通道；已标定走参数审批）----
+const channels = ref<ChannelRow[]>([])
+const activeChannelRow = computed(() => channels.value.find((c) => c.id === activeChannelId.value) ?? null)
+// 已标定通道的直发不再被拦（审批环节已取消），标记只用于提示"下发后核对读数"
+const activeCalibrated = computed(() => activeChannelRow.value?.kL != null)
+const tune = reactive({
+  gain: null as number | null,
+  echoWinNs: null as number | null,
+  echoWidthUs: null as number | null,
+  probeFreqMhz: null as number | null,
+  sending: false,
+  open: false,
+})
+async function loadChannels() {
+  try {
+    const res = await channelApi.list()
+    if (!disposed) channels.value = res.items
+  } catch { /* 面板降级隐藏，不拖垮波形页 */ }
+}
+async function sendTune() {
+  const row = activeChannelRow.value
+  if (!row) return
+  const updates: { gain?: number; probeFreqMhz?: number; echoWinNs?: number; echoWidthUs?: number } = {}
+  if (tune.gain != null) updates.gain = tune.gain
+  if (tune.echoWinNs != null) updates.echoWinNs = tune.echoWinNs
+  if (tune.echoWidthUs != null) updates.echoWidthUs = tune.echoWidthUs
+  if (tune.probeFreqMhz != null) updates.probeFreqMhz = tune.probeFreqMhz
+  if (!Object.keys(updates).length) return ElMessage.warning('没有要下发的参数（留空 = 不改）')
+  tune.sending = true
+  try {
+    await configChangeApi.commission(row.deviceId, row.channelNo, updates)
+    ElMessage.success('参数已下发。观察波形变化，锁到真实回波后请做重标定设基线。')
+  } catch (e) {
+    ElMessage.error((e as Error)?.message || '下发失败')
+  } finally {
+    tune.sending = false
+  }
+}
+
+// ---- 相关法声时稳定性诊断（旁路证据）----
+// 阈值法声时对回波幅度敏感（耦合稍变、过阈时刻就漂）；相关法对齐整段波形形态、对幅度免疫。
+// 这里按需触发一次对比：窗口内逐波形算相关法 ΔTOF，与设备阈值法 EchoTime 的波动并排给结论。
+const xd = reactive({
+  running: false,
+  minutes: 60,
+  result: null as XcorrTofResult | null,
+  error: null as string | null,
+  open: false,
+})
+async function runXcorr() {
+  if (activeChannelId.value == null) return
+  xd.running = true
+  xd.error = null
+  try {
+    xd.result = await waveApi.xcorrTof(activeChannelId.value, xd.minutes)
+  } catch (e) {
+    xd.result = null
+    xd.error = (e as Error)?.message || '诊断失败'
+  } finally {
+    xd.running = false
+  }
+}
+
 // 把当前波形设为该通道的参考基线（健康基线）
 async function setAsReference() {
   const fid = cur.value?.featureId
@@ -153,6 +218,7 @@ onMounted(async () => {
   } finally {
     if (!disposed) loading.value = false
   }
+  loadChannels()
   startLive()
   document.addEventListener('visibilitychange', onVisibility)
 })
@@ -304,6 +370,72 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
       <div v-if="metrics && hasRef" class="diag-note">
         参考口径：经验阈值（相似度&lt;0.85、健康度&lt;50 提示耦合/探头劣化）<b>仅作诊断展示，未驱动告警</b>。
       </div>
+
+      <!-- 调参：看着上方波形直调，全通道直发设备（审计留痕）。2026-08-19 取消审批环节 -->
+      <div v-if="activeChannelRow" class="tune">
+        <div class="tune-hd" @click="tune.open = !tune.open">
+          <span class="tune-title"><el-icon><Operation /></el-icon> 调试调参 · CH{{ activeChannelRow.channelNo }}
+            <span v-if="activeCalibrated" class="tune-tag tune-tag--locked">已标定 · 下发后核对读数</span>
+            <span v-else class="tune-tag">未标定 · 可直发</span>
+          </span>
+          <span class="dim">{{ tune.open ? '收起 ▲' : '展开 ▼' }}</span>
+        </div>
+        <template v-if="tune.open">
+          <div class="tune-body">
+            <div class="tune-fields">
+              <label class="tune-f"><span>增益（1~47 档）</span>
+                <el-input-number v-model="tune.gain" :min="1" :max="47" :step="1" size="small" controls-position="right" style="width: 110px" /></label>
+              <label class="tune-f"><span>回波窗（ns）</span>
+                <el-input-number v-model="tune.echoWinNs" :min="0" :max="200000" :step="100" size="small" controls-position="right" style="width: 130px" /></label>
+              <label class="tune-f"><span>回波宽度（µs）</span>
+                <el-input-number v-model="tune.echoWidthUs" :min="1" :max="1000" :step="1" size="small" controls-position="right" style="width: 110px" /></label>
+              <label class="tune-f"><span>探头频率（MHz）</span>
+                <el-input-number v-model="tune.probeFreqMhz" :min="0.5" :max="10" :step="0.5" size="small" controls-position="right" style="width: 110px" /></label>
+              <el-button type="primary" size="small" :loading="tune.sending" @click="sendTune">下发设备</el-button>
+            </div>
+            <div class="tune-hint">
+              留空 = 不改，只下发填了的参数。下发即写设备（审计留痕），上方波形 1.5 秒内反映效果——
+              增益调到回波峰清晰高于阈值带、不削顶为宜。<b>已标定通道</b>下发后核对实时读数（增益/回波窗会平移声时检出，
+              漂移明显需重新置零/标定）；未标定通道锁到真实回波后执行<b>重标定</b>设基线，再进标定流程。
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- 相关法声时诊断：旁路证据，不改在产计算 -->
+      <div v-if="activeChannelId != null" class="tune">
+        <div class="tune-hd" @click="xd.open = !xd.open">
+          <span class="tune-title"><el-icon><DataAnalysis /></el-icon> 相关法声时 · 稳定性对比
+            <span class="tune-tag">旁路诊断</span>
+          </span>
+          <span class="dim">{{ xd.open ? '收起 ▲' : '展开 ▼' }}</span>
+        </div>
+        <template v-if="xd.open">
+          <div class="tune-body">
+            <div class="tune-fields">
+              <label class="tune-f"><span>回看窗口（分钟）</span>
+                <el-input-number v-model="xd.minutes" :min="5" :max="1440" :step="30" size="small" controls-position="right" style="width: 120px" /></label>
+              <el-button type="primary" size="small" :loading="xd.running" :disabled="!hasRef" @click="runXcorr">运行诊断</el-button>
+              <span v-if="!hasRef" class="dim">需要先"设为参考"——相关法以参考波形为对齐基准</span>
+            </div>
+            <div v-if="xd.error" class="xd-err">{{ xd.error }}</div>
+            <div v-else-if="xd.result" class="xd-result">
+              <div class="xd-stats">
+                <span>样本 <b class="mono">{{ xd.result.usableCount }}/{{ xd.result.waveCount }}</b></span>
+                <span>阈值法波动 <b class="mono">{{ xd.result.deviceEchoStddevNs != null ? '±' + xd.result.deviceEchoStddevNs + ' ns' : '—' }}</b></span>
+                <span>相关法波动 <b class="mono" style="color: var(--ok)">±{{ xd.result.xcorrLagStddevNs }} ns</b></span>
+                <span v-if="xd.result.improvementRatio != null">稳定性比 <b class="mono" :style="xd.result.improvementRatio >= 1.5 ? 'color: var(--ok)' : ''">{{ xd.result.improvementRatio }}×</b></span>
+              </div>
+              <div class="tune-hint">{{ xd.result.verdict }}<template v-if="xd.result.lowSimilarityCount || xd.result.corruptCount">
+                （剔除：低相似 {{ xd.result.lowSimilarityCount }} 条 / 损坏 {{ xd.result.corruptCount }} 条）</template></div>
+            </div>
+            <div v-else class="tune-hint">
+              原理：设备阈值法的过阈时刻会随回波幅度漂移（耦合稍变就像声时变了）；相关法对齐整段波形形态，
+              对幅度免疫。此诊断只做对比取证，<b>不改变任何在产计算</b>——数据说话后再决定是否切换跟踪算法。
+            </div>
+          </div>
+        </template>
+      </div>
     </div>
 
     <!-- 波形特征（全局，点选切换通道） -->
@@ -316,7 +448,8 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
         <div class="tr th"><span>时间</span><span>通道/螺栓</span><span>SNR dB</span><span>峰峰值</span><span>噪声 RMS</span><span>阈值</span><span>点数</span></div>
         <div v-for="(f, i) in features" :key="f.id" class="tr" :class="{ active: activeChannelId === f.channelId }" @click="selectChannel(f)">
           <span class="mono dim">{{ fmt(f.ts) }}<span v-if="i === 0" class="latest-tag">最新</span></span>
-          <span class="mono">{{ f.channelNo != null ? 'CH' + f.channelNo : '—' }}{{ f.boltId ? ' · #' + f.boltId : '' }}</span>
+          <!-- 内部 boltId 不上屏（#42 这类编号用户对不上号）；有螺栓时用"已绑"点亮即可，名称在详情页 -->
+          <span class="mono">{{ f.channelNo != null ? 'CH' + f.channelNo : '—' }}<i v-if="f.boltId" class="bound-dot" title="已绑螺栓" /></span>
           <span class="mono" :style="f.snrDb != null && Number(f.snrDb) < 12 ? 'color:var(--warn)' : ''">{{ f.snrDb != null ? Number(f.snrDb).toFixed(1) : '—' }}</span>
           <span class="mono">{{ f.peakToPeak ?? '—' }}</span>
           <span class="mono">{{ f.noiseRms != null ? Number(f.noiseRms).toFixed(1) : '—' }}</span>
@@ -384,5 +517,24 @@ function fmtClock(ms: number | null) { return ms == null ? '—' : new Date(ms).
 .tr.th:hover { background: none; }
 .dim { color: var(--text-3); }
 .latest-tag { display: inline-block; margin-left: 8px; font-size: 10px; color: #10b981; border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 8px; padding: 0 6px; }
+.bound-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-left: 6px; vertical-align: middle; }
 .tbl-empty { display: flex; align-items: center; gap: 8px; justify-content: center; padding: 30px; color: var(--text-3); text-align: center; }
+
+/* 调试调参面板 */
+.tune { margin: 0 18px 14px; border: 1px solid var(--hairline); border-radius: 10px; background: rgba(148, 163, 184, 0.04); }
+.tune-hd { display: flex; align-items: center; justify-content: space-between; padding: 9px 14px; cursor: pointer; user-select: none; }
+.tune-title { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: var(--text-1); }
+.tune-tag { font-size: 10px; padding: 1px 7px; border-radius: 8px; border: 1px solid rgba(16, 185, 129, 0.4); color: #10b981; font-weight: 400; }
+.tune-tag--locked { border-color: rgba(245, 158, 11, 0.45); color: var(--warn); }
+.tune-locked { padding: 4px 14px 12px; font-size: 12px; color: var(--text-2); line-height: 1.7; }
+.tune-body { padding: 2px 14px 12px; }
+.tune-fields { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; }
+.tune-f { display: flex; flex-direction: column; gap: 4px; }
+.tune-f > span { font-size: 11px; color: var(--text-3); }
+.tune-hint { margin-top: 8px; font-size: 11px; color: var(--text-3); line-height: 1.6; }
+.tune-hint b { color: var(--text-2); }
+.xd-err { margin-top: 8px; font-size: 12px; color: var(--warn); line-height: 1.6; }
+.xd-result { margin-top: 8px; }
+.xd-stats { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12.5px; color: var(--text-2); }
+.xd-stats b { font-size: 14px; }
 </style>

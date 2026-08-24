@@ -259,6 +259,11 @@ async function startScan() {
   try {
     const r = await probeScanApi.start(selected.value.deviceId, {})
     ElMessage.success(`已发起通道自动检测（约 ${r.estimatedSeconds}s）`)
+    // 被剔除的墓碑通道要让人看见：这些口子不在本次报告里，不是"扫过了没探头"
+    if (r.skippedTombstoneChannels?.length) {
+      ElMessage.warning(
+        `已跳过 ${r.skippedTombstoneChannels.length} 个已删除通道（CH${r.skippedTombstoneChannels.join('、CH')}），如需扫描请先在通道目录中恢复`)
+    }
     scanning.value = true
     pollScan()
   } catch (e) {
@@ -397,7 +402,8 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
         </div>
         <div class="dc-state mono">{{ DEV_STATE[d.state] || d.state }}</div>
         <div class="dc-metrics">
-          <div><b class="metric">{{ d.sessionChannels?.length ?? 0 }}</b><span>通道</span></div>
+          <!-- 在采通道 = 实际轮询数（被删除的通道不轮询），与右上物理"通道数"可以不同，标签必须区分 -->
+          <div><b class="metric">{{ d.sessionChannels?.length ?? 0 }}</b><span>在采通道</span></div>
           <div><b class="metric">{{ fmt(d.channelResultCount ?? 0) }}</b><span>测量</span></div>
           <div><b class="metric" :style="d.writeFailureCount ? 'color:var(--warn)' : ''">{{ d.writeFailureCount ?? 0 }}</b><span>异常</span></div>
         </div>
@@ -416,7 +422,7 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
         <span class="hd-tools">
           <el-tooltip content="设备物理通道数（全通道轮询/识别范围 1..N）。点击重建通道目录" placement="bottom">
             <el-button size="small" text type="primary" :loading="rebuildingCatalog" :disabled="!auth.isReviewer" @click="editChannelCatalog">
-              通道数 {{ selected.options?.channelCount || '—' }}
+              物理通道 {{ selected.options?.channelCount || '—' }}
             </el-button>
           </el-tooltip>
           <el-tooltip :content="settingsError ? `默认组读取失败：${settingsError}` : '探头在位自动建档的归属监测组。未设置时新探头只采集不建档'" placement="bottom">
@@ -461,7 +467,8 @@ function fmt(n: number) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : S
               <span class="mono">{{ c.measurement.total }} <i class="dim">/ {{ c.measurement.echoRatePct }}%</i></span>
               <span class="mono">{{ c.measurement.avgEchoNs != null ? Number(c.measurement.avgEchoNs).toFixed(0) : '—' }}</span>
               <span class="mono">{{ c.measurement.avgTempC != null ? Number(c.measurement.avgTempC).toFixed(1) + '°C' : '—' }}</span>
-              <span class="mono">{{ c.latestWave.snrDb != null ? Number(c.latestWave.snrDb).toFixed(1) : '—' }}</span>
+              <!-- SNR < 12dB 标橙：链路"在位"不代表信号可用，CH 在位但耦合差时这里是唯一的可视线索 -->
+              <span class="mono" :style="c.latestWave.snrDb != null && Number(c.latestWave.snrDb) < 12 ? 'color:var(--warn)' : ''">{{ c.latestWave.snrDb != null ? Number(c.latestWave.snrDb).toFixed(1) : '—' }}</span>
               <span class="mono">{{ c.latestWave.peakToPeak ?? '—' }}</span>
               <span><el-button v-if="auth.isReviewer && c.bolt" size="small" text type="primary" @click="recalibrate(c)">重标定</el-button></span>
             </div>
