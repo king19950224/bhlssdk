@@ -25,9 +25,12 @@ public sealed class MainForm : Form
     private bool _closing;
     private ushort _selected;
 
-    /// <summary>标定斜率 kN/ns；空 = 没加载标定文件，此时不显示任何夹紧力（没有出处的数不上界面）。</summary>
-    private decimal? _coefK;
-    private decimal _coefB;
+    /// <summary>
+    /// 接线、标定与口径：和大屏同一份 farm.json（放在 exe 旁）、同一套 CalPlan——同一颗螺栓两边算出来必须是同一个数。
+    /// 没有 farm.json 时只有程序目录的 .ucf 兜底，口径无从得知，按自由置零口径显示 k·Δt+b 并在标签上说明。
+    /// 没有任何标定文件就不显示夹紧力（没有出处的数不上界面）。
+    /// </summary>
+    private CalPlan _plan = CalPlan.Load(null, AppContext.BaseDirectory, _ => { });
 
     private readonly TextBox _ipBox = new() { Width = 150, Text = "192.168.0.7:23" };
     private readonly Button _btnConnect = new() { Text = "连接", Width = 88, Height = 30 };
@@ -140,10 +143,7 @@ public sealed class MainForm : Form
         _btnZero.Click += (_, _) => ShowZeroDialog();
         _btnScan.Click += async (_, _) => await RescanAsync();
 
-        var bundled = Directory.GetFiles(AppContext.BaseDirectory, "*.ucf")
-            .OrderByDescending(File.GetLastWriteTime)
-            .FirstOrDefault();
-        if (bundled != null) TryLoadUcf(bundled);
+        LoadPlan();
         _linkTimer.Tick += (_, _) =>
         {
             if (_connected && _engine != null && !_engine.IsConnected)
@@ -208,6 +208,8 @@ public sealed class MainForm : Form
         top.Controls.Add(row1);
 
         _list.Columns.Add("通道", S(56));
+        // 位置 = farm.json 接线表里这一路装在哪个法兰的几号螺栓；没有 farm.json 时这一列是空的
+        _list.Columns.Add("位置", S(118));
         _list.Columns.Add("夹紧力kN", S(86));
         _list.Columns.Add("声时差ns", S(84));
         _list.Columns.Add("温度℃", S(72));
@@ -556,8 +558,16 @@ public sealed class MainForm : Form
             row.SubItems.Add("--");
         }
 
+        row.SubItems[1].Text = _plan.Describe(ch);
         _list.Items.Add(row);
         return row;
+    }
+
+    /// <summary>"CH3（塔筒顶段法兰 #24）"——对话框标题和操作记录里用，让现场知道拧的是哪颗。</summary>
+    private string ChannelLabel(ushort ch)
+    {
+        var where = _plan.Describe(ch);
+        return where.Length > 0 ? $"CH{ch}（{where}）" : $"CH{ch}";
     }
 
     private async Task DisconnectAsync()
@@ -604,7 +614,7 @@ public sealed class MainForm : Form
         }
 
         HashSet<ushort> zeroed;
-        using (var dlg = new ZeroDialog(_engine, monitored, _selected == 0 ? monitored[0] : _selected))
+        using (var dlg = new ZeroDialog(_engine, monitored, _selected == 0 ? monitored[0] : _selected, ChannelLabel, _plan.Mode))
         {
             dlg.ShowDialog(this);
             zeroed = dlg.ZeroedChannels;
@@ -721,7 +731,30 @@ public sealed class MainForm : Form
         if (m.Channel == _selected) RefreshSelected();
     }
 
-    private decimal? Force(decimal deltaTof) => _coefK is { } k ? deltaTof * k + _coefB : null;
+    /// <summary>
+    /// 这一路的夹紧力显示值。有 farm.json：按它的口径——自由置零是 k·Δt+b，在役锚定是"额定 + k·Δt"，
+    /// 锚定但没配额定值时只能给较锚定的变化量（IsDelta = true，界面前面标 Δ）。和大屏同一套 CalPlan，两边一个数。
+    /// 没有 farm.json：不知道口径，按历来的自由置零口径显示 k·Δt+b。
+    /// </summary>
+    private (decimal? Value, bool IsDelta) Force(ushort ch, decimal deltaTof)
+    {
+        if (!_plan.HasFarm)
+        {
+            return (_plan.GlobalCal is { } c ? deltaTof * c.K + c.B : null, false);
+        }
+
+        if (_plan.ForceKn(ch, deltaTof) is { } f) return (f, false);
+        var d = _plan.DeltaKn(ch, deltaTof);
+        return (d, d is not null && _plan.Mode == BaselineMode.Anchor);
+    }
+
+    private string ForceText(ushort ch, decimal? deltaTof)
+    {
+        if (deltaTof is not { } dt) return "--";
+        var (v, isDelta) = Force(ch, dt);
+        if (v is not { } f) return "--";
+        return isDelta ? "Δ" + (f > 0 ? "+" : string.Empty) + f.ToString("F2") : f.ToString("F2");
+    }
 
     private void UpdateParams()
     {
@@ -767,14 +800,15 @@ public sealed class MainForm : Form
     {
         if (c.Row == null || c.Last == null) return;
         var dt = c.Last.DeltaTof;
-        c.Row.SubItems[1].Text = dt.HasValue && Force(dt.Value) is { } f ? f.ToString("F2") : "--";
-        c.Row.SubItems[2].Text = dt?.ToString("F2") ?? "--";
+        c.Row.SubItems[1].Text = _plan.Describe(c.Ch);
+        c.Row.SubItems[2].Text = ForceText(c.Ch, dt);
+        c.Row.SubItems[3].Text = dt?.ToString("F2") ?? "--";
         var temp = c.Last.SpTemp ?? c.Last.RawTemp;
-        c.Row.SubItems[3].Text = temp?.ToString("F2") ?? "--";
-        c.Row.SubItems[4].Text = c.Snr.HasValue ? c.Snr.Value.ToString("0") : "--";
+        c.Row.SubItems[4].Text = temp?.ToString("F2") ?? "--";
+        c.Row.SubItems[5].Text = c.Snr.HasValue ? c.Snr.Value.ToString("0") : "--";
         var normal = c.Last.StatusCode == MeasStatusCode.Normal;
         var weak = c.Snr.HasValue && c.Snr.Value < DeviceEngine.ProbeSnrDb;
-        c.Row.SubItems[5].Text = normal ? (weak ? "信号弱" : "正常") : DeviceEngine.DescribeStatus(c.Last.StatusCode);
+        c.Row.SubItems[6].Text = normal ? (weak ? "信号弱" : "正常") : DeviceEngine.DescribeStatus(c.Last.StatusCode);
         c.Row.ForeColor = !normal ? Color.Firebrick : weak ? Color.DarkOrange : Color.Black;
     }
 
@@ -783,7 +817,7 @@ public sealed class MainForm : Form
         if (!_channels.TryGetValue(_selected, out var c) || c.Last == null) return;
         var m = c.Last;
 
-        _cardValues[0].Text = m.DeltaTof.HasValue && Force(m.DeltaTof.Value) is { } force ? force.ToString("F2") : "--";
+        _cardValues[0].Text = ForceText(c.Ch, m.DeltaTof);
         _cardValues[1].Text = m.DeltaTof?.ToString("F2") ?? "--";
         _cardValues[2].Text = m.EchoTime?.ToString("F1") ?? "--";
         _cardValues[3].Text = m.SpTemp?.ToString("F2")
@@ -865,15 +899,57 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>
+    /// 启动时读 exe 旁的 farm.json（和大屏那份一样）与程序目录的 .ucf。有 farm.json 就按法兰取标定/额定/口径，
+    /// 列表多一列"位置"；没有就退回"程序目录最新 .ucf + 自由置零口径"的老行为，并在标签上说明。
+    /// </summary>
+    private void LoadPlan()
+    {
+        var notes = new List<string>();
+        var farm = CalPlan.FindFarm(AppContext.BaseDirectory, notes.Add);
+        _plan = CalPlan.Load(farm, AppContext.BaseDirectory, notes.Add);
+        foreach (var n in notes) OpsLog.Append(n);
+        ShowPlan();
+    }
+
+    private void ShowPlan()
+    {
+        var live = _plan.Flanges.Where(f => f.OnDevice).ToList();
+        string text;
+        Color color;
+        if (_plan.HasFarm && live.Count > 0)
+        {
+            var parts = live.Select(f =>
+                $"{f.Name}：{(f.Cal is { } c ? $"{c.FileName} {c.K:F4} {c.Unit}/ns" : "未标定")}"
+                + (_plan.Mode == BaselineMode.Anchor ? (f.Rated > 0 ? $"，额定 {f.Rated} kN" : "，未配额定值（只显示 Δ 变化量）") : string.Empty));
+            text = $"{_plan.ModeText} · " + string.Join("；", parts);
+            color = live.All(f => f.Cal is { }) ? Color.FromArgb(0, 110, 200) : Color.DarkOrange;
+        }
+        else if (_plan.GlobalCal is { } g)
+        {
+            text = $"标定：{g.FileName}（{g.Points} 点） {g.K:F4} {g.Unit}/ns"
+                   + (g.B != 0 ? $" {(g.B > 0 ? "+" : "-")} {Math.Abs(g.B):F2}" : string.Empty)
+                   + " · 未找到 farm.json，按自由置零口径显示 k·Δt+b（在役锚定的螺栓这是较锚定的变化量）";
+            color = Color.FromArgb(0, 110, 200);
+        }
+        else
+        {
+            text = "标定：未加载标定文件（不显示夹紧力，请加载 .ucf）";
+            color = Color.DarkOrange;
+        }
+
+        _lblCal.Text = text;
+        _lblCal.ForeColor = color;
+        _tip.SetToolTip(_lblCal, text);
+    }
+
     private void LoadUcf(string path)
     {
-        // 拟合只在 FxDevice.Ucf 里做一份，桌面版和大屏算出来的力必须是同一套系数
+        // 拟合只在 FxDevice.Ucf 里做一份，桌面版和大屏算出来的力必须是同一套系数。
+        // 手工指定的标定文件对所有法兰生效——这是工程师的显式动作，记操作记录
         var cal = Ucf.Load(path);
-        _coefK = cal.K;
-        _coefB = cal.B;
-        _lblCal.Text = $"标定：{cal.FileName}（{cal.Points} 点） {cal.K:F4} {cal.Unit}/ns"
-                       + (_coefB != 0 ? $" {(_coefB > 0 ? "+" : "-")} {Math.Abs(_coefB):F2}" : string.Empty);
-        _lblCal.ForeColor = Color.FromArgb(0, 110, 200);
-        OpsLog.Append($"加载标定文件 {cal.FileName}（{cal.Points} 点）k={cal.K:F4} {cal.Unit}/ns b={_coefB:F2}");
+        _plan = _plan.WithCal(cal);
+        ShowPlan();
+        OpsLog.Append($"手工加载标定文件 {cal.FileName}（{cal.Points} 点）k={cal.K:F4} {cal.Unit}/ns b={cal.B:F2}，对全部通道生效");
     }
 }

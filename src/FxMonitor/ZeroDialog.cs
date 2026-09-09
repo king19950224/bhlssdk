@@ -38,7 +38,13 @@ internal sealed class ZeroDialog : Form
 
     public HashSet<ushort> ZeroedChannels { get; } = new();
 
-    public ZeroDialog(DeviceEngine engine, IReadOnlyList<ushort> monitoredChannels, ushort selectedChannel)
+    /// <summary>通道 → "CH3（塔筒顶段法兰 #24）"：下拉框和操作记录里都用它，现场知道拧的是哪颗。</summary>
+    private readonly Func<ushort, string> _label;
+
+    private readonly BaselineMode _mode;
+
+    public ZeroDialog(DeviceEngine engine, IReadOnlyList<ushort> monitoredChannels, ushort selectedChannel,
+        Func<ushort, string>? label = null, BaselineMode mode = BaselineMode.Anchor)
     {
         if (monitoredChannels.Count == 0)
         {
@@ -47,6 +53,8 @@ internal sealed class ZeroDialog : Form
 
         _engine = engine;
         _monitored = monitoredChannels;
+        _label = label ?? (ch => "CH" + ch);
+        _mode = mode;
 
         Text = "通道置零";
         Font = new Font("Microsoft YaHei UI", 9.5f);
@@ -63,7 +71,15 @@ internal sealed class ZeroDialog : Form
 
         foreach (var ch in monitoredChannels)
         {
-            _channel.Items.Add("CH" + ch);
+            _channel.Items.Add(_label(ch));
+        }
+
+        // 带位置的名字长（"CH3（塔筒顶段法兰 #24）"），下拉框按最长的一项放宽
+        if (label is not null)
+        {
+            using var g = CreateGraphics();
+            var widest = monitoredChannels.Max(ch => (int)Math.Ceiling(g.MeasureString(_label(ch), Font).Width));
+            _channel.Width = Math.Clamp(widest + 32, 90, 300);
         }
 
         var idx = monitoredChannels.ToList().IndexOf(selectedChannel);
@@ -123,13 +139,18 @@ internal sealed class ZeroDialog : Form
         _status.Location = new Point(14, 6);
         row5.Controls.Add(_status);
 
+        // 提示按项目口径写：自由置零要求螺栓处于自由状态；在役锚定则是在已拧紧的螺栓上置零，之后看的是较此刻的变化量。
+        // 口径写错了，现场就会在错误的状态下置零，大屏上的每个数都跟着错
         var hint = new Label
         {
             Dock = DockStyle.Bottom,
             Height = 46,
             Padding = new Padding(14, 4, 10, 2),
             ForeColor = Color.Gray,
-            Text = "置零会用当前实测的声时、温度和回波覆盖该通道的基线。请在螺栓处于自由状态时置零；置零后该通道之前的读数不再可比。",
+            Text = "置零会用当前实测的声时、温度和回波覆盖该通道的基线；置零后该通道之前的读数不再可比。"
+                   + (_mode == BaselineMode.Free
+                       ? "本项目口径为自由状态置零：请在螺栓拧紧前置零。"
+                       : "本项目口径为在役锚定：在螺栓已拧紧的状态下置零，之后显示的是较此刻的变化量（按额定值估算预紧力）。"),
         };
 
         Controls.Add(row5);
@@ -289,7 +310,7 @@ internal sealed class ZeroDialog : Form
                 ZeroedChannels.Add(ch);
             }
 
-            OpsLog.Append($"CH{ch} 置零{(ok ? "成功" : "失败")} {detail} 标准差={std:F2}ns 帧数={count}{(_force.Checked ? " 强制" : "")}");
+            OpsLog.Append($"{_label(ch)} 置零{(ok ? "成功" : "失败")} {detail} 标准差={std:F2}ns 帧数={count}{(_force.Checked ? " 强制" : "")}");
             ShowBaseline();
             ResetStatsAfterZero();
         }
