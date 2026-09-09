@@ -1,103 +1,61 @@
-# BoltPreload — 螺栓预紧力在线监测系统
+# BoltPreload — 螺栓预紧力超声测量
 
-用超声波量螺栓的回波渡越时间，反算这颗螺栓当前被拧到多紧。7×24 连续盯着，松了报警，另外能看历史趋势、出报告。设备侧接厂家 FxSDK（C# 1.4）。
+用超声波量螺栓的回波渡越时间，反算这颗螺栓当前被拧到多紧。设备侧接厂家 FxSDK 1.6（C# 源码编入，`bhls1.6/sdk16`）。
 
-## 文档
+产品线只有两个软件（2026-08-28 定型）。此前的在线监测平台（ASP.NET API + PostgreSQL + Vue 控制台）与 Avalonia 工位软件试验线已整体废弃并从仓库移除。
 
-全部在 `资料/工程文档/`：
+## 两个软件
 
-- 开发文档：`资料/工程文档/development-guide.md`，新人先看这份
-- 现场部署手册：`资料/工程文档/deployment-guide.md`
-- 标定现场操作规程：`资料/工程文档/calibration-field-guide.md`
-- 运维排障：`资料/工程文档/troubleshooting.md`
-- 完整设计方案：`资料/工程文档/plan.md`
+### 1. FxMonitor（现场桌面软件，运维/安装用）
 
-## 开发环境要求
+`src/FxMonitor` — WinForms 程序：连上设备看实时波形/夹紧力/声时差，加载 `.ucf` 标定文件；
+「参数下发…」按通道段批量写可在线改的参数（探头频率/回波窗/回波宽度/增益/脉冲组），写完逐项读回核对。
 
-- macOS（开发机）或 Linux/Windows
-- .NET 8 SDK（[下载](https://dotnet.microsoft.com/en-us/download/dotnet/8.0)）
-- Docker Desktop（[下载](https://www.docker.com/products/docker-desktop/)），用于本地跑 PostgreSQL + TimescaleDB
-- Node 20+（前端开发）
-- Git
-
-部署环境是 Windows 工控机，**不能用 Docker**，PG 走原生安装。开发机用 Docker 只是为了不污染原生 macOS。
-
-现场部署目前按 `资料/工程文档/deployment-guide.md` 手工执行（建库跑迁移 → 注入配置 → 签发授权 → NSSM 注册服务 → 自检）。
-Windows Inno Setup 脚本已入库（`deploy/installer/installer.iss` + README）；本机构建仍需安装 Inno Setup 并做工控机彩排。
-
-## 快速开始
-
-### 启动本地依赖
-
-```bash
-docker compose up -d postgres
+```powershell
+dotnet run --project src/FxMonitor              # 或 FxMonitor.exe [ip:port] [--auto] [--demo]
+dotnet publish src/FxMonitor -c Release         # 自包含单文件 exe，拷走就能跑
 ```
 
-第一次启动会自动创建数据库并按序执行 `deploy/sql/0*.sql` 全部迁移（含 dev 种子），
-同时写 `schema_migrations` 账本——语义与生产升级脚本 `deploy/windows/apply-migrations.ps1` 一致。
+### 2. BoltPreload.Monitor（业主网页大屏）
 
-### 跑后端
+`src/BoltPreload.Monitor` — 自托管只读监视器：本机 SDK 直连设备，浏览器（局域网任意电脑/手机）开网页就能看，无需登录。历史数据落本地 SQLite（exe 旁 `data/history.db`），标定用 exe 旁的 `.ucf` 文件。
 
-```bash
-cd src/BoltPreload.Api
-dotnet run
+```powershell
+dotnet run --project src/BoltPreload.Monitor    # 默认 http://0.0.0.0:5080
 ```
 
-默认端口 5000，UI 在 http://localhost:5000（当前进程只提供 HTTP，TLS 由现场反向代理终结，见部署手册 §5）
+**注意：设备只允许一路 TCP 连接** —— FxMonitor 和大屏不能同时连同一台设备，现场调参先停大屏。
 
-开发环境会自动创建 `admin` / `admin123`（仅 Development）。生产环境不会自动建账号，
-首装必须提供 `BoltPreload__BootstrapAdminPassword`，否则没人能登录 —— 详见部署手册 §5。
+页面配置在 `wwwroot/farm.json`，改完刷新页面即生效（`device` / `channels` / `thresholds` 由服务端启动时读取，改这三项要重启）：
 
-### 跑测试
+| 字段 | 含义 |
+|---|---|
+| `device` | 设备 `ip:port`，服务端自动连接、断线重连 |
+| `channels` | **实际接了探头**的通道，服务端只轮询这些 |
+| `plannedChannels` | 全局缺省的规划探头位（含未接的），页面按它固定显示 8 个位子，没接的标"待接入" |
+| `thresholds.ratedKn / warnRatio / alarmRatio` | 额定预紧力与偏低/松动判定比例 |
+| `bind.turbine / bind.flangeIndex` | 设备装在哪台机组的哪个法兰（`flanges` 下标） |
+| `flanges[].boltCount` | 该法兰螺栓总数，全部画出 |
+| `flanges[].kind` | `"root"` 表示叶根（画成层合板筒 + 变桨轴承），不写按塔筒钢法兰画 |
+| `flanges[].plannedChannels` | 该法兰自己的规划探头位，覆盖全局 `plannedChannels`（叶根法兰预设 12 位）；写了的法兰在机组图上也会画出这些位子 |
+| `flanges[].numbering` | `{ topBolt, clockwise }`：图纸上正上方那颗的编号、编号方向，用来和图纸对号 |
+| `flanges[].channelBolts` | `{ "通道": 螺栓号 }`，每个探头实际装在哪颗螺栓上；没配的从 #1 起均匀占位 |
+| `flanges[].marks` | 可选，`[{ at: 螺栓号, label }]`，在环外标基准位置 |
 
-```bash
-dotnet test
-```
+页面路由：`#/farm` 总览、`#/turbine/N` 任一机组、`#/flange/i` 当前机组任一法兰（没接入的也能看画面，只是没数据）、`#/alarms`、`#/report`。
 
-**数据库必须先起来**（见上面的“启动本地依赖”）。连不上库时约 **171** 个 Postgres 集成测试会自动跳过，
-`dotnet test` 照样报“已通过”，只在末尾一行写“已跳过: 171”—— 很容易被当成全测过了。
-跳过的恰好是覆盖面最广的一批：权限守卫、建档绑定、报警管线、入库热路径、EF 模型与
-手写 schema 的一致性。CI 已对跳过数=0 设门禁。合入前请确认那行是“已跳过: 0”。
+机组结构页是 Three.js 三维场景（`wwwroot/tower3d.js`，库文件 vendored 在 `wwwroot/vendor/three`，MIT，随 exe 一起发布，不依赖外网）；浏览器没有 WebGL 时自动退回 SVG 版。
 
-### 关停依赖
+## 仓库结构
 
-```bash
-docker compose down
-```
+- `src/FxMonitor` — 桌面软件（监视 + 参数下发）
+- `src/BoltPreload.Monitor` — 网页大屏
+- `src/FxDevice` — 两者共用的设备连接引擎（协议分组、写后读回判定都在这里）
+- `bhls1.6/` — 厂家 C# SDK 1.6 源码
+- `bhls1.6/FxReader` — 厂家示例 CLI（抓 raw / 打零点），不进主方案、不随现场发布
+- `资料/工程文档/` — 历史设计与现场记录（多针对已废弃平台，不作现行手册）
+- `tmp/` — 本机联调草稿（gitignore，不入库）
 
-数据保留在 `.docker-data/` 下，下次启动还能用。完全清空：`docker compose down -v`。
+## 环境
 
-## 项目结构
-
-```
-BoltPreload/
-├── src/
-│   ├── BoltPreload.Domain/            领域模型
-│   ├── BoltPreload.Application/       用例
-│   ├── BoltPreload.Infrastructure/    EF Core + Timescale
-│   ├── BoltPreload.Fx/                FxSDK 包装
-│   ├── BoltPreload.Algorithms/        TOF / 应力 / 温度补偿
-│   ├── BoltPreload.Calibration/       标定算法
-│   ├── BoltPreload.Api/               ASP.NET Core
-│   └── BoltPreload.Tests/             单测 + 集成测试
-├── web/                                Vue 3 前端
-├── deploy/
-│   ├── docker-compose.yml              本地开发用
-│   ├── sql/                            数据库迁移脚本（生产只跑 0*.sql，不含 dev/）
-│   ├── windows/                        工控机部署脚本（NSSM 服务注册、备份、诊断收集）
-│   └── installer/                      Windows Inno Setup 脚本（需本机装 Inno 构建）
-├── tools/
-│   ├── DeviceSmokeTest/                真机连通性烟测
-│   └── LicenseSigner/                  授权签发（供应商侧，不随交付包发出）
-└── 资料/工程文档/                       工程文档（开发/部署/标定/排障手册与设计方案）
-```
-
-## 业务约束
-
-**这是商用关键基础设施监测系统**，监测对象（风电塔筒、桥梁、压力容器法兰等）失效后果可能是人员伤亡。所有设计、开发、部署严守 6 条商用底线（见方案 §0），违反任意一条都是给未来的灾难性事故埋雷。
-
-任何对算法、阈值、报警规则的修改都要能追溯到国标、SDK 源码或现场标定数据。"我觉得" 不能进系统。
-
-## License
-
-待定（视客户合同）。
+- .NET 8 SDK；目标机 Windows（FxMonitor 为 WinForms）

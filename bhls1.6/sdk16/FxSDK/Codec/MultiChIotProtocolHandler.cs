@@ -30,6 +30,17 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
     private const byte LoraChMax = 79; //Lora的话 最大信道设置
     public const ushort QuantizationUnit = 1000;//量化单位
     private const ushort StorageMaxPts = 120;//最大存储波形点数
+    private const byte ChannelRegisterCount = 5; //通道硬件寄存器个数(0x00 探头频率 ~ 0x04 增益)
+    /// <summary>
+    /// ReadChannelParamAsync 的合并读名：一帧读回 0x00~0x04 全部通道寄存器，
+    /// 解码后仍按 ProbeFreq/EchoWin/EchoWidth/PulseConfig/Gain 逐个抛出 DeviceParameter。
+    /// </summary>
+    public const string ChannelRegistersParam = "ChannelRegisters";
+    /// <summary>
+    /// 写参数(0xA1)/写存储(0xC1)应答帧对应的 DeviceParameter 名，ParamValue 为应答命令码。
+    /// 上层据此得知设备已处理写命令，不必靠定长等待。
+    /// </summary>
+    public const string WriteAckParam = "WriteAck";
     #region 对象编码成字节数组
     /// <summary>
     /// 设备配置,不使用参数的话只包含通用测量参数配置
@@ -529,6 +540,11 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                 var readGainConfig = new ParameterConfig(0x04, 1, new byte[1]);
                 encodeMessages.Add(WrapCommand(device, device.Address,EncodeReadParamCmd(address, readGainConfig, Convert.ToByte(channel))));
             }
+            if (propertyName.Equals(ChannelRegistersParam)) //一帧读全部通道寄存器
+            {
+                var readAllConfig = new ParameterConfig(0x00, ChannelRegisterCount, new byte[1]);
+                encodeMessages.Add(WrapCommand(device, device.Address,EncodeReadParamCmd(address, readAllConfig, Convert.ToByte(channel))));
+            }
             
             if (propertyName.Equals(nameof(ChannelConfig.RefTime))) //初始化值
             {
@@ -729,8 +745,9 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
     {
         var decodedList = new List<DecodedResult>(); //解码结果列表
         //最小数据帧长度 帧头(4) + 长度(2) + Id(2) + 指令码(1) + 通道/标识(1) + CRC(2)
-        var minFrameSize = FrameHead.Length + 2 + 2 + 1 + 1 + 2 + FrameTail.Length;
-        while (!token.IsCancellationRequested && ContextData.Count > minFrameSize)
+        //帧尾不计入：否则一条最短的应答帧单独到达时会一直攒着不解，等到下一帧才被处理
+        var minFrameSize = FrameHead.Length + 2 + 2 + 1 + 1 + 2;
+        while (!token.IsCancellationRequested && ContextData.Count >= minFrameSize)
         {
             token.ThrowIfCancellationRequested(); 
             try
@@ -823,9 +840,16 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
                                         }
                                         break;
                                     case 0x81:
-                                    case 0x91:
-                                    case 0xA1: //写参数回应先忽略，但必须消费完整帧，避免破坏后续帧头
+                                    case 0x91: //模式命令回应忽略，但必须消费完整帧，避免破坏后续帧头
                                         isComplete = true;
+                                        break;
+                                    case 0xA1: //写参数回应
+                                    case 0xC1: //写存储回应
+                                        isComplete = true;
+                                        decodedList.Add(new DeviceParameter(WriteAckParam, decodedFrame[8])
+                                        {
+                                            Address = address, Channel = channel, ReceiveTime = DateTime.Now,
+                                        });
                                         break;
                                 }
 
@@ -1117,71 +1141,20 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             var startAddress = decodedFrame[payloadIdx];
             if (channel > 0)//通道参数
             {
-                if (startAddress == 0x00) //读探头频率
+                //回应：起始地址(1)+寄存器个数(1)+每个寄存器 2 字节。个数字节只在与帧内实际字节数吻合时才采信，
+                //否则按单寄存器解（老固件单读回应的个数字节不可靠时，不能把 CRC 解成下一个寄存器）。
+                var valueBytes = decodedFrame.Count - 2 - (payloadIdx + 2);
+                var countByte = decodedFrame[payloadIdx + 1];
+                var count = countByte > 1 && valueBytes == countByte * 2 ? countByte : 1;
+                var receiveTime = DateTime.Now;
+                for (var i = 0; i < count; i++)
                 {
-                    var probeFreqBytes = decodedFrame.GetRange(payloadIdx + 2, 2).ToArray();
-                    var probeFreq = BitConverter.ToUInt16(probeFreqBytes, 0) / 1000M;
-                    var probeFreqParam = new DeviceParameter(nameof(ChannelConfig.ProbeFreq), probeFreq)
-                    {
-                        Channel = channel,
-                        Address = address,
-                        ReceiveTime = DateTime.Now
-                    };
-                    paramList.Add(probeFreqParam);
-                }
-                else if (startAddress == 0x01) //读窗口时间
-                {
-                    var echoWinBytes = decodedFrame.GetRange(payloadIdx + 2, 2).ToArray();
-                    var echoWin = BitConverter.ToUInt16(echoWinBytes, 0) * 1000M;//to ns
-                    var echoWinParam = new DeviceParameter(nameof(ChannelConfig.EchoWin), echoWin)
-                    {
-                        Channel = channel,
-                        Address = address,
-                        ReceiveTime = DateTime.Now
-                    };
-                    paramList.Add(echoWinParam);   
-                }
-                else if (startAddress == 0x02) //读回波宽度
-                {
-                    var echoWidthBytes = decodedFrame.GetRange(payloadIdx + 2, 2).ToArray();
-                    var echoWidth = BitConverter.ToUInt16(echoWidthBytes, 0);//use us
-                    var echoWidthParam = new DeviceParameter(nameof(ChannelConfig.EchoWidth), echoWidth)
-                    {
-                        Channel = channel,
-                        Address = address,
-                        ReceiveTime = DateTime.Now
-                    };
-                    paramList.Add(echoWidthParam);  
-                }
-                else if (startAddress == 0x03)//读脉冲参数
-                {
-                    var forwardNum = (byte) ((decodedFrame[payloadIdx+3] & 0xF0) >> 4); //高4位
-                    var reverseNum = (byte) (decodedFrame[payloadIdx+3] & 0x0F); //低4位
-                    var pulseConfig = new PulseConfig
-                    {
-                        Duty = decodedFrame[payloadIdx+2], 
-                        Forward = forwardNum, 
-                        Reverse = reverseNum,
-                    };
-                    var pulseParam = new DeviceParameter(nameof(ChannelConfig.PulseConfig), pulseConfig)
-                    {
-                        Channel = channel,
-                        Address = address,
-                        ReceiveTime = DateTime.Now,
-                    };
-                    paramList.Add(pulseParam);   
-                }
-                else if (startAddress == 0x04)//增益
-                {
-                    var gainBytes = decodedFrame.GetRange(payloadIdx + 2, 2).ToArray();
-                    var gain = BitConverter.ToUInt16(gainBytes, 0);
-                    var gainParam = new DeviceParameter(nameof(ChannelConfig.Gain), gain)
-                    {
-                        Channel = channel,
-                        Address = address,
-                        ReceiveTime = DateTime.Now
-                    };
-                    paramList.Add(gainParam);   
+                    var param = DecodeChannelRegister((byte)(startAddress + i), decodedFrame, payloadIdx + 2 + i * 2);
+                    if (param == null) continue;
+                    param.Channel = channel;
+                    param.Address = address;
+                    param.ReceiveTime = receiveTime;
+                    paramList.Add(param);
                 }
                 isComplete = true;
             }
@@ -1229,6 +1202,33 @@ public class MultiChIotProtocolHandler : FxProtocolHandler
             //Console.WriteLine(ex);
         }
         return paramList;
+    }
+    /// <summary>
+    /// 解码单个通道寄存器(2 字节)：0x00 探头频率、0x01 窗口时间、0x02 窗口宽度、0x03 脉冲、0x04 增益
+    /// </summary>
+    private static DeviceParameter? DecodeChannelRegister(byte register, List<byte> decodedFrame, int at)
+    {
+        var raw = BitConverter.ToUInt16(new[] {decodedFrame[at], decodedFrame[at + 1]}, 0);
+        switch (register)
+        {
+            case 0x00:
+                return new DeviceParameter(nameof(ChannelConfig.ProbeFreq), raw / 1000M);
+            case 0x01:
+                return new DeviceParameter(nameof(ChannelConfig.EchoWin), raw * 1000M); //to ns
+            case 0x02:
+                return new DeviceParameter(nameof(ChannelConfig.EchoWidth), raw); //us
+            case 0x03:
+                return new DeviceParameter(nameof(ChannelConfig.PulseConfig), new PulseConfig
+                {
+                    Duty = decodedFrame[at], //低字节 占空比
+                    Forward = (byte) ((decodedFrame[at + 1] & 0xF0) >> 4), //高 4 位
+                    Reverse = (byte) (decodedFrame[at + 1] & 0x0F), //低 4 位
+                });
+            case 0x04:
+                return new DeviceParameter(nameof(ChannelConfig.Gain), raw);
+            default:
+                return null;
+        }
     }
     /// <summary>
     /// 解码设备状态参数结果

@@ -7,62 +7,27 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WarningsNotAsErrors>CS1591;CA1822;NU1903</WarningsNotAsErrors>
-    <!-- 豁免几条对 Phase 1 不必要的 CA 规则（详见每条注释）：
-         CS1591 缺 XML 注释
-         CA1031 catch (Exception) 过宽（IngestionService 等故意这么写避免单点失败）
-         CA1062 公共方法参数 null 检查（Phase 1 不强求）
-         CA1303 字符串硬编码本地化（中文日志故意硬编码）
-         CA1707 命名规范禁下划线（DTO 字段保留下划线表意）
-         CA1716 标识符不要跟保留字冲突
-         CA1848 必须用 LoggerMessage 委托（Phase 1 直接调 LogXxx，Phase 2 优化）
-         CA2007 await 必须 ConfigureAwait(false)（ASP.NET Core 不需要，反而有害）
-         CA2254 日志消息必须是常量模板
-         CA1859 参数应改用具体类型提性能（LeastSquaresFitter.FindGrubbsOutlier 的 indices）：
-                标定拟合不在 50Hz 入库热路径上，一次标定跑几十个点，这点装箱开销无意义；
-                参数保持 IReadOnlyList 是为了表达"被调方不改集合"。9.0 SDK 把这条默认升成
-                warning、8.0 SDK 不升，不豁免则同一份代码在 CI 能编、在装了新 SDK 的开发机编不过 -->
+    <!-- 现场软件以中文日志/注释为主，不强制 XML 文档与本地化资源。
+         分析器锁 net8：新 SDK 升默认严重度时，同一份代码不应在开发机编不过、CI 能过。 -->
     <NoWarn>$(NoWarn);CS1591;CA1031;CA1062;CA1303;CA1305;CA1707;CA1716;CA1848;CA2007;CA2254;CA1859</NoWarn>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <InvariantGlobalization>false</InvariantGlobalization>
-
-    <!-- 商用关键基础设施监测系统：编译期更严格 -->
     <AnalysisMode>Recommended</AnalysisMode>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
-    <!-- 分析器规则集锁到 net8：配 TreatWarningsAsErrors 之后，新 SDK 新增的规则会直接变成编译错误，
-         同一份代码在 CI（8.0.x）能编、在装了新 SDK 的开发机编不过。锁住只挡"新版本新增"的规则；
-         已存在规则被新版本调高默认严重度（如 9.0 把 CA1859 升成 warning）挡不住，那类仍需逐条进上面
-         的 NoWarn 并写明理由。 -->
     <AnalysisLevel>8.0</AnalysisLevel>
 
-    <!-- macOS 卷拷到 Windows 会在每个文件旁留一份同名的 ._xxx 资源派生文件（AppleDouble，二进制）。
-         .gitignore 拦得住入库，拦不住 MSBuild 的 **/*.cs 通配：实测 39 个 ._*.cs 被当源码编译，
-         报 CS2015“是二进制文件而非文本文件”，整个解决方案在 Windows 上编不过。
-         部署目标就是 Windows 工控机，这条排除是交付路径上的必需项。 -->
+    <!-- macOS 拷到 Windows 会留下 AppleDouble 的 ._*.cs，MSBuild 会当源码编并报 CS2015。 -->
     <DefaultItemExcludes>$(DefaultItemExcludes);**/._*</DefaultItemExcludes>
 
-    <Company>BoltPreload</Company>
-    <Product>BoltPreload — 螺栓预紧力在线监测系统</Product>
-    <Copyright>(c) BoltPreload Team</Copyright>
-    <!-- 交付版本：与前端 package.json、界面版本标识保持一致。
-         1.2.0：1.1.0（探头热插拔识别）之后新增四个特性批次——告警阈值进库（两步异人复核）、
-         告警出站通知（事务性发件箱 + webhook）、设备生命周期管理（不重启热增删）、
-         HTTPS 定稿与备份计划任务脚本。按语义化版本升次版本号。
-         1.2.1：商用交付冲刺批——假安全清零（DB 故障降级可见 + system_degraded 审计 + 前端陈旧态）、
-         真机回归（集成测试跳过归零、验收拦截闭环、故障演练）、安装包首次出包与部署脚本 BOM 修复、
-         备份月备/一键恢复、设备下发两段式与安全加固。 -->
-    <Version>1.2.1</Version>
+    <Company>青岛百恒新能源技术有限公司</Company>
+    <Product>螺栓预紧力超声测量</Product>
+    <Copyright>Copyright © 2026 青岛百恒新能源技术有限公司</Copyright>
   </PropertyGroup>
 
-  <ItemGroup>
-    <!-- 全局禁用一些过于啰嗦的分析器警告（保留真正有意义的） -->
-  </ItemGroup>
-
-  <!-- FxSDK→MathNet.Symbolics→FParsec 传递引入含高危 CVE 的 4.3.0 旧包，
-       传递版本提升不沿 ProjectReference 传播，故在此对全部项目统一提升到修复版。
-       net8 下两者均为 facade 包（运行时用内置实现），无任何行为影响，仅消除安全审计告警。
-       注意：external/FxSDK/Directory.Build.props 会截断本文件的继承，那里另有一份同样的提升，
-       改版本号时两处要一起改。 -->
+  <!-- FxSDK→MathNet.Symbolics→FParsec 可能带上含 CVE 的 4.3.0 facade 包；
+       提升不沿 ProjectReference 传播。厂家包在 bhls1.6/sdk16/FxSDK/Directory.Build.props
+       截断本文件继承，那边另有一份同样的提升。 -->
   <ItemGroup>
     <PackageReference Include="System.Net.Http" Version="4.3.4" />
     <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Company>青岛百恒新能源技术有限公司</Company>
+    <Copyright>Copyright © 2026 青岛百恒新能源技术有限公司</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\bhls1.6\sdk16\FxSDK\FxSDK.csproj" />
+  </ItemGroup>
+
+</Project>

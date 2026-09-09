@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>百恒风电场螺栓预紧力在线监测系统</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="bgfx"></div>
+
+  <header class="nav">
+    <div class="nav-l"><span id="clock">--</span></div>
+    <div class="nav-c">
+      <div class="title" id="farmName">百恒风电场螺栓预紧力在线监测系统</div>
+    </div>
+    <div class="nav-r">
+      <span class="statebox"><span class="dot" id="navDot"></span><span id="navState">未连接</span></span>
+    </div>
+  </header>
+
+  <div class="shell">
+    <aside class="menu">
+      <a class="mi" id="mi-farm" href="#/farm"><i>❖</i><span>风场总览</span></a>
+      <a class="mi" id="mi-flange" href="#/flange"><i>◎</i><span>实时监测</span></a>
+      <a class="mi" id="mi-alarms" href="#/alarms"><i>⚠</i><span>报警中心</span><b class="badge" id="alarmBadge" hidden>0</b></a>
+      <a class="mi" id="mi-report" href="#/report"><i>▤</i><span>统计报告</span></a>
+    </aside>
+
+    <div class="content">
+  <div class="subbar">
+    <div class="crumb" id="crumb">风场总览</div>
+    <a class="opslink" id="opsToggle" hidden>运维详情 ›</a>
+    <div class="notice" id="notice" hidden></div>
+    <div class="tagline">超声波法 · 螺栓预紧力实时在线监测</div>
+  </div>
+
+  <!-- 视图 1：风场总览（风机矩阵） -->
+  <div class="view" id="view-farm">
+    <div class="statbar" id="statbar"></div>
+    <div class="matrix" id="matrix"></div>
+  </div>
+
+  <!-- 视图 2：机组详情 -->
+  <div class="view" id="view-turbine" hidden>
+    <div class="tmain">
+      <div class="panel">
+        <div class="hd" id="towerTitle">机组结构</div>
+        <div class="towerbox" id="tower"></div>
+      </div>
+      <div class="tside">
+        <div class="panel">
+          <div class="hd">法兰监测点</div>
+          <div id="flangeList"></div>
+        </div>
+        <div class="panel grow">
+          <div class="hd">探头状态<span class="hdr" id="slotHint"></span></div>
+          <div class="slotgrid" id="slotGrid"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 视图 3：法兰详情。默认业主视图（螺栓状态结论），运维详情里才有波形/参数 -->
+  <div class="view" id="view-flange" hidden>
+    <div class="fmain owner" id="flangeGrid">
+      <div class="panel">
+        <div class="hd"><span id="flangeTitle">螺栓布置</span><span class="hdr" id="flangeStat"></span></div>
+        <div class="flangebox" id="flange"></div>
+      </div>
+      <div class="panel" id="ownerPanel">
+        <div class="hd">螺栓状态<span class="hdr" id="ratedShow"></span></div>
+        <div class="boltgrid" id="boltCards"></div>
+      </div>
+      <div class="panel" id="opsDetail" hidden>
+        <div class="hd" id="detailTitle">测点详情</div>
+        <div class="big"><div class="v" id="bigForce">--<small>kN</small></div><div class="k">预 紧 力</div></div>
+        <div class="mrow" id="mrow"></div>
+        <canvas id="wave" height="190"></canvas>
+        <div class="wavefoot">
+          <label><input type="checkbox" id="showref" checked> 叠加参考回波（置零基线）</label>
+          <span id="waveStatus"></span>
+        </div>
+      </div>
+      <div class="panel" id="opsTable" hidden>
+        <div class="hd">测点实时数据</div>
+        <div class="chtable" id="chtable"></div>
+      </div>
+    </div>
+    <div class="bottomgrid">
+      <div class="panel">
+        <div class="hd">法兰轴力分布</div>
+        <canvas id="dist" height="150"></canvas>
+      </div>
+      <div class="panel">
+        <div class="hd">预紧力趋势
+          <span class="chips" id="trendRange">
+            <a data-r="5m" class="on">5分钟</a>
+            <a data-r="1h">1小时</a>
+            <a data-r="24h">今天</a>
+            <a data-r="7d">7天</a>
+            <a data-r="30d">30天</a>
+          </span>
+        </div>
+        <canvas id="trend" height="150"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- 视图 4：报警中心 -->
+  <div class="view" id="view-alarms" hidden>
+    <div class="statbar alarmbar" id="alarmStats"></div>
+    <div class="panel">
+        <div class="hd">报警与事件记录
+          <span class="chips" id="alarmRange">
+            <a data-r="24h" class="on">今天</a>
+            <a data-r="7d">7天</a>
+            <a data-r="30d">30天</a>
+          </span>
+          <span class="hdr">关软件后仍保留</span>
+        </div>
+        <div class="evlist" id="evList"><div class="evempty">暂无事件 —— 所有监测螺栓状态正常</div></div>
+    </div>
+  </div>
+
+  <!-- 视图 5：统计报告 -->
+  <div class="view" id="view-report" hidden>
+    <div class="subtools">
+      <span class="chips" id="reportRange">
+        <a data-r="24h" class="on">今天</a>
+        <a data-r="7d">7天</a>
+        <a data-r="30d">30天</a>
+      </span>
+      <a class="btn" id="exportCsv" href="/api/export.csv?range=24h">导出 CSV</a>
+    </div>
+    <div class="rmain">
+      <div class="panel">
+        <div class="hd">全场螺栓健康度<span class="hdr" id="reportHint">当前快照 · 下表含区间统计</span></div>
+        <div class="ringwrap">
+          <div class="ring" id="healthRing"><div class="rv"><span id="healthPct">--</span><small>%</small><div class="rk">健康率</div></div></div>
+          <div class="rcounts" id="healthCounts"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="hd">测点明细<span class="hdr" id="reportTime"></span></div>
+        <div class="rtwrap">
+          <table class="rtable">
+            <thead><tr><th>测点</th><th>位置</th><th>当前 kN</th><th>最低</th><th>最高</th><th>平均</th><th>温度 ℃</th><th>占额定</th><th>状态</th></tr></thead>
+            <tbody id="reportRows"><tr><td colspan="9" class="revempty">等待数据……</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div class="hd">预紧力历史<span class="hdr" id="histHint">区间内落盘数据</span></div>
+      <canvas id="hist" height="220"></canvas>
+    </div>
+  </div>
+
+    </div><!-- /content -->
+  </div><!-- /shell -->
+
+  <footer class="foot">
+    <span>采集设备 <span id="epShow" class="epshow">--</span></span>
+    <span id="stateText">未连接</span>
+    <span id="calText"></span>
+    <span id="archText"></span>
+    <span id="log"></span>
+  </footer>
+
+<script src="app.js"></script>
+<!-- 机组结构三维版：three 随程序本地发布（局域网大屏没有外网）。模块加载失败或 WebGL 不可用时 app.js 用 SVG 版 -->
+<script type="importmap">{ "imports": { "three": "./vendor/three/three.module.js" } }</script>
+<script type="module" src="tower3d.js"></script>
+</body>
+</html>

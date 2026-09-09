@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>BoltPreload.Monitor</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- 业主大屏独立于旧服务端版本线（Directory.Build.props 里是 1.2.x），此处覆盖 -->
+    <Product>谛听·恒 螺栓预紧力监视大屏</Product>
+    <AssemblyTitle>谛听·恒 螺栓预紧力监视大屏</AssemblyTitle>
+    <Company>青岛百恒新能源技术有限公司</Company>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FxDevice\FxDevice.csproj" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 直接跑 bin 里的 exe（不经 dotnet run）时也要能找到页面 -->
+    <Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
