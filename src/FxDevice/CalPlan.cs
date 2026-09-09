@@ -162,7 +162,21 @@ public sealed class CalPlan
         return null;
     }
 
-    public static CalPlan Load(JsonElement? farm, string baseDir, Action<string> log)
+    internal static ushort[] ReadChannels(JsonElement el, string name)
+        => el.TryGetProperty(name, out var arr) && arr.ValueKind == JsonValueKind.Array
+            ? arr.EnumerateArray().Where(x => x.TryGetInt32(out var v) && v is > 0 and <= ushort.MaxValue)
+                .Select(x => (ushort)x.GetInt32()).Distinct().OrderBy(c => c).ToArray()
+            : Array.Empty<ushort>();
+
+    /// <summary>老写法（一台设备、接线写在顶层 flanges[] 里）。</summary>
+    public static CalPlan Load(JsonElement? farm, string baseDir, Action<string> log) => Load(farm, null, baseDir, log);
+
+    /// <summary>
+    /// 解析一台设备的方案。farm 是整份 farm.json：baseline / thresholds / flanges[] 结构模板；
+    /// device 是 devices[] 里这台设备那一项（它的 flanges[] 按 index 或 name 对上模板，写接线/标定/额定）；
+    /// device 为空时按老写法从顶层 flanges[] 直接读接线。
+    /// </summary>
+    public static CalPlan Load(JsonElement? farm, JsonElement? device, string baseDir, Action<string> log)
     {
         var mode = BaselineMode.Anchor;
         decimal globalRated = 0, warn = 0.85m, alarm = 0.7m;
@@ -188,12 +202,6 @@ public sealed class CalPlan
             return cal;
         }
 
-        static ushort[] ReadChannels(JsonElement el, string name)
-            => el.TryGetProperty(name, out var arr) && arr.ValueKind == JsonValueKind.Array
-                ? arr.EnumerateArray().Where(x => x.TryGetInt32(out var v) && v is > 0 and <= ushort.MaxValue)
-                    .Select(x => (ushort)x.GetInt32()).Distinct().OrderBy(c => c).ToArray()
-                : Array.Empty<ushort>();
-
         // 程序目录里最新的 .ucf 做兜底
         var newest = Directory.Exists(baseDir)
             ? Directory.GetFiles(baseDir, "*.ucf").OrderByDescending(File.GetLastWriteTime).FirstOrDefault()
@@ -218,24 +226,53 @@ public sealed class CalPlan
                 alarm = ReadDec("alarmRatio", 0.7m);
             }
 
-            if (root.TryGetProperty("bind", out var bind) && bind.TryGetProperty("flangeIndex", out var fiEl) && fiEl.TryGetInt32(out var fi))
+            var legacy = device is null;
+            if (legacy && root.TryGetProperty("bind", out var bind) && bind.TryGetProperty("flangeIndex", out var fiEl) && fiEl.TryGetInt32(out var fi))
             {
                 boundIndex = fi;
             }
 
             // 老写法：顶层 channels / plannedChannels 归到绑定法兰
-            var legacyChannels = ReadChannels(root, "channels");
-            var legacyPlanned = ReadChannels(root, "plannedChannels");
+            var legacyChannels = legacy ? ReadChannels(root, "channels") : Array.Empty<ushort>();
+            var legacyPlanned = legacy ? ReadChannels(root, "plannedChannels") : Array.Empty<ushort>();
+
+            // 新写法：这台设备的 flanges[]，按 index（或 name）对到模板上
+            var wiring = new Dictionary<int, JsonElement>();
+            if (device is { } dev && dev.TryGetProperty("flanges", out var dfl) && dfl.ValueKind == JsonValueKind.Array
+                && root.TryGetProperty("flanges", out var tmpl) && tmpl.ValueKind == JsonValueKind.Array)
+            {
+                var names = tmpl.EnumerateArray().Select((f, i) => (Name: f.TryGetProperty("name", out var nm) ? nm.GetString() : null, Index: i)).ToList();
+                foreach (var w in dfl.EnumerateArray())
+                {
+                    int? idx = w.TryGetProperty("index", out var ie) && ie.TryGetInt32(out var iv) ? iv : null;
+                    if (idx is null && w.TryGetProperty("name", out var wn) && wn.ValueKind == JsonValueKind.String)
+                    {
+                        idx = names.FirstOrDefault(x => x.Name == wn.GetString()).Name is null ? null : names.First(x => x.Name == wn.GetString()).Index;
+                    }
+
+                    if (idx is null || idx < 0 || idx >= names.Count)
+                    {
+                        log($"设备接线里有一项对不上 flanges 模板（要写 index 或和模板一致的 name），跳过：{w.GetRawText()}");
+                        continue;
+                    }
+
+                    wiring[idx.Value] = w;
+                }
+            }
 
             if (root.TryGetProperty("flanges", out var arr) && arr.ValueKind == JsonValueKind.Array)
             {
                 var index = 0;
+                var boundSet = !legacy;   // 新写法：镜头聚焦第一个接了线的法兰
                 foreach (var f in arr.EnumerateArray())
                 {
                     var name = f.TryGetProperty("name", out var nm) && nm.ValueKind == JsonValueKind.String ? nm.GetString()! : $"法兰 #{index}";
-                    var channels = ReadChannels(f, "channels");
-                    var planned = ReadChannels(f, "plannedChannels");
-                    if (index == boundIndex)
+                    // 接线/标定/额定：新写法从这台设备的那一项读，老写法就在模板自己身上
+                    var src = legacy ? f : wiring.TryGetValue(index, out var w) ? w : (JsonElement?)null;
+                    var channels = src is { } s1 ? ReadChannels(s1, "channels") : Array.Empty<ushort>();
+                    // 规划位：模板给全场统一的，设备那一项也可以覆盖
+                    var planned = src is { } s2 && s2.TryGetProperty("plannedChannels", out _) ? ReadChannels(s2, "plannedChannels") : ReadChannels(f, "plannedChannels");
+                    if (legacy && index == boundIndex)
                     {
                         if (channels.Length == 0) channels = legacyChannels;
                         if (planned.Length == 0) planned = legacyPlanned;
@@ -243,7 +280,7 @@ public sealed class CalPlan
 
                     // channelBolts 是接线表：键是通道、值是螺栓号，键也算接了线的位子
                     var bolts = new Dictionary<ushort, int>();
-                    if (f.TryGetProperty("channelBolts", out var cb) && cb.ValueKind == JsonValueKind.Object)
+                    if (src is { } s3 && s3.TryGetProperty("channelBolts", out var cb) && cb.ValueKind == JsonValueKind.Object)
                     {
                         foreach (var p in cb.EnumerateObject())
                         {
@@ -251,11 +288,16 @@ public sealed class CalPlan
                         }
                     }
 
-                    var ucfName = f.TryGetProperty("ucf", out var u) && u.ValueKind == JsonValueKind.String ? u.GetString() : null;
+                    var ucfName = src is { } s4 && s4.TryGetProperty("ucf", out var u) && u.ValueKind == JsonValueKind.String ? u.GetString() : null;
                     var ownCal = string.IsNullOrWhiteSpace(ucfName) ? null : LoadUcf(ucfName!, $"法兰「{name}」");
                     var cal = ownCal ?? globalCal;
                     var source = ownCal is not null ? $"法兰自己的 {ucfName}" : globalSource;
-                    var rated = f.TryGetProperty("ratedKn", out var r) && r.TryGetDecimal(out var rv) ? rv : globalRated;
+                    var rated = src is { } s5 && s5.TryGetProperty("ratedKn", out var r) && r.TryGetDecimal(out var rv) ? rv : globalRated;
+                    if (!boundSet && (channels.Length > 0 || bolts.Count > 0))
+                    {
+                        boundIndex = index;
+                        boundSet = true;
+                    }
 
                     var fc = new FlangeCal
                     {

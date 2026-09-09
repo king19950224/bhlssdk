@@ -326,6 +326,8 @@ public sealed class MainForm : Form
 
         _btnConnect.Enabled = false;
         _lblState.ForeColor = Color.Gray;
+        // 连哪台设备就用哪台的接线/标定（farm.json 里一个风场很多台）
+        LoadPlan();
         try
         {
             _cts = new CancellationTokenSource();
@@ -900,17 +902,41 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
-    /// 启动时读 exe 旁的 farm.json（和大屏那份一样）与程序目录的 .ucf。有 farm.json 就按法兰取标定/额定/口径，
-    /// 列表多一列"位置"；没有就退回"程序目录最新 .ucf + 自由置零口径"的老行为，并在标签上说明。
+    /// 读 exe 旁的 farm.json（和大屏那份一样）与程序目录的 .ucf。farm.json 里一个风场有很多台设备，
+    /// 按地址栏里的 IP 找到"我连的是哪台"，用它那台的接线/标定/额定/口径，列表多一列"位置"；
+    /// 找不到对应设备（或没有 farm.json）就退回"程序目录最新 .ucf + 自由置零口径"的老行为，并在标签上说明。
+    /// 连接时会按当时的地址再选一次。
     /// </summary>
     private void LoadPlan()
     {
         var notes = new List<string>();
-        var farm = CalPlan.FindFarm(AppContext.BaseDirectory, notes.Add);
-        _plan = CalPlan.Load(farm, AppContext.BaseDirectory, notes.Add);
+        var farmRoot = CalPlan.FindFarm(AppContext.BaseDirectory, notes.Add);
+        var farm = FarmPlan.Load(farmRoot, AppContext.BaseDirectory, notes.Add);
+        var dev = farm.ForEndpoint(_ipBox.Text);
+        if (dev is not null)
+        {
+            _plan = dev.Plan;
+            _planLabel = $"F{dev.Turbine:00} 机组";
+            if (farm.Devices.Count > 1) notes.Add($"farm.json 有 {farm.Devices.Count} 台设备，按地址 {_ipBox.Text.Trim()} 选中 {dev.Label}");
+        }
+        else
+        {
+            _plan = CalPlan.Load(null, AppContext.BaseDirectory, notes.Add);
+            _planLabel = string.Empty;
+            if (farm.HasFarm && farm.Devices.Count > 0)
+            {
+                notes.Add($"farm.json 里没有地址为 {_ipBox.Text.Trim()} 的设备（有：{string.Join("、", farm.Devices.Select(d => d.Label))}），按无 farm.json 处理");
+            }
+        }
+
         foreach (var n in notes) OpsLog.Append(n);
         ShowPlan();
+        foreach (var c in _channels.Values) UpdateRow(c);
+        RefreshSelected();
     }
+
+    /// <summary>"F01 机组"：当前方案属于哪台机组，标签上带着，免得连错设备还拿别台的接线表看。</summary>
+    private string _planLabel = string.Empty;
 
     private void ShowPlan()
     {
@@ -922,7 +948,7 @@ public sealed class MainForm : Form
             var parts = live.Select(f =>
                 $"{f.Name}：{(f.Cal is { } c ? $"{c.FileName} {c.K:F4} {c.Unit}/ns" : "未标定")}"
                 + (_plan.Mode == BaselineMode.Anchor ? (f.Rated > 0 ? $"，额定 {f.Rated} kN" : "，未配额定值（只显示 Δ 变化量）") : string.Empty));
-            text = $"{_plan.ModeText} · " + string.Join("；", parts);
+            text = $"{(_planLabel.Length > 0 ? _planLabel + " · " : string.Empty)}{_plan.ModeText} · " + string.Join("；", parts);
             color = live.All(f => f.Cal is { }) ? Color.FromArgb(0, 110, 200) : Color.DarkOrange;
         }
         else if (_plan.GlobalCal is { } g)

@@ -28,15 +28,12 @@ builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 builder.Logging.SetMinimumLevel(LogLevel.Warning);
 var app = builder.Build();
 
-var hub = new MonitorHub();
-var history = new HistoryStore(Path.Combine(AppContext.BaseDirectory, "data", "history.db"));
-hub.History = history;
 // Web 默认规则：字段名大小写不敏感（页面发的是小写 endpoint）
 var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
 Console.OutputEncoding = Encoding.UTF8;
 
-// farm.json：设备地址、测点、法兰、标定与阈值都在这。先整份读进来，下面分段取
+// farm.json：全场法兰模板、每台设备（机组、地址、接线、标定、额定）、阈值都在这
 var farmPath = Path.Combine(AppContext.BaseDirectory, "wwwroot", "farm.json");
 JsonElement? farmRoot = null;
 try
@@ -51,12 +48,40 @@ catch (Exception ex)
     Console.WriteLine($"farm.json 读取失败，全部用默认值：{ex.Message}");
 }
 
-// 标定与口径：按绑定法兰取 .ucf 和额定值，没配的回落到程序目录里的 .ucf。
+// 一个大屏接很多台设备：每台设备一个采集器（各自连接/保活/巡检/维护），共用一个广播和一个历史库。
+// 标定与口径按各台设备各法兰取 .ucf 和额定值，没配的回落到程序目录里的 .ucf。
 // 没有标定就不算力值——历史里 kn 留空、状态记"未标定"，页面只显示声时差。宁可没数，不能有假数。
-var plan = CalPlan.Load(farmRoot, AppContext.BaseDirectory, Console.WriteLine);
-hub.Plan = plan;
+var farm = FarmPlan.Load(farmRoot, AppContext.BaseDirectory, Console.WriteLine);
+if (farm.Devices.Count == 0)
+{
+    Console.WriteLine("farm.json 里没有配置任何设备（devices[] 或老写法的 device），按默认 192.168.0.7:23 / F01 / CH1–CH4 跑");
+    farm = FarmPlan.Load(JsonDocument.Parse("""{"device":"192.168.0.7:23","bind":{"turbine":1,"flangeIndex":0}}""").RootElement, AppContext.BaseDirectory, Console.WriteLine);
+}
+
+var legacyTurbine = farm.Devices[0].Turbine;
+var history = new HistoryStore(Path.Combine(AppContext.BaseDirectory, "data", "history.db"), legacyTurbine);
 // 不管有没有标定都登记一次：cal_log 里就能看出这段时间的历史是用哪份系数、哪种口径算的
-history.SetPlan(plan);
+history.SetPlans(farm.Devices.Select(d => (d.Turbine, d.Plan)));
+
+var broadcaster = new Broadcaster();
+var hubs = farm.Devices.Select(d => new MonitorHub(d.Turbine, d.Endpoint, d.Plan, d.Guard, broadcaster, history)).ToList();
+var hubByTurbine = hubs.ToDictionary(h => h.Turbine);
+var planMode = farm.Devices[0].Plan;   // 口径/阈值全场统一，取第一台的
+
+// 整站状态：农场级口径 + 每台设备各自的状态。页面开 WebSocket 先收这一份，之后按设备增量更新
+object FullState() => new
+{
+    farmName = farm.FarmName,
+    turbineCount = farm.TurbineCount,
+    baseline = planMode.Mode == BaselineMode.Anchor ? "anchor" : "free",
+    baselineText = planMode.ModeText,
+    warnRatio = planMode.WarnRatio,
+    alarmRatio = planMode.AlarmRatio,
+    devices = hubs.Select(h => h.State()).ToList(),
+};
+broadcaster.FullState = FullState;
+
+MonitorHub? HubOf(int? turbine) => turbine is { } t ? hubByTurbine.GetValueOrDefault(t) : hubs.Count == 1 ? hubs[0] : null;
 
 app.UseDefaultFiles();
 // 静态文件每次都让浏览器回来核对（ETag 命中就 304，代价很小）。默认不发 Cache-Control 时浏览器按启发式
@@ -73,36 +98,22 @@ static bool IsLocalCall(HttpContext ctx) =>
     ctx.Connection.RemoteIpAddress is { } ip
     && (IPAddress.IsLoopback(ip) || ip.Equals(ctx.Connection.LocalIpAddress));
 
-app.MapPost("/api/connect", async (HttpContext ctx) =>
+// 手动断开某台设备（重连由保活循环自动做）。只许大屏主机本地调用
+app.MapPost("/api/disconnect", async (HttpContext ctx, int? turbine) =>
 {
     if (!IsLocalCall(ctx)) return Results.StatusCode(403);
-    var req = await JsonSerializer.DeserializeAsync<ConnectReq>(ctx.Request.Body, jsonOpts);
-    var endpoint = req?.Endpoint;
-    if (string.IsNullOrWhiteSpace(endpoint)) return Results.BadRequest(new { error = "endpoint 不能为空" });
-    try
-    {
-        await hub.ConnectAsync(endpoint.Trim());
-        return Results.Json(hub.State());
-    }
-    catch (Exception ex)
-    {
-        return Results.Json(new { error = ex.Message }, statusCode: 500);
-    }
-});
-
-app.MapPost("/api/disconnect", async (HttpContext ctx) =>
-{
-    if (!IsLocalCall(ctx)) return Results.StatusCode(403);
+    if (HubOf(turbine) is not { } hub) return Results.BadRequest(new { error = "turbine 不对或没写" });
     await hub.DisconnectAsync();
     return Results.Json(hub.State());
 });
 
-// 维护模式：现场要用桌面端置零/调参时，大屏让出设备（只有一路 TCP）并在期限内不再重连；minutes<=0 结束维护立即恢复。
+// 维护模式：现场要用桌面端置零/调参时，大屏让出那台设备（只有一路 TCP）并在期限内不再重连；minutes<=0 结束维护立即恢复。
 // 只许大屏主机本地调用，页面上的按钮在别的电脑上按会得到 403
 app.MapPost("/api/maintenance", async (HttpContext ctx) =>
 {
     if (!IsLocalCall(ctx)) return Results.StatusCode(403);
     var req = await JsonSerializer.DeserializeAsync<MaintenanceReq>(ctx.Request.Body, jsonOpts);
+    if (HubOf(req?.Turbine) is not { } hub) return Results.BadRequest(new { error = "turbine 不对或没写" });
     var minutes = req?.Minutes ?? 0;
     if (minutes <= 0)
     {
@@ -117,28 +128,30 @@ app.MapPost("/api/maintenance", async (HttpContext ctx) =>
 });
 
 // 立刻巡检一轮（换插探头后不想等 10 分钟）：保活循环最多 10 秒内响应
-app.MapPost("/api/scan", (HttpContext ctx) =>
+app.MapPost("/api/scan", (HttpContext ctx, int? turbine) =>
 {
     if (!IsLocalCall(ctx)) return Results.StatusCode(403);
+    if (HubOf(turbine) is not { } hub) return Results.BadRequest(new { error = "turbine 不对或没写" });
     hub.ScanRequested = true;
     return Results.Json(new { ok = true, scanning = hub.ScanActive });
 });
 
-app.MapGet("/api/state", () => Results.Json(hub.State()));
+app.MapGet("/api/state", () => Results.Json(FullState()));
 
-app.MapGet("/api/history", (string? range) => Results.Json(history.QuerySamples(range ?? "24h")));
-app.MapGet("/api/events", (string? range) => Results.Json(history.QueryEvents(range ?? "24h")));
-app.MapGet("/api/report", (string? range) => Results.Json(history.QueryReport(range ?? "24h")));
+// turbine 不给 = 全场（报告页、报警中心）；给了 = 只这台机组（机组页、法兰页趋势）
+app.MapGet("/api/history", (string? range, int? turbine) => Results.Json(history.QuerySamples(range ?? "24h", turbine)));
+app.MapGet("/api/events", (string? range, int? turbine) => Results.Json(history.QueryEvents(range ?? "24h", turbine)));
+app.MapGet("/api/report", (string? range, int? turbine) => Results.Json(history.QueryReport(range ?? "24h", turbine)));
 app.MapGet("/api/archive", () => Results.Json(history.Stats()));
 // 边查边写到响应流：30 天的数据攒成一个字节数组再发会把内存吃光
-app.MapGet("/api/export.csv", async (HttpContext ctx, string? range) =>
+app.MapGet("/api/export.csv", async (HttpContext ctx, string? range, int? turbine) =>
 {
     var r = HistoryStore.CanonicalRange(range);
     ctx.Response.ContentType = "text/csv; charset=utf-8";
     var disposition = new ContentDispositionHeaderValue("attachment");
-    disposition.SetHttpFileName($"preload-{r}.csv");
+    disposition.SetHttpFileName(turbine is { } tb ? $"preload-F{tb:00}-{r}.csv" : $"preload-{r}.csv");
     ctx.Response.Headers.ContentDisposition = disposition.ToString();
-    await history.ExportCsvAsync(r, ctx.Response.Body, ctx.RequestAborted);
+    await history.ExportCsvAsync(r, turbine, ctx.Response.Body, ctx.RequestAborted);
 });
 
 app.Map("/ws", async ctx =>
@@ -150,70 +163,39 @@ app.Map("/ws", async ctx =>
     }
 
     using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-    await hub.ServeSocketAsync(ws, ctx.RequestAborted);
+    await broadcaster.ServeSocketAsync(ws, ctx.RequestAborted);
 });
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {
-    hub.DisconnectAsync().GetAwaiter().GetResult();
+    foreach (var h in hubs) h.DisconnectAsync().GetAwaiter().GetResult();
     history.Dispose();
 });
 
 Console.WriteLine($"监视服务已启动：http://localhost:{port}/  （局域网访问用本机 IP）");
-Console.WriteLine($"基线口径：{plan.ModeText}" + (plan.Mode == BaselineMode.Anchor
+Console.WriteLine($"基线口径：{planMode.ModeText}" + (planMode.Mode == BaselineMode.Anchor
     ? "——k·Δt 是较锚定时刻的变化量，绝对预紧力按“锚定时 = 额定值”估算"
     : "——k·Δt + b 就是绝对预紧力"));
-// 各法兰的接线/标定/额定在 CalPlan.Load 里已逐条打印；这里只补全局兜底和没配到的情况
-if (!plan.Flanges.Any(f => f.OnDevice))
-{
-    Console.WriteLine("farm.json 里没有任何法兰配置在测通道（flanges[].channels），按默认 CH1–CH4 监测；"
-                      + (plan.GlobalCal is { } g ? $"标定用程序目录的 {g.FileName}" : "且没有 .ucf，不计算预紧力"));
-}
-else if (plan.GlobalCal is null && plan.Flanges.Any(f => f.OnDevice && f.Cal is null))
-{
-    Console.WriteLine("有法兰没配 ucf、程序目录里也没有 .ucf：这些法兰不计算预紧力，页面显示“未标定”");
-}
-
-if (plan.Mode == BaselineMode.Anchor && plan.Flanges.Any(f => f.OnDevice && f.Rated <= 0))
-{
-    Console.WriteLine("有法兰未配置额定预紧力：锚定口径下只能显示变化量，不能估算绝对预紧力，也不判松动");
-}
-
-// ── 自动连接：展示页上没有连接按钮，由服务自己连设备并保活 ──────────────
-// 设备地址从 farm.json 的 device 字段来，没有就用默认。测点、规划位由 CalPlan 按法兰汇总，这里只读巡检位
-var device = "192.168.0.7:23";
-if (farmRoot is { } root)
-{
-    try
-    {
-        if (root.TryGetProperty("device", out var d) && d.GetString() is { Length: > 0 } dev)
-        {
-            device = dev;
-        }
-
-        // 巡检位：只轮询、只判有没有探头，抓插到规划外通道的探头
-        if (root.TryGetProperty("guardChannels", out var arr) && arr.ValueKind == JsonValueKind.Array)
-        {
-            hub.Guard = arr.EnumerateArray().Where(x => x.TryGetInt32(out var v) && v is > 0 and <= ushort.MaxValue)
-                .Select(x => (ushort)x.GetInt32()).Distinct().ToArray();
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"farm.json 里的设备配置读取失败，用默认值：{ex.Message}");
-    }
-}
-
 Console.WriteLine($"历史库：{history.DbPath}（采样每 5 秒一条保留 90 天，事件保留 2 年）");
-Console.WriteLine($"采集设备：{device}（自动连接，断线自动重连），测点 "
-                  + string.Join("、", hub.WantedChannels.Select(c => "CH" + c))
-                  + (plan.WantedChannels.Count > 0 ? "（farm.json 配置，主动下发轮询）" : "（未配置，按默认 CH1–CH4）"));
-var extra = hub.Planned.Concat(hub.Guard).Except(hub.WantedChannels).Distinct().OrderBy(c => c).ToList();
-if (extra.Count > 0)
+Console.WriteLine($"接入设备 {hubs.Count} 台：");
+foreach (var h in hubs)
 {
-    Console.WriteLine($"探头在位识别：额外轮询 {string.Join("、", extra.Select(c => "CH" + c))}，按波形信噪比判断有没有探头");
+    var p = h.Plan;
+    // 各法兰的接线/标定/额定在 CalPlan.Load 里已逐条打印；这里只补全局兜底和没配到的情况
+    var note = !p.Flanges.Any(f => f.OnDevice)
+        ? "没有任何法兰配置在测通道，按默认 CH1–CH4 监测" + (p.GlobalCal is { } g ? $"，标定用程序目录的 {g.FileName}" : "，且没有 .ucf，不计算预紧力")
+        : p.GlobalCal is null && p.Flanges.Any(f => f.OnDevice && f.Cal is null)
+            ? "有法兰没配 ucf、程序目录里也没有 .ucf：这些法兰不计算预紧力"
+            : p.Mode == BaselineMode.Anchor && p.Flanges.Any(f => f.OnDevice && f.Rated <= 0)
+                ? "有法兰未配置额定预紧力：锚定口径下只显示变化量，不判松动"
+                : string.Empty;
+    var extra = h.Planned.Concat(h.Guard).Except(h.WantedChannels).Distinct().OrderBy(c => c).ToList();
+    Console.WriteLine($"  {h.Label}：测点 {string.Join("、", h.WantedChannels.Select(c => "CH" + c))}"
+                      + (extra.Count > 0 ? $"，在位识别另轮询 {string.Join("、", extra.Select(c => "CH" + c))}" : string.Empty)
+                      + (note.Length > 0 ? $"。{note}" : string.Empty));
 }
 
+// ── 自动连接：展示页上没有连接按钮，由服务自己连设备并保活；每台设备一条循环 ──────────────
 // TCP 没断但测量帧停了（设备被切到待机、卡死、链路半开）也算断：超过这个时间没有帧就重连，
 // 不然页面会一直拿最后一帧当"实时"显示。
 var stallAfter = TimeSpan.FromSeconds(90);
@@ -221,110 +203,102 @@ var stallAfter = TimeSpan.FromSeconds(90);
 // 一直读不到的（通道确实没置零）就逐次拉长间隔，最长一小时一次，别老打断业主的实时画面。
 var retryMissingMin = TimeSpan.FromMinutes(10);
 var retryMissingMax = TimeSpan.FromHours(1);
-var retryMissingEvery = retryMissingMin;
 // 探头在位巡检：连上先巡一轮，之后每 10 分钟一轮（本机 POST /api/scan 可随时触发），每轮轮宽集 45 秒
 var scanLength = TimeSpan.FromSeconds(45);
 var scanEvery = TimeSpan.FromMinutes(10);
-_ = Task.Run(async () =>
+foreach (var hub in hubs)
 {
-    while (true)
+    _ = Task.Run(async () =>
     {
-        try
+        var retryMissingEvery = retryMissingMin;
+        var tag = hub.Label;
+        while (true)
         {
-            // 维护中：不连、不重连，把设备留给现场的桌面端；到期自动往下走恢复连接
-            if (hub.InMaintenance)
+            try
             {
-                await Task.Delay(TimeSpan.FromSeconds(5));
-                continue;
+                // 维护中：不连、不重连，把设备留给现场的桌面端；到期自动往下走恢复连接
+                if (hub.InMaintenance)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5));
+                    continue;
+                }
+
+                if (hub.MaintenanceUntil is { } expired)
+                {
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 维护期限到（{expired.ToLocalTime():HH:mm}），恢复连接设备");
+                    hub.ExitMaintenance();
+                }
+
+                if (!hub.IsConnected)
+                {
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 尝试连接……");
+                    await hub.ConnectAsync();
+                    retryMissingEvery = retryMissingMin;
+                    var missing = hub.MissingChannels;
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 已连接，{hub.ChannelCount} 个测点在监测"
+                                      + (missing.Count > 0
+                                          ? $"；{string.Join("、", missing.Select(c => "CH" + c))} 读不到参考声时，{retryMissingEvery.TotalMinutes:0} 分钟后重试"
+                                          : string.Empty));
+                }
+                else if (DateTime.UtcNow - hub.LastFrameAt > stallAfter)
+                {
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 连接还在但 {stallAfter.TotalSeconds:0} 秒没有测量帧，重连设备");
+                    await hub.DisconnectAsync();
+                    continue;
+                }
+                else if (hub.ScanActive && DateTime.UtcNow - hub.ScanStartedAt > scanLength)
+                {
+                    var strays = await hub.EndScanAsync();
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 巡检结束"
+                                      + (strays.Count > 0 ? $"：{string.Join("、", strays.Select(c => "CH" + c))} 有探头信号但未在配置中" : "，未发现插错位的探头"));
+                }
+                else if (!hub.ScanActive && (hub.ScanRequested || DateTime.UtcNow - hub.LastScanAt > scanEvery))
+                {
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 巡检开始（{(hub.ScanRequested ? "手动触发" : "定时")}）");
+                    await hub.StartScanAsync();
+                }
+                else if (hub.MissingChannels.Count > 0 && DateTime.UtcNow - hub.LastChannelRetryAt > retryMissingEvery)
+                {
+                    var added = await hub.RetryMissingChannelsAsync();
+                    retryMissingEvery = added > 0
+                        ? retryMissingMin
+                        : TimeSpan.FromTicks(Math.Min(retryMissingEvery.Ticks * 2, retryMissingMax.Ticks));
+                    var missing = hub.MissingChannels;
+                    Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 补读测点：新增 {added} 个，现在 {hub.ChannelCount} 个在监测"
+                                      + (missing.Count > 0
+                                          ? $"；{string.Join("、", missing.Select(c => "CH" + c))} 仍读不到，{retryMissingEvery.TotalMinutes:0} 分钟后再试"
+                                          : string.Empty));
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} {(hub.IsConnected ? "保活出错" : "连接失败")}：{ex.Message}，稍后重试");
+                hub.NoteFailure(ex.Message);
             }
 
-            if (hub.MaintenanceUntil is { } expired)
-            {
-                Console.WriteLine($"{DateTime.Now:HH:mm:ss} 维护期限到（{expired.ToLocalTime():HH:mm}），恢复连接设备");
-                hub.ExitMaintenance();
-            }
-
-            if (!hub.IsConnected)
-            {
-                Console.WriteLine($"{DateTime.Now:HH:mm:ss} 尝试连接设备 {device}……");
-                await hub.ConnectAsync(device);
-                retryMissingEvery = retryMissingMin;
-                var missing = hub.MissingChannels;
-                Console.WriteLine($"{DateTime.Now:HH:mm:ss} 已连接，{hub.ChannelCount} 个测点在监测"
-                                  + (missing.Count > 0
-                                      ? $"；{string.Join("、", missing.Select(c => "CH" + c))} 读不到参考声时，{retryMissingEvery.TotalMinutes:0} 分钟后重试"
-                                      : string.Empty));
-            }
-            else if (DateTime.UtcNow - hub.LastFrameAt > stallAfter)
-            {
-                Console.WriteLine($"{DateTime.Now:HH:mm:ss} 连接还在但 {stallAfter.TotalSeconds:0} 秒没有测量帧，重连设备");
-                await hub.DisconnectAsync();
-                continue;
-            }
-            else if (hub.ScanActive && DateTime.UtcNow - hub.ScanStartedAt > scanLength)
-            {
-                var strays = await hub.EndScanAsync();
-                Console.WriteLine($"{DateTime.Now:HH:mm:ss} 巡检结束"
-                                  + (strays.Count > 0 ? $"：{string.Join("、", strays.Select(c => "CH" + c))} 有探头信号但未在配置中" : "，未发现插错位的探头"));
-            }
-            else if (!hub.ScanActive && (hub.ScanRequested || DateTime.UtcNow - hub.LastScanAt > scanEvery))
-            {
-                Console.WriteLine($"{DateTime.Now:HH:mm:ss} 巡检开始（{(hub.ScanRequested ? "手动触发" : "定时")}）");
-                await hub.StartScanAsync();
-            }
-            else if (hub.MissingChannels.Count > 0 && DateTime.UtcNow - hub.LastChannelRetryAt > retryMissingEvery)
-            {
-                var added = await hub.RetryMissingChannelsAsync();
-                retryMissingEvery = added > 0
-                    ? retryMissingMin
-                    : TimeSpan.FromTicks(Math.Min(retryMissingEvery.Ticks * 2, retryMissingMax.Ticks));
-                var missing = hub.MissingChannels;
-                Console.WriteLine($"{DateTime.Now:HH:mm:ss} 补读测点：新增 {added} 个，现在 {hub.ChannelCount} 个在监测"
-                                  + (missing.Count > 0
-                                      ? $"；{string.Join("、", missing.Select(c => "CH" + c))} 仍读不到，{retryMissingEvery.TotalMinutes:0} 分钟后再试"
-                                      : string.Empty));
-            }
+            // 维护刚结束要马上连回去，别让业主多等 30 秒
+            await Task.Delay(TimeSpan.FromSeconds(hub.IsConnected ? 10 : hub.MaintenanceUntil is null ? 30 : 1));
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"{DateTime.Now:HH:mm:ss} {(hub.IsConnected ? "保活出错" : "连接失败")}：{ex.Message}，稍后重试");
-        }
-
-        // 维护刚结束要马上连回去，别让业主多等 30 秒
-        await Task.Delay(TimeSpan.FromSeconds(hub.IsConnected ? 10 : hub.MaintenanceUntil is null ? 30 : 1));
-    }
-});
+    });
+}
 
 app.Run();
 
-internal sealed record ConnectReq(string? Endpoint);
+internal sealed record MaintenanceReq(int? Turbine, int? Minutes, string? Note);
 
-internal sealed record MaintenanceReq(int? Minutes, string? Note);
-
-/// <summary>设备连接与 WebSocket 广播。一台设备一份全局状态，多个浏览器同时看。</summary>
-internal sealed class MonitorHub : IDisposable
+/// <summary>
+/// WebSocket 广播：所有设备共用。每个浏览器连接的出站消息按产生顺序进有界队列，由一个发送循环依次写出：
+/// 之前每条消息 Task.Run 一次，任务抢锁的先后不定，帧会乱序到达；慢客户端还会把任务无限堆起来。
+/// 队列满了丢最旧的一条——实时帧过时了就没意义，下一帧马上会来。
+/// </summary>
+internal sealed class Broadcaster
 {
-    private static readonly ushort[] DefaultChannels = { 1, 2, 3, 4 };
-
-    /// <summary>串行化连接/断开/补读这类会动设备模式的操作。</summary>
-    private readonly SemaphoreSlim _gate = new(1, 1);
-
-    /// <summary>保护 _params/_refWaves：State() 在任意 HTTP 线程上枚举，连接流程在另一个线程上改。</summary>
-    private readonly object _stateLock = new();
-
-    public void Dispose() => _gate.Dispose();
-
-    /// <summary>
-    /// 一个浏览器连接。出站消息按产生顺序进有界队列，由一个发送循环依次写出：
-    /// 之前每条消息 Task.Run 一次，任务抢锁的先后不定，帧会乱序到达；慢客户端还会把任务无限堆起来。
-    /// 队列满了丢最旧的一条——实时帧过时了就没意义，下一帧马上会来。
-    /// </summary>
     private sealed class Client
     {
         public Client(WebSocket ws)
         {
             Ws = ws;
-            Outbox = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(256)
+            Outbox = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(512)
             {
                 SingleReader = true,
                 FullMode = BoundedChannelFullMode.DropOldest,
@@ -337,6 +311,112 @@ internal sealed class MonitorHub : IDisposable
     }
 
     private readonly List<Client> _clients = new();
+
+    /// <summary>整站状态（农场级 + 每台设备），新连上的浏览器先收这一份。</summary>
+    public Func<object> FullState { get; set; } = () => new { };
+
+    public void Broadcast(object msg)
+    {
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(msg);
+        lock (_clients)
+        {
+            foreach (var c in _clients) c.Outbox.Writer.TryWrite(bytes);
+        }
+    }
+
+    public async Task ServeSocketAsync(WebSocket ws, CancellationToken ct)
+    {
+        var client = new Client(ws);
+        lock (_clients) _clients.Add(client);
+        // 发送循环和接收循环并行：接收只为了收到 Close，发送把队列里的消息按序写出
+        var sender = SendLoopAsync(client, ct);
+        try
+        {
+            client.Outbox.Writer.TryWrite(JsonSerializer.SerializeToUtf8Bytes(new { type = "state", state = FullState() }));
+            var buf = new byte[1024];
+            while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
+            {
+                var r = await ws.ReceiveAsync(buf, ct);
+                if (r.MessageType == WebSocketMessageType.Close) break;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (WebSocketException) { }
+        finally
+        {
+            lock (_clients) _clients.Remove(client);
+            client.Outbox.Writer.TryComplete();
+            try { await sender; } catch { /* 连接已断，发送循环怎么退出都无所谓 */ }
+            // 浏览器主动断开时回一个 Close 把握手做完；发送循环已停，这里不会和 SendAsync 撞车
+            if (ws.State == WebSocketState.CloseReceived)
+            {
+                try { await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None); }
+                catch { /* 对方已经不在了 */ }
+            }
+        }
+    }
+
+    private static async Task SendLoopAsync(Client client, CancellationToken ct)
+    {
+        try
+        {
+            await foreach (var bytes in client.Outbox.Reader.ReadAllAsync(ct))
+            {
+                if (client.Ws.State != WebSocketState.Open) break;
+                await client.Ws.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (WebSocketException) { }
+    }
+}
+
+/// <summary>一台采集设备的连接、在位识别、状态判定与状态快照。一个大屏有很多个，各自独立连自己那台设备，共用广播和历史库。</summary>
+internal sealed class MonitorHub : IDisposable
+{
+    private static readonly ushort[] DefaultChannels = { 1, 2, 3, 4 };
+
+    /// <summary>串行化连接/断开/补读这类会动设备模式的操作。</summary>
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    /// <summary>保护 _params/_refWaves：State() 在任意 HTTP 线程上枚举，连接流程在另一个线程上改。</summary>
+    private readonly object _stateLock = new();
+
+    private readonly Broadcaster _bc;
+    private readonly HistoryStore _history;
+
+    public MonitorHub(int turbine, string endpoint, CalPlan plan, IReadOnlyList<ushort> guard, Broadcaster bc, HistoryStore history)
+    {
+        Turbine = turbine;
+        ConfiguredEndpoint = endpoint;
+        Plan = plan;
+        Guard = guard;
+        _bc = bc;
+        _history = history;
+    }
+
+    /// <summary>这台设备装在哪台机组上。帧、状态、历史都带它。</summary>
+    public int Turbine { get; }
+
+    /// <summary>farm.json 里配的地址（连接前也知道）。</summary>
+    public string ConfiguredEndpoint { get; }
+
+    public string Label => $"F{Turbine:00}（{ConfiguredEndpoint}）";
+
+    public void Dispose() => _gate.Dispose();
+
+    private void Broadcast(object msg) => _bc.Broadcast(msg);
+
+    /// <summary>这台设备的状态变了：只发它自己那份，页面按机组增量更新。</summary>
+    private void BroadcastState() => Broadcast(new { type = "device", state = State() });
+
+    /// <summary>保活循环里连接失败时记一句，页面上"未连接"旁边能看到为什么。</summary>
+    public void NoteFailure(string reason)
+    {
+        _lastLog = $"{DateTime.Now:HH:mm:ss} 连接失败：{reason}";
+        BroadcastState();
+    }
+
     private DeviceEngine? _engine;
     private string _endpoint = "";
     private string _lastLog = "";
@@ -401,8 +481,8 @@ internal sealed class MonitorHub : IDisposable
             LastScanAt = DateTime.UtcNow;
             ScanRequested = false;
             _lastLog = $"{DateTime.Now:HH:mm:ss} 巡检开始：轮询 {string.Join("、", wide.Select(c => "CH" + c))} 看各路有没有探头";
-            Broadcast(new { type = "log", text = _lastLog });
-            Broadcast(new { type = "state", state = State() });
+            Broadcast(new { type = "log", t = Turbine, text = _lastLog });
+            BroadcastState();
         }
         finally
         {
@@ -423,8 +503,8 @@ internal sealed class MonitorHub : IDisposable
             var strays = narrow.Where(c => !WantedChannels.Contains(c)).ToList();
             _lastLog = $"{DateTime.Now:HH:mm:ss} 巡检结束：常态轮询 {string.Join("、", narrow.Select(c => "CH" + c))}"
                        + (strays.Count > 0 ? $"，其中 {string.Join("、", strays.Select(c => "CH" + c))} 是未配置却有探头信号的通道" : "，规划位/巡检位都没有探头");
-            Broadcast(new { type = "log", text = _lastLog });
-            Broadcast(new { type = "state", state = State() });
+            Broadcast(new { type = "log", t = Turbine, text = _lastLog });
+            BroadcastState();
             return strays;
         }
         finally
@@ -525,9 +605,7 @@ internal sealed class MonitorHub : IDisposable
     }
 
     /// <summary>标定与口径方案（启动时定，之后只读）。</summary>
-    public CalPlan Plan { get; set; } = CalPlan.Load(null, AppContext.BaseDirectory, _ => { });
-
-    public HistoryStore? History { get; set; }
+    public CalPlan Plan { get; }
 
     /// <summary>TCP 还活着就算连着。帧停了由外面的看门狗按 LastFrameAt 判。</summary>
     public bool IsConnected => _engine is { IsConnected: true };
@@ -572,9 +650,9 @@ internal sealed class MonitorHub : IDisposable
     public IReadOnlyList<ushort> Planned => Plan.PlannedChannels;
 
     /// <summary>巡检位（farm.json guardChannels）：只读寄存器、只轮询、只判有没有探头，抓插到规划外通道的探头。</summary>
-    public IReadOnlyList<ushort> Guard { get; set; } = Array.Empty<ushort>();
+    public IReadOnlyList<ushort> Guard { get; }
 
-    public async Task ConnectAsync(string endpoint)
+    public async Task ConnectAsync()
     {
         await _gate.WaitAsync();
         try
@@ -586,7 +664,7 @@ internal sealed class MonitorHub : IDisposable
             {
                 // 引擎日志自带 HH:mm:ss 前缀
                 _lastLog = s;
-                Broadcast(new { type = "log", text = s });
+                Broadcast(new { type = "log", t = Turbine, text = s });
             };
             engine.OnMeasurement += m =>
             {
@@ -621,7 +699,7 @@ internal sealed class MonitorHub : IDisposable
 
                 Broadcast(FrameJson(m, snr, zeroed, mismatch, kn, dkn, health));
                 // 刚连上、在位判定还没定下来的那几帧不进历史：空通道会先记"检测异常"再改"探头无信号"，每次重连都多两条假事件
-                if (zeroed && settled) History?.Ingest(m, health!, kn, dkn);
+                if (zeroed && settled) _history.Ingest(Turbine, m, health!, kn, dkn);
                 if (flip is { } f)
                 {
                     var configured = WantedChannels.Contains(m.Channel);
@@ -638,16 +716,16 @@ internal sealed class MonitorHub : IDisposable
                     {
                         Console.WriteLine($"{DateTime.Now:HH:mm:ss} 在位识别：{msg}");
                         _lastLog = $"{DateTime.Now:HH:mm:ss} {msg}";
-                        Broadcast(new { type = "log", text = _lastLog });
+                        Broadcast(new { type = "log", t = Turbine, text = _lastLog });
                     }
 
-                    Broadcast(new { type = "state", state = State() });
+                    BroadcastState();
                 }
             };
 
             var opt = new DeviceOptions
             {
-                Endpoint = endpoint,
+                Endpoint = ConfiguredEndpoint,
                 Address = 1,
                 Resume = "multi",
             };
@@ -753,12 +831,12 @@ internal sealed class MonitorHub : IDisposable
             Interlocked.Exchange(ref _lastFrameTicks, DateTime.UtcNow.Ticks);
             LastChannelRetryAt = DateTime.UtcNow;
             _engine = engine;
-            _endpoint = endpoint;
+            _endpoint = ConfiguredEndpoint;
             // 读到的基线交历史库比对：和上次记的不一样就是现场重新置零过，记流水 + "基线重置"事件
             Dictionary<ushort, (decimal? RefTime, decimal? RefTemp)> read;
             lock (_stateLock) read = _lastReadBaselines;
-            if (read.Count > 0) History?.RecordBaselines(read);
-            Broadcast(new { type = "state", state = State() });
+            if (read.Count > 0) _history.RecordBaselines(Turbine, read);
+            BroadcastState();
         }
         finally
         {
@@ -797,7 +875,7 @@ internal sealed class MonitorHub : IDisposable
         MaintenanceNote = string.Empty;
         _lastLog = $"{DateTime.Now:HH:mm:ss} 维护结束，恢复连接设备";
         Console.WriteLine(_lastLog);
-        Broadcast(new { type = "state", state = State() });
+        BroadcastState();
     }
 
     public async Task DisconnectAsync()
@@ -807,7 +885,7 @@ internal sealed class MonitorHub : IDisposable
         {
             if (_engine is null) return;
             await CloseEngineAsync();
-            Broadcast(new { type = "state", state = State() });
+            BroadcastState();
         }
         finally
         {
@@ -857,8 +935,8 @@ internal sealed class MonitorHub : IDisposable
                 Interlocked.Exchange(ref _lastFrameTicks, DateTime.UtcNow.Ticks);
             }
 
-            if (baselines.Count > 0) History?.RecordBaselines(baselines);
-            if (fresh.Count > 0) Broadcast(new { type = "state", state = State() });
+            if (baselines.Count > 0) _history.RecordBaselines(Turbine, baselines);
+            if (fresh.Count > 0) BroadcastState();
             return fresh.Count;
         }
         finally
@@ -946,8 +1024,9 @@ internal sealed class MonitorHub : IDisposable
 
         return new
         {
+            turbine = Turbine,
             connected = _engine is { IsConnected: true },
-            endpoint = _endpoint,
+            endpoint = ConfiguredEndpoint,
             log = _lastLog,
             // 维护模式：大屏主动让出设备给现场桌面端，到期自动恢复。页面据此把"未连接"说成"维护中"
             maintenance = InMaintenance ? new { until = MaintenanceUntil, note = MaintenanceNote } : null,
@@ -967,6 +1046,8 @@ internal sealed class MonitorHub : IDisposable
                 onDevice = f.OnDevice,
                 channels = f.Channels,
                 planned = f.Planned,
+                // 接线表：通道 → 螺栓号，页面按它把探头画到图纸上的那颗螺栓
+                bolts = f.Bolts.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
                 rated = f.Rated,
                 cal = CalJson(f.Cal, f.CalSource),
             }).ToList(),
@@ -977,12 +1058,13 @@ internal sealed class MonitorHub : IDisposable
         };
     }
 
-    private static object FrameJson(ChannelResult m, double? snr, bool monitored, bool mismatch, decimal? kn, decimal? dkn, string? health)
+    private object FrameJson(ChannelResult m, double? snr, bool monitored, bool mismatch, decimal? kn, decimal? dkn, string? health)
     {
         // 力值和状态只在服务端算这一次，页面照抄：基线失配或未标定 kn 就是空，页面不得自己拿声时差乘系数、也不自己判状态
         return new
         {
             type = "frame",
+            t = Turbine,
             ch = m.Channel,
             monitored,
             snr = snr is { } s ? Math.Round(s, 1) : (double?)null,
@@ -1020,64 +1102,4 @@ internal sealed class MonitorHub : IDisposable
             : "无",
         _ => DeviceEngine.Raw(bag, key),
     };
-
-    // ── WebSocket ────────────────────────────────────────────────────────
-    public async Task ServeSocketAsync(WebSocket ws, CancellationToken ct)
-    {
-        var client = new Client(ws);
-        lock (_clients) _clients.Add(client);
-        // 发送循环和接收循环并行：接收只为了收到 Close，发送把队列里的消息按序写出
-        var sender = SendLoopAsync(client, ct);
-        try
-        {
-            client.Outbox.Writer.TryWrite(JsonSerializer.SerializeToUtf8Bytes(new { type = "state", state = State() }));
-            var buf = new byte[1024];
-            while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
-            {
-                var r = await ws.ReceiveAsync(buf, ct);
-                if (r.MessageType == WebSocketMessageType.Close) break;
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (WebSocketException) { }
-        finally
-        {
-            lock (_clients) _clients.Remove(client);
-            client.Outbox.Writer.TryComplete();
-            try { await sender; } catch { /* 连接已断，发送循环怎么退出都无所谓 */ }
-            // 浏览器主动断开时回一个 Close 把握手做完；发送循环已停，这里不会和 SendAsync 撞车
-            if (ws.State == WebSocketState.CloseReceived)
-            {
-                try { await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None); }
-                catch { /* 对方已经不在了 */ }
-            }
-        }
-    }
-
-    private static async Task SendLoopAsync(Client client, CancellationToken ct)
-    {
-        try
-        {
-            await foreach (var json in client.Outbox.Reader.ReadAllAsync(ct))
-            {
-                if (client.Ws.State != WebSocketState.Open) break;
-                await client.Ws.SendAsync(json, WebSocketMessageType.Text, true, ct);
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (WebSocketException) { }
-    }
-
-    private void Broadcast(object payload)
-    {
-        Client[] targets;
-        lock (_clients) targets = _clients.ToArray();
-        if (targets.Length == 0) return;
-        var json = JsonSerializer.SerializeToUtf8Bytes(payload);
-        foreach (var c in targets)
-        {
-            // DropOldest 模式下 TryWrite 总是成功；慢客户端丢的是它自己队列里最旧的一条
-            c.Outbox.Writer.TryWrite(json);
-        }
-    }
 }

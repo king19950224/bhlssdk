@@ -1,18 +1,14 @@
 {
   "farmName": "百恒风电场",
-  "device": "192.168.0.7:23",
+  "turbineCount": 20,
   "baseline": "anchor",
   "thresholds": { "ratedKn": 28, "warnRatio": 0.85, "alarmRatio": 0.7 },
-  "turbineCount": 20,
-  "bind": { "turbine": 1, "flangeIndex": 0 },
   "flanges": [
     {
       "name": "塔筒顶段法兰",
       "boltCount": 92,
-      "channels": [1, 2, 3, 4, 8],
-      "plannedChannels": [1, 2, 3, 4, 5, 6, 7, 8],
       "numbering": { "topBolt": 23, "clockwise": true },
-      "channelBolts": { "1": 1, "2": 12, "3": 24, "4": 35, "5": 47, "6": 58, "7": 70, "8": 81 }
+      "plannedChannels": [1, 2, 3, 4, 5, 6, 7, 8]
     },
     { "name": "塔筒中段法兰", "boltCount": 80 },
     { "name": "塔筒底段法兰", "boltCount": 96 },
@@ -21,6 +17,19 @@
       "kind": "root",
       "boltCount": 54,
       "plannedChannels": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    }
+  ],
+  "devices": [
+    {
+      "turbine": 1,
+      "device": "192.168.0.7:23",
+      "flanges": [
+        {
+          "index": 0,
+          "channels": [1, 2, 3, 4, 8],
+          "channelBolts": { "1": 1, "2": 12, "3": 24, "4": 35, "5": 47, "6": 58, "7": 70, "8": 81 }
+        }
+      ]
     }
   ]
 }
