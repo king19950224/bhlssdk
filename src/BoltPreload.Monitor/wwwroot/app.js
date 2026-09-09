@@ -135,14 +135,15 @@ function boltHealth(ch) {
   const m = c.last;
   if (!m) return "offline";
   if (c.at && Date.now() - c.at > STALE_MS) return "offline";
-  // 监测中的通道波形里连续没有像样的回波：探头被拔了或接到别处，比笼统的"检测异常"更准
+  // 状态是服务端每帧判好的（Health.Judge：在位、失配、标定、负力值、阈值全在那一份口径里），
+  // 历史采样和事件记的就是它，页面照抄——业主看到的和报表里写的才是同一个结论
+  if (m.health) return m.health;
+
+  // 老服务端的帧没有 health：按旧逻辑兜底
   if (g && g.presence === "none") return "noprobe";
-  // 声时偏离置零基线超出物理可能（>2 µs）：探头贴到别的螺栓上/重新耦合过/基线错了，不能当力值
   if (m.mismatch) return "shift";
   if (!m.normal || m.deltaTof == null) return "fault";
-  // 测得到、但这个法兰没有标定文件：算不出力值，也就下不了"正常/偏低/松动"的结论
   if (!calibratedCh(ch)) return "uncal";
-  // 阈值判定用服务端算好的 kn（和历史库、事件表同一个数）；锚定口径没额定值时 kn 为空，不判松动
   const rated = ratedOf(ch);
   const f = liveForce(ch);
   if (rated > 0 && f != null) {
@@ -155,10 +156,16 @@ function boltHealth(ch) {
 
 const HEALTH_TEXT = {
   ok: "正常", warn: "预紧力偏低", loose: "松动报警", fault: "检测异常", offline: "离线", pending: "待接入",
-  noprobe: "探头无信号", stray: "有信号·未配置", shift: "基线失配", uncal: "未标定",
+  noprobe: "探头无信号", stray: "有信号·未配置", shift: "基线失配", uncal: "未标定", badbase: "基线可疑",
+  rezero: "基线重置", unknown: "未知",
 };
 const UNCAL_TEXT = "未加载标定文件（.ucf），不计算预紧力";
-const ALARM_HEALTH = new Set(["loose", "fault", "noprobe", "shift"]);
+const BADBASE_TEXT = "力值为负：基线或额定值有误，需现场核对并重新置零";
+const ALARM_HEALTH = new Set(["loose", "fault", "noprobe", "shift", "badbase"]);
+// 卡片/槽位上要带颜色样式的状态
+const STYLED_HEALTH = ["loose", "warn", "pending", "noprobe", "stray", "shift", "badbase"];
+// 牌子上写文字而不是数字的状态
+const TEXTUAL_HEALTH = ["pending", "stray", "noprobe", "shift", "uncal", "badbase"];
 // 信号质量分级（厂家指南要求测量值与信号质量分开管理）：真探头 30 dB 以上，16 dB 以下算弱
 const WEAK_SNR_DB = 16;
 const isWeakSignal = ch => sigs[ch] && sigs[ch].presence === "probe" && sigs[ch].snr != null && sigs[ch].snr < WEAK_SNR_DB;
@@ -258,10 +265,37 @@ function probeNotice() {
   return { level, text: parts.join("；") };
 }
 
+// ── 维护模式：大屏让出设备给现场桌面端（设备只有一路 TCP），到期自动恢复 ─────
+let maintenance = null;   // {until, note} | null
+const hhmm = t => { const d = new Date(t); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+function updateMaintBox() {
+  const msg = $("maintMsg");
+  if (!msg) return;
+  const box = $("maintBox");
+  box.classList.toggle("active", !!maintenance);
+  if (maintenance) msg.textContent = `维护中，${hhmm(maintenance.until)} 自动恢复`;
+  else if (!msg.dataset.err) msg.textContent = "";
+}
+document.querySelectorAll("#maintBox a[data-min]").forEach(a => {
+  a.onclick = async () => {
+    const msg = $("maintMsg");
+    delete msg.dataset.err;
+    try {
+      const r = await fetch("/api/maintenance", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ minutes: Number(a.dataset.min), note: "现场置零/调参" }) });
+      if (r.status === 403) { msg.dataset.err = "1"; msg.textContent = "只能在大屏主机上操作"; return; }
+      if (!r.ok) { msg.dataset.err = "1"; msg.textContent = "操作失败"; return; }
+      applyState(await r.json());
+    } catch { msg.dataset.err = "1"; msg.textContent = "操作失败"; }
+  };
+});
+
 function refreshNotice() {
   const el = $("notice");
   if (!el) return;
-  const n = connected ? probeNotice() : null;
+  const n = maintenance
+    ? { level: "info", text: `现场维护中（${maintenance.note}）：大屏已让出设备给桌面端，预计 ${hhmm(maintenance.until)} 自动恢复监测；期间画面不更新` }
+    : connected ? probeNotice() : null;
   el.hidden = !n;
   if (!n) return;
   el.className = "notice " + n.level;
@@ -809,7 +843,7 @@ function updateSlotGrid() {
   for (const { ch } of entries) {
     const h = boundT ? boltHealth(ch) : "pending";
     const card = $("slot-" + ch);
-    const cls = "slot" + (["loose", "warn", "pending", "noprobe", "stray", "shift"].includes(h) ? " " + h : "") + (recentFlip(ch) ? " flash" : "");
+    const cls = "slot" + (STYLED_HEALTH.includes(h) ? " " + h : "") + (recentFlip(ch) ? " flash" : "");
     if (card.className !== cls) card.className = cls;
     const st = $("slot-st-" + ch);
     if (st.className !== "bst " + h) st.className = "bst " + h;
@@ -827,6 +861,7 @@ function updateSlotGrid() {
     const weak = isWeakSignal(ch) ? " · 信号弱，建议检查耦合" : "";
     const sub = h === "pending" ? (g && g.presence === "none" ? "规划探头位 · 已确认无探头信号" : "规划探头位，尚未接入")
       : h === "uncal" ? UNCAL_TEXT
+      : h === "badbase" ? BADBASE_TEXT
       : h === "noprobe" ? "探头信号消失：可能被拔出或接错"
       : h === "stray" ? (g && g.configured ? "有探头信号，但未置零" : "未配置通道出现探头信号 —— 可能插错位置")
       : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs，需重新置零`
@@ -910,7 +945,7 @@ function updateBoltCard(ch) {
   const h = viewHealth(ch);
   // 接线核对：在位判定刚翻转的通道闪几秒，现场脱耦一颗就知道是几号
   const flip = isBoundFlange() ? recentFlip(ch) : null;
-  const cls = ("bolt " + (["loose", "warn", "pending", "noprobe", "stray", "shift"].includes(h) ? h : "")
+  const cls = ("bolt " + (STYLED_HEALTH.includes(h) ? h : "")
     + (ch === selected ? " sel" : "") + (flip ? " flash" : "")).trim();
   if (card.className !== cls) card.className = cls;
   const bst = $("bst-" + ch);
@@ -928,7 +963,7 @@ function updateBoltCard(ch) {
   const rated = ratedOf(ch);
   const tempTxt = m && m.temp != null ? `温度 ${Number(m.temp).toFixed(1)} ℃` : "温度 --";
   const weakTxt = isWeakSignal(ch) ? ` · 信号弱（${sigs[ch].snr} dB），建议检查耦合` : "";
-  if (rated > 0 && f != null && h !== "offline") {
+  if (rated > 0 && f != null && h !== "offline" && h !== "badbase") {
     const pct = Math.max(0, f / rated * 100);
     $("bbar-" + ch).style.width = Math.min(100, pct) + "%";
     setSub(ch, `额定 ${rated} kN 的 ${pct.toFixed(0)}%` + (anchored() ? ` · ${deltaTxt(ch)}` : "") + ` · ${tempTxt}${weakTxt}${negativeHint(f)}`);
@@ -941,6 +976,7 @@ function updateBoltCard(ch) {
     const snrTxt = g && g.snr != null ? `信噪比 ${g.snr} dB` : "";
     const why = h === "fault" ? (noBase ? "有回波但无基线（通道未置零）" : "信号异常，等待恢复")
       : h === "uncal" ? `${UNCAL_TEXT}；声时差 ${m && m.deltaTof != null ? fmt(m.deltaTof, 1) + " ns" : "--"}`
+      : h === "badbase" ? `${BADBASE_TEXT}（算得 ${f == null ? "--" : f.toFixed(1)} kN，${deltaTxt(ch) || "声时差 " + fmt(m && m.deltaTof, 1) + " ns"}）`
       : h === "noprobe" ? `探头信号消失（${snrTxt}）：可能被拔出或接到了别的通道`
       : h === "stray" ? (g && g.configured
           ? `有探头信号（${snrTxt}），但该通道未置零，无法测力`
@@ -952,7 +988,7 @@ function updateBoltCard(ch) {
       : h === "pending" ? (g && g.presence === "none" ? "规划探头位 · 已确认无探头信号" : "规划探头位，尚未接入")
       : mk && mk.delta ? `${deltaTxt(ch)} · 未配置额定值，无法估算绝对预紧力`
       : "未配置额定预紧力" + negativeHint(f);
-    setSub(ch, ["pending", "noprobe", "stray", "shift", "uncal"].includes(h) ? why : why + " · " + tempTxt);
+    setSub(ch, ["pending", "noprobe", "stray", "shift", "uncal", "badbase"].includes(h) ? why : why + " · " + tempTxt);
   }
 }
 
@@ -1409,7 +1445,7 @@ function drawFlange() {
     setAttrIfChanged(b.chip, "data-flash", flash); setAttrIfChanged(b.g, "data-flash", flash);
     // 牌子上写的是文字状态（未标定/探头无信号/有信号·未配置…）还是数字：
     // 数字右对齐贴着单位；文字从牌子左侧排起，否则"有信号·未配置"这种长词会从左边顶出牌子
-    const textual = ["pending", "stray", "noprobe", "shift", "uncal"].includes(h);
+    const textual = TEXTUAL_HEALTH.includes(h);
     if (b.kn.getAttribute("data-textual") !== String(textual)) {
       b.kn.setAttribute("data-textual", String(textual));
       b.kn.setAttribute("x", textual ? 12 : FL.chipW - 26);
@@ -1420,6 +1456,7 @@ function drawFlange() {
       : h === "noprobe" ? "探头无信号"
       : h === "shift" ? "基线失配"
       : h === "uncal" ? "未标定"
+      : h === "badbase" ? "基线可疑"
       : mk == null ? "--"
       : mk.delta ? "Δ" + fmtSigned(mk.v, 1)
       : fmt(mk.v, 1);
@@ -1692,7 +1729,8 @@ function axisLabel(spanMs, i, n) {
   return `-${Math.round(ms / 86400000)}d`;
 }
 
-function drawForceChart(cv, ctx, series, spanMs, emptyText = "这段时间还没有落盘数据……") {
+// marks：基线重置事件 [{t, ch}]——现场重新置零后曲线会跳一截，画条竖虚线标出来，别让人以为是螺栓动了
+function drawForceChart(cv, ctx, series, spanMs, emptyText = "这段时间还没有落盘数据……", marks = []) {
   const w = cv.clientWidth, h = cv.clientHeight || cv.height;
   if (!w) return;
   if (cv.width !== w) cv.width = w;
@@ -1744,6 +1782,23 @@ function drawForceChart(cv, ctx, series, spanMs, emptyText = "这段时间还没
   }
   ctx.lineWidth = 1;
 
+  // 基线重置标记：只标画在图上的通道
+  const shown = new Set(chs);
+  const inSpan = marks.filter(mk => shown.has(Number(mk.ch)) && now - mk.t <= spanMs && now - mk.t >= 0);
+  if (inSpan.length) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(240, 180, 41, .8)"; ctx.setLineDash([4, 3]);
+    ctx.fillStyle = "rgba(240, 180, 41, .9)"; ctx.font = "10px sans-serif"; ctx.textAlign = "left";
+    let lastX = -Infinity;
+    for (const mk of inSpan.sort((a, b) => a.t - b.t)) {
+      const x = px(mk.t);
+      ctx.beginPath(); ctx.moveTo(x, rc.y); ctx.lineTo(x, rc.y + rc.h); ctx.stroke();
+      // 挨得太近的只写一个标签
+      if (x - lastX > 60) { ctx.fillText(`CH${mk.ch} 重新置零`, x + 3, rc.y + rc.h - 4); lastX = x; }
+    }
+    ctx.restore();
+  }
+
   let ly = rc.y + 8;
   ctx.textAlign = "left"; ctx.font = "12px sans-serif";
   for (const ch of chs) {
@@ -1766,22 +1821,31 @@ function drawTrend() {
   if (!isBoundFlange()) { drawForceChart(tcv, tctx, {}, span, "本法兰尚未接入监测"); return; }
   const chs = viewChannels();
   const series = trendRange === "5m" ? seriesFromLive(span, chs) : seriesFromArchive(histPoints, chs);
-  drawForceChart(tcv, tctx, series, span, flangeCal(viewFlange) ? undefined : UNCAL_TEXT);
+  drawForceChart(tcv, tctx, series, span, flangeCal(viewFlange) ? undefined : UNCAL_TEXT, rezeroMarks);
 }
 
 const hcv = $("hist"), hctx = hcv.getContext("2d");
 function drawHist() {
   if (!hcv) return;
   drawForceChart(hcv, hctx, seriesFromArchive(histPoints), RANGE_MS[reportRange] || RANGE_MS["24h"],
-    anyCalibrated() ? undefined : UNCAL_TEXT + "，这段时间没有力值曲线");
+    anyCalibrated() ? undefined : UNCAL_TEXT + "，这段时间没有力值曲线", rezeroMarks);
 }
 
+// 基线重置事件（现场重新置零）：和历史曲线一起拉，画在趋势图上
+let rezeroMarks = [];
 async function loadTrend(range) {
   try {
-    const r = await fetch(`/api/history?range=${range}`, { cache: "no-store" });
+    const [r, ev] = await Promise.all([
+      fetch(`/api/history?range=${range}`, { cache: "no-store" }),
+      fetch(`/api/events?range=${range}`, { cache: "no-store" }).catch(() => null),
+    ]);
     if (!r.ok) return;
     const j = await r.json();
     histPoints = j.points || [];
+    if (ev && ev.ok) {
+      const je = await ev.json();
+      rezeroMarks = (je.events || []).filter(e => e.to === "rezero").map(e => ({ t: e.t, ch: e.ch }));
+    }
     if (!$("view-flange").hidden) drawTrend();
     if (!$("view-report").hidden) drawHist();
   } catch { /* 服务刚起来或断了，下轮再拉 */ }
@@ -1883,13 +1947,14 @@ function renderAlarms() {
   const t = tid(FARM.bind.turbine);
   // 位置按通道所属法兰写；不在任何法兰接线表里的标"未分配"
   const where = ch => { const i = chFlange(Number(ch)); return i >= 0 ? flangeName(i) : "未分配"; };
+  // 基线重置事件（现场重新置零）没有"当时力值"，右侧写参考声时怎么变的
   list.innerHTML = archiveEvents.map(e => `
-    <div class="ev">
+    <div class="ev${e.to === "rezero" ? " rezero" : ""}">
       <span class="et">${fmtTime(e.t)}</span>
       <span class="ew">${t} · ${where(e.ch)} · CH${e.ch}</span>
       <span class="emsg"><span class="tag ${e.from}">${HEALTH_TEXT[e.from] || e.from}</span>
         <span class="arrow">→</span><span class="tag ${e.to}">${HEALTH_TEXT[e.to] || e.to}</span></span>
-      <span class="ekn">${e.kn == null ? "--" : "当时 " + e.kn.toFixed(2) + " kN"}</span>
+      <span class="ekn" title="${e.note || ""}">${e.note ? e.note : e.kn == null ? "--" : "当时 " + e.kn.toFixed(2) + " kN"}</span>
     </div>`).join("");
 }
 
@@ -1910,7 +1975,7 @@ async function loadReport(range) {
 function updateReport() {
   const chs = chList();
   // 每一种 boltHealth 可能返回的状态都要有桶，否则那颗螺栓就从统计里消失了，几项加起来对不上总数
-  const counts = { ok: 0, warn: 0, loose: 0, fault: 0, noprobe: 0, shift: 0, uncal: 0, offline: 0, other: 0 };
+  const counts = { ok: 0, warn: 0, loose: 0, fault: 0, noprobe: 0, shift: 0, badbase: 0, uncal: 0, offline: 0, other: 0 };
   chs.forEach(ch => {
     const h = boltHealth(ch);
     counts[h in counts ? h : "other"]++;
@@ -1918,8 +1983,8 @@ function updateReport() {
   const total = chs.length;
   // 没有标定就没有"健康率"这回事——不能把测得到的都算成正常
   const pct = total && anyCalibrated() ? Math.round(counts.ok / total * 100) : null;
-  // 探头无信号也归到"检测异常"里算一颗
-  const abnormal = counts.fault + counts.noprobe + counts.other;
+  // 探头无信号、基线可疑也归到"检测异常"里算一颗：都是"测不了/不该信"的螺栓
+  const abnormal = counts.fault + counts.noprobe + counts.badbase + counts.other;
   const degraded = counts.warn || abnormal || counts.shift;
 
   const ring = $("healthRing");
@@ -2014,13 +2079,18 @@ function applyState(s) {
     : `标定：${cal.k > 0 ? `${s.cal.name}（${s.cal.points} 点） ${cal.k.toFixed(4)} ${s.cal.unit}/ns · ${plan.baselineText}` : UNCAL_TEXT}`;
   $("calText").title = $("calText").textContent;
   $("calText").style.color = anyCalibrated() ? "" : "var(--warn)";
+  // 维护模式：大屏主动让出了设备（现场在用桌面端置零/调参），这不是故障，页面上说清楚
+  maintenance = s.maintenance || null;
   const healthy = connected && s.channels.length > 0;
-  $("stateText").textContent = healthy
-    ? `监测中，${s.channels.length} 个测点`
-    : connected ? "已连接，等待设备上报（自动重试中）" : "未连接（服务自动重连中）";
-  $("stateText").className = healthy ? "ok" : "";
-  $("navState").textContent = healthy ? "监测中" : "未连接";
-  $("navDot").className = healthy ? "dot on" : "dot";
+  $("stateText").textContent = maintenance
+    ? `维护中（${maintenance.note}），预计 ${hhmm(maintenance.until)} 自动恢复监测`
+    : healthy
+      ? `监测中，${s.channels.length} 个测点`
+      : connected ? "已连接，等待设备上报（自动重试中）" : "未连接（服务自动重连中）";
+  $("stateText").className = maintenance ? "maint" : healthy ? "ok" : "";
+  $("navState").textContent = maintenance ? "维护中" : healthy ? "监测中" : "未连接";
+  $("navDot").className = maintenance ? "dot maint" : healthy ? "dot on" : "dot";
+  updateMaintBox();
   if (s.endpoint) $("epShow").textContent = s.endpoint;
   // 在位识别结果：每一路有没有探头信号
   const prevSlots = slotList().join(",");

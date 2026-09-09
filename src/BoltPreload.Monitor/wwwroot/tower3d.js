@@ -17,7 +17,7 @@ const HUB_Y = H + 1.7;
 const STATUS_COLOR = {
   ok: 0x35c463, online: 0x35c463, warn: 0xf0b429, loose: 0xe5484d, alarm: 0xe5484d,
   fault: 0xd68a3c, offline: 0x5b7089, pending: 0x3a4c63, na: 0x4d637e,
-  noprobe: 0xff6a3d, stray: 0xf0b429, shift: 0xc46ee6, uncal: 0xf0b429,
+  noprobe: 0xff6a3d, stray: 0xf0b429, shift: 0xc46ee6, uncal: 0xf0b429, badbase: 0xc46ee6,
 };
 
 let renderer, scene, camera, controls, clock;

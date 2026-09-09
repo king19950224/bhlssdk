@@ -97,6 +97,25 @@ app.MapPost("/api/disconnect", async (HttpContext ctx) =>
     return Results.Json(hub.State());
 });
 
+// 维护模式：现场要用桌面端置零/调参时，大屏让出设备（只有一路 TCP）并在期限内不再重连；minutes<=0 结束维护立即恢复。
+// 只许大屏主机本地调用，页面上的按钮在别的电脑上按会得到 403
+app.MapPost("/api/maintenance", async (HttpContext ctx) =>
+{
+    if (!IsLocalCall(ctx)) return Results.StatusCode(403);
+    var req = await JsonSerializer.DeserializeAsync<MaintenanceReq>(ctx.Request.Body, jsonOpts);
+    var minutes = req?.Minutes ?? 0;
+    if (minutes <= 0)
+    {
+        hub.ExitMaintenance();
+    }
+    else
+    {
+        await hub.EnterMaintenanceAsync(TimeSpan.FromMinutes(Math.Min(minutes, 24 * 60)), string.IsNullOrWhiteSpace(req?.Note) ? "现场置零/调参" : req!.Note!.Trim());
+    }
+
+    return Results.Json(hub.State());
+});
+
 // 立刻巡检一轮（换插探头后不想等 10 分钟）：保活循环最多 10 秒内响应
 app.MapPost("/api/scan", (HttpContext ctx) =>
 {
@@ -212,6 +231,19 @@ _ = Task.Run(async () =>
     {
         try
         {
+            // 维护中：不连、不重连，把设备留给现场的桌面端；到期自动往下走恢复连接
+            if (hub.InMaintenance)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5));
+                continue;
+            }
+
+            if (hub.MaintenanceUntil is { } expired)
+            {
+                Console.WriteLine($"{DateTime.Now:HH:mm:ss} 维护期限到（{expired.ToLocalTime():HH:mm}），恢复连接设备");
+                hub.ExitMaintenance();
+            }
+
             if (!hub.IsConnected)
             {
                 Console.WriteLine($"{DateTime.Now:HH:mm:ss} 尝试连接设备 {device}……");
@@ -258,13 +290,16 @@ _ = Task.Run(async () =>
             Console.WriteLine($"{DateTime.Now:HH:mm:ss} {(hub.IsConnected ? "保活出错" : "连接失败")}：{ex.Message}，稍后重试");
         }
 
-        await Task.Delay(TimeSpan.FromSeconds(hub.IsConnected ? 10 : 30));
+        // 维护刚结束要马上连回去，别让业主多等 30 秒
+        await Task.Delay(TimeSpan.FromSeconds(hub.IsConnected ? 10 : hub.MaintenanceUntil is null ? 30 : 1));
     }
 });
 
 app.Run();
 
 internal sealed record ConnectReq(string? Endpoint);
+
+internal sealed record MaintenanceReq(int? Minutes, string? Note);
 
 /// <summary>设备连接与 WebSocket 广播。一台设备一份全局状态，多个浏览器同时看。</summary>
 internal sealed class MonitorHub : IDisposable
@@ -560,14 +595,33 @@ internal sealed class MonitorHub : IDisposable
                 // 只有配置在监测的通道才算测点帧，才落历史；规划位/巡检位的帧只带 monitored=false 给页面做在位识别
                 bool zeroed;
                 double? snr;
+                var presence = "unknown";
+                var settled = false;
                 lock (_stateLock)
                 {
                     zeroed = _params.ContainsKey(m.Channel);
-                    snr = _signals.TryGetValue(m.Channel, out var tr) ? tr.LastSnr : (double?)null;
+                    if (_signals.TryGetValue(m.Channel, out var tr))
+                    {
+                        snr = tr.LastSnr;
+                        presence = tr.Presence;
+                        // 在位判定要攒几帧才定下来；定不下来（信噪比常年悬在灰区）的攒满一窗也算"看过了"
+                        settled = tr.Presence != "unknown" || tr.Recent.Count >= SnrWindow;
+                    }
+                    else
+                    {
+                        snr = null;
+                    }
                 }
 
-                Broadcast(FrameJson(m, snr, zeroed));
-                if (zeroed) History?.Ingest(m);
+                // 力值和状态只在这里算一次：帧、历史、事件、页面全用同一个数、同一个结论
+                var mismatch = HistoryStore.IsBaselineMismatch(m.DeltaTof);
+                var kn = mismatch ? null : Plan.ForceKn(m.Channel, m.DeltaTof);
+                var dkn = mismatch ? null : Plan.DeltaKn(m.Channel, m.DeltaTof);
+                var health = zeroed ? Health.Judge(m.StatusCode == MeasStatusCode.Normal, mismatch, presence, Plan, m.Channel, kn) : null;
+
+                Broadcast(FrameJson(m, snr, zeroed, mismatch, kn, dkn, health));
+                // 刚连上、在位判定还没定下来的那几帧不进历史：空通道会先记"检测异常"再改"探头无信号"，每次重连都多两条假事件
+                if (zeroed && settled) History?.Ingest(m, health!, kn, dkn);
                 if (flip is { } f)
                 {
                     var configured = WantedChannels.Contains(m.Channel);
@@ -614,6 +668,7 @@ internal sealed class MonitorHub : IDisposable
                 // 页面上每颗螺栓都会变成"检测异常"。所以走带三轮补读的全量读。
                 var fresh = new SortedDictionary<ushort, List<KeyValuePair<string, string>>>();
                 var freshWaves = new SortedDictionary<ushort, object>();
+                var baselines = new Dictionary<ushort, (decimal? RefTime, decimal? RefTemp)>();
                 var signalOnly = new List<ushort>();   // 只轮询做在位识别、不测力：规划位/巡检位，以及配置了但没置零的
                 var zeroedExtra = new HashSet<ushort>(); // 规划位里设备上已有基线的（历史置过零），给页面提示用
                 // 配置的测点 ∪ 规划位一起全量读。只有 channels 里配置的才算监测；规划位即使置过零也只做在位识别——
@@ -627,7 +682,7 @@ internal sealed class MonitorHub : IDisposable
                     foreach (var ch in pending)
                     {
                         var wanted = WantedChannels.Contains(ch);
-                        var r = await ReadChannelIntoAsync(engine, ch, wanted ? fresh : null, freshWaves);
+                        var r = await ReadChannelIntoAsync(engine, ch, wanted ? fresh : null, freshWaves, baselines);
                         if (r == ReadOutcome.NoReply) { still.Add(ch); continue; }
                         if (!wanted || r == ReadOutcome.NotZeroed) signalOnly.Add(ch);
                         if (!wanted && r == ReadOutcome.Zeroed) zeroedExtra.Add(ch);
@@ -683,6 +738,7 @@ internal sealed class MonitorHub : IDisposable
                     foreach (var ch in zeroedExtra) _zeroedExtra.Add(ch);
                     _reachable = reachable;
                     _polled = reachable;
+                    _lastReadBaselines = baselines;
                     ScanActive = true;
                     ScanStartedAt = DateTime.UtcNow;
                     LastScanAt = DateTime.UtcNow;
@@ -698,12 +754,50 @@ internal sealed class MonitorHub : IDisposable
             LastChannelRetryAt = DateTime.UtcNow;
             _engine = engine;
             _endpoint = endpoint;
+            // 读到的基线交历史库比对：和上次记的不一样就是现场重新置零过，记流水 + "基线重置"事件
+            Dictionary<ushort, (decimal? RefTime, decimal? RefTemp)> read;
+            lock (_stateLock) read = _lastReadBaselines;
+            if (read.Count > 0) History?.RecordBaselines(read);
             Broadcast(new { type = "state", state = State() });
         }
         finally
         {
             _gate.Release();
         }
+    }
+
+    /// <summary>连接流程里读到的各路基线，连接成功后交给历史库。放字段是为了不改 ConnectAsync 里那段 try 的结构。</summary>
+    private Dictionary<ushort, (decimal? RefTime, decimal? RefTemp)> _lastReadBaselines = new();
+
+    // ── 维护模式 ─────────────────────────────────────────────────────────
+    // 设备只允许一路 TCP。现场要用桌面端置零/调参时，大屏得主动让出设备并且别再抢回来；
+    // 之前只能把大屏进程杀掉——业主眼前的画面直接黑掉，谁也不知道是坏了还是在维护。
+    // 维护模式有期限：到点自动恢复监测，忘了点"结束"也不会让大屏一直断着。
+
+    /// <summary>维护截止时刻（UTC）；空 = 不在维护。</summary>
+    public DateTime? MaintenanceUntil { get; private set; }
+
+    public string MaintenanceNote { get; private set; } = string.Empty;
+
+    public bool InMaintenance => MaintenanceUntil is { } u && u > DateTime.UtcNow;
+
+    public async Task EnterMaintenanceAsync(TimeSpan duration, string note)
+    {
+        MaintenanceUntil = DateTime.UtcNow + duration;
+        MaintenanceNote = note;
+        _lastLog = $"{DateTime.Now:HH:mm:ss} 进入维护模式（{note}），{MaintenanceUntil.Value.ToLocalTime():HH:mm} 自动恢复监测；已让出设备连接";
+        Console.WriteLine(_lastLog);
+        await DisconnectAsync();   // 里面会广播 state
+    }
+
+    public void ExitMaintenance()
+    {
+        if (MaintenanceUntil is null) return;
+        MaintenanceUntil = null;
+        MaintenanceNote = string.Empty;
+        _lastLog = $"{DateTime.Now:HH:mm:ss} 维护结束，恢复连接设备";
+        Console.WriteLine(_lastLog);
+        Broadcast(new { type = "state", state = State() });
     }
 
     public async Task DisconnectAsync()
@@ -737,12 +831,13 @@ internal sealed class MonitorHub : IDisposable
 
             var fresh = new SortedDictionary<ushort, List<KeyValuePair<string, string>>>();
             var freshWaves = new SortedDictionary<ushort, object>();
+            var baselines = new Dictionary<ushort, (decimal? RefTime, decimal? RefTemp)>();
             await engine.StopStreamAsync();
             try
             {
                 foreach (var ch in missing)
                 {
-                    await ReadChannelIntoAsync(engine, ch, fresh, freshWaves);
+                    await ReadChannelIntoAsync(engine, ch, fresh, freshWaves, baselines);
                 }
             }
             finally
@@ -762,6 +857,7 @@ internal sealed class MonitorHub : IDisposable
                 Interlocked.Exchange(ref _lastFrameTicks, DateTime.UtcNow.Ticks);
             }
 
+            if (baselines.Count > 0) History?.RecordBaselines(baselines);
             if (fresh.Count > 0) Broadcast(new { type = "state", state = State() });
             return fresh.Count;
         }
@@ -779,11 +875,14 @@ internal sealed class MonitorHub : IDisposable
     /// </summary>
     private static async Task<ReadOutcome> ReadChannelIntoAsync(DeviceEngine engine, ushort ch,
         SortedDictionary<ushort, List<KeyValuePair<string, string>>>? into,
-        SortedDictionary<ushort, object> waves)
+        SortedDictionary<ushort, object> waves,
+        Dictionary<ushort, (decimal? RefTime, decimal? RefTemp)> baselines)
     {
         var bag = await engine.ReadChannelValuesAsync(ch, CancellationToken.None);
         if (bag.Count == 0) return ReadOutcome.NoReply;
         if (!DeviceEngine.IsZeroed(bag)) return ReadOutcome.NotZeroed;
+        // 设备上这一路的基线（参考声时/参考温度）：交给历史库比对，变了就是现场重新置零过
+        baselines[ch] = (ParseDec(DeviceEngine.Raw(bag, "RefTime")), ParseDec(DeviceEngine.Raw(bag, "RefTemp")));
         if (into is null) return ReadOutcome.Zeroed;
 
         into[ch] = ParamOrder.Select(p => new KeyValuePair<string, string>(p.Cn, Render(p.Key, bag))).ToList();
@@ -850,6 +949,8 @@ internal sealed class MonitorHub : IDisposable
             connected = _engine is { IsConnected: true },
             endpoint = _endpoint,
             log = _lastLog,
+            // 维护模式：大屏主动让出设备给现场桌面端，到期自动恢复。页面据此把"未连接"说成"维护中"
+            maintenance = InMaintenance ? new { until = MaintenanceUntil, note = MaintenanceNote } : null,
             // 全局兜底标定（程序目录）；k = 0 表示未标定
             cal = CalJson(Plan.GlobalCal, Plan.GlobalCal is null ? "无" : "程序目录"),
             // 基线口径与阈值由服务端统一给出，页面不再自己从 farm.json 猜：两边算出来的必须是同一个数
@@ -876,10 +977,9 @@ internal sealed class MonitorHub : IDisposable
         };
     }
 
-    private object FrameJson(ChannelResult m, double? snr, bool monitored)
+    private static object FrameJson(ChannelResult m, double? snr, bool monitored, bool mismatch, decimal? kn, decimal? dkn, string? health)
     {
-        // 力值只在服务端算这一次，页面照抄：基线失配或未标定就是空，页面不得自己拿声时差乘系数
-        var mismatch = HistoryStore.IsBaselineMismatch(m.DeltaTof);
+        // 力值和状态只在服务端算这一次，页面照抄：基线失配或未标定 kn 就是空，页面不得自己拿声时差乘系数、也不自己判状态
         return new
         {
             type = "frame",
@@ -890,8 +990,10 @@ internal sealed class MonitorHub : IDisposable
             deltaTof = m.DeltaTof,
             // 声时偏离置零基线超出物理可能：不算力值
             mismatch,
-            kn = mismatch ? null : Plan.ForceKn(m.Channel, m.DeltaTof),
-            dkn = mismatch ? null : Plan.DeltaKn(m.Channel, m.DeltaTof),
+            kn,
+            dkn,
+            // 服务端判定（Health.Judge）；规划位/巡检位的帧没有
+            health,
             temp = m.SpTemp ?? m.RawTemp,
             status = DeviceEngine.DescribeStatus(m.StatusCode),
             normal = m.StatusCode == MeasStatusCode.Normal,
@@ -900,6 +1002,9 @@ internal sealed class MonitorHub : IDisposable
                 : null,
         };
     }
+
+    private static decimal? ParseDec(string s)
+        => decimal.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : null;
 
     private static string Render(string key, Dictionary<string, string> bag) => key switch
     {

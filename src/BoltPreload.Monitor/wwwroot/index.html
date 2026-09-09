@@ -85,6 +85,12 @@
       <div class="panel" id="opsTable" hidden>
         <div class="hd">测点实时数据</div>
         <div class="chtable" id="chtable"></div>
+        <!-- 设备只允许一路 TCP：现场要用桌面端置零/调参时，在这里让大屏让出设备，到期自动恢复。只能在大屏主机上操作 -->
+        <div class="maint" id="maintBox">
+          <span class="ml">现场维护（让出设备给桌面端）</span>
+          <a data-min="30">30 分钟</a><a data-min="120">2 小时</a><a data-min="0" class="end">结束维护</a>
+          <span class="mm" id="maintMsg"></span>
+        </div>
       </div>
     </div>
     <div class="bottomgrid">

@@ -36,8 +36,12 @@ internal sealed class HistoryStore : IDisposable
 
     public static bool IsBaselineMismatch(decimal? deltaTof) => deltaTof is { } d && Math.Abs(d) > MaxPlausibleDeltaTofNs;
 
-    /// <summary>一帧里落盘要用到的东西。在回调线程上抓一份就走，别让回调等磁盘。</summary>
-    private readonly record struct Frame(long At, int Ch, bool Normal, decimal? DeltaTof, decimal? EchoTime, decimal? Temp);
+    /// <summary>
+    /// 一帧里落盘要用到的东西。在回调线程上抓一份就走，别让回调等磁盘。力值和状态是服务端（MonitorHub）算好的，这里只记。
+    /// Baseline 不为空时这不是测量帧，是"连接时读到的这一路参考声时"，写线程拿它和上次记的比，变了就记基线流水。
+    /// </summary>
+    private readonly record struct Frame(long At, int Ch, bool Normal, decimal? DeltaTof, decimal? EchoTime, decimal? Temp,
+        string Health, double? Kn, double? Dkn, (double? RefTime, double? RefTemp)? Baseline = null);
 
     private readonly string _connString;
 
@@ -52,6 +56,8 @@ internal sealed class HistoryStore : IDisposable
     private readonly Dictionary<int, long> _lastSampleAt = new();
     private readonly Dictionary<int, string> _lastHealth = new();
     private readonly Dictionary<int, long> _lastEventAt = new();
+    // 每一路最近记下的基线（参考声时/参考温度）：连接时读到的和它不一样 = 现场重新置零过
+    private readonly Dictionary<int, (double? RefTime, double? RefTemp)> _lastBaseline = new();
     private long _lastPurgeAt;
     private long _lastErrorLogAt;
 
@@ -123,17 +129,29 @@ internal sealed class HistoryStore : IDisposable
                   b REAL,
                   points INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS zero_log (
+                  ts INTEGER NOT NULL,
+                  ch INTEGER NOT NULL,
+                  ref_time REAL,
+                  ref_temp REAL,
+                  prev_ref_time REAL,
+                  prev_ref_temp REAL
+                );
+                CREATE INDEX IF NOT EXISTS ix_zero_ch_ts ON zero_log(ch, ts);
                 """;
             cmd.ExecuteNonQuery();
         }
 
-        // 老库补列：dkn = 较基线变化量（k·Δt）；cal_log.mode = 基线口径、scope = 作用的法兰/通道、rated = 当时额定。ALTER 只加列不动数据
+        // 老库补列：dkn = 较基线变化量（k·Δt）；cal_log.mode = 基线口径、scope = 作用的法兰/通道、rated = 当时额定；
+        // events.note = 事件说明（基线重置写"参考声时 A → B"）。ALTER 只加列不动数据
         AddColumnIfMissing("samples", "dkn", "REAL");
         AddColumnIfMissing("cal_log", "mode", "TEXT");
         AddColumnIfMissing("cal_log", "scope", "TEXT");
         AddColumnIfMissing("cal_log", "rated", "REAL");
+        AddColumnIfMissing("events", "note", "TEXT");
 
         LoadLastHealth();
+        LoadLastBaselines();
         _sampleCount = Scalar(_write, "SELECT COUNT(*) FROM samples");
         _eventCount = Scalar(_write, "SELECT COUNT(*) FROM events");
         _lastPurgeAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -221,8 +239,8 @@ internal sealed class HistoryStore : IDisposable
         alter.ExecuteNonQuery();
     }
 
-    /// <summary>测量回调里调用：只入队，不抛，不等磁盘。</summary>
-    public void Ingest(ChannelResult m)
+    /// <summary>测量回调里调用：只入队，不抛，不等磁盘。力值与状态是 MonitorHub 用 Health.Judge 算好的那一份。</summary>
+    public void Ingest(ChannelResult m, string health, decimal? kn, decimal? dkn)
     {
         if (_disposed)
         {
@@ -235,10 +253,36 @@ internal sealed class HistoryStore : IDisposable
             m.StatusCode == MeasStatusCode.Normal,
             m.DeltaTof,
             m.EchoTime,
-            m.SpTemp ?? m.RawTemp);
+            m.SpTemp ?? m.RawTemp,
+            health,
+            (double?)kn,
+            (double?)dkn);
         if (!_queue.Writer.TryWrite(frame))
         {
             Interlocked.Increment(ref _dropped);
+        }
+    }
+
+    /// <summary>
+    /// 连接/补读时把每一路读到的参考声时、参考温度交进来。和上次记的不一样 = 现场用桌面端重新置零过：
+    /// 记一条基线流水，并写一条"基线重置"事件——不然趟势图上力值突然跳一截，谁也说不清是螺栓动了还是基线换了。
+    /// 第一次见到的通道只记流水不记事件。
+    /// </summary>
+    public void RecordBaselines(IReadOnlyDictionary<ushort, (decimal? RefTime, decimal? RefTemp)> baselines)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        foreach (var (ch, b) in baselines)
+        {
+            var frame = new Frame(now, ch, true, null, null, null, string.Empty, null, null, ((double?)b.RefTime, (double?)b.RefTemp));
+            if (!_queue.Writer.TryWrite(frame))
+            {
+                Interlocked.Increment(ref _dropped);
+            }
         }
     }
 
@@ -289,23 +333,78 @@ internal sealed class HistoryStore : IDisposable
 
     private void Process(Frame f)
     {
-        // 声时偏离置零基线超出物理可能（预紧变化只有几十上百 ns、温度全程 ±200 ns）：
-        // 探头位置或耦合变了，这帧不能算成力值。单独记成 shift，和页面上"基线失配"叫法一致
-        var mismatch = IsBaselineMismatch(f.DeltaTof);
-        var normal = f.Normal && !mismatch;
-        var plan = _plan;
-        var ch = (ushort)f.Ch;
-        // kn：预紧力（自由置零 = 绝对；锚定 = 按锚定时=额定估算，没额定就空）；dkn：较基线变化量 k·Δt。系数/额定按通道所属法兰取
-        var kn = mismatch ? null : (double?)plan?.ForceKn(ch, f.DeltaTof);
-        var dkn = mismatch ? null : (double?)plan?.DeltaKn(ch, f.DeltaTof);
-        var health = Judge(normal, mismatch, plan, ch, kn);
-        WriteEventIfChanged(f.At, f.Ch, health, kn);
+        if (f.Baseline is { } b)
+        {
+            ProcessBaseline(f.At, f.Ch, b);
+            return;
+        }
+
+        // 力值与状态都是服务端 Health.Judge 那一份；这里只负责记。normal 列记"测得到且没失配"，方便报表按它筛
+        var normal = f.Normal && !IsBaselineMismatch(f.DeltaTof);
+        WriteEventIfChanged(f.At, f.Ch, f.Health, f.Kn, null);
 
         if (!_lastSampleAt.TryGetValue(f.Ch, out var prev) || f.At - prev >= SampleMs)
         {
-            InsertSample(f.At, f.Ch, kn, dkn, (double?)f.Temp, (double?)f.DeltaTof, (double?)f.EchoTime, normal, health);
+            InsertSample(f.At, f.Ch, f.Kn, f.Dkn, (double?)f.Temp, (double?)f.DeltaTof, (double?)f.EchoTime, normal, f.Health);
             _lastSampleAt[f.Ch] = f.At;
             Interlocked.Increment(ref _sampleCount);
+        }
+    }
+
+    private void ProcessBaseline(long now, int ch, (double? RefTime, double? RefTemp) cur)
+    {
+        var known = _lastBaseline.TryGetValue(ch, out var last);
+        if (known && Same(last.RefTime, cur.RefTime) && Same(last.RefTemp, cur.RefTemp))
+        {
+            return;
+        }
+
+        using (var cmd = _write.CreateCommand())
+        {
+            cmd.CommandText =
+                """
+                INSERT INTO zero_log(ts, ch, ref_time, ref_temp, prev_ref_time, prev_ref_temp)
+                VALUES ($ts, $ch, $rt, $rtemp, $prt, $prtemp)
+                """;
+            cmd.Parameters.AddWithValue("$ts", now);
+            cmd.Parameters.AddWithValue("$ch", ch);
+            cmd.Parameters.AddWithValue("$rt", cur.RefTime is { } rt ? rt : DBNull.Value);
+            cmd.Parameters.AddWithValue("$rtemp", cur.RefTemp is { } rtp ? rtp : DBNull.Value);
+            cmd.Parameters.AddWithValue("$prt", known && last.RefTime is { } prt ? prt : DBNull.Value);
+            cmd.Parameters.AddWithValue("$prtemp", known && last.RefTemp is { } prtp ? prtp : DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+
+        _lastBaseline[ch] = cur;
+        if (!known)
+        {
+            return;   // 第一次见到这一路：只记下基线，不算"重置"
+        }
+
+        // 基线变了：记事件，并把这一路的"上一个状态"置成 rezero——下一帧的状态会记成 "rezero → ok/…"，趋势上这一跳就有出处
+        var note = $"参考声时 {Fmt(last.RefTime)} → {Fmt(cur.RefTime)} ns，参考温度 {Fmt(last.RefTemp)} → {Fmt(cur.RefTemp)} ℃";
+        var from = _lastHealth.TryGetValue(ch, out var h) ? h : "unknown";
+        InsertEvent(now, ch, from, Health.Rezero, null, note);
+        _lastHealth[ch] = Health.Rezero;
+        _lastEventAt[ch] = now;
+
+        static bool Same(double? a, double? b) => a is null ? b is null : b is { } bv && Math.Abs(a.Value - bv) < 0.5;
+        static string Fmt(double? v) => v is { } x ? x.ToString("0", CultureInfo.InvariantCulture) : "-";
+    }
+
+    private void LoadLastBaselines()
+    {
+        using var cmd = _write.CreateCommand();
+        cmd.CommandText =
+            """
+            SELECT z.ch, z.ref_time, z.ref_temp FROM zero_log z
+            JOIN (SELECT ch, MAX(ts) AS ts FROM zero_log GROUP BY ch) x
+              ON z.ch = x.ch AND z.ts = x.ts
+            """;
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            _lastBaseline[r.GetInt32(0)] = (r.IsDBNull(1) ? null : r.GetDouble(1), r.IsDBNull(2) ? null : r.GetDouble(2));
         }
     }
 
@@ -345,7 +444,7 @@ internal sealed class HistoryStore : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    private void WriteEventIfChanged(long now, int ch, string health, double? kn)
+    private void WriteEventIfChanged(long now, int ch, string health, double? kn, string? note)
     {
         if (!_lastHealth.TryGetValue(ch, out var prev))
         {
@@ -359,67 +458,34 @@ internal sealed class HistoryStore : IDisposable
         }
 
         // 轻状态 10 秒内不重复记，恶化成报警/异常的立刻记
-        if (health is not ("loose" or "fault" or "shift")
+        if (!Health.IsUrgent(health)
             && _lastEventAt.TryGetValue(ch, out var last)
             && now - last < EventDebounceMs)
         {
             return;
         }
 
+        InsertEvent(now, ch, prev, health, kn, note);
+        _lastHealth[ch] = health;
+        _lastEventAt[ch] = now;
+    }
+
+    private void InsertEvent(long now, int ch, string from, string to, double? kn, string? note)
+    {
         using var cmd = _write.CreateCommand();
         cmd.CommandText =
             """
-            INSERT INTO events(ts, ch, from_h, to_h, kn)
-            VALUES ($ts, $ch, $from, $to, $kn)
+            INSERT INTO events(ts, ch, from_h, to_h, kn, note)
+            VALUES ($ts, $ch, $from, $to, $kn, $note)
             """;
         cmd.Parameters.AddWithValue("$ts", now);
         cmd.Parameters.AddWithValue("$ch", ch);
-        cmd.Parameters.AddWithValue("$from", prev);
-        cmd.Parameters.AddWithValue("$to", health);
+        cmd.Parameters.AddWithValue("$from", from);
+        cmd.Parameters.AddWithValue("$to", to);
         cmd.Parameters.AddWithValue("$kn", kn is { } k ? k : DBNull.Value);
+        cmd.Parameters.AddWithValue("$note", note is { } n ? n : DBNull.Value);
         cmd.ExecuteNonQuery();
-        _lastHealth[ch] = health;
-        _lastEventAt[ch] = now;
         Interlocked.Increment(ref _eventCount);
-    }
-
-    /// <summary>
-    /// 状态口径（和页面 boltHealth 一致）：先看测不测得到（fault / shift），再看有没有标定（uncal），
-    /// 最后才拿力值比阈值。没有标定文件时绝不给出"正常/偏低/松动"这种需要力值才能下的结论；
-    /// 没有额定值时不判偏低/松动（锚定口径下连绝对预紧力都估不出来）。
-    /// </summary>
-    private static string Judge(bool normal, bool mismatch, CalPlan? plan, ushort ch, double? kn)
-    {
-        if (mismatch)
-        {
-            return "shift";
-        }
-
-        if (!normal)
-        {
-            return "fault";
-        }
-
-        if (plan?.CalFor(ch) is null)
-        {
-            return "uncal";
-        }
-
-        var rated = plan.RatedFor(ch);
-        if (rated > 0 && kn is { } f)
-        {
-            if ((decimal)f < rated * plan.AlarmRatio)
-            {
-                return "loose";
-            }
-
-            if ((decimal)f < rated * plan.WarnRatio)
-            {
-                return "warn";
-            }
-        }
-
-        return "ok";
     }
 
     private void Purge()
@@ -489,7 +555,7 @@ internal sealed class HistoryStore : IDisposable
         using var cmd = conn.CreateCommand();
         cmd.CommandText =
             """
-            SELECT ts, ch, from_h, to_h, kn
+            SELECT ts, ch, from_h, to_h, kn, note
             FROM events
             WHERE ts >= $from AND ts <= $to
             ORDER BY ts DESC
@@ -508,6 +574,7 @@ internal sealed class HistoryStore : IDisposable
                 from = r.GetString(2),
                 to = r.GetString(3),
                 kn = r.IsDBNull(4) ? (double?)null : r.GetDouble(4),
+                note = r.IsDBNull(5) ? null : r.GetString(5),
             });
         }
 
@@ -629,6 +696,7 @@ internal sealed class HistoryStore : IDisposable
     {
         long? oldest;
         object? cal = null;
+        var baselines = new List<object>();
         using (var conn = OpenRead())
         {
             oldest = NullableScalar(conn, "SELECT MIN(ts) FROM samples");   // 走主键索引，不扫表
@@ -659,6 +727,28 @@ internal sealed class HistoryStore : IDisposable
             }
 
             cal = list;
+
+            // 每一路当前记在案的基线（参考声时/温度）和重置次数：运维核对"这颗螺栓的基线是什么时候定的"
+            using var zc = conn.CreateCommand();
+            zc.CommandText =
+                """
+                SELECT z.ch, z.ts, z.ref_time, z.ref_temp, (SELECT COUNT(*) FROM zero_log WHERE ch = z.ch AND prev_ref_time IS NOT NULL) AS rezeros
+                FROM zero_log z
+                JOIN (SELECT ch, MAX(ts) AS ts FROM zero_log GROUP BY ch) x ON z.ch = x.ch AND z.ts = x.ts
+                ORDER BY z.ch
+                """;
+            using var zr = zc.ExecuteReader();
+            while (zr.Read())
+            {
+                baselines.Add(new
+                {
+                    ch = zr.GetInt32(0),
+                    since = zr.GetInt64(1),
+                    refTime = zr.IsDBNull(2) ? (double?)null : zr.GetDouble(2),
+                    refTemp = zr.IsDBNull(3) ? (double?)null : zr.GetDouble(3),
+                    rezeros = zr.GetInt64(4),
+                });
+            }
         }
 
         var mb = 0d;
@@ -688,6 +778,7 @@ internal sealed class HistoryStore : IDisposable
             writeErrors = Interlocked.Read(ref _writeErrors),
             lastError = _lastError,
             cal,
+            baselines,
         };
     }
 
