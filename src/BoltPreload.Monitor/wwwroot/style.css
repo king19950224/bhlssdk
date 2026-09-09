@@ -52,16 +52,18 @@ body { font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; font-si
 .dot.on { background: var(--ok); box-shadow: 0 0 9px var(--ok); }
 .dot.err { background: var(--bad); box-shadow: 0 0 9px var(--bad); }
 
-.subbar { display: flex; align-items: center; padding: 7px 26px; color: var(--muted); }
+/* 面包屑固定宽度、副标题固定宽度，中间的提示条吃剩余空间并可收缩——窄屏下不再把副标题顶出视口 */
+.subbar { display: flex; align-items: center; padding: 7px 26px; color: var(--muted); min-width: 0; }
+.crumb { flex: none; white-space: nowrap; }
 .crumb a { color: var(--blue); text-decoration: none; cursor: pointer; }
 .crumb a:hover { color: var(--cyan); }
 .crumb .sep { margin: 0 8px; color: #33475f; }
 .crumb .crumb-na { margin-left: 8px; padding: 1px 8px; border: 1px dashed #3a4c63; border-radius: 3px;
                    color: #6c839e; font-size: 11px; letter-spacing: 1px; }
-.tagline { margin-left: auto; font-size: 12px; letter-spacing: 2px; color: #4d637e; }
-/* 探头在位提示条：拔空/插错位时全站可见 */
+.tagline { margin-left: auto; flex: none; white-space: nowrap; font-size: 12px; letter-spacing: 2px; color: #4d637e; }
+/* 探头在位提示条：拔空/插错位时全站可见。放不下就省略号，完整内容在 title 里悬停可见 */
 .notice { margin-left: 22px; padding: 4px 14px; border-radius: 3px; font-size: 12.5px; letter-spacing: .5px;
-          max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .notice.warn { color: #f5c34d; background: rgba(240, 180, 41, .12); border: 1px solid rgba(240, 180, 41, .5); }
 .notice.bad { color: #ff8a7a; background: rgba(229, 72, 77, .14); border: 1px solid rgba(229, 72, 77, .55);
               animation: stPulse 1.6s ease-in-out infinite; }
@@ -115,6 +117,7 @@ body { font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; font-si
 .ev .tag.loose { color: #ff6b70; background: rgba(229, 72, 77, .14); border: 1px solid rgba(229, 72, 77, .5); }
 .ev .tag.warn { color: #f5c34d; background: rgba(240, 180, 41, .12); border: 1px solid rgba(240, 180, 41, .45); }
 .ev .tag.fault { color: #d8a15c; background: rgba(214, 138, 60, .12); border: 1px solid rgba(214, 138, 60, .45); }
+.ev .tag.shift { color: #e78cff; background: rgba(190, 90, 230, .12); border: 1px solid rgba(190, 90, 230, .45); }
 .ev .tag.ok { color: #4be08a; background: rgba(53, 196, 99, .12); border: 1px solid rgba(53, 196, 99, .4); }
 .ev .arrow { color: #4d637e; margin: 0 6px; }
 
@@ -266,6 +269,9 @@ canvas { display: block; width: 100%; }
 .slot .bst.fault { color: #d8a15c; background: rgba(214, 138, 60, .12); border: 1px solid rgba(214, 138, 60, .45); }
 .slot .bst.offline { color: #7d92aa; background: rgba(90, 110, 135, .12); border: 1px solid #3a4c63; }
 .slot .bst.pending { color: #6c839e; border: 1px dashed #3a4c63; }
+/* 未标定：设备在测、声时正常，但没有标定文件算不出力值 —— 橙色虚框提醒运维去放 .ucf */
+.slot .bst.uncal, .bolt .bst.uncal, .rtable .bst.uncal { color: #f0b429; background: rgba(240, 180, 41, .08); border: 1px dashed rgba(240, 180, 41, .6); }
+.ev .tag.uncal { color: #f0b429; background: rgba(240, 180, 41, .08); border: 1px dashed rgba(240, 180, 41, .5); }
 .slot.warn .sv { color: var(--warn); }
 .slot.loose .sv { color: var(--bad); }
 .slot.loose { border-color: rgba(229, 72, 77, .6); }
@@ -330,13 +336,15 @@ canvas { display: block; width: 100%; }
 .fl.offline .nm { color: #64809f; }
 
 /* ══ 视图3 ══ */
-.fmain { display: grid; grid-template-columns: 30% 1fr 292px; gap: 10px; }
-.fmain.owner { grid-template-columns: 58% 1fr; }
+/* 轨道用 minmax(0, …)：不然网格列不肯缩到内容最小宽度以下，1100～1400 的视口里右栏会被卡片撑出屏外再被裁掉 */
+.fmain { display: grid; grid-template-columns: minmax(0, 30%) minmax(0, 1fr) 292px; gap: 10px; }
+.fmain.owner { grid-template-columns: minmax(0, 58%) minmax(0, 1fr); }
+@media (max-width: 1400px) { .fmain.owner { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
 
 /* 实时监测页整体撑满视口：法兰是主角，上面这一行吃掉主要高度；底部轴力/趋势两个图表固定紧凑高度 */
 #view-flange { display: flex; flex-direction: column; }
 #view-flange .fmain { flex: 1 1 auto; min-height: 380px; }
-#view-flange .fmain > .panel, #view-flange .fmain > div { min-height: 0; }
+#view-flange .fmain > .panel, #view-flange .fmain > div { min-height: 0; min-width: 0; }
 #view-flange .bottomgrid { flex: none; }
 .bottomgrid .panel canvas { height: 190px; }
 #wave { height: 190px; }
@@ -441,15 +449,31 @@ canvas { display: block; width: 100%; }
 .flangebox .chip[data-st="pending"] .chip-kn { fill: #5f7690; font-size: 12px; font-weight: normal; font-family: inherit; }
 .flangebox .chip[data-st="pending"] .chip-u { display: none; }
 .flangebox .chip .chip-no { fill: #6c839e; }
+/* 未标定：橙色虚线，牌子上写文字而不是数字，用正文字号 */
+.flangebox [data-st="uncal"] .stat { stroke: var(--warn); stroke-dasharray: 4 3; }
+.flangebox [data-st="uncal"] .halo { stroke: var(--warn); opacity: .3; }
+.flangebox [data-st="uncal"] .led { fill: var(--warn); filter: drop-shadow(0 0 3px var(--warn)); }
+.flangebox .lead[data-st="uncal"] line { stroke: rgba(240, 180, 41, .5); }
+.flangebox .lead[data-st="uncal"] circle { fill: var(--warn); }
+.flangebox .chip[data-st="uncal"] rect { stroke-dasharray: 4 3; }
+.flangebox .chip[data-st="uncal"] .bar { fill: var(--warn); }
+.flangebox .chip[data-st="uncal"] .chip-kn { fill: #f0b429; font-size: 12px; font-weight: normal; font-family: inherit; }
+.flangebox .chip[data-st="uncal"] .chip-u { display: none; }
+/* 锚定口径没额定值时牌子上是带符号的变化量（"Δ+113.4"），字多一截，收一号免得顶出牌子 */
+.flangebox .chip[data-delta="1"] .chip-kn { font-size: 14px; }
+/* 文字状态统一用正文字号（脚本同时把它改成左对齐）；放在各状态规则之后，优先生效 */
+.flangebox .chip .chip-kn[data-textual="true"] { font-size: 11.5px; font-weight: normal; font-family: inherit; letter-spacing: 0; }
+.towerbox .pdot[data-st="uncal"] { fill: var(--warn); }
 /* 图纸编号与基准标记 */
 .flangebox .bno { fill: #8aa2bd; font-size: 8.5px; text-anchor: middle; font-family: var(--num); }
 .flangebox .mark line { stroke: rgba(127, 182, 216, .7); stroke-width: 1; }
 .flangebox .mark text { fill: #7fb6d8; font-size: 10px; letter-spacing: .5px; }
 
 /* 业主视图：螺栓状态卡 */
-.opslink { color: var(--blue); cursor: pointer; margin-left: 26px; font-size: 12px; letter-spacing: 1px; }
+.opslink { color: var(--blue); cursor: pointer; margin-left: 26px; font-size: 12px; letter-spacing: 1px; flex: none; white-space: nowrap; }
 .opslink:hover { color: var(--cyan); }
-.hdr { margin-left: auto; color: var(--muted); font-size: 12px; letter-spacing: 0; }
+.hdr { margin-left: auto; color: var(--muted); font-size: 12px; letter-spacing: 0;
+       min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 最多两列；卡片取自然高度（紧凑），行与行在面板里均匀留白，不把卡片拉得又高又空 */
 .boltgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(max(240px, 45%), 1fr));
             grid-auto-rows: auto; align-content: space-evenly; gap: 12px; padding: 14px 16px; overflow-y: auto; flex: 1; }
@@ -493,6 +517,13 @@ canvas { display: block; width: 100%; }
 .slot.noprobe { border-color: rgba(255, 106, 61, .6); }
 .slot.stray { border-style: dashed; border-color: rgba(240, 180, 41, .6); }
 @keyframes stPulse { 50% { box-shadow: 0 0 12px rgba(229, 72, 77, .55); } }
+/* 接线核对：在位判定刚翻转的通道（现场刚脱耦/插上探头）白框闪几秒，一眼看出是几号 */
+@keyframes flipFlash { 50% { box-shadow: 0 0 0 2px rgba(255, 255, 255, .15), 0 0 4px rgba(255, 255, 255, .1); } }
+.bolt.flash, .slot.flash { border-color: #fff !important; box-shadow: 0 0 0 2px #fff, 0 0 18px rgba(255, 255, 255, .55);
+                           animation: flipFlash 1s ease-in-out infinite; }
+@keyframes chipFlash { 50% { stroke-opacity: .2; } }
+.flangebox .chip[data-flash="1"] rect { stroke: #fff; stroke-width: 2; animation: chipFlash 1s ease-in-out infinite; }
+.flangebox .mon[data-flash="1"] .halo { stroke: #fff; opacity: .9; animation: chipFlash 1s ease-in-out infinite; }
 .bolt.loose { border-color: rgba(229, 72, 77, .6); }
 /* 规划了但还没接探头的位子：虚线框、压暗，占着位置说明"这里会有一个" */
 .bolt.pending { border-style: dashed; background: rgba(10, 22, 40, .45); }
@@ -530,7 +561,10 @@ canvas { display: block; width: 100%; }
                 transition: width .5s; }
 .bolt.warn .bbar i { background: var(--warn); }
 .bolt.loose .bbar i { background: var(--bad); }
-.bolt .bsub { color: var(--muted); font-size: 12px; }
+/* 副文字最多两行，多了省略号；完整内容在 title 里悬停可见，卡片高度不被长说明撑乱 */
+.bolt .bsub { color: var(--muted); font-size: 12px; line-height: 1.5;
+              display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.slot .ssub { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .big { text-align: center; padding: 10px 0 0; }
 .big .v { font-family: var(--num); font-size: 52px; font-weight: bold; color: var(--cyan);
   line-height: 1.05; font-variant-numeric: tabular-nums;

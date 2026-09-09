@@ -6,8 +6,10 @@ using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using FxDevice;
 using FxSDK.Models;
+using Microsoft.Net.Http.Headers;
 
 var port = 5080;
 for (var i = 0; i < args.Length - 1; i++)
@@ -32,22 +34,37 @@ hub.History = history;
 // Web 默认规则：字段名大小写不敏感（页面发的是小写 endpoint）
 var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
-// 标定文件：exe 旁边的 .ucf，跟桌面版同一个规则
-var ucfPath = Directory.GetFiles(AppContext.BaseDirectory, "*.ucf")
-    .OrderByDescending(File.GetLastWriteTime)
-    .FirstOrDefault();
-if (ucfPath is not null)
+Console.OutputEncoding = Encoding.UTF8;
+
+// farm.json：设备地址、测点、法兰、标定与阈值都在这。先整份读进来，下面分段取
+var farmPath = Path.Combine(AppContext.BaseDirectory, "wwwroot", "farm.json");
+JsonElement? farmRoot = null;
+try
 {
-    try
+    if (File.Exists(farmPath))
     {
-        hub.Cal = Ucf.Load(ucfPath);
-        history.SetCal(hub.Cal.K, hub.Cal.B);
+        farmRoot = JsonDocument.Parse(File.ReadAllText(farmPath)).RootElement;
     }
-    catch (Exception ex) { Console.WriteLine($"标定文件读不了：{ex.Message}"); }
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"farm.json 读取失败，全部用默认值：{ex.Message}");
 }
 
+// 标定与口径：按绑定法兰取 .ucf 和额定值，没配的回落到程序目录里的 .ucf。
+// 没有标定就不算力值——历史里 kn 留空、状态记"未标定"，页面只显示声时差。宁可没数，不能有假数。
+var plan = CalPlan.Load(farmRoot, AppContext.BaseDirectory, Console.WriteLine);
+hub.Plan = plan;
+// 不管有没有标定都登记一次：cal_log 里就能看出这段时间的历史是用哪份系数、哪种口径算的
+history.SetPlan(plan);
+
 app.UseDefaultFiles();
-app.UseStaticFiles();
+// 静态文件每次都让浏览器回来核对（ETag 命中就 304，代价很小）。默认不发 Cache-Control 时浏览器按启发式
+// 缓存 app.js 好几天：升级大屏后业主的浏览器还在跑旧前端、对新后端的数据，算出来的力值就是错的
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = ctx => ctx.Context.Response.Headers.CacheControl = "no-cache",
+});
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
 
 // 业主页面是只读的，改设备地址/断开这两个动作只允许在大屏主机上本地调用，
@@ -94,11 +111,15 @@ app.MapGet("/api/history", (string? range) => Results.Json(history.QuerySamples(
 app.MapGet("/api/events", (string? range) => Results.Json(history.QueryEvents(range ?? "24h")));
 app.MapGet("/api/report", (string? range) => Results.Json(history.QueryReport(range ?? "24h")));
 app.MapGet("/api/archive", () => Results.Json(history.Stats()));
-app.MapGet("/api/export.csv", (string? range) =>
+// 边查边写到响应流：30 天的数据攒成一个字节数组再发会把内存吃光
+app.MapGet("/api/export.csv", async (HttpContext ctx, string? range) =>
 {
-    var r = range ?? "24h";
-    var bytes = history.ExportCsv(r);
-    return Results.File(bytes, "text/csv; charset=utf-8", $"preload-{r}.csv");
+    var r = HistoryStore.CanonicalRange(range);
+    ctx.Response.ContentType = "text/csv; charset=utf-8";
+    var disposition = new ContentDispositionHeaderValue("attachment");
+    disposition.SetHttpFileName($"preload-{r}.csv");
+    ctx.Response.Headers.ContentDisposition = disposition.ToString();
+    await history.ExportCsvAsync(r, ctx.Response.Body, ctx.RequestAborted);
 });
 
 app.Map("/ws", async ctx =>
@@ -119,59 +140,55 @@ app.Lifetime.ApplicationStopping.Register(() =>
     history.Dispose();
 });
 
-Console.OutputEncoding = Encoding.UTF8;
 Console.WriteLine($"监视服务已启动：http://localhost:{port}/  （局域网访问用本机 IP）");
-Console.WriteLine(hub.Cal is { } c
-    ? $"标定：{c.FileName}（{c.Points} 点） {c.K:F4} {c.Unit}/ns"
-    : "没找到 .ucf 标定文件，夹紧力用内置 0.8919 kN/ns");
+Console.WriteLine($"基线口径：{plan.ModeText}" + (plan.Mode == BaselineMode.Anchor
+    ? "——k·Δt 是较锚定时刻的变化量，绝对预紧力按“锚定时 = 额定值”估算"
+    : "——k·Δt + b 就是绝对预紧力"));
+// 各法兰的接线/标定/额定在 CalPlan.Load 里已逐条打印；这里只补全局兜底和没配到的情况
+if (!plan.Flanges.Any(f => f.OnDevice))
+{
+    Console.WriteLine("farm.json 里没有任何法兰配置在测通道（flanges[].channels），按默认 CH1–CH4 监测；"
+                      + (plan.GlobalCal is { } g ? $"标定用程序目录的 {g.FileName}" : "且没有 .ucf，不计算预紧力"));
+}
+else if (plan.GlobalCal is null && plan.Flanges.Any(f => f.OnDevice && f.Cal is null))
+{
+    Console.WriteLine("有法兰没配 ucf、程序目录里也没有 .ucf：这些法兰不计算预紧力，页面显示“未标定”");
+}
+
+if (plan.Mode == BaselineMode.Anchor && plan.Flanges.Any(f => f.OnDevice && f.Rated <= 0))
+{
+    Console.WriteLine("有法兰未配置额定预紧力：锚定口径下只能显示变化量，不能估算绝对预紧力，也不判松动");
+}
 
 // ── 自动连接：展示页上没有连接按钮，由服务自己连设备并保活 ──────────────
-// 设备地址从 farm.json 的 device 字段来，没有就用默认。
+// 设备地址从 farm.json 的 device 字段来，没有就用默认。测点、规划位由 CalPlan 按法兰汇总，这里只读巡检位
 var device = "192.168.0.7:23";
-var farmPath = Path.Combine(AppContext.BaseDirectory, "wwwroot", "farm.json");
-try
+if (farmRoot is { } root)
 {
-    if (File.Exists(farmPath))
+    try
     {
-        var root = JsonDocument.Parse(File.ReadAllText(farmPath)).RootElement;
         if (root.TryGetProperty("device", out var d) && d.GetString() is { Length: > 0 } dev)
         {
             device = dev;
         }
 
-        ushort[] ReadChannels(JsonElement el, string name)
-            => el.TryGetProperty(name, out var arr) && arr.ValueKind == JsonValueKind.Array
-                ? arr.EnumerateArray().Select(x => (ushort)x.GetInt32()).Distinct().ToArray()
-                : Array.Empty<ushort>();
-        if (ReadChannels(root, "channels") is { Length: > 0 } configured) hub.Channels = configured;
-        // 规划位和巡检位也一起轮询：不为测力，只看那一路有没有探头信号，抓插错位/拔空。
-        // 规划位优先取绑定法兰自己的 flanges[].plannedChannels（各法兰规划可以不同，如叶根法兰 12 位），没写的用全局的
-        hub.Planned = ReadChannels(root, "plannedChannels");
-        if (root.TryGetProperty("bind", out var bind) && bind.TryGetProperty("flangeIndex", out var fiEl) && fiEl.TryGetInt32(out var fi)
-            && root.TryGetProperty("flanges", out var flanges) && flanges.ValueKind == JsonValueKind.Array
-            && fi >= 0 && fi < flanges.GetArrayLength() && flanges[fi].TryGetProperty("plannedChannels", out _))
+        // 巡检位：只轮询、只判有没有探头，抓插到规划外通道的探头
+        if (root.TryGetProperty("guardChannels", out var arr) && arr.ValueKind == JsonValueKind.Array)
         {
-            hub.Planned = ReadChannels(flanges[fi], "plannedChannels");
-        }
-        hub.Guard = ReadChannels(root, "guardChannels");
-
-        if (root.TryGetProperty("thresholds", out var th) && th.ValueKind == JsonValueKind.Object)
-        {
-            decimal ReadDec(string name, decimal fallback)
-                => th.TryGetProperty(name, out var n) && n.TryGetDecimal(out var v) ? v : fallback;
-            history.SetThresholds(ReadDec("ratedKn", 0), ReadDec("warnRatio", 0.85m), ReadDec("alarmRatio", 0.7m));
+            hub.Guard = arr.EnumerateArray().Where(x => x.TryGetInt32(out var v) && v is > 0 and <= ushort.MaxValue)
+                .Select(x => (ushort)x.GetInt32()).Distinct().ToArray();
         }
     }
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"farm.json 读取失败，用默认设备地址：{ex.Message}");
+    catch (Exception ex)
+    {
+        Console.WriteLine($"farm.json 里的设备配置读取失败，用默认值：{ex.Message}");
+    }
 }
 
-Console.WriteLine($"历史库：{history.DbPath}（每 5 秒落盘，保留 90 天）");
+Console.WriteLine($"历史库：{history.DbPath}（采样每 5 秒一条保留 90 天，事件保留 2 年）");
 Console.WriteLine($"采集设备：{device}（自动连接，断线自动重连），测点 "
                   + string.Join("、", hub.WantedChannels.Select(c => "CH" + c))
-                  + (hub.Channels.Count > 0 ? "（farm.json 配置，主动下发轮询）" : "（未配置，按默认 CH1–CH4）"));
+                  + (plan.WantedChannels.Count > 0 ? "（farm.json 配置，主动下发轮询）" : "（未配置，按默认 CH1–CH4）"));
 var extra = hub.Planned.Concat(hub.Guard).Except(hub.WantedChannels).Distinct().OrderBy(c => c).ToList();
 if (extra.Count > 0)
 {
@@ -261,7 +278,30 @@ internal sealed class MonitorHub : IDisposable
     private readonly object _stateLock = new();
 
     public void Dispose() => _gate.Dispose();
-    private readonly List<(WebSocket Ws, SemaphoreSlim SendLock)> _sockets = new();
+
+    /// <summary>
+    /// 一个浏览器连接。出站消息按产生顺序进有界队列，由一个发送循环依次写出：
+    /// 之前每条消息 Task.Run 一次，任务抢锁的先后不定，帧会乱序到达；慢客户端还会把任务无限堆起来。
+    /// 队列满了丢最旧的一条——实时帧过时了就没意义，下一帧马上会来。
+    /// </summary>
+    private sealed class Client
+    {
+        public Client(WebSocket ws)
+        {
+            Ws = ws;
+            Outbox = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(256)
+            {
+                SingleReader = true,
+                FullMode = BoundedChannelFullMode.DropOldest,
+            });
+        }
+
+        public WebSocket Ws { get; }
+
+        public Channel<byte[]> Outbox { get; }
+    }
+
+    private readonly List<Client> _clients = new();
     private DeviceEngine? _engine;
     private string _endpoint = "";
     private string _lastLog = "";
@@ -363,8 +403,9 @@ internal sealed class MonitorHub : IDisposable
     // 所以不能看"有没有解出回波"，要看信噪比是否够高且连续多帧稳定。
     // 真机标定（09-03）：真探头 30–37 dB，空通道 0–6 dB，噪声尖峰偶到 14 dB，个别通道常年 10 dB 上下悬着。
     // 16/12 两道门中间是灰区，不改判，宁可不报也别误报。
-    private const double SnrProbeDb = 16;   // ≥ 这个且多数帧如此 → 有探头
-    private const double SnrNoneDb = 12;    // < 这个且绝大多数帧如此 → 没探头
+    // 门限和算法都用 DeviceEngine 那一份：桌面版和大屏对同一路波形必须给同一个在位结论
+    private const double SnrProbeDb = DeviceEngine.ProbeSnrDb;   // ≥ 这个且多数帧如此 → 有探头
+    private const double SnrNoneDb = DeviceEngine.NoiseSnrDb;    // < 这个且绝大多数帧如此 → 没探头
     private const int SnrWindow = 10;
 
     private sealed class SignalTrack
@@ -374,6 +415,9 @@ internal sealed class MonitorHub : IDisposable
         public string Presence = "unknown";   // probe / none / unknown
         public double LastSnr;
         public DateTime LastAt;
+
+        /// <summary>在位判定上次翻转的时刻（UTC）。页面靠它做"接线核对"：刚脱耦/插上的那一路高亮几秒，现场对号。</summary>
+        public DateTime? ChangedAt;
     }
 
     /// <summary>
@@ -399,27 +443,11 @@ internal sealed class MonitorHub : IDisposable
 
     private readonly Dictionary<ushort, SignalTrack> _signals = new();
 
-    /// <summary>波形信噪比（dB）：窗口开头一段当噪声底，其余部分的峰值当信号。</summary>
-    private static double? Snr(EchoWave? w)
-    {
-        var d = w?.WaveData;
-        if (d is null || d.Count < 64) return null;
-        var head = Math.Max(16, d.Count / 8);
-        double mean = 0;
-        for (var i = 0; i < head; i++) mean += d[i];
-        mean /= head;
-        double sq = 0;
-        for (var i = 0; i < head; i++) sq += (d[i] - mean) * (d[i] - mean);
-        var noise = Math.Max(1.0, Math.Sqrt(sq / head));
-        double peak = 0;
-        for (var i = head; i < d.Count; i++) peak = Math.Max(peak, Math.Abs(d[i] - mean));
-        return 20 * Math.Log10(Math.Max(peak, 1.0) / noise);
-    }
-
     /// <summary>收一帧就更新该路的在位判定；判定翻转时返回 (旧, 新)，否则 null。</summary>
     private (string From, string To)? TrackSignal(ChannelResult m)
     {
-        var snr = Snr(m.EchoWave);
+        // 和桌面版同一个 Snr：那份带削顶保护（超过一半采样打满量程按 0 dB），这里之前少了这一句
+        var snr = DeviceEngine.Snr(m.EchoWave);
         if (snr is null) return null;
         lock (_stateLock)
         {
@@ -455,11 +483,14 @@ internal sealed class MonitorHub : IDisposable
             if (next == t.Presence) return null;
             var prev = t.Presence;
             t.Presence = next;
+            // 第一次从 unknown 定下来不算"变化"，那只是刚连上；之后的翻转才是接线动作/探头故障
+            if (prev != "unknown") t.ChangedAt = DateTime.UtcNow;
             return (prev, next);
         }
     }
 
-    public Ucf.Cal? Cal { get; set; }
+    /// <summary>标定与口径方案（启动时定，之后只读）。</summary>
+    public CalPlan Plan { get; set; } = CalPlan.Load(null, AppContext.BaseDirectory, _ => { });
 
     public HistoryStore? History { get; set; }
 
@@ -474,8 +505,8 @@ internal sealed class MonitorHub : IDisposable
 
     public int ChannelCount { get { lock (_stateLock) return _params.Count; } }
 
-    /// <summary>要监测的测点：farm.json 配了就用配置，没配按默认 CH1–CH4。</summary>
-    public IReadOnlyList<ushort> WantedChannels => Channels.Count > 0 ? Channels : DefaultChannels;
+    /// <summary>要监测的测点：各法兰 channels 之并；一个都没配按默认 CH1–CH4。</summary>
+    public IReadOnlyList<ushort> WantedChannels => Plan.WantedChannels.Count > 0 ? Plan.WantedChannels : DefaultChannels;
 
     /// <summary>想监测但这次没读到参考声时、暂未纳入的测点。</summary>
     public IReadOnlyList<ushort> MissingChannels
@@ -502,11 +533,8 @@ internal sealed class MonitorHub : IDisposable
         ("LEchoWave", "参考波形"),
     };
 
-    /// <summary>配置的测点通道。给了的话连接时主动下发轮询集把设备拉起来。</summary>
-    public IReadOnlyList<ushort> Channels { get; set; } = Array.Empty<ushort>();
-
-    /// <summary>规划的探头位（farm.json plannedChannels）：也轮询，已置零的自动纳入监测，没置零的只做在位识别。</summary>
-    public IReadOnlyList<ushort> Planned { get; set; } = Array.Empty<ushort>();
+    /// <summary>规划的探头位（各法兰 plannedChannels 之并）：也轮询，已置零的自动纳入监测，没置零的只做在位识别。</summary>
+    public IReadOnlyList<ushort> Planned => Plan.PlannedChannels;
 
     /// <summary>巡检位（farm.json guardChannels）：只读寄存器、只轮询、只判有没有探头，抓插到规划外通道的探头。</summary>
     public IReadOnlyList<ushort> Guard { get; set; } = Array.Empty<ushort>();
@@ -793,6 +821,7 @@ internal sealed class MonitorHub : IDisposable
             channels = _params.Select(kv => (object)new
             {
                 ch = kv.Key,
+                flange = Plan.FlangeOf(kv.Key),
                 @params = kv.Value.Select(p => new { n = p.Key, v = p.Value }).ToList(),
                 refWave = _refWaves.GetValueOrDefault(kv.Key),
             }).ToList();
@@ -801,23 +830,45 @@ internal sealed class MonitorHub : IDisposable
             signals = _signals.OrderBy(kv => kv.Key).Select(kv => (object)new
             {
                 ch = kv.Key,
+                flange = Plan.FlangeOf(kv.Key),
                 snr = Math.Round(kv.Value.LastSnr, 1),
                 presence = kv.Value.Presence,
                 zeroed = _params.ContainsKey(kv.Key) || _zeroedExtra.Contains(kv.Key),
                 configured = WantedChannels.Contains(kv.Key),
                 planned = Planned.Contains(kv.Key),
                 at = kv.Value.LastAt,
+                changedAt = kv.Value.ChangedAt,
             }).ToList();
         }
+
+        static object CalJson(Ucf.Cal? c, string source) => c is { }
+            ? new { k = c.K, b = c.B, unit = c.Unit, name = c.FileName, points = c.Points, umPerNs = Ucf.UmPerNs, source }
+            : new { k = 0m, b = 0m, unit = "kN", name = "未标定", points = 0, umPerNs = Ucf.UmPerNs, source };
 
         return new
         {
             connected = _engine is { IsConnected: true },
             endpoint = _endpoint,
             log = _lastLog,
-            cal = Cal is { } c
-                ? new { k = c.K, b = c.B, unit = c.Unit, name = c.FileName, points = c.Points }
-                : new { k = 0.8919m, b = 0m, unit = "kN", name = "内置", points = 0 },
+            // 全局兜底标定（程序目录）；k = 0 表示未标定
+            cal = CalJson(Plan.GlobalCal, Plan.GlobalCal is null ? "无" : "程序目录"),
+            // 基线口径与阈值由服务端统一给出，页面不再自己从 farm.json 猜：两边算出来的必须是同一个数
+            baseline = Plan.Mode == BaselineMode.Anchor ? "anchor" : "free",
+            baselineText = Plan.ModeText,
+            rated = Plan.GlobalRated,
+            warnRatio = Plan.WarnRatio,
+            alarmRatio = Plan.AlarmRatio,
+            // 每个法兰的接线与标定：通道归属、在测/规划位、用的哪份 .ucf、额定多少。页面按这个分组，不再假设只有一个绑定法兰
+            flanges = Plan.Flanges.Select(f => new
+            {
+                index = f.Index,
+                name = f.Name,
+                onDevice = f.OnDevice,
+                channels = f.Channels,
+                planned = f.Planned,
+                rated = f.Rated,
+                cal = CalJson(f.Cal, f.CalSource),
+            }).ToList(),
             channels,
             polled,
             signals,
@@ -825,23 +876,30 @@ internal sealed class MonitorHub : IDisposable
         };
     }
 
-    private static object FrameJson(ChannelResult m, double? snr, bool monitored) => new
+    private object FrameJson(ChannelResult m, double? snr, bool monitored)
     {
-        type = "frame",
-        ch = m.Channel,
-        monitored,
-        snr = snr is { } s ? Math.Round(s, 1) : (double?)null,
-        echoTime = m.EchoTime,
-        deltaTof = m.DeltaTof,
-        // 声时偏离置零基线超出物理可能：页面不得把它算成力值显示
-        mismatch = HistoryStore.IsBaselineMismatch(m.DeltaTof),
-        temp = m.SpTemp ?? m.RawTemp,
-        status = DeviceEngine.DescribeStatus(m.StatusCode),
-        normal = m.StatusCode == MeasStatusCode.Normal,
-        wave = m.EchoWave?.WaveData is { Count: > 0 }
-            ? new { start = m.EchoWave.EchoStart, clock = m.EchoWave.ClockInt, data = m.EchoWave.WaveData }
-            : null,
-    };
+        // 力值只在服务端算这一次，页面照抄：基线失配或未标定就是空，页面不得自己拿声时差乘系数
+        var mismatch = HistoryStore.IsBaselineMismatch(m.DeltaTof);
+        return new
+        {
+            type = "frame",
+            ch = m.Channel,
+            monitored,
+            snr = snr is { } s ? Math.Round(s, 1) : (double?)null,
+            echoTime = m.EchoTime,
+            deltaTof = m.DeltaTof,
+            // 声时偏离置零基线超出物理可能：不算力值
+            mismatch,
+            kn = mismatch ? null : Plan.ForceKn(m.Channel, m.DeltaTof),
+            dkn = mismatch ? null : Plan.DeltaKn(m.Channel, m.DeltaTof),
+            temp = m.SpTemp ?? m.RawTemp,
+            status = DeviceEngine.DescribeStatus(m.StatusCode),
+            normal = m.StatusCode == MeasStatusCode.Normal,
+            wave = m.EchoWave?.WaveData is { Count: > 0 }
+                ? new { start = m.EchoWave.EchoStart, clock = m.EchoWave.ClockInt, data = m.EchoWave.WaveData }
+                : null,
+        };
+    }
 
     private static string Render(string key, Dictionary<string, string> bag) => key switch
     {
@@ -861,11 +919,13 @@ internal sealed class MonitorHub : IDisposable
     // ── WebSocket ────────────────────────────────────────────────────────
     public async Task ServeSocketAsync(WebSocket ws, CancellationToken ct)
     {
-        var entry = (ws, new SemaphoreSlim(1, 1));
-        lock (_sockets) _sockets.Add(entry);
+        var client = new Client(ws);
+        lock (_clients) _clients.Add(client);
+        // 发送循环和接收循环并行：接收只为了收到 Close，发送把队列里的消息按序写出
+        var sender = SendLoopAsync(client, ct);
         try
         {
-            await SendAsync(entry, new { type = "state", state = State() }, ct);
+            client.Outbox.Writer.TryWrite(JsonSerializer.SerializeToUtf8Bytes(new { type = "state", state = State() }));
             var buf = new byte[1024];
             while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
             {
@@ -877,42 +937,42 @@ internal sealed class MonitorHub : IDisposable
         catch (WebSocketException) { }
         finally
         {
-            lock (_sockets) _sockets.Remove(entry);
+            lock (_clients) _clients.Remove(client);
+            client.Outbox.Writer.TryComplete();
+            try { await sender; } catch { /* 连接已断，发送循环怎么退出都无所谓 */ }
+            // 浏览器主动断开时回一个 Close 把握手做完；发送循环已停，这里不会和 SendAsync 撞车
+            if (ws.State == WebSocketState.CloseReceived)
+            {
+                try { await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None); }
+                catch { /* 对方已经不在了 */ }
+            }
         }
+    }
+
+    private static async Task SendLoopAsync(Client client, CancellationToken ct)
+    {
+        try
+        {
+            await foreach (var json in client.Outbox.Reader.ReadAllAsync(ct))
+            {
+                if (client.Ws.State != WebSocketState.Open) break;
+                await client.Ws.SendAsync(json, WebSocketMessageType.Text, true, ct);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (WebSocketException) { }
     }
 
     private void Broadcast(object payload)
     {
-        (WebSocket, SemaphoreSlim)[] targets;
-        lock (_sockets) targets = _sockets.ToArray();
+        Client[] targets;
+        lock (_clients) targets = _clients.ToArray();
         if (targets.Length == 0) return;
         var json = JsonSerializer.SerializeToUtf8Bytes(payload);
-        foreach (var t in targets)
+        foreach (var c in targets)
         {
-            _ = Task.Run(async () =>
-            {
-                try { await SendRawAsync(t, json, CancellationToken.None); }
-                catch { lock (_sockets) _sockets.Remove(t); }
-            });
-        }
-    }
-
-    private static async Task SendAsync((WebSocket Ws, SemaphoreSlim Lock) t, object payload, CancellationToken ct)
-        => await SendRawAsync(t, JsonSerializer.SerializeToUtf8Bytes(payload), ct);
-
-    private static async Task SendRawAsync((WebSocket Ws, SemaphoreSlim Lock) t, byte[] json, CancellationToken ct)
-    {
-        await t.Lock.WaitAsync(ct);
-        try
-        {
-            if (t.Ws.State == WebSocketState.Open)
-            {
-                await t.Ws.SendAsync(json, WebSocketMessageType.Text, true, ct);
-            }
-        }
-        finally
-        {
-            t.Lock.Release();
+            // DropOldest 模式下 TryWrite 总是成功；慢客户端丢的是它自己队列里最旧的一条
+            c.Outbox.Writer.TryWrite(json);
         }
     }
 }

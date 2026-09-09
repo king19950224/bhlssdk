@@ -22,8 +22,8 @@ let FARM = {
 };
 
 const METRICS = ["声时差 ns", "回波声时 ns", "温度 ℃", "伸长量 um"];
-// 伸长量 = 声时差 × 0.807（厂家标定同一试件 25.81um/31.99ns 反推，含声弹性修正）
-const UM_PER_NS = 0.807;
+// 伸长量 = 声时差 × umPerNs。系数由服务端随 state.cal 下发（FxDevice.Ucf.UmPerNs 唯一一份），这里只是没连上时的兜底
+let umPerNs = 0.807;
 const TREND_MS = 5 * 60 * 1000;
 // 测点超过这么久没来新帧就按离线显示，别拿最后一帧当"实时"骗人
 const STALE_MS = 60 * 1000;
@@ -36,9 +36,15 @@ let archiveEvents = [];
 let reportStats = null;
 const COLORS = ["#2fd0c8", "#f0b429", "#8f7bf0", "#35c463", "#e57373", "#4f9cf0", "#d179c8", "#a4c94b"];
 
-let cal = { k: 0.8919, b: 0 };
+// k = 0 表示未标定：不算、不显示任何力值。服务端没有 .ucf 时就是这个状态；这里不放任何默认斜率
+let cal = { k: 0, b: 0 };   // 服务端的全局兜底标定（程序目录 .ucf）；各法兰各有自己的，见 flangeCal()
+// 基线口径与阈值：由服务端 state 下发，页面不自己从 farm.json 猜（两边算出来的必须是同一个数）。
+//   anchor 在役锚定：帧里的 kn 是"按锚定时 = 额定"估算的预紧力（没额定值就为空），dkn 是较锚定的变化量
+//   free   自由置零：kn 就是绝对预紧力
+let plan = { baseline: "anchor", baselineText: "在役锚定", rated: 0, warnRatio: 0.85, alarmRatio: 0.7 };
+const anchored = () => plan.baseline === "anchor";
 let channels = {};   // ch -> {params, refWave, last, dts[], hist[]}
-// 服务端的探头在位识别：ch -> {snr, presence: probe/none/unknown, zeroed, configured, planned}
+// 服务端的探头在位识别：ch -> {snr, presence: probe/none/unknown, zeroed, configured, planned, flange, changedAt}
 let sigs = {};
 let polled = [];
 let scanning = false;   // 巡检中（轮宽集，测点刷新变慢）
@@ -46,18 +52,66 @@ let selected = 0;
 let connected = false;
 
 const $ = id => document.getElementById(id);
-const force = dt => dt * cal.k + cal.b;
 const fmt = (v, d) => v == null ? "--" : Number(v).toFixed(d);
+const fmtSigned = (v, d) => v == null ? "--" : (Number(v) > 0 ? "+" : "") + Number(v).toFixed(d);
 const chList = () => Object.keys(channels).map(Number).sort((a, b) => a - b);
 const uniqSorted = a => [...new Set((a || []).map(Number))].sort((x, y) => x - y);
-// 一个法兰的规划探头位：法兰自己写了 plannedChannels 就用它的（叶根法兰 12 位），没写的沿用全局规划。
-// 没接入的法兰/机组也按规划显示这些位子，状态一律"待接入"
-const plannedList = fdef => uniqSorted(fdef && Array.isArray(fdef.plannedChannels) ? fdef.plannedChannels : FARM.plannedChannels);
-const boundFlangeDef = () => FARM.flanges[FARM.bind.flangeIndex] || FARM.flanges[0];
-// 绑定法兰的规划位 ∪ 实际在上报的通道 ∪ 冒出探头信号的通道：螺栓状态卡和法兰图按这个画；
-// 统计/报警只看 chList（真有数据的）。插到规划外通道（如 CH10）的探头也会因此多出一张卡
+
+// ── 通道归属法兰 ──────────────────────────────────────────────────────────
+// 一台 48 路设备可以跨多个法兰（CH1–8 顶段、CH9–16 中段……）。哪路通道属于哪个法兰、用哪份标定、额定多少，
+// 以服务端 state.flanges 为准（[{index,name,onDevice,channels,planned,rated,cal}]）；state 还没到时按 farm.json 推一份先把图画出来
+let flangePlan = [];
+function fallbackPlan() {
+  return FARM.flanges.map((f, i) => {
+    let chs = uniqSorted(f.channels || []);
+    let planned = uniqSorted([...(Array.isArray(f.plannedChannels) ? f.plannedChannels : []), ...Object.keys(f.channelBolts || {})]);
+    // 老写法：顶层 channels / plannedChannels 归到绑定法兰
+    if (i === FARM.bind.flangeIndex) {
+      if (!chs.length) chs = uniqSorted(FARM.channels || []);
+      if (!planned.length) planned = uniqSorted(FARM.plannedChannels || []);
+    }
+    // 接在设备上 = 写了在测通道或接线表；只写规划位的法兰是"规划"，它的通道号不参与归属
+    const onDevice = chs.length > 0 || Object.keys(f.channelBolts || {}).length > 0;
+    return { index: i, name: f.name, onDevice, channels: chs, planned, rated: Number(f.ratedKn ?? (FARM.thresholds || {}).ratedKn) || 0, cal: null };
+  });
+}
+const flanges = () => flangePlan.length ? flangePlan : fallbackPlan();
+const planOf = i => flanges()[i];
+const flangeName = i => (FARM.flanges[i] && FARM.flanges[i].name) || (planOf(i) && planOf(i).name) || `法兰 #${i}`;
+// 通道属于哪个法兰；-1 = 不在任何接入法兰的配置里（未分配）。一个法兰都没接时（老配置/默认 CH1–4）全归绑定法兰
+function chFlange(ch) {
+  const fs = flanges().filter(f => f.onDevice);
+  for (const f of fs) if ((f.channels || []).map(Number).includes(ch) || (f.planned || []).map(Number).includes(ch)) return f.index;
+  return fs.length ? -1 : FARM.bind.flangeIndex;
+}
+// 接在这台设备上的法兰（配了在测通道）；一个都没配但设备在上报，就当绑定法兰
+function deviceFlanges() {
+  const d = flanges().filter(f => f.onDevice).map(f => f.index);
+  if (d.length) return d;
+  return chList().length || strayList().length ? [FARM.bind.flangeIndex] : [];
+}
+// 某法兰生效的标定/额定：服务端已经把"法兰自己的 .ucf → 程序目录兜底"算好了，这里不再兜底；state 没到时一律未标定
+const flangeCal = i => { const f = flangePlan[i]; return f && f.cal && Number(f.cal.k) > 0 ? f.cal : null; };
+const flangeRated = i => { const f = planOf(i); return f ? Number(f.rated) || 0 : Number(plan.rated) || 0; };
+const calibratedCh = ch => { const i = chFlange(ch); return i >= 0 ? !!flangeCal(i) : cal.k > 0; };
+const ratedOf = ch => { const i = chFlange(ch); return i >= 0 ? flangeRated(i) : Number(plan.rated) || 0; };
+const anyCalibrated = () => deviceFlanges().some(i => flangeCal(i)) || (deviceFlanges().length === 0 && cal.k > 0);
+const isConfigured = ch => (sigs[ch] && sigs[ch].configured) || flanges().some(f => (f.channels || []).map(Number).includes(ch));
+
+// 各法兰的通道集合
+const flangeChannels = i => chList().filter(ch => chFlange(ch) === i);            // 在测（设备上有基线、在上报）
+const flangePlanned = i => { const f = planOf(i); return f ? uniqSorted(f.planned) : []; };   // 规划探头位（含未接的）
 const strayList = () => Object.values(sigs).filter(g => g.presence === "probe" && !channels[g.ch]).map(g => Number(g.ch));
-const slotList = () => uniqSorted([...plannedList(boundFlangeDef()), ...chList(), ...strayList()]);
+const flangeStrays = i => strayList().filter(ch => chFlange(ch) === i);
+// 一个法兰要画的位子：规划位 ∪ 实际在上报的 ∪ 冒出探头信号的。统计/报警只看 chList（真有数据的）
+const flangeSlots = i => uniqSorted([...flangePlanned(i), ...flangeChannels(i), ...flangeStrays(i)]);
+// 有探头信号却不在任何法兰配置里的通道：不知道装在哪，只能在提示条里点名
+const unassignedStrays = () => strayList().filter(ch => chFlange(ch) < 0);
+// 全站槽位：接在设备上的各法兰 ∪ 未分配的野通道
+const slotList = () => uniqSorted([...deviceFlanges().flatMap(flangeSlots), ...unassignedStrays()]);
+// 没接入的法兰/机组也按规划显示这些位子，状态一律"待接入"
+const plannedList = fdef => { const i = FARM.flanges.indexOf(fdef); return i >= 0 ? flangePlanned(i) : uniqSorted(FARM.plannedChannels); };
+const boundFlangeDef = () => FARM.flanges[FARM.bind.flangeIndex] || FARM.flanges[0];
 const chColor = ch => COLORS[(chList().indexOf(ch) + COLORS.length) % COLORS.length];
 const pad2 = x => String(x).padStart(2, "0");
 const tid = n => "F" + pad2(n);
@@ -76,7 +130,7 @@ function boltHealth(ch) {
   if (!c) {
     // 设备上这一路没有置零基线：冒出探头信号 = 插错位/没置零；否则配了的算离线，没配的是规划位"待接入"
     if (g && g.presence === "probe") return "stray";
-    return (FARM.channels || []).map(Number).includes(ch) ? "offline" : "pending";
+    return isConfigured(ch) ? "offline" : "pending";
   }
   const m = c.last;
   if (!m) return "offline";
@@ -86,12 +140,14 @@ function boltHealth(ch) {
   // 声时偏离置零基线超出物理可能（>2 µs）：探头贴到别的螺栓上/重新耦合过/基线错了，不能当力值
   if (m.mismatch) return "shift";
   if (!m.normal || m.deltaTof == null) return "fault";
-  const t = FARM.thresholds || {};
-  const rated = Number(t.ratedKn) || 0;
-  if (rated > 0) {
-    const f = force(Number(m.deltaTof));
-    if (f < rated * (t.alarmRatio ?? 0.7)) return "loose";
-    if (f < rated * (t.warnRatio ?? 0.85)) return "warn";
+  // 测得到、但这个法兰没有标定文件：算不出力值，也就下不了"正常/偏低/松动"的结论
+  if (!calibratedCh(ch)) return "uncal";
+  // 阈值判定用服务端算好的 kn（和历史库、事件表同一个数）；锚定口径没额定值时 kn 为空，不判松动
+  const rated = ratedOf(ch);
+  const f = liveForce(ch);
+  if (rated > 0 && f != null) {
+    if (f < rated * plan.alarmRatio) return "loose";
+    if (f < rated * plan.warnRatio) return "warn";
   }
 
   return "ok";
@@ -99,52 +155,107 @@ function boltHealth(ch) {
 
 const HEALTH_TEXT = {
   ok: "正常", warn: "预紧力偏低", loose: "松动报警", fault: "检测异常", offline: "离线", pending: "待接入",
-  noprobe: "探头无信号", stray: "有信号·未配置", shift: "基线失配",
+  noprobe: "探头无信号", stray: "有信号·未配置", shift: "基线失配", uncal: "未标定",
 };
+const UNCAL_TEXT = "未加载标定文件（.ucf），不计算预紧力";
 const ALARM_HEALTH = new Set(["loose", "fault", "noprobe", "shift"]);
 // 信号质量分级（厂家指南要求测量值与信号质量分开管理）：真探头 30 dB 以上，16 dB 以下算弱
 const WEAK_SNR_DB = 16;
 const isWeakSignal = ch => sigs[ch] && sigs[ch].presence === "probe" && sigs[ch].snr != null && sigs[ch].snr < WEAK_SNR_DB;
 
 // 一个测点的力值能不能显示：有声时差、状态正常、且没有基线失配
+// 预紧力 kN：服务端算好放在帧里（自由置零 = 绝对值；锚定 = 按锚定时=额定估算，没额定值为空）
 function liveForce(ch) {
   const m = channels[ch] && channels[ch].last;
-  if (!m || m.deltaTof == null || m.mismatch) return null;
-  return force(Number(m.deltaTof));
+  if (!m || m.mismatch || m.kn == null) return null;
+  return Number(m.kn);
 }
+// 较置零基线的变化量 kN（k·Δt）：两种口径下都有，锚定口径下这是业主最该看的数
+function liveDelta(ch) {
+  const m = channels[ch] && channels[ch].last;
+  if (!m || m.mismatch || m.dkn == null) return null;
+  return Number(m.dkn);
+}
+// 卡片主数字：有预紧力就是预紧力；锚定口径没额定值时退到带符号的变化量，并标明是变化量
+function mainKn(ch) {
+  const f = liveForce(ch);
+  if (f != null) return { v: f, delta: false };
+  const d = liveDelta(ch);
+  if (anchored() && d != null) return { v: d, delta: true };
+  return null;
+}
+const mainKnHtml = (mk, digits) => mk == null
+  ? `--<small>kN</small>`
+  : (mk.delta ? fmtSigned(mk.v, digits) : mk.v.toFixed(digits)) + `<small>${mk.delta ? "kN 较锚定" : "kN"}</small>`;
+// 锚定口径的补充说明："较锚定 −3.2 kN（−2.8%）"
+function deltaTxt(ch) {
+  const d = liveDelta(ch);
+  if (!anchored() || d == null) return "";
+  const r = ratedOf(ch);
+  return `较锚定 ${fmtSigned(d, 1)} kN` + (r > 0 ? `（${fmtSigned(d / r * 100, 1)}%）` : "");
+}
+// 接线核对：这一路的在位判定是不是刚刚翻转（现场脱耦/插上探头，几秒内页面上亮出来是几号）
+const FLIP_HIGHLIGHT_MS = 20000;
+function recentFlip(ch) {
+  const g = sigs[ch];
+  if (!g || !g.changedAt) return null;
+  const age = Date.now() - Date.parse(g.changedAt);
+  return age >= 0 && age < FLIP_HIGHLIGHT_MS ? { secs: Math.round(age / 1000), to: g.presence } : null;
+}
+// 预紧力物理上不会是负的。超出噪声的负值只有一个解释：基线不对（置零后拧过、探头挪过、或压根没在自由状态置零）
+const negativeHint = f => f != null && f < 0 ? " · 力值为负，基线可能有误，建议核对置零" : "";
 
-/// 绑定机组当前状态：offline / online / alarm（有松动、检测异常或探头丢失）
-function bindState() {
-  if (!connected || chList().length === 0) return "offline";
-  const hs = chList().map(boltHealth);
-  // 所有测点都超时没帧才算整机离线；页面刚打开还没收到第一帧的那一两秒不算
-  if (hs.every(h => h === "offline") && chList().some(ch => channels[ch].at)) return "offline";
+/// 一个法兰当前状态：offline / online / alarm（有松动、检测异常或探头丢失）
+function flangeState(i) {
+  const chs = flangeChannels(i);
+  if (!connected || chs.length === 0) return "offline";
+  const hs = chs.map(boltHealth);
+  // 所有测点都超时没帧才算离线；页面刚打开还没收到第一帧的那一两秒不算
+  if (hs.every(h => h === "offline") && chs.some(ch => channels[ch].at)) return "offline";
   return hs.some(h => ALARM_HEALTH.has(h)) ? "alarm" : "online";
+}
+/// 绑定机组当前状态：接在设备上的各法兰取最坏的那个
+function bindState() {
+  if (!connected) return "offline";
+  const sts = deviceFlanges().map(flangeState);
+  return sts.includes("alarm") ? "alarm" : sts.includes("online") ? "online" : "offline";
 }
 
 // ── 探头在位提示：根据服务端的在位识别给一句人话 ──────────────────────────
 function probeNotice() {
   const slots = slotList();
+  const chs = a => a.map(c => "CH" + c).join("、");
+  const parts = [];
+  let level = "info";
+  // 接线核对：刚翻转的通道排最前面——现场脱耦一颗，几秒内这里就写出是几号、在哪个法兰
+  const flips = slots.map(ch => ({ ch, f: recentFlip(ch) })).filter(x => x.f);
+  if (flips.length) {
+    parts.push("接线核对：" + flips.map(({ ch, f }) => {
+      const fi = chFlange(ch);
+      return `CH${ch}${fi >= 0 ? `（${flangeName(fi)}）` : ""} ${f.secs} 秒前${f.to === "probe" ? "出现探头信号" : "探头信号消失"}`;
+    }).join("，"));
+  }
+
   const lost = slots.filter(ch => boltHealth(ch) === "noprobe");
   // 只有"未配置的通道冒出探头"才算插错位；配置了的通道有探头但没读到基线是另一回事，会自动补读
   const stray = slots.filter(ch => boltHealth(ch) === "stray" && !(sigs[ch] && sigs[ch].configured));
   const noBase = slots.filter(ch => boltHealth(ch) === "stray" && sigs[ch] && sigs[ch].configured);
-  const anyShift = slots.some(ch => boltHealth(ch) === "shift");
-  if (lost.length === 0 && stray.length === 0 && noBase.length === 0 && !anyShift) return scanning ? { level: "info", text: "巡检中：正在轮询规划位看有没有探头，测点刷新会慢几十秒" } : null;
-  const chs = a => a.map(c => "CH" + c).join("、");
-  // 未配置通道冒出探头，分两种：设备上已有基线（置过零）→ 更像装好了没写进配置；没基线 → 更像插错位
-  const strayZeroed = stray.filter(ch => sigs[ch] && sigs[ch].zeroed);
-  const strayRaw = stray.filter(ch => !(sigs[ch] && sigs[ch].zeroed));
-  const parts = [];
+  const shifted = slots.filter(ch => boltHealth(ch) === "shift");
+  // 未配置通道冒出探头，分三种：不在任何法兰里 → 不知道装在哪；设备上已有基线 → 更像装好了没写进配置；没基线 → 更像插错位
+  const unassigned = stray.filter(ch => chFlange(ch) < 0);
+  const strayZeroed = stray.filter(ch => chFlange(ch) >= 0 && sigs[ch] && sigs[ch].zeroed);
+  const strayRaw = stray.filter(ch => chFlange(ch) >= 0 && !(sigs[ch] && sigs[ch].zeroed));
   if (lost.length) parts.push(`${chs(lost)} 探头信号消失（拔出、接错或耦合失效）`);
-  if (strayZeroed.length) parts.push(`${chs(strayZeroed)} 有探头信号且设备上已有基线 —— 若是新装探头，加进 farm.json 的 channels 即可监测${lost.length ? "；若是从别处挪来的，请核对接线" : ""}`);
+  if (unassigned.length) parts.push(`${chs(unassigned)} 有探头信号，但不在任何法兰的接线表里 —— 请在 farm.json 的对应法兰写上 channels/channelBolts`);
+  if (strayZeroed.length) parts.push(`${chs(strayZeroed)} 有探头信号且设备上已有基线 —— 若是新装探头，加进该法兰的 channels 即可监测${lost.length ? "；若是从别处挪来的，请核对接线" : ""}`);
   if (strayRaw.length) parts.push(`${chs(strayRaw)} 有探头信号但未配置、未置零 —— 可能插错位置${lost.length ? `（${chs(lost)} 的探头？）` : ""}`);
   if (noBase.length) parts.push(`${chs(noBase)} 有探头信号但本次没读到基线，稍后自动补读`);
   // 基线失配：探头还插在原通道，但声时对不上置零基线（贴到别的螺栓上/重新耦合过）
-  const shifted = slots.filter(ch => boltHealth(ch) === "shift");
   if (shifted.length) parts.push(`${chs(shifted)} 声时偏离置零基线超过 2 µs —— 探头位置或耦合已变，需重新置零`);
-  if (parts.length === 0) return null;
-  return { level: lost.length || shifted.length ? "bad" : stray.length ? "warn" : "info", text: parts.join("；") };
+  if (lost.length || shifted.length) level = "bad";
+  else if (stray.length) level = "warn";
+  if (parts.length === 0) return scanning ? { level: "info", text: "巡检中：正在轮询规划位看有没有探头，测点刷新会慢几十秒" } : null;
+  return { level, text: parts.join("；") };
 }
 
 function refreshNotice() {
@@ -154,18 +265,20 @@ function refreshNotice() {
   el.hidden = !n;
   if (!n) return;
   el.className = "notice " + n.level;
-  if (el.textContent !== n.text) el.textContent = n.text;
+  // 窄屏下提示条会被省略号截断，完整内容放 title 悬停可见
+  if (el.textContent !== n.text) { el.textContent = n.text; el.title = n.text; }
 }
 
-function minForce() {
+function minForceOf(chs) {
   let v = null;
-  for (const ch of chList()) {
+  for (const ch of chs) {
     if (boltHealth(ch) === "offline") continue;
     const f = liveForce(ch);
     if (f != null && (v == null || f < v)) v = f;
   }
   return v;
 }
+const minForce = () => minForceOf(chList());
 
 setInterval(() => {
   const n = new Date();
@@ -178,10 +291,12 @@ setInterval(() => {
 //   #/flange/2    看当前机组的第 3 个法兰  #/flange   看绑定法兰（并回到绑定机组）
 let viewTurbine = 1, viewFlange = 0;
 const isBoundTurbine = () => viewTurbine === FARM.bind.turbine;
-const isBoundFlange = () => isBoundTurbine() && viewFlange === FARM.bind.flangeIndex;
+// 当前看的法兰是不是接在这台设备上的（配了在测通道的都算，不再只认 bind.flangeIndex 那一个）
+const isBoundFlange = () => isBoundTurbine() && deviceFlanges().includes(viewFlange);
 const viewFlangeDef = () => FARM.flanges[viewFlange] || FARM.flanges[0];
-// 当前查看法兰的探头位与状态：绑定法兰用真实数据，没接入的法兰是它自己的规划位、全部"待接入"
-const viewSlots = () => isBoundFlange() ? slotList() : plannedList(viewFlangeDef());
+// 当前查看法兰的探头位与状态：接入的法兰用真实数据（只看属于它的通道），没接入的是它自己的规划位、全部"待接入"
+const viewSlots = () => isBoundFlange() ? flangeSlots(viewFlange) : plannedList(viewFlangeDef());
+const viewChannels = () => isBoundFlange() ? flangeChannels(viewFlange) : [];
 const viewHealth = ch => isBoundFlange() ? boltHealth(ch) : "pending";
 
 const VIEWS = ["farm", "turbine", "flange", "alarms", "report"];
@@ -326,17 +441,17 @@ function updateFarm() {
 }
 
 // ══ 视图2：机组详情（当前查看的机组 viewTurbine，不一定是绑定机组） ═══════════
-// 当前查看的机组里，绑定监测点的法兰序号；不是绑定机组就是 -1（全部未接入）
-const boundFlangeInView = () => isBoundTurbine() ? FARM.bind.flangeIndex : -1;
+// 当前查看的机组里，法兰 i 是不是接在设备上的（不是绑定机组就全部未接入）
+const flangeLiveInView = i => isBoundTurbine() && deviceFlanges().includes(i);
 // 机组图上法兰 i 要画的探头位：
-//   绑定法兰       真实槽位（规划 ∪ 实接 ∪ 冒出信号的）；没接入的机组在同一个法兰上画同样的规划（全部"待接入"）
-//   自带规划的法兰 画它自己的 plannedChannels（叶根法兰 12 位），不管哪台机组
+//   接入的法兰     真实槽位（规划 ∪ 实接 ∪ 冒出信号的）；没接入的机组在同一个法兰上画同样的规划（全部"待接入"）
+//   有规划的法兰   画它自己的 plannedChannels（叶根法兰 12 位），不管哪台机组
 //   其余法兰       不画
 function towerSlotsFor(i) {
   const f = FARM.flanges[i];
   if (!f) return [];
-  if (i === FARM.bind.flangeIndex) return isBoundTurbine() ? slotList() : plannedList(f);
-  return Array.isArray(f.plannedChannels) ? plannedList(f) : [];
+  if (flangeLiveInView(i)) return flangeSlots(i);
+  return plannedList(f);
 }
 const towerSlotsKey = () => FARM.flanges.map((f, i) => towerSlotsFor(i).join(",")).join("|");
 
@@ -360,26 +475,25 @@ function buildFlangeList() {
 
 function updateFlangeList() {
   if (String($("flangeList").dataset.turbine) !== String(viewTurbine)) buildFlangeList();
-  const bi = boundFlangeInView();
-  const st = bi >= 0 ? bindState() : "offline";
   FARM.flanges.forEach((f, i) => {
-  const row = $("fl-row-" + i);
-  if (!row) return;
-    const isBound = i === bi;
-    const cls = "fl " + (isBound && st !== "offline" ? "online" : "offline");
-  if (row.className !== cls) row.className = cls;
-    const dotCls = ("dot " + (!isBound ? "" : st === "alarm" ? "err" : st === "online" ? "on" : "")).trim();
-  const dot = $("fl-rdot-" + i);
+    const row = $("fl-row-" + i);
+    if (!row) return;
+    const live = flangeLiveInView(i);
+    const st = live ? flangeState(i) : "offline";
+    const cls = "fl " + (live && st !== "offline" ? "online" : "offline");
+    if (row.className !== cls) row.className = cls;
+    const dotCls = ("dot " + (!live ? "" : st === "alarm" ? "err" : st === "online" ? "on" : "")).trim();
+    const dot = $("fl-rdot-" + i);
     if (dot.className !== dotCls) dot.className = dotCls;
-    if (!isBound) {
+    if (!live) {
       const planned = towerSlotsFor(i).length;
       $("fl-meta-" + i).innerHTML = `螺栓 ${f.boltCount} 颗 · ${planned ? `规划探头 ${planned} 位 · ` : ""}未接入监测`;
       return;
     }
 
-    const pts = chList().length, slots = slotList().length;
-  const mf = minForce();
-  $("fl-meta-" + i).innerHTML = st === "offline"
+    const pts = flangeChannels(i).length, slots = flangeSlots(i).length;
+    const mf = minForceOf(flangeChannels(i));
+    $("fl-meta-" + i).innerHTML = st === "offline"
       ? `螺栓 ${f.boltCount} 颗 · 探头位 ${slots} · 设备未连接`
       : `螺栓 ${f.boltCount} 颗 · 探头 <b>${pts}</b>/${slots} 在线 · 最小预紧力 <b>${mf == null ? "--" : mf.toFixed(1)}</b> kN`
       + (st === "alarm" ? ` · <span style="color:var(--bad)">有测点异常</span>` : "");
@@ -389,14 +503,14 @@ function updateFlangeList() {
 // 机组结构：正视 SVG。结构只建一次，数据帧来了只改 data-st 和文字，颜色/光晕/旋转全交给 CSS，
 // 避免整图重建抖动，也避免脚本里散落一堆颜色值。
 function towerFlangeSub(i) {
-  if (i !== boundFlangeInView()) {
+  if (!flangeLiveInView(i)) {
     const planned = towerSlotsFor(i).length;
     return planned ? `规划探头 ${planned} 位 · 未接入` : "未接入";
   }
-  const st = bindState();
+  const st = flangeState(i);
   if (st === "offline") return "设备未连接";
-  const mf = minForce();
-  return `探头 ${chList().length}/${slotList().length} · 最小 ${mf == null ? "--" : mf.toFixed(1)} kN`
+  const mf = minForceOf(flangeChannels(i));
+  return `探头 ${flangeChannels(i).length}/${flangeSlots(i).length} · 最小 ${mf == null ? "--" : mf.toFixed(1)} kN`
          + (st === "alarm" ? " · 有异常" : "");
 }
 
@@ -594,16 +708,14 @@ window.addEventListener("tower3d-ready", () => {
   if (!$("view-turbine").hidden) { $("tower").dataset.key = ""; renderView("turbine"); }
 });
 
-// 机组图上某个探头位的状态：只有绑定法兰上的才有真实状态，其余（没接入的机组、自带规划的法兰）都是"待接入"影子
+// 机组图上某个探头位的状态：只有接入法兰上的才有真实状态，其余（没接入的机组、只有规划的法兰）都是"待接入"影子
 function towerProbeHealth(fi, ch) {
-  if (fi !== boundFlangeInView()) return "pending";
-  const st = bindState();
-  return st === "offline" ? "offline" : boltHealth(ch);
+  if (!flangeLiveInView(fi)) return "pending";
+  return flangeState(fi) === "offline" ? "offline" : boltHealth(ch);
 }
 
 function updateTower3d() {
-  const bound = boundFlangeInView();
-  const st = bound >= 0 ? bindState() : "offline";
+  const st = isBoundTurbine() ? bindState() : "offline";
   // 每个法兰的探头小球各按自己法兰的螺栓角度排；镜头仍聚焦在绑定法兰所在的位置
   const probes = [];
   FARM.flanges.forEach((fdef, fi) => {
@@ -618,7 +730,7 @@ function updateTower3d() {
     bound: FARM.bind.flangeIndex,
     turbine: viewTurbine,
     live: st !== "offline",
-    states: FARM.flanges.map((f, i) => i === bound ? st : "na"),
+    states: FARM.flanges.map((f, i) => flangeLiveInView(i) ? flangeState(i) : "na"),
     names: FARM.flanges.map(f => f.name),
     subs: FARM.flanges.map((f, i) => towerFlangeSub(i)),
     probes,
@@ -628,14 +740,13 @@ function updateTower3d() {
 function updateTowerSvg() {
   if (tower3dReady()) { updateTower3d(); return; }
   const box = $("tower");
-  const bound = boundFlangeInView();
-  // 任一法兰的探头位数变了（规划或实接）或换了机组要重建，法兰环上的点数才对
-  const key = towerSlotsKey() + "#" + bound + "|" + viewTurbine;
+  // 任一法兰的探头位数变了（规划或实接）、接入的法兰集变了或换了机组要重建，法兰环上的点数才对
+  const key = towerSlotsKey() + "#" + deviceFlanges().join(",") + "|" + viewTurbine;
   if (!box.firstElementChild || box.dataset.key !== key) { buildTowerSvg(); box.dataset.key = key; }
-  const st = bound >= 0 ? bindState() : "offline";
+  const st = isBoundTurbine() ? bindState() : "offline";
   box.classList.toggle("live", st !== "offline");
   FARM.flanges.forEach((f, i) => {
-    const s = i === bound ? st : "na";
+    const s = flangeLiveInView(i) ? flangeState(i) : "na";
     box.querySelectorAll(`[data-fi="${i}"]`).forEach(g => { if (g.dataset.st !== s) g.dataset.st = s; });
     const sub = $("tw-sub-" + i);
     if (!sub) return;
@@ -648,21 +759,23 @@ function updateTowerSvg() {
   });
 }
 
-// 机组页右下：监测法兰上 8 个探头位的小卡（法兰页螺栓状态卡的紧凑版）
+// 机组页右下：接入法兰上各探头位的小卡（法兰页螺栓状态卡的紧凑版）。多个法兰接在同一台设备上时全列出来，卡上标法兰名
 let slotGridKey = "";
 function updateSlotGrid() {
   const grid = $("slotGrid");
   if (!grid) return;
-  // 没接入的机组也按同样规划显示这些位子（全部"待接入"），装在和绑定机组同一个法兰上
+  // 没接入的机组也按绑定法兰的规划显示这些位子（全部"待接入"）
   const boundT = isBoundTurbine();
-  const fdef = boundFlangeDef();
-  const slots = boundT ? slotList() : plannedList(fdef);
-  const cb = (fdef && fdef.channelBolts) || {};
-  const key = slots.join(",") + "|" + FARM.bind.flangeIndex + "|" + viewTurbine;
-  if (slots.length === 0) {
+  const liveFlanges = boundT ? deviceFlanges() : [];
+  const entries = liveFlanges.length
+    ? liveFlanges.flatMap(fi => flangeSlots(fi).map(ch => ({ ch, fi })))
+    : plannedList(boundFlangeDef()).map(ch => ({ ch, fi: FARM.bind.flangeIndex }));
+  const multi = liveFlanges.length > 1;
+  const key = entries.map(e => e.fi + ":" + e.ch).join(",") + "|" + viewTurbine;
+  if (entries.length === 0) {
     if (slotGridKey !== key) {
       slotGridKey = key;
-      grid.innerHTML = `<div class="slot-empty">${tid(viewTurbine)} 机组尚未规划探头位<br><small>在 farm.json 的 plannedChannels 里配置</small></div>`;
+      grid.innerHTML = `<div class="slot-empty">${tid(viewTurbine)} 机组尚未规划探头位<br><small>在 farm.json 的 flanges[].plannedChannels 里配置</small></div>`;
       $("slotHint").textContent = "未接入";
     }
     return;
@@ -671,52 +784,60 @@ function updateSlotGrid() {
   if (key !== slotGridKey) {
     slotGridKey = key;
     grid.innerHTML = "";
-    for (const ch of slots) {
+    for (const { ch, fi } of entries) {
+      const fdef = FARM.flanges[fi] || {};
+      const cb = fdef.channelBolts || {};
       const d = document.createElement("div");
       d.className = "slot";
       d.id = "slot-" + ch;
       const no = Number(cb[ch]);
-      d.innerHTML = `<div class="srow"><span class="sc">CH${ch}${no ? `<span class="sno">#${no}</span>` : ""}</span>
+      const flTag = multi ? `<span class="sno">${fdef.name || ""}</span>` : "";
+      d.innerHTML = `<div class="srow"><span class="sc">CH${ch}${no ? `<span class="sno">#${no}</span>` : ""}${flTag}</span>
           <span class="bst pending" id="slot-st-${ch}">--</span></div>
         <div class="sv" id="slot-v-${ch}">--<small>kN</small></div>
         <div class="ssub" id="slot-sub-${ch}">--</div>`;
-      d.onclick = () => { selected = ch; location.hash = "#/flange/" + FARM.bind.flangeIndex; };
+      d.onclick = () => { selected = ch; location.hash = "#/flange/" + fi; };
       grid.appendChild(d);
     }
   }
 
-  const live = boundT ? chList().length : 0;
-  const hint = `${fdef ? fdef.name + " · " : ""}` + (boundT ? `探头 ${live} / ${slots.length} 在线` : `规划探头 ${slots.length} 位 · 尚未接入`);
+  const live = boundT ? entries.filter(e => channels[e.ch]).length : 0;
+  const hint = (multi ? `${liveFlanges.length} 个法兰 · ` : `${flangeName(entries[0].fi)} · `)
+    + (boundT ? `探头 ${live} / ${entries.length} 在线` : `规划探头 ${entries.length} 位 · 尚未接入`);
   if ($("slotHint").textContent !== hint) $("slotHint").textContent = hint;
 
-  for (const ch of slots) {
+  for (const { ch } of entries) {
     const h = boundT ? boltHealth(ch) : "pending";
     const card = $("slot-" + ch);
-    const cls = "slot" + (["loose", "warn", "pending", "noprobe", "stray", "shift"].includes(h) ? " " + h : "");
+    const cls = "slot" + (["loose", "warn", "pending", "noprobe", "stray", "shift"].includes(h) ? " " + h : "") + (recentFlip(ch) ? " flash" : "");
     if (card.className !== cls) card.className = cls;
     const st = $("slot-st-" + ch);
     if (st.className !== "bst " + h) st.className = "bst " + h;
     if (st.textContent !== HEALTH_TEXT[h]) st.textContent = HEALTH_TEXT[h];
     const m = h === "pending" ? null : channels[ch] && channels[ch].last;
-    const liveVal = h === "pending" || h === "offline" ? null : liveForce(ch);
-    const html = `${liveVal == null ? "--" : liveVal.toFixed(1)}<small>kN</small>`;
+    const mk = h === "pending" || h === "offline" ? null : mainKn(ch);
+    const liveVal = mk && !mk.delta ? mk.v : null;
+    const html = mainKnHtml(mk, 1);
     const el = $("slot-v-" + ch);
     if (el.innerHTML !== html) el.innerHTML = html;
 
-    const rated = Number((FARM.thresholds || {}).ratedKn) || 0;
+    const rated = ratedOf(ch);
     // 在位识别结果只属于绑定机组的设备；别的机组"待接入"就是待接入，不能借它写"已确认无探头信号"
     const g = boundT ? sigs[ch] : undefined;
     const weak = isWeakSignal(ch) ? " · 信号弱，建议检查耦合" : "";
     const sub = h === "pending" ? (g && g.presence === "none" ? "规划探头位 · 已确认无探头信号" : "规划探头位，尚未接入")
+      : h === "uncal" ? UNCAL_TEXT
       : h === "noprobe" ? "探头信号消失：可能被拔出或接错"
       : h === "stray" ? (g && g.configured ? "有探头信号，但未置零" : "未配置通道出现探头信号 —— 可能插错位置")
       : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs，需重新置零`
       : h === "offline" ? (m ? "超过 1 分钟没有新数据" : channels[ch] ? "等待数据" : "已接探头，设备未上报")
-      : liveVal == null ? HEALTH_TEXT[h]
+      : mk == null ? HEALTH_TEXT[h]
+      : mk.delta ? `${deltaTxt(ch)} · 未配置额定值，无法估算绝对预紧力`
       : (rated > 0 ? `额定的 ${(liveVal / rated * 100).toFixed(0)}%` : "未配置额定值")
-        + (m.temp != null ? ` · ${Number(m.temp).toFixed(1)} ℃` : "") + weak;
+        + (anchored() ? ` · ${deltaTxt(ch)}` : "")
+        + (m.temp != null ? ` · ${Number(m.temp).toFixed(1)} ℃` : "") + weak + negativeHint(liveVal);
     const subEl = $("slot-sub-" + ch);
-    if (subEl.textContent !== sub) subEl.textContent = sub;
+    if (subEl.textContent !== sub) { subEl.textContent = sub; subEl.title = sub; }
   }
 }
 
@@ -741,7 +862,8 @@ function applyOpsMode() {
 }
 
 let boltCardsKey = "";
-const boltCardsKeyNow = () => `${viewTurbine}|${viewFlange}|${viewSlots().join(",")}`;
+// 额定值/口径是 state 来的，第一帧 state 到了要重建一次卡片头上的说明
+const boltCardsKeyNow = () => `${viewTurbine}|${viewFlange}|${viewSlots().join(",")}|${plan.baseline}|${flangeRated(viewFlange)}|${!!flangeCal(viewFlange)}`;
 function buildBoltCards() {
   const g = $("boltCards");
   g.innerHTML = "";
@@ -753,7 +875,7 @@ function buildBoltCards() {
     g.classList.remove("dense", "packed");
     g.innerHTML = `<div class="bolt-empty"><div class="t">${tid(viewTurbine)} · ${f.name}</div>
       <div class="d">共 ${f.boltCount} 颗螺栓 · 尚未规划探头位</div>
-      <div class="s">在 farm.json 的 plannedChannels 里配置探头位后这里显示每个位子的状态</div></div>`;
+      <div class="s">在 farm.json 该法兰的 plannedChannels 里配置探头位后这里显示每个位子的状态</div></div>`;
     $("ratedShow").textContent = "";
     return;
   }
@@ -773,18 +895,23 @@ function buildBoltCards() {
     g.appendChild(d);
   }
 
-  const rated = Number((FARM.thresholds || {}).ratedKn) || 0;
-  $("ratedShow").textContent = rated > 0
-    ? `额定预紧力 ${rated} kN · 低于 ${Math.round((FARM.thresholds.alarmRatio ?? 0.7) * 100)}% 报警`
-    : "未配置额定预紧力（farm.json 的 thresholds.ratedKn）";
+  // 头上的说明按当前法兰：它自己的标定文件、额定值
+  const rated = flangeRated(viewFlange);
+  const fc = flangeCal(viewFlange);
+  const calTxt = isBoundFlange() ? (fc ? `标定 ${fc.name} ${Number(fc.k).toFixed(4)} kN/ns · ` : "未标定 · ") : "";
+  $("ratedShow").textContent = calTxt + (rated > 0
+    ? `额定预紧力 ${rated} kN · 低于 ${Math.round(plan.alarmRatio * 100)}% 报警` + (anchored() ? " · 锚定口径：按锚定时 = 额定估算" : "")
+    : "未配置额定预紧力（farm.json 该法兰的 ratedKn）" + (anchored() ? " · 锚定口径下只显示较锚定变化量" : ""));
 }
 
 function updateBoltCard(ch) {
   const card = $("bolt-" + ch);
   if (!card) return;
   const h = viewHealth(ch);
+  // 接线核对：在位判定刚翻转的通道闪几秒，现场脱耦一颗就知道是几号
+  const flip = isBoundFlange() ? recentFlip(ch) : null;
   const cls = ("bolt " + (["loose", "warn", "pending", "noprobe", "stray", "shift"].includes(h) ? h : "")
-    + (ch === selected ? " sel" : "")).trim();
+    + (ch === selected ? " sel" : "") + (flip ? " flash" : "")).trim();
   if (card.className !== cls) card.className = cls;
   const bst = $("bst-" + ch);
   const bstCls = "bst " + h;
@@ -793,17 +920,18 @@ function updateBoltCard(ch) {
   const stTxt = h === "stray" && sigs[ch] && sigs[ch].configured ? "有信号·无基线" : HEALTH_TEXT[h];
   if (bst.textContent !== stTxt) bst.textContent = stTxt;
 
-  // 没接入的法兰上，channels 里的实时值属于绑定法兰，不能拿来显示；基线失配的帧也不能算力值
+  // 没接入的法兰上，channels 里的实时值属于别的法兰，不能拿来显示；基线失配的帧也不能算力值
   const m = h === "pending" ? null : channels[ch] && channels[ch].last;
-  const f = h === "pending" ? null : liveForce(ch);
-  $("bkn-" + ch).innerHTML = (f == null ? "--" : f.toFixed(2)) + "<small>kN</small>";
-  const rated = Number((FARM.thresholds || {}).ratedKn) || 0;
+  const mk = h === "pending" ? null : mainKn(ch);
+  const f = mk && !mk.delta ? mk.v : null;
+  $("bkn-" + ch).innerHTML = mainKnHtml(mk, 2);
+  const rated = ratedOf(ch);
   const tempTxt = m && m.temp != null ? `温度 ${Number(m.temp).toFixed(1)} ℃` : "温度 --";
   const weakTxt = isWeakSignal(ch) ? ` · 信号弱（${sigs[ch].snr} dB），建议检查耦合` : "";
   if (rated > 0 && f != null && h !== "offline") {
     const pct = Math.max(0, f / rated * 100);
     $("bbar-" + ch).style.width = Math.min(100, pct) + "%";
-    $("bsub-" + ch).textContent = `额定 ${rated} kN 的 ${pct.toFixed(0)}% · ${tempTxt}${weakTxt}`;
+    setSub(ch, `额定 ${rated} kN 的 ${pct.toFixed(0)}%` + (anchored() ? ` · ${deltaTxt(ch)}` : "") + ` · ${tempTxt}${weakTxt}${negativeHint(f)}`);
   } else {
     $("bbar-" + ch).style.width = "0%";
     // 有回波、状态正常却没有声时差 = 会话里没有参考声时（通道没置零或基线没读到），不是信号问题
@@ -812,6 +940,7 @@ function updateBoltCard(ch) {
     const g = isBoundFlange() ? sigs[ch] : undefined;
     const snrTxt = g && g.snr != null ? `信噪比 ${g.snr} dB` : "";
     const why = h === "fault" ? (noBase ? "有回波但无基线（通道未置零）" : "信号异常，等待恢复")
+      : h === "uncal" ? `${UNCAL_TEXT}；声时差 ${m && m.deltaTof != null ? fmt(m.deltaTof, 1) + " ns" : "--"}`
       : h === "noprobe" ? `探头信号消失（${snrTxt}）：可能被拔出或接到了别的通道`
       : h === "stray" ? (g && g.configured
           ? `有探头信号（${snrTxt}），但该通道未置零，无法测力`
@@ -821,9 +950,16 @@ function updateBoltCard(ch) {
       : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs（预紧变化只会有几十 ns）：探头贴到了别的螺栓或重新耦合过，需重新置零`
       : h === "offline" ? (m ? "超过 1 分钟没有新数据" : channels[ch] ? "等待数据" : "已接探头，设备未上报该通道")
       : h === "pending" ? (g && g.presence === "none" ? "规划探头位 · 已确认无探头信号" : "规划探头位，尚未接入")
-      : "未配置额定预紧力";
-    $("bsub-" + ch).textContent = ["pending", "noprobe", "stray", "shift"].includes(h) ? why : why + " · " + tempTxt;
+      : mk && mk.delta ? `${deltaTxt(ch)} · 未配置额定值，无法估算绝对预紧力`
+      : "未配置额定预紧力" + negativeHint(f);
+    setSub(ch, ["pending", "noprobe", "stray", "shift", "uncal"].includes(h) ? why : why + " · " + tempTxt);
   }
+}
+
+// 副文字两行截断，完整内容进 title；内容没变就不碰 DOM
+function setSub(ch, text) {
+  const el = $("bsub-" + ch);
+  if (el && el.textContent !== text) { el.textContent = text; el.title = text; }
 }
 
 function updateBoltCards() {
@@ -1266,26 +1402,42 @@ function drawFlange() {
     setAttrIfChanged(b.g, "data-st", h); setAttrIfChanged(b.g, "data-sel", sel);
     setAttrIfChanged(b.chip, "data-st", h); setAttrIfChanged(b.chip, "data-sel", sel);
     setAttrIfChanged(b.lead, "data-st", h);
-    const lf = h === "pending" || h === "offline" ? null : liveForce(b.ch);
+    const mk = h === "pending" || h === "offline" ? null : mainKn(b.ch);
+    setAttrIfChanged(b.chip, "data-delta", mk && mk.delta ? "1" : "0");
+    // 接线核对：刚翻转的通道，牌子和螺栓一起闪
+    const flash = bound && recentFlip(b.ch) ? "1" : "0";
+    setAttrIfChanged(b.chip, "data-flash", flash); setAttrIfChanged(b.g, "data-flash", flash);
+    // 牌子上写的是文字状态（未标定/探头无信号/有信号·未配置…）还是数字：
+    // 数字右对齐贴着单位；文字从牌子左侧排起，否则"有信号·未配置"这种长词会从左边顶出牌子
+    const textual = ["pending", "stray", "noprobe", "shift", "uncal"].includes(h);
+    if (b.kn.getAttribute("data-textual") !== String(textual)) {
+      b.kn.setAttribute("data-textual", String(textual));
+      b.kn.setAttribute("x", textual ? 12 : FL.chipW - 26);
+      b.kn.style.textAnchor = textual ? "start" : "end";   // text-anchor 被样式表定着，要用 style 覆盖
+    }
     const kn = h === "pending" ? "待接入"
       : h === "stray" ? (sigs[b.ch] && sigs[b.ch].configured ? "有信号·无基线" : "有信号·未配置")
       : h === "noprobe" ? "探头无信号"
       : h === "shift" ? "基线失配"
-      : lf != null ? fmt(lf, 1) : "--";
+      : h === "uncal" ? "未标定"
+      : mk == null ? "--"
+      : mk.delta ? "Δ" + fmtSigned(mk.v, 1)
+      : fmt(mk.v, 1);
     if (b.kn.textContent !== kn) b.kn.textContent = kn;
   }
 
   const stat = bound
-    ? `探头 ${chList().length} / ${slots.length} 在线 · ${connected ? "监测中" : "未连接"}`
+    ? `探头 ${viewChannels().length} / ${slots.length} 在线 · ${connected ? "监测中" : "未连接"}`
     : `${tid(viewTurbine)} · 规划探头 ${slots.length} 位 · 尚未接入 · ${fdef.boltCount} 颗螺栓`;
   const statEl = $("flangeStat");
   if (statEl.textContent !== stat) statEl.textContent = stat;
 }
 
+// 运维视图的测点表：只列当前法兰的通道
 function rebuildTable() {
   const t = $("chtable");
   t.innerHTML = "";
-  for (const ch of chList()) {
+  for (const ch of viewChannels()) {
     const d = document.createElement("div");
     d.className = "chrow";
     d.dataset.ch = ch;
@@ -1301,9 +1453,10 @@ function updateRow(ch) {
   const c = channels[ch];
   if (!d || !c || !c.last) return;
   const m = c.last;
-  const lf = liveForce(ch);
+  const mk = mainKn(ch);
   d.querySelector(".dot").className = "dot " + (m.normal && !m.mismatch ? "on" : "err");
-  d.querySelector(".f").innerHTML = (lf == null ? "--" : fmt(lf, 2)) + "<small> kN</small>";
+  d.querySelector(".f").innerHTML = mk == null ? "--<small> kN</small>"
+    : (mk.delta ? fmtSigned(mk.v, 2) + "<small> kN 较锚定</small>" : fmt(mk.v, 2) + "<small> kN</small>");
   d.querySelector(".d").innerHTML = m.mismatch
     ? `<span class="bad">基线失配 Δt ${fmt(m.deltaTof, 0)} ns</span>`
     : m.normal
@@ -1311,11 +1464,18 @@ function updateRow(ch) {
       : `<span class="bad">${m.status}</span>`;
 }
 
+// 选中的测点得是当前法兰上的：切换法兰时把选中项挪到该法兰的第一个通道
+function ensureSelectedInView() {
+  const vc = viewChannels();
+  if (vc.length && !vc.includes(selected)) selected = vc[0];
+}
+
 function refreshAll() {
+  ensureSelectedInView();
   document.querySelectorAll(".chrow").forEach(d =>
     d.classList.toggle("sel", Number(d.dataset.ch) === selected));
   $("detailTitle").textContent = selected ? `测点详情 · CH${selected}` : "测点详情";
-  chList().forEach(ch => updateRow(ch));
+  viewChannels().forEach(ch => updateRow(ch));
   updateBoltCards();
   refreshDetail();
   drawFlange();
@@ -1327,17 +1487,20 @@ function refreshAll() {
 function refreshDetail() {
   const c = channels[selected];
   const m = c && c.last;
-  const lf = m ? liveForce(selected) : null;
-  $("bigForce").innerHTML = (lf != null ? fmt(lf, 2) : m && m.mismatch ? "失配" : "--") + "<small>kN</small>";
+  const mk = m ? mainKn(selected) : null;
+  $("bigForce").innerHTML = mk != null
+    ? mainKnHtml(mk, 2)
+    : (m && m.mismatch ? "失配" : m && !calibratedCh(selected) ? "未标定" : "--") + "<small>kN</small>";
   const snrTxt = sigs[selected] && sigs[selected].snr != null ? `   信噪比 ${sigs[selected].snr} dB${isWeakSignal(selected) ? "（弱）" : ""}` : "";
+  const dTxt = m && !m.mismatch && anchored() && liveForce(selected) != null ? `   ${deltaTxt(selected)}` : "";
   $("waveStatus").textContent = m
-    ? `状态：${m.mismatch ? "声时偏离基线 " + fmt(m.deltaTof, 0) + " ns" : m.status}   波动 ±${stddev(c.dts) == null ? "--" : stddev(c.dts).toFixed(2)} ns${snrTxt}`
+    ? `状态：${m.mismatch ? "声时偏离基线 " + fmt(m.deltaTof, 0) + " ns" : m.status}   波动 ±${stddev(c.dts) == null ? "--" : stddev(c.dts).toFixed(2)} ns${snrTxt}${dTxt}`
     : "";
   if (!m) { metricVals.forEach(v => v.textContent = "--"); return; }
   metricVals[0].textContent = fmt(m.deltaTof, 2);
   metricVals[1].textContent = fmt(m.echoTime, 1);
   metricVals[2].textContent = fmt(m.temp, 2);
-  metricVals[3].textContent = m.deltaTof == null ? "--" : fmt(m.deltaTof * UM_PER_NS, 2);
+  metricVals[3].textContent = m.deltaTof == null ? "--" : fmt(m.deltaTof * umPerNs, 2);
 }
 
 // ── 波形 ──
@@ -1425,17 +1588,19 @@ function drawDist() {
   dctx.strokeStyle = "#1e3a5c";
   dctx.strokeRect(rc.x, rc.y, rc.w, rc.h);
 
-  // 看的是没接入的法兰：没有数据可画
-  const chs = isBoundFlange() ? chList() : [];
+  // 看的是没接入的法兰：没有数据可画。接入的只画属于这个法兰的通道
+  const chs = viewChannels();
   const vals = chs.map(ch => liveForce(ch));
   if (chs.length === 0 || vals.every(v => v == null)) {
     dctx.fillStyle = "#44566e"; dctx.textAlign = "center"; dctx.font = "12px sans-serif";
-    dctx.fillText(isBoundFlange() ? "等待数据……" : "本法兰尚未接入监测", rc.x + rc.w / 2, rc.y + rc.h / 2 + 4);
+    dctx.fillText(!isBoundFlange() ? "本法兰尚未接入监测"
+      : !flangeCal(viewFlange) ? UNCAL_TEXT
+      : anchored() && flangeRated(viewFlange) === 0 ? "未配置额定值：锚定口径下估不出绝对预紧力，轴力分布不画"
+      : "等待数据……", rc.x + rc.w / 2, rc.y + rc.h / 2 + 4);
     return;
   }
 
-  const t = FARM.thresholds || {};
-  const rated = Number(t.ratedKn) || 0;
+  const rated = flangeRated(viewFlange);
   let yMax = Math.max(rated, ...vals.filter(v => v != null));
   yMax = Math.ceil(yMax * 1.25 / 5) * 5 || 10;
   const py = v => rc.y + (1 - v / yMax) * rc.h;
@@ -1446,7 +1611,7 @@ function drawDist() {
     dctx.strokeStyle = "rgba(53, 196, 99, .55)";
     dctx.setLineDash([5, 4]);
     dctx.beginPath(); dctx.moveTo(rc.x, py(rated)); dctx.lineTo(rc.x + rc.w, py(rated)); dctx.stroke();
-    const alarmY = rated * (t.alarmRatio ?? 0.7);
+    const alarmY = rated * plan.alarmRatio;
     dctx.strokeStyle = "rgba(229, 72, 77, .55)";
     dctx.beginPath(); dctx.moveTo(rc.x, py(alarmY)); dctx.lineTo(rc.x + rc.w, py(alarmY)); dctx.stroke();
     dctx.setLineDash([]);
@@ -1491,20 +1656,31 @@ function drawDist() {
   });
 }
 
-function seriesFromLive(spanMs) {
+// 近 5 分钟实时曲线：只画给定的通道（法兰页 = 当前法兰的通道）
+function seriesFromLive(spanMs, chs) {
   const now = Date.now(), out = {};
-  for (const ch of chList()) {
-    out[ch] = (channels[ch].hist || []).filter(p => now - p.t <= spanMs);
+  for (const ch of chs) {
+    out[ch] = ((channels[ch] && channels[ch].hist) || []).filter(p => now - p.t <= spanMs);
   }
   return out;
 }
 
-function seriesFromArchive(points) {
+// 曲线画什么：有预紧力（估算或绝对）画预紧力；锚定口径没额定值时画较锚定变化量。
+// 同一个法兰内两者不会混：kn 为空当且仅当"锚定 + 该法兰未配置额定值"，那时它所有通道都是 dkn
+const trendValue = p => p.kn != null ? Number(p.kn) : p.dkn != null ? Number(p.dkn) : null;
+// 当前法兰的曲线画的是不是变化量（决定图例带不带 Δ 和符号）
+const trendIsDelta = () => anchored() && flangeRated(viewFlange) === 0;
+
+// 历史曲线：chs 给了就只留这些通道（法兰页），不给就全部（报告页）
+function seriesFromArchive(points, chs) {
   const out = {};
+  const keep = chs ? new Set(chs) : null;
   for (const p of points) {
-    if (p.kn == null) continue;
+    if (keep && !keep.has(Number(p.ch))) continue;
+    const v = trendValue(p);
+    if (v == null) continue;
     if (!out[p.ch]) out[p.ch] = [];
-    out[p.ch].push({ t: p.t, f: p.kn });
+    out[p.ch].push({ t: p.t, f: v });
   }
   return out;
 }
@@ -1576,7 +1752,9 @@ function drawForceChart(cv, ctx, series, spanMs, emptyText = "这段时间还没
     ctx.fillStyle = chColor(ch);
     ctx.fillRect(rc.x + rc.w + 16, ly - 8, 14, 3);
     ctx.fillStyle = "#9db8d6";
-    ctx.fillText(`CH${ch}  ${last == null ? "--" : last.toFixed(2)} kN`, rc.x + rc.w + 36, ly - 2);
+    // 锚定口径没额定值时画的是较锚定变化量：带符号、标 Δ，别让人当成绝对预紧力
+    const isDelta = anchored() && ratedOf(Number(ch)) === 0;
+    ctx.fillText(`CH${ch}  ${last == null ? "--" : isDelta ? "Δ" + fmtSigned(last, 2) : last.toFixed(2)} kN`, rc.x + rc.w + 36, ly - 2);
     ly += 19;
   }
 }
@@ -1584,16 +1762,18 @@ function drawForceChart(cv, ctx, series, spanMs, emptyText = "这段时间还没
 const tcv = $("trend"), tctx = tcv.getContext("2d");
 function drawTrend() {
   const span = RANGE_MS[trendRange] || TREND_MS;
-  // 没接入的法兰没有历史，画空图说明
+  // 没接入的法兰没有历史，画空图说明；接入的只画本法兰的通道
   if (!isBoundFlange()) { drawForceChart(tcv, tctx, {}, span, "本法兰尚未接入监测"); return; }
-  const series = trendRange === "5m" ? seriesFromLive(span) : seriesFromArchive(histPoints);
-  drawForceChart(tcv, tctx, series, span);
+  const chs = viewChannels();
+  const series = trendRange === "5m" ? seriesFromLive(span, chs) : seriesFromArchive(histPoints, chs);
+  drawForceChart(tcv, tctx, series, span, flangeCal(viewFlange) ? undefined : UNCAL_TEXT);
 }
 
 const hcv = $("hist"), hctx = hcv.getContext("2d");
 function drawHist() {
   if (!hcv) return;
-  drawForceChart(hcv, hctx, seriesFromArchive(histPoints), RANGE_MS[reportRange] || RANGE_MS["24h"]);
+  drawForceChart(hcv, hctx, seriesFromArchive(histPoints), RANGE_MS[reportRange] || RANGE_MS["24h"],
+    anyCalibrated() ? undefined : UNCAL_TEXT + "，这段时间没有力值曲线");
 }
 
 async function loadTrend(range) {
@@ -1613,11 +1793,12 @@ async function seedLiveHist() {
     if (!r.ok) return;
     const j = await r.json();
     for (const p of j.points || []) {
-      if (p.kn == null) continue;
+      const v = trendValue(p);
+      if (v == null) continue;
       // 只给服务端当前在监测的通道回填近 5 分钟曲线；刚被停掉监测的通道不能凭历史"复活"成测点
       const c = channels[p.ch];
       if (!c) continue;
-      c.hist.push({ t: p.t, f: p.kn });
+      c.hist.push({ t: p.t, f: v });
     }
   } catch { /* 没有历史就从现在开始攒 */ }
 }
@@ -1647,29 +1828,14 @@ setInterval(() => {
   refreshArchive();
 }, 15000);
 
-// ══ 视图4：报警中心（状态变化事件流，本次运行期间） ═══════════════════════
-const events = [];        // {t, ch, from, to, kn}
-const prevHealth = {};
-const lastEvtAt = {};
+// ══ 视图4：报警中心（事件流来自服务端历史库，页面不再自己记一份） ═══════════
 
-function trackHealth(ch) {
-  const h = boltHealth(ch);
-  const prev = prevHealth[ch];
-  prevHealth[ch] = h;
-  if (prev === undefined || h === prev) return;
-  if (prev === "offline") return; // 刚上线不算事件
-  // 边界来回抖动限流：轻事件 10 秒内不重复记，恶化成报警/异常的不限
-  const now = Date.now();
-  if (h !== "loose" && h !== "fault" && lastEvtAt[ch] && now - lastEvtAt[ch] < 10000) return;
-  lastEvtAt[ch] = now;
-  events.unshift({ t: now, ch, from: prev, to: h, kn: liveForce(ch) });
-  if (events.length > 500) events.pop();
-  if (!$("view-alarms").hidden) renderAlarms();
-}
+// 要人处理的探头位：松动、检测异常、探头无信号、基线失配，以及冒出来的未配置探头。
+// 右上角角标和报警中心顶部的卡片都从这一个口径出，数才对得上
+const attentionList = () => slotList().filter(ch => ALARM_HEALTH.has(boltHealth(ch)) || boltHealth(ch) === "stray");
 
 function updateAlarmBadge() {
-  // 松动/异常/探头丢失 + 冒出来的未配置探头，都是要人处理的事
-  const n = slotList().filter(ch => ALARM_HEALTH.has(boltHealth(ch)) || boltHealth(ch) === "stray").length;
+  const n = attentionList().length;
   const b = $("alarmBadge");
   b.hidden = n === 0;
   b.textContent = n;
@@ -1694,15 +1860,18 @@ async function loadEvents(range) {
 }
 
 function renderAlarms() {
-  const looseNow = chList().filter(ch => boltHealth(ch) === "loose").length;
+  const attention = attentionList().map(boltHealth);
+  const looseNow = attention.filter(h => h === "loose").length;
   const warnNow = chList().filter(ch => boltHealth(ch) === "warn").length;
-  const faultNow = chList().filter(ch => boltHealth(ch) === "fault").length;
+  // 检测异常这张卡把探头无信号、基线失配、未配置却有信号的都算进去：它们都是"测不了/不该信"的螺栓，
+  // 和角标的数保持一致（角标 = 松动 + 这一项）
+  const abnormalNow = attention.length - looseNow;
   const stat = (cls, v, k) =>
     `<div class="stat ${cls}"><div><span class="v">${v}</span><span class="u">颗</span></div><div class="k">${k}</div></div>`;
   $("alarmStats").innerHTML =
     stat(looseNow ? "bad" : "", looseNow, "当前松动报警")
     + stat(warnNow ? "" : "", warnNow, "当前预紧力偏低")
-    + stat("", faultNow, "当前检测异常")
+    + stat(abnormalNow ? "bad" : "", abnormalNow, "当前检测异常")
     + stat("", archiveEvents.length, "区间事件");
 
   const list = $("evList");
@@ -1712,11 +1881,12 @@ function renderAlarms() {
   }
 
   const t = tid(FARM.bind.turbine);
-  const f = FARM.flanges[FARM.bind.flangeIndex].name;
+  // 位置按通道所属法兰写；不在任何法兰接线表里的标"未分配"
+  const where = ch => { const i = chFlange(Number(ch)); return i >= 0 ? flangeName(i) : "未分配"; };
   list.innerHTML = archiveEvents.map(e => `
     <div class="ev">
       <span class="et">${fmtTime(e.t)}</span>
-      <span class="ew">${t} · ${f} · CH${e.ch}</span>
+      <span class="ew">${t} · ${where(e.ch)} · CH${e.ch}</span>
       <span class="emsg"><span class="tag ${e.from}">${HEALTH_TEXT[e.from] || e.from}</span>
         <span class="arrow">→</span><span class="tag ${e.to}">${HEALTH_TEXT[e.to] || e.to}</span></span>
       <span class="ekn">${e.kn == null ? "--" : "当时 " + e.kn.toFixed(2) + " kN"}</span>
@@ -1739,49 +1909,77 @@ async function loadReport(range) {
 
 function updateReport() {
   const chs = chList();
-  const counts = { ok: 0, warn: 0, loose: 0, fault: 0, offline: 0 };
-  chs.forEach(ch => counts[boltHealth(ch)]++);
+  // 每一种 boltHealth 可能返回的状态都要有桶，否则那颗螺栓就从统计里消失了，几项加起来对不上总数
+  const counts = { ok: 0, warn: 0, loose: 0, fault: 0, noprobe: 0, shift: 0, uncal: 0, offline: 0, other: 0 };
+  chs.forEach(ch => {
+    const h = boltHealth(ch);
+    counts[h in counts ? h : "other"]++;
+  });
   const total = chs.length;
-  const pct = total ? Math.round(counts.ok / total * 100) : null;
+  // 没有标定就没有"健康率"这回事——不能把测得到的都算成正常
+  const pct = total && anyCalibrated() ? Math.round(counts.ok / total * 100) : null;
+  // 探头无信号也归到"检测异常"里算一颗
+  const abnormal = counts.fault + counts.noprobe + counts.other;
+  const degraded = counts.warn || abnormal || counts.shift;
 
   const ring = $("healthRing");
-  const color = pct == null ? "#16304f" : counts.loose ? "var(--bad)" : counts.warn || counts.fault ? "var(--warn)" : "var(--ok)";
+  const color = pct == null ? "#16304f" : counts.loose ? "var(--bad)" : degraded ? "var(--warn)" : "var(--ok)";
   ring.style.background = pct == null
     ? "#16304f"
     : `conic-gradient(${color} 0 ${pct}%, #16304f ${pct}% 100%)`;
-  ring.className = "ring" + (counts.loose ? " bad" : counts.warn || counts.fault ? " warn" : "");
+  ring.className = "ring" + (counts.loose ? " bad" : degraded ? " warn" : "");
   $("healthPct").textContent = pct == null ? "--" : pct;
 
   const evN = reportStats && reportStats.eventCount != null ? reportStats.eventCount : "--";
-  $("healthCounts").innerHTML = `
+  $("healthCounts").innerHTML = !anyCalibrated() && total ? `
+    <div class="rc"><span class="l">监测螺栓</span><span class="n" style="color:#cfe3f5">${total}</span></div>
+    <div class="rc"><span class="l">未标定</span><span class="n" style="color:var(--warn)">${counts.uncal}</span></div>
+    <div class="rc"><span class="l">检测异常</span><span class="n" style="color:#d8a15c">${abnormal}</span></div>
+    <div class="rc"><span class="l">基线失配</span><span class="n" style="color:#e78cff">${counts.shift}</span></div>
+    <div class="rc"><span class="l">离线</span><span class="n" style="color:#5b7089">${counts.offline}</span></div>
+    <div class="rc"><span class="l">区间事件</span><span class="n" style="color:#7d92aa">${evN}</span></div>
+    <div class="rc" style="grid-column:1/-1;justify-content:center"><span class="l" style="color:var(--warn)">${UNCAL_TEXT}，把 .ucf 放到程序目录后重启</span></div>` : `
     <div class="rc"><span class="l">监测螺栓</span><span class="n" style="color:#cfe3f5">${total || "--"}</span></div>
     <div class="rc"><span class="l">正常</span><span class="n" style="color:var(--ok)">${counts.ok}</span></div>
     <div class="rc"><span class="l">预紧力偏低</span><span class="n" style="color:var(--warn)">${counts.warn}</span></div>
     <div class="rc"><span class="l">松动报警</span><span class="n" style="color:var(--bad)">${counts.loose}</span></div>
-    <div class="rc"><span class="l">检测异常</span><span class="n" style="color:#d8a15c">${counts.fault}</span></div>
+    <div class="rc"><span class="l">检测异常</span><span class="n" style="color:#d8a15c">${abnormal}</span></div>
+    <div class="rc"><span class="l">基线失配</span><span class="n" style="color:#e78cff">${counts.shift}</span></div>
+    <div class="rc"><span class="l">离线</span><span class="n" style="color:#5b7089">${counts.offline}</span></div>
     <div class="rc"><span class="l">区间事件</span><span class="n" style="color:#7d92aa">${evN}</span></div>`;
 
   const t = tid(FARM.bind.turbine);
-  const f = FARM.flanges[FARM.bind.flangeIndex].name;
-  const rated = Number((FARM.thresholds || {}).ratedKn) || 0;
   const byCh = {};
   if (reportStats && reportStats.channels) {
     for (const row of reportStats.channels) byCh[row.ch] = row;
   }
   $("reportTime").textContent = "更新于 " + fmtTime(Date.now());
-  const knTxt = v => v == null ? "--" : Number(v).toFixed(2);
+  // 表头写明口径：锚定口径下的"当前"是按锚定时=额定估算的（各法兰额定可能不同，有一个配了就按估算写）
+  const thKn = $("thKn");
+  const anyRated = deviceFlanges().some(i => flangeRated(i) > 0);
+  const thTxt = anchored() ? (anyRated ? "当前 kN（估算）" : "当前 Δ kN（较锚定）") : "当前 kN";
+  if (thKn && thKn.textContent !== thTxt) thKn.textContent = thTxt;
   $("reportRows").innerHTML = chs.length === 0
-    ? `<tr><td colspan="9" class="revempty">等待数据……</td></tr>`
+    ? `<tr><td colspan="10" class="revempty">等待数据……</td></tr>`
     : chs.map(ch => {
         const h = boltHealth(ch);
         const m = channels[ch] && channels[ch].last;
-        const kn = liveForce(ch);
+        const mk = mainKn(ch);
+        const kn = mk && !mk.delta ? mk.v : null;
+        const d = liveDelta(ch);
+        const rated = ratedOf(ch);
+        // 这一路所属法兰没配额定值：统计列也只能给变化量（带符号）
+        const delta = anchored() && rated === 0;
+        const knTxt = v => v == null ? "--" : delta ? fmtSigned(v, 2) : Number(v).toFixed(2);
         const pctTxt = rated > 0 && kn != null ? (kn / rated * 100).toFixed(0) + "%" : "--";
         const tempTxt = m && m.temp != null ? Number(m.temp).toFixed(1) : "--";
         const s = byCh[ch] || {};
-        return `<tr><td>CH${ch}</td><td>${t} · ${f}</td>
-          <td class="knv">${kn == null ? "--" : kn.toFixed(2)}</td>
-          <td>${knTxt(s.knMin)}</td><td>${knTxt(s.knMax)}</td><td>${knTxt(s.knAvg)}</td>
+        const [mn, mx, av] = delta ? [s.dknMin, s.dknMax, s.dknAvg] : [s.knMin, s.knMax, s.knAvg];
+        const fi = chFlange(ch);
+        return `<tr><td>CH${ch}</td><td>${t} · ${fi >= 0 ? flangeName(fi) : "未分配"}</td>
+          <td class="knv">${mk == null ? "--" : mk.delta ? fmtSigned(mk.v, 2) : mk.v.toFixed(2)}</td>
+          <td>${d == null ? "--" : fmtSigned(d, 2)}</td>
+          <td>${knTxt(mn)}</td><td>${knTxt(mx)}</td><td>${knTxt(av)}</td>
           <td>${tempTxt}</td><td>${pctTxt}</td>
           <td><span class="bst ${h}">${HEALTH_TEXT[h]}</span></td></tr>`;
       }).join("");
@@ -1792,8 +1990,30 @@ function applyState(s) {
   const prevKeys = chList().join(",");
   const wasOn = connected;
   connected = s.connected;
-  cal = { k: Number(s.cal.k), b: Number(s.cal.b) };
-  $("calText").textContent = `标定：${s.cal.name}${s.cal.points ? `（${s.cal.points} 点）` : ""} ${cal.k.toFixed(4)} ${s.cal.unit}/ns`;
+  cal = { k: Number(s.cal.k) || 0, b: Number(s.cal.b) || 0 };
+  if (Number(s.cal.umPerNs) > 0) umPerNs = Number(s.cal.umPerNs);
+  // 口径与阈值以服务端为准；老服务端没这些字段时保持默认
+  plan = {
+    baseline: s.baseline === "free" ? "free" : "anchor",
+    baselineText: s.baselineText || (s.baseline === "free" ? "自由状态置零" : "在役锚定"),
+    rated: Number(s.rated) || 0,
+    warnRatio: Number(s.warnRatio) || 0.85,
+    alarmRatio: Number(s.alarmRatio) || 0.7,
+  };
+  // 各法兰的接线与标定（服务端解析好的 farm.json）；老服务端没这个字段时留空，按 farm.json 兜底推
+  flangePlan = Array.isArray(s.flanges) ? s.flanges.map(f => ({ ...f, channels: uniqSorted(f.channels), planned: uniqSorted(f.planned) })) : [];
+  // 底栏：逐法兰写标定和额定。没放 .ucf 的法兰服务端不给斜率（k=0）：页面不算它的力值，只看声时差
+  const live = deviceFlanges();
+  const calParts = live.map(i => {
+    const fc = flangeCal(i), r = flangeRated(i);
+    return `${flangeName(i)}：${fc ? `${fc.name} ${Number(fc.k).toFixed(4)} kN/ns` : "未标定"}`
+      + (anchored() ? (r > 0 ? `，额定 ${r} kN` : "，未配置额定值") : "");
+  });
+  $("calText").textContent = calParts.length
+    ? `${plan.baselineText} · ` + calParts.join("；")
+    : `标定：${cal.k > 0 ? `${s.cal.name}（${s.cal.points} 点） ${cal.k.toFixed(4)} ${s.cal.unit}/ns · ${plan.baselineText}` : UNCAL_TEXT}`;
+  $("calText").title = $("calText").textContent;
+  $("calText").style.color = anyCalibrated() ? "" : "var(--warn)";
   const healthy = connected && s.channels.length > 0;
   $("stateText").textContent = healthy
     ? `监测中，${s.channels.length} 个测点`
@@ -1816,7 +2036,8 @@ function applyState(s) {
                        dts: old[c.ch]?.dts || [], hist: old[c.ch]?.hist || [] };
   }
   if (!channels[selected]) {
-    const keys = chList();
+    // 优先选当前法兰上的通道，没有再退到全部里的第一个
+    const keys = viewChannels().length ? viewChannels() : chList();
     selected = keys.length ? keys[0] : 0;
   }
   const changed = wasOn !== connected || prevKeys !== chList().join(",");
@@ -1849,14 +2070,15 @@ function onFrame(f) {
     const dt = Number(f.deltaTof);
     c.dts.push(dt);
     if (c.dts.length > 20) c.dts.shift();
-    if (!f.mismatch) c.hist.push({ t: Date.now(), f: force(dt) });
+    // 曲线用服务端算好的值（预紧力，或锚定口径没额定值时的变化量），页面不自己乘系数
+    const v = f.mismatch ? null : trendValue(f);
+    if (v != null) c.hist.push({ t: Date.now(), f: v });
     const cut = Date.now() - TREND_MS - 10000;
     while (c.hist.length && c.hist[0].t < cut) c.hist.shift();
   }
   if (!selected) selected = f.ch;
 
-  // 状态变化事件与报警角标不分视图，始终跟踪
-  trackHealth(f.ch);
+  // 报警角标不分视图，始终跟踪（事件流由服务端落库，页面不再自己记）
   updateAlarmBadge();
 
   // 只刷当前视图，别的视图切过去时整体重画
@@ -1939,6 +2161,9 @@ async function refreshArchive() {
     if (!r.ok) return;
     const s = await r.json();
     const oldest = s.oldest ? fmtTime(s.oldest) : "--";
-    $("archText").textContent = `历史 ${s.samples} 点 · 事件 ${s.events} · 最早 ${oldest} · ${s.dbMb} MB`;
+    // 丢帧 / 写入失败不能静默：只要不是 0 就亮出来，历史不完整得让人知道
+    const loss = (s.dropped ? ` · 丢帧 ${s.dropped}` : "") + (s.writeErrors ? ` · 写入失败 ${s.writeErrors}` : "");
+    $("archText").textContent = `历史 ${s.samples} 点 · 事件 ${s.events} · 最早 ${oldest} · ${s.dbMb} MB${loss}`;
+    $("archText").style.color = loss ? "var(--bad)" : "";
   } catch { /* 服务未起 */ }
 }

@@ -29,10 +29,22 @@ internal sealed class ZeroDialog : Form
 
     private readonly Action<ChannelResult> _onMeasurement;
     private bool _busy;
+
+    /// <summary>
+    /// 当前选中的通道号，给 SDK 接收线程上的 OnMeasurement 用。那条线程不能碰 _channel 这种控件：
+    /// WinForms 控件只能在 UI 线程访问，跨线程读 SelectedIndex 轻则偶发异常，重则和 UI 线程互等死锁。
+    /// </summary>
+    private volatile int _currentCh;
+
     public HashSet<ushort> ZeroedChannels { get; } = new();
 
     public ZeroDialog(DeviceEngine engine, IReadOnlyList<ushort> monitoredChannels, ushort selectedChannel)
     {
+        if (monitoredChannels.Count == 0)
+        {
+            throw new ArgumentException("没有可置零的通道", nameof(monitoredChannels));
+        }
+
         _engine = engine;
         _monitored = monitoredChannels;
 
@@ -56,7 +68,12 @@ internal sealed class ZeroDialog : Form
 
         var idx = monitoredChannels.ToList().IndexOf(selectedChannel);
         _channel.SelectedIndex = idx >= 0 ? idx : 0;
-        _channel.SelectedIndexChanged += (_, _) => ResetSamples();
+        _currentCh = Current;
+        _channel.SelectedIndexChanged += (_, _) =>
+        {
+            _currentCh = Current;
+            ResetSamples();
+        };
 
         _onMeasurement = OnMeasurement;
         _engine.OnMeasurement += _onMeasurement;
@@ -123,11 +140,13 @@ internal sealed class ZeroDialog : Form
         Controls.Add(hint);
     }
 
+    /// <summary>只在 UI 线程上用；SDK 线程看 _currentCh。</summary>
     private ushort Current => _monitored[Math.Max(0, _channel.SelectedIndex)];
 
+    /// <summary>跑在 SDK 接收线程上：只动自己的字段和锁，不碰任何控件。</summary>
     private void OnMeasurement(ChannelResult m)
     {
-        if (m.Channel != Current)
+        if (m.Channel != _currentCh)
         {
             return;
         }
@@ -270,7 +289,7 @@ internal sealed class ZeroDialog : Form
                 ZeroedChannels.Add(ch);
             }
 
-            AppendLog($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} CH{ch} 置零{(ok ? "成功" : "失败")} {detail} 标准差={std:F2}ns 帧数={count}{(_force.Checked ? " 强制" : "")}");
+            OpsLog.Append($"CH{ch} 置零{(ok ? "成功" : "失败")} {detail} 标准差={std:F2}ns 帧数={count}{(_force.Checked ? " 强制" : "")}");
             ShowBaseline();
             ResetStatsAfterZero();
         }
@@ -300,19 +319,6 @@ internal sealed class ZeroDialog : Form
         lock (_lock)
         {
             _samples.Clear();
-        }
-    }
-
-    private static void AppendLog(string line)
-    {
-        try
-        {
-            File.AppendAllText(
-                Path.Combine(AppContext.BaseDirectory, "操作记录.log"),
-                line + Environment.NewLine);
-        }
-        catch (Exception)
-        {
         }
     }
 

@@ -24,7 +24,9 @@ public sealed class MainForm : Form
     private bool _connected;
     private bool _closing;
     private ushort _selected;
-    private decimal _coefK = 0.8919m;
+
+    /// <summary>标定斜率 kN/ns；空 = 没加载标定文件，此时不显示任何夹紧力（没有出处的数不上界面）。</summary>
+    private decimal? _coefK;
     private decimal _coefB;
 
     private readonly TextBox _ipBox = new() { Width = 150, Text = "192.168.0.7:23" };
@@ -34,7 +36,7 @@ public sealed class MainForm : Form
     private bool _scanning;
     private List<ushort> _unheard = new();
     private readonly Label _lblState = new() { AutoSize = true, Text = "未连接", ForeColor = Color.Gray };
-    private readonly Label _lblCal = new() { AutoSize = true, Text = "标定：默认 0.8919 kN/ns", ForeColor = Color.DimGray };
+    private readonly Label _lblCal = new() { AutoSize = true, Text = "标定：未加载标定文件（不显示夹紧力，请加载 .ucf）", ForeColor = Color.DarkOrange };
     private readonly Button _btnCal = new() { Text = "标定文件...", AutoSize = true, MinimumSize = new Size(92, 30) };
     private readonly Button _btnParams = new() { Text = "参数下发...", AutoSize = true, MinimumSize = new Size(92, 30), Enabled = false };
     private readonly Button _btnZero = new() { Text = "通道置零...", AutoSize = true, MinimumSize = new Size(92, 30), Enabled = false };
@@ -82,7 +84,6 @@ public sealed class MainForm : Form
     private readonly Label[] _cardValues = new Label[6];
     private static readonly string[] CardTitles = { "夹紧力 kN", "声时差 ns", "回波声时 ns", "温度 ℃", "伸长量 um", "标准差 ns" };
 
-    private const decimal UmPerNs = 0.807m;
     private readonly WavePanel _wave = new() { Dock = DockStyle.Fill };
     private readonly CheckBox _chkRef = new() { Text = "显示参考回波", Checked = true, AutoSize = true };
     private readonly Label _lblLog = new() { AutoSize = true, ForeColor = Color.Gray, Text = "" };
@@ -594,6 +595,14 @@ public sealed class MainForm : Form
         }
 
         var monitored = _channels.Keys.OrderBy(c => c).ToArray();
+        if (monitored.Length == 0)
+        {
+            // 连上了但一个探头都没扫到时按钮仍是亮的；置零要拿实时波形当基线，没有在测的通道就没法做
+            MessageBox.Show(this, "当前没有在监测的通道，无法置零。\n请检查探头连接后点“扫描通道”。",
+                "通道置零", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
         HashSet<ushort> zeroed;
         using (var dlg = new ZeroDialog(_engine, monitored, _selected == 0 ? monitored[0] : _selected))
         {
@@ -712,7 +721,7 @@ public sealed class MainForm : Form
         if (m.Channel == _selected) RefreshSelected();
     }
 
-    private decimal Force(decimal deltaTof) => deltaTof * _coefK + _coefB;
+    private decimal? Force(decimal deltaTof) => _coefK is { } k ? deltaTof * k + _coefB : null;
 
     private void UpdateParams()
     {
@@ -758,7 +767,7 @@ public sealed class MainForm : Form
     {
         if (c.Row == null || c.Last == null) return;
         var dt = c.Last.DeltaTof;
-        c.Row.SubItems[1].Text = dt.HasValue ? Force(dt.Value).ToString("F2") : "--";
+        c.Row.SubItems[1].Text = dt.HasValue && Force(dt.Value) is { } f ? f.ToString("F2") : "--";
         c.Row.SubItems[2].Text = dt?.ToString("F2") ?? "--";
         var temp = c.Last.SpTemp ?? c.Last.RawTemp;
         c.Row.SubItems[3].Text = temp?.ToString("F2") ?? "--";
@@ -774,13 +783,13 @@ public sealed class MainForm : Form
         if (!_channels.TryGetValue(_selected, out var c) || c.Last == null) return;
         var m = c.Last;
 
-        _cardValues[0].Text = m.DeltaTof.HasValue ? Force(m.DeltaTof.Value).ToString("F2") : "--";
+        _cardValues[0].Text = m.DeltaTof.HasValue && Force(m.DeltaTof.Value) is { } force ? force.ToString("F2") : "--";
         _cardValues[1].Text = m.DeltaTof?.ToString("F2") ?? "--";
         _cardValues[2].Text = m.EchoTime?.ToString("F1") ?? "--";
         _cardValues[3].Text = m.SpTemp?.ToString("F2")
                               ?? m.RawTemp?.ToString("F2") ?? "--";
         _cardValues[4].Text = m.DeltaTof.HasValue
-            ? (m.DeltaTof.Value * UmPerNs).ToString("F2")
+            ? (m.DeltaTof.Value * Ucf.UmPerNs).ToString("F2")
             : "--";
         _cardValues[5].Text = StdDev(c.Dt)?.ToString("F2") ?? "--";
 
@@ -858,50 +867,13 @@ public sealed class MainForm : Form
 
     private void LoadUcf(string path)
     {
-        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
-        var root = doc.RootElement;
-
-        var xs = new List<double>();
-        var ys = new List<double>();
-        foreach (var key in new[] { "SelectedDatas", "AvgDatas", "Datas" })
-        {
-            if (!root.TryGetProperty(key, out var node)) continue;
-            var arr = node.ValueKind == System.Text.Json.JsonValueKind.Object
-                      && node.TryGetProperty("v", out var inner)
-                ? inner
-                : node;
-            if (arr.ValueKind != System.Text.Json.JsonValueKind.Array) continue;
-            foreach (var p in arr.EnumerateArray())
-            {
-                if (p.ValueKind != System.Text.Json.JsonValueKind.Array || p.GetArrayLength() < 2) continue;
-                xs.Add(p[0].GetDouble());
-                ys.Add(p[1].GetDouble());
-            }
-
-            if (xs.Count >= 2) break;
-            xs.Clear();
-            ys.Clear();
-        }
-
-        if (xs.Count < 2) throw new InvalidOperationException("文件中没有标定点");
-
-        var n = xs.Count;
-        var sx = xs.Sum();
-        var sy = ys.Sum();
-        var sxx = xs.Sum(x => x * x);
-        var sxy = xs.Zip(ys, (x, y) => x * y).Sum();
-        var denom = n * sxx - sx * sx;
-        if (Math.Abs(denom) < 1e-9) throw new InvalidOperationException("标定点无效，无法拟合");
-
-        var k = (n * sxy - sx * sy) / denom;
-        var b = (sy - k * sx) / n;
-        if (k <= 0) throw new InvalidOperationException($"拟合斜率为 {k:F6}，不是正数");
-
-        _coefK = (decimal)k;
-        _coefB = Math.Abs(b) < 0.005 ? 0m : (decimal)b;
-        var unit = root.TryGetProperty("CalibUnit", out var u) ? u.GetString() : "kN";
-        _lblCal.Text = $"标定：{Path.GetFileName(path)}（{xs.Count} 点） {_coefK:F4} {unit}/ns"
+        // 拟合只在 FxDevice.Ucf 里做一份，桌面版和大屏算出来的力必须是同一套系数
+        var cal = Ucf.Load(path);
+        _coefK = cal.K;
+        _coefB = cal.B;
+        _lblCal.Text = $"标定：{cal.FileName}（{cal.Points} 点） {cal.K:F4} {cal.Unit}/ns"
                        + (_coefB != 0 ? $" {(_coefB > 0 ? "+" : "-")} {Math.Abs(_coefB):F2}" : string.Empty);
         _lblCal.ForeColor = Color.FromArgb(0, 110, 200);
+        OpsLog.Append($"加载标定文件 {cal.FileName}（{cal.Points} 点）k={cal.K:F4} {cal.Unit}/ns b={_coefB:F2}");
     }
 }

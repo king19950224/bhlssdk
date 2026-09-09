@@ -6,6 +6,15 @@ public static class Ucf
 {
     public sealed record Cal(decimal K, decimal B, string Unit, int Points, string FileName);
 
+    // 这里刻意没有"默认斜率"：没有标定文件就不算力值。曾经的内置 0.8919 kN/ns 没有任何出处，
+    // 真机上的标定文件是 3.63 kN/ns，差 4 倍——用它算出来的数进了历史库和报警，就是假数据。
+
+    /// <summary>
+    /// 伸长量换算（µm/ns）：厂家用同一试件标定得 25.81 µm / 31.99 ns 反推，含声弹性修正。
+    /// 单试件的数，只作参考显示，不参与任何判定。
+    /// </summary>
+    public const decimal UmPerNs = 0.807m;
+
     public static Cal Load(string path)
     {
         using var doc = JsonDocument.Parse(File.ReadAllText(path));

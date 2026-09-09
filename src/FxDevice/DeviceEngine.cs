@@ -863,9 +863,11 @@ public sealed class DeviceEngine
 
     private async Task EnsureChannelSessionAsync(ushort ch)
     {
-        if (!_sessionChannels.Add(ch)) return;
+        if (_sessionChannels.Contains(ch)) return;
         await _client.ConfigureChannelAsync(_sessionId,
             new ChannelConfig { Address = _opt.Address, Channel = ch }, null, false).ConfigureAwait(false);
+        // 配置真发出去了才登记；先登记再 await 的话，抛了异常这一路就永远跳过配置
+        _sessionChannels.Add(ch);
     }
 
     public static string? Validate(string name, decimal value) => name switch

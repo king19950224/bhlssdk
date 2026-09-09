@@ -24,6 +24,12 @@ internal sealed class ParamsDialog : Form
     private readonly DeviceEngine _engine;
     private readonly IReadOnlyList<ushort> _monitored;
 
+    /// <summary>
+    /// 主窗口是否真有在测的通道。没有时对话框兜底看一个通道的参数，但关闭后不能顺手把设备切成
+    /// 只轮询那一路的监测模式——用户什么都没做，设备状态却变了。
+    /// </summary>
+    private readonly bool _hadMonitored;
+
     private readonly Button _btnRead = new() { Text = "重新读取", Width = 90, Height = 30 };
     private readonly Button _btnWrite = new() { Text = "下发修改", Width = 130, Height = 30, Enabled = false };
     private readonly Button _btnRevert = new() { Text = "放弃修改", Width = 90, Height = 30, Enabled = false };
@@ -64,7 +70,8 @@ internal sealed class ParamsDialog : Form
     public ParamsDialog(DeviceEngine engine, IReadOnlyList<ushort> monitoredChannels, ushort selectedChannel)
     {
         _engine = engine;
-        _monitored = monitoredChannels.Count > 0
+        _hadMonitored = monitoredChannels.Count > 0;
+        _monitored = _hadMonitored
             ? monitoredChannels
             : new[] { selectedChannel >= 1 ? selectedChannel : (ushort)1 };
 
@@ -493,6 +500,11 @@ internal sealed class ParamsDialog : Form
                     var notes = wrong.Concat(blind).Select(Describe).ToList();
                     if (unverified > 0) notes.Add($"连带写入的 {unverified} 项未能读回核对");
 
+                    // 参数下发会改设备行为、改声时口径，和置零一样必须留痕
+                    OpsLog.Append($"CH{ch} 参数下发：" + string.Join("，", rows.Where(r => !r.Implicit)
+                                      .Select(r => $"{r.Cn} {r.BeforeValue}->{r.Wrote}（{(r.Verdict == Verdict.StoredOk ? "成功" : Describe(r))}）"))
+                                  + (notes.Count > 0 ? "；" + string.Join("；", notes) : string.Empty));
+
                     if (wrong.Count == 0 && blind.Count == 0)
                     {
                         row.Cells["result"].Value = $"{rows.Count(r => !r.Implicit)} 项写入成功"
@@ -518,6 +530,7 @@ internal sealed class ParamsDialog : Form
                 {
                     row.Cells["result"].Value = "失败：" + ex.Message;
                     failed.Add(ch);
+                    OpsLog.Append($"CH{ch} 参数下发失败：{ex.Message}");
                 }
             }
 
@@ -532,6 +545,7 @@ internal sealed class ParamsDialog : Form
             {
                 inflight.Cells["result"].Value = "已中断：写入可能已生效但未核对，请点“重新读取”";
                 inflight.Cells["result"].Style.BackColor = Blind;
+                OpsLog.Append($"参数下发在 {inflight.Cells["ch"].Value} 处被手动停止：写入可能已生效但未读回核对");
             }
 
             _status.Text = $"已停止，完成 {ok}，失败 {failed.Count}";
@@ -577,7 +591,8 @@ internal sealed class ParamsDialog : Form
     {
         try
         {
-            if (_monitored.Count == 0) return;
+            // 主窗口本来就没在监测：读写前 StopStreamAsync 已把设备留在待机，保持原样即可
+            if (!_hadMonitored) return;
             await _engine.ResumeMonitorAsync(_monitored, CancellationToken.None);
             _status.Text += "，已恢复监测";
         }

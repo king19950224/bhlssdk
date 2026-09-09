@@ -17,7 +17,7 @@ const HUB_Y = H + 1.7;
 const STATUS_COLOR = {
   ok: 0x35c463, online: 0x35c463, warn: 0xf0b429, loose: 0xe5484d, alarm: 0xe5484d,
   fault: 0xd68a3c, offline: 0x5b7089, pending: 0x3a4c63, na: 0x4d637e,
-  noprobe: 0xff6a3d, stray: 0xf0b429, shift: 0xc46ee6,
+  noprobe: 0xff6a3d, stray: 0xf0b429, shift: 0xc46ee6, uncal: 0xf0b429,
 };
 
 let renderer, scene, camera, controls, clock;
@@ -228,7 +228,13 @@ function buildScene() {
 }
 
 function setProbes(probes) {
-  for (const m of probeMeshes) m.parent.remove(m);
+  // 从场景摘下来还不够：不 dispose 的话 Three.js 一直握着对应的 WebGL 缓冲，
+  // 这页 7×24 挂着、每轮巡检探头集一变就新建一批，显存慢慢涨
+  for (const m of probeMeshes) {
+    m.parent.remove(m);
+    m.geometry.dispose();
+    m.material.dispose();
+  }
   probeMeshes = [];
   for (const p of probes) {
     const f = flanges.find(x => x.i === p.fi);
