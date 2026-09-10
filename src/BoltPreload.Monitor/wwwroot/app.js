@@ -187,7 +187,6 @@ const healthLabel = (h, ch) => h === "stray" && sigs[ch] && sigs[ch].configured 
 const UNCAL_TEXT = "未标定";
 // 有标定没额定：只测得到较锚定的变化量，"正常/偏低/松动"都下不了结论，不能写成"正常"
 const UNRATED_TEXT = "未配置额定值";
-const BADBASE_TEXT = "基线可疑，需重新置零";
 const ALARM_HEALTH = new Set(["loose", "fault", "noprobe", "shift", "badbase"]);
 // 卡片/槽位上要带颜色样式的状态
 const STYLED_HEALTH = ["loose", "warn", "pending", "noprobe", "stray", "shift", "badbase"];
@@ -237,8 +236,6 @@ function recentFlip(ch) {
   return age >= 0 && age < FLIP_HIGHLIGHT_MS ? { secs: Math.round(age / 1000), to: g.presence } : null;
 }
 // 预紧力物理上不会是负的。超出噪声的负值只有一个解释：基线不对（置零后拧过、探头挪过、或压根没在自由状态置零）
-const negativeHint = f => f != null && f < 0 ? " · 基线可疑" : "";
-
 /// 一个法兰当前状态：offline / online / alarm（有松动、检测异常或探头丢失）
 function flangeState(i) {
   const chs = flangeChannels(i);
@@ -917,31 +914,19 @@ function updateSlotGrid() {
     if (st.textContent !== stTxt) st.textContent = stTxt;
     const m = h === "pending" ? null : channels[ch] && channels[ch].last;
     const mk = h === "pending" || h === "offline" ? null : mainKn(ch);
-    const liveVal = mk && !mk.delta ? mk.v : null;
     const html = mainKnHtml(mk, 1);
     const el = $("slot-v-" + ch);
     if (el.innerHTML !== html) el.innerHTML = html;
 
-    const rated = ratedOf(ch);
     // 在位识别结果只属于绑定机组的设备；别的机组"待接入"就是待接入
     const g = boundT ? sigs[ch] : undefined;
-    const tempPart = m && m.temp != null ? `，温度 ${Number(m.temp).toFixed(1)} ℃` : "";
     const tempEl = $("slot-temp-" + ch);
     const tempShow = m && m.temp != null && h !== "offline" && h !== "pending" ? `${Number(m.temp).toFixed(1)} ℃` : "";
     if (tempEl && tempEl.textContent !== tempShow) tempEl.textContent = tempShow;
-    // 正文没有副文字；占比、较锚定变化、温度、原因只进悬停提示
-    const tip = h === "pending" ? "规划探头位，尚未接入"
-      : h === "uncal" ? "未加载标定文件，不计算预紧力"
-      : h === "badbase" ? BADBASE_TEXT
-      : h === "noprobe" ? "探头信号消失：可能被拔出、接错或耦合失效"
-      : h === "stray" ? (g && g.configured ? "有探头信号，但该通道未置零，无法测力" : "有探头信号，但该通道不在配置里：可能插错位置")
-      : h === "shift" ? "声时偏离置零基线，需重新置零"
-      : h === "offline" ? (m ? "超过 1 分钟没有新数据" : "等待数据")
-      : mk == null ? HEALTH_TEXT[h]
-      : mk.delta ? `${deltaTxt(ch)}${tempPart}；未配置额定预紧力，只显示较锚定的变化量`
-      : (rated > 0 ? `额定 ${rated} kN 的 ${(liveVal / rated * 100).toFixed(0)}%` : UNRATED_TEXT)
-        + (anchored() ? `，${deltaTxt(ch)}` : "") + tempPart + (isWeakSignal(ch) ? "；信号弱，建议检查耦合" : "") + negativeHint(liveVal);
-    if (card.title !== tip) card.title = tip;
+    // 卡片没有悬停提示；异常状态在状态牌上挂一句原因
+    if (card.title) card.title = "";
+    const reason = abnormalReason(h, m, g, channels[ch]);
+    if (st.title !== reason) st.title = reason;
   }
 }
 
@@ -1034,41 +1019,32 @@ function updateBoltCard(ch) {
   const f = mk && !mk.delta ? mk.v : null;
   $("bkn-" + ch).innerHTML = mainKnHtml(mk, 2);
   const rated = ratedOf(ch);
-  const tempTxt = m && m.temp != null ? `，温度 ${Number(m.temp).toFixed(1)} ℃` : "";
   // 温度写在通道号旁边（在测且有数据才有）
   const tempEl = $("btemp-" + ch);
   const tempShow = m && m.temp != null && h !== "offline" && h !== "pending" ? `${Number(m.temp).toFixed(1)} ℃` : "";
   if (tempEl && tempEl.textContent !== tempShow) tempEl.textContent = tempShow;
-  // 其余（占比、较锚定变化、原因、处置）都只进悬停提示
-  let detail;
-  if (rated > 0 && f != null && h !== "offline" && h !== "badbase") {
-    const pct = Math.max(0, f / rated * 100);
-    $("bbar-" + ch).style.width = Math.min(100, pct) + "%";
-    detail = `额定 ${rated} kN 的 ${pct.toFixed(0)}%` + (anchored() ? `，${deltaTxt(ch)}（绝对值按锚定时 = 额定估算）` : "") + tempTxt
-      + (isWeakSignal(ch) ? `；信号弱（${sigs[ch].snr} dB），建议检查耦合` : "") + negativeHint(f);
-  } else {
-    $("bbar-" + ch).style.width = "0%";
-    // 有回波、状态正常却没有声时差 = 会话里没有参考声时（通道没置零或基线没读到），不是信号问题
-    const noBase = m && m.normal && m.echoTime != null && m.deltaTof == null;
-    // 在位识别结果只属于绑定法兰；没接入的法兰（叶根 12 位等）一律"尚未接入"
-    const g = isBoundFlange() ? sigs[ch] : undefined;
-    const snrTxt = g && g.snr != null ? `信噪比 ${g.snr} dB` : "";
-    detail = h === "fault" ? (noBase ? "有回波但无基线：通道未置零" : "设备这帧没解出声时，等待恢复")
-      : h === "uncal" ? `未加载标定文件，不计算预紧力；声时差 ${m && m.deltaTof != null ? fmt(m.deltaTof, 1) + " ns" : "--"}`
-      : h === "badbase" ? `力值为负（算得 ${f == null ? "--" : f.toFixed(1)} kN）：基线或额定值有误，需现场核对并重新置零`
-      : h === "noprobe" ? `探头信号消失（${snrTxt}）：可能被拔出、接错或耦合失效`
-      : h === "stray" ? (g && g.configured
-          ? `有探头信号（${snrTxt}），但该通道未置零，无法测力`
-          : g && g.zeroed
-            ? `检测到探头信号（${snrTxt}），设备上已有基线：确认已安装就加进该法兰的接线表`
-            : `检测到探头信号（${snrTxt}），此通道未配置、未置零：探头可能插错位置`)
-      : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs（预紧变化只会有几十 ns）：探头贴到了别的螺栓或重新耦合过，需重新置零`
-      : h === "offline" ? (m ? "超过 1 分钟没有新数据" : channels[ch] ? "等待数据" : "已接探头，设备未上报该通道")
-      : h === "pending" ? (g && g.presence === "none" ? "规划探头位，已确认无探头信号" : "规划探头位，尚未接入")
-      : mk && mk.delta ? `${deltaTxt(ch)}${tempTxt}；未配置额定预紧力，只显示较锚定的变化量，不判偏低/松动`
-      : "未配置额定预紧力，只显示较锚定的变化量，不判偏低/松动" + negativeHint(f);
-  }
-  if (card.title !== detail) card.title = detail;
+  // 卡片本身没有悬停提示。只有异常状态在状态牌上挂一句原因（鼠标放到状态词上才出来）
+  $("bbar-" + ch).style.width = rated > 0 && f != null && h !== "offline" && h !== "badbase"
+    ? Math.min(100, Math.max(0, f / rated * 100)) + "%" : "0%";
+  if (card.title) card.title = "";
+  const g = isBoundFlange() ? sigs[ch] : undefined;
+  const reason = abnormalReason(h, m, g, channels[ch]);
+  if (bst.title !== reason) bst.title = reason;
+}
+
+// 异常状态的一句话原因（挂在状态牌上）；正常/偏低/松动/待接入不解释
+function abnormalReason(h, m, g, c) {
+  // 有回波、状态正常却没有声时差 = 会话里没有参考声时（通道没置零或基线没读到），不是信号问题
+  const noBase = m && m.normal && m.echoTime != null && m.deltaTof == null;
+  return h === "fault" ? (noBase ? "通道未置零" : "设备未解出声时，等待恢复")
+    : h === "uncal" ? "未加载标定文件"
+    : h === "unrated" ? "未配置额定值，只显示较锚定变化量"
+    : h === "badbase" ? "力值为负，基线或额定值有误，需重新置零"
+    : h === "noprobe" ? "探头信号消失，检查探头"
+    : h === "stray" ? (g && g.configured ? "有探头信号，通道未置零" : "有探头信号，通道不在配置里")
+    : h === "shift" ? "声时偏离置零基线，需重新置零"
+    : h === "offline" ? (m ? "超过 1 分钟没有新数据" : c ? "等待数据" : "设备未上报该通道")
+    : "";
 }
 
 function updateBoltCards() {
