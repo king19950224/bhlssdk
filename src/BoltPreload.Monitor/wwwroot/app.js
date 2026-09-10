@@ -892,10 +892,10 @@ function updateSlotGrid() {
       d.id = "slot-" + ch;
       const no = Number(cb[ch]);
       const flTag = multi ? `<span class="sno">${fdef.name || ""}</span>` : "";
+      // 槽位卡只有通道 + 状态词和力值，说明进悬停提示
       d.innerHTML = `<div class="srow"><span class="sc">CH${ch}${no ? `<span class="sno">#${no}</span>` : ""}${flTag}</span>
           <span class="bst pending" id="slot-st-${ch}">--</span></div>
-        <div class="sv" id="slot-v-${ch}">--<small>kN</small></div>
-        <div class="ssub" id="slot-sub-${ch}">--</div>`;
+        <div class="sv" id="slot-v-${ch}">--<small>kN</small></div>`;
       d.onclick = () => { selected = ch; location.hash = "#/flange/" + fi; };
       grid.appendChild(d);
     }
@@ -925,22 +925,20 @@ function updateSlotGrid() {
     const rated = ratedOf(ch);
     // 在位识别结果只属于绑定机组的设备；别的机组"待接入"就是待接入
     const g = boundT ? sigs[ch] : undefined;
-    const weak = isWeakSignal(ch) ? " · 信号弱" : "";
-    const tempPart = m && m.temp != null ? ` · ${Number(m.temp).toFixed(1)} ℃` : "";
-    // 副文字只写结论和数字；状态词已经在上面的牌子里，这里不重复解释
-    const sub = h === "pending" ? "规划探头位"
-      : h === "uncal" ? UNCAL_TEXT
+    const tempPart = m && m.temp != null ? `，温度 ${Number(m.temp).toFixed(1)} ℃` : "";
+    // 正文没有副文字；占比、较锚定变化、温度、原因只进悬停提示
+    const tip = h === "pending" ? "规划探头位，尚未接入"
+      : h === "uncal" ? "未加载标定文件，不计算预紧力"
       : h === "badbase" ? BADBASE_TEXT
-      : h === "noprobe" ? "请检查探头"
-      : h === "stray" ? (g && g.configured ? "有信号，待置零" : "有信号，未在配置")
-      : h === "shift" ? "需重新置零"
-      : h === "offline" ? (m ? "1 分钟无数据" : "等待数据")
+      : h === "noprobe" ? "探头信号消失：可能被拔出、接错或耦合失效"
+      : h === "stray" ? (g && g.configured ? "有探头信号，但该通道未置零，无法测力" : "有探头信号，但该通道不在配置里：可能插错位置")
+      : h === "shift" ? "声时偏离置零基线，需重新置零"
+      : h === "offline" ? (m ? "超过 1 分钟没有新数据" : "等待数据")
       : mk == null ? HEALTH_TEXT[h]
-      : mk.delta ? deltaTxt(ch) + tempPart
-      : (rated > 0 ? `${(liveVal / rated * 100).toFixed(0)}%` : UNRATED_TEXT)
-        + (anchored() ? ` · ${deltaTxt(ch)}` : "") + tempPart + weak + negativeHint(liveVal);
-    const subEl = $("slot-sub-" + ch);
-    if (subEl.textContent !== sub) { subEl.textContent = sub; subEl.title = sub; }
+      : mk.delta ? `${deltaTxt(ch)}${tempPart}；未配置额定预紧力，只显示较锚定的变化量`
+      : (rated > 0 ? `额定 ${rated} kN 的 ${(liveVal / rated * 100).toFixed(0)}%` : UNRATED_TEXT)
+        + (anchored() ? `，${deltaTxt(ch)}` : "") + tempPart + (isWeakSignal(ch) ? "；信号弱，建议检查耦合" : "") + negativeHint(liveVal);
+    if (card.title !== tip) card.title = tip;
   }
 }
 
@@ -992,10 +990,10 @@ function buildBoltCards() {
     const d = document.createElement("div");
     d.className = "bolt";
     d.id = "bolt-" + ch;
+    // 卡片只有三样：通道 + 状态词、力值、占额定的条。没有副文字——解释在卡片的悬停提示里
     d.innerHTML = `<div class="brow"><span class="bch">CH${ch}</span><span class="bst offline" id="bst-${ch}">--</span></div>
       <div class="bkn" id="bkn-${ch}">--<small>kN</small></div>
-      <div class="bbar"><i id="bbar-${ch}" style="width:0%"></i></div>
-      <div class="bsub" id="bsub-${ch}">--</div>`;
+      <div class="bbar"><i id="bbar-${ch}" style="width:0%"></i></div>`;
     d.onclick = () => { selected = ch; refreshAll(); };
     g.appendChild(d);
   }
@@ -1033,15 +1031,14 @@ function updateBoltCard(ch) {
   const f = mk && !mk.delta ? mk.v : null;
   $("bkn-" + ch).innerHTML = mainKnHtml(mk, 2);
   const rated = ratedOf(ch);
-  const tempPart = m && m.temp != null ? ` · ${Number(m.temp).toFixed(1)} ℃` : "";
-  const weakTxt = isWeakSignal(ch) ? " · 信号弱" : "";
+  const tempTxt = m && m.temp != null ? `，温度 ${Number(m.temp).toFixed(1)} ℃` : "";
+  // 卡片正文只有状态词、力值和占额定的条。下面这些（占比、较锚定变化、温度、原因、处置）都只进悬停提示
+  let detail;
   if (rated > 0 && f != null && h !== "offline" && h !== "badbase") {
     const pct = Math.max(0, f / rated * 100);
     $("bbar-" + ch).style.width = Math.min(100, pct) + "%";
-    // 正文：占额定百分比、较锚定变化、温度；悬停：额定值和口径
-    setSub(ch, `${pct.toFixed(0)}%` + (anchored() ? ` · ${deltaTxt(ch)}` : "") + tempPart + weakTxt + negativeHint(f),
-      `额定 ${rated} kN 的 ${pct.toFixed(0)}%` + (anchored() ? `，${deltaTxt(ch)}（绝对值按锚定时 = 额定估算）` : "")
-      + (isWeakSignal(ch) ? `；信号弱（${sigs[ch].snr} dB），建议检查耦合` : ""));
+    detail = `额定 ${rated} kN 的 ${pct.toFixed(0)}%` + (anchored() ? `，${deltaTxt(ch)}（绝对值按锚定时 = 额定估算）` : "") + tempTxt
+      + (isWeakSignal(ch) ? `；信号弱（${sigs[ch].snr} dB），建议检查耦合` : "") + negativeHint(f);
   } else {
     $("bbar-" + ch).style.width = "0%";
     // 有回波、状态正常却没有声时差 = 会话里没有参考声时（通道没置零或基线没读到），不是信号问题
@@ -1049,19 +1046,8 @@ function updateBoltCard(ch) {
     // 在位识别结果只属于绑定法兰；没接入的法兰（叶根 12 位等）一律"尚未接入"
     const g = isBoundFlange() ? sigs[ch] : undefined;
     const snrTxt = g && g.snr != null ? `信噪比 ${g.snr} dB` : "";
-    // 正文一句结论，原因和处置进 title
-    const text = h === "fault" ? (noBase ? "未置零" : "等待恢复")
-      : h === "uncal" ? `${UNCAL_TEXT} · 声时差 ${m && m.deltaTof != null ? fmt(m.deltaTof, 1) + " ns" : "--"}`
-      : h === "badbase" ? BADBASE_TEXT
-      : h === "noprobe" ? "请检查探头"
-      : h === "stray" ? (g && g.configured ? "有信号，待置零" : "有信号，未在配置")
-      : h === "shift" ? "需重新置零"
-      : h === "offline" ? (m ? "1 分钟无数据" : "等待数据")
-      : h === "pending" ? "规划探头位"
-      : mk && mk.delta ? deltaTxt(ch) + tempPart
-      : UNRATED_TEXT + negativeHint(f);
-    const detail = h === "fault" ? (noBase ? "有回波但无基线：通道未置零" : "设备这帧没解出声时，等待恢复")
-      : h === "uncal" ? "未加载标定文件，不计算预紧力，只显示声时差"
+    detail = h === "fault" ? (noBase ? "有回波但无基线：通道未置零" : "设备这帧没解出声时，等待恢复")
+      : h === "uncal" ? `未加载标定文件，不计算预紧力；声时差 ${m && m.deltaTof != null ? fmt(m.deltaTof, 1) + " ns" : "--"}`
       : h === "badbase" ? `力值为负（算得 ${f == null ? "--" : f.toFixed(1)} kN）：基线或额定值有误，需现场核对并重新置零`
       : h === "noprobe" ? `探头信号消失（${snrTxt}）：可能被拔出、接错或耦合失效`
       : h === "stray" ? (g && g.configured
@@ -1072,18 +1058,10 @@ function updateBoltCard(ch) {
       : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs（预紧变化只会有几十 ns）：探头贴到了别的螺栓或重新耦合过，需重新置零`
       : h === "offline" ? (m ? "超过 1 分钟没有新数据" : channels[ch] ? "等待数据" : "已接探头，设备未上报该通道")
       : h === "pending" ? (g && g.presence === "none" ? "规划探头位，已确认无探头信号" : "规划探头位，尚未接入")
-      : "未配置额定预紧力：只显示较锚定的变化量，不判偏低/松动";
-    setSub(ch, text, detail);
+      : mk && mk.delta ? `${deltaTxt(ch)}${tempTxt}；未配置额定预紧力，只显示较锚定的变化量，不判偏低/松动`
+      : "未配置额定预紧力，只显示较锚定的变化量，不判偏低/松动" + negativeHint(f);
   }
-}
-
-// 副文字两行截断；title 放完整解释（没给就用正文）。内容没变就不碰 DOM
-function setSub(ch, text, detail) {
-  const el = $("bsub-" + ch);
-  if (!el) return;
-  if (el.textContent !== text) el.textContent = text;
-  const title = detail || text;
-  if (el.title !== title) el.title = title;
+  if (card.title !== detail) card.title = detail;
 }
 
 function updateBoltCards() {
