@@ -1782,9 +1782,11 @@ function seriesFromLive(spanMs, chs) {
   return out;
 }
 
-// 曲线画什么：有预紧力（估算或绝对）画预紧力；锚定口径没额定值时画较锚定变化量。
-// 同一个法兰内两者不会混：kn 为空当且仅当"锚定 + 该法兰未配置额定值"，那时它所有通道都是 dkn
-const trendValue = p => p.kn != null ? Number(p.kn) : p.dkn != null ? Number(p.dkn) : null;
+// 曲线画什么：这一路所属法兰现在配了额定值就画预紧力（只认 kn），没配就画较锚定变化量（只认 dkn）。
+// 不能"kn 为空就退回 dkn"：改过额定/标定重启后，历史里同一路既有旧配置下的 dkn 行又有新配置下的 kn 行，
+// 混进一条线就是 −81 和 1570 连在一起的锯齿。口径按当前配置定，另一种口径的行直接不画
+const trendValueFor = (p, isDelta) => { const v = isDelta ? p.dkn : p.kn; return v == null ? null : Number(v); };
+const chIsDelta = ch => anchored() && ratedOf(Number(ch)) === 0;
 // 当前法兰的曲线画的是不是变化量（决定图例带不带 Δ 和符号）
 const trendIsDelta = () => anchored() && flangeRated(viewFlange) === 0;
 
@@ -1797,12 +1799,14 @@ function seriesFromArchive(points, chs, turbine) {
     const t = p.tb ?? defaultTurbine();
     if (turbine != null && t !== turbine) continue;
     if (keep && !keep.has(Number(p.ch))) continue;
-    const v = trendValue(p);
-    if (v == null) continue;
     const key = `${t}:${p.ch}`;
     if (!out[key]) out[key] = seriesEntry(t, p.ch, multi);
+    const v = trendValueFor(p, out[key].isDelta);
+    if (v == null) continue;
     out[key].pts.push({ t: p.t, f: v });
   }
+  // 库里按时间出来的，但保险起见按时间排一遍：折线的点序乱了会画成来回扫的扇面
+  for (const e of Object.values(out)) e.pts.sort((a, b) => a.t - b.t);
   return out;
 }
 
@@ -1939,20 +1943,29 @@ async function loadTrend(range) {
   } catch { /* 服务刚起来或断了，下轮再拉 */ }
 }
 
+// 用库里近 5 分钟的采样回填实时曲线（页面刚打开/刚重连时不用等 5 分钟才有线）。
+// 幂等：按时间戳合并，同一条采样重复回填不会再加一次；合并后按时间排序——这个函数会被反复调用，
+// 之前每次都直接 push，5 分钟下来一路攒出 6000 多个乱序点，曲线画成扇面
 async function seedLiveHist() {
   try {
     const r = await fetch("/api/history?range=5m", { cache: "no-store" });
     if (!r.ok) return;
     const j = await r.json();
+    const touched = new Map();   // channel 对象 → 按 t 去重的点
     for (const p of j.points || []) {
-      const v = trendValue(p);
-      if (v == null) continue;
       // 按机组回填；只给服务端当前在监测的通道回填近 5 分钟曲线，刚被停掉监测的通道不能凭历史"复活"成测点
-      const d = devices[p.tb ?? defaultTurbine()];
+      const t = p.tb ?? defaultTurbine();
+      const d = devices[t];
       const c = d && d.channels[p.ch];
       if (!c) continue;
-      c.hist.push({ t: p.t, f: v });
+      const v = trendValueFor(p, withTurbine(t, () => chIsDelta(p.ch)));
+      if (v == null) continue;
+      let byT = touched.get(c);
+      if (!byT) { byT = new Map(c.hist.map(q => [q.t, q])); touched.set(c, byT); }
+      if (!byT.has(p.t)) byT.set(p.t, { t: p.t, f: v });
     }
+    const cut = Date.now() - TREND_MS - 10000;
+    for (const [c, byT] of touched) c.hist = [...byT.values()].filter(q => q.t >= cut).sort((a, b) => a.t - b.t);
   } catch { /* 没有历史就从现在开始攒 */ }
 }
 
@@ -2151,8 +2164,11 @@ function updateReport() {
 }
 
 // ══ 状态与数据流 ════════════════════════════════════════════════════════
-// 整站状态：农场级口径 + 每台设备一份。开 WebSocket 先收这一份，/api/state 也是它
-function applyState(s) {
+// 整站状态：农场级口径 + 每台设备一份。开 WebSocket 先收这一份，/api/state 也是它。
+// viaPoll = 3 秒一次的兜底轮询拿到的：没变化就只做轻量刷新——之前每次轮询都走"整体重画 + 回填曲线"，
+// 页面每 3 秒重排一遍、曲线缓冲每 3 秒多塞一份历史
+let stateApplied = false;
+function applyState(s, viaPoll = false) {
   // 老服务端（单设备）的 state 没有 devices：包一层当成一台
   const devs = Array.isArray(s.devices) ? s.devices : [{ ...s, turbine: s.turbine ?? 1 }];
   if (Number(s.turbineCount) > 0) FARM.turbineCount = Number(s.turbineCount);
@@ -2174,7 +2190,10 @@ function applyState(s) {
   // 第一次拿到设备列表时，默认看第一台接了设备的机组
   if (!hasDevice(viewTurbine) && deviceTurbines().length && !location.hash.match(/#\/(turbine|flange)\/\d/)) viewTurbine = defaultTurbine();
   bindTurbine(viewTurbine);
-  afterDeviceUpdate(viewTurbine, true);
+  // 第一份 state、WebSocket 重连收到的 state、设备增减：整体重画；轮询拿到的没变化就走轻量路径
+  const full = !viaPoll || !stateApplied || before !== deviceTurbines().join(",");
+  stateApplied = true;
+  afterDeviceUpdate(viewTurbine, full);
 }
 
 // 一台设备的状态（服务端只在它变化时发它自己那份）。silent = 由 applyState 统一收尾，这里不刷视图
@@ -2185,6 +2204,8 @@ function applyDevice(s, silent = false) {
   const prevKeys = Object.keys(d.channels).join(",");
   const wasOn = d.connected;
   const prevSlots = isView ? slotList().join(",") : "";
+  // 接线/标定/额定变了（改 farm.json 重启服务）也算"这台设备变了"：视图要按新口径整体重画
+  const prevPlan = JSON.stringify(d.flangePlan || []);
 
   d.connected = !!s.connected;
   d.endpoint = s.endpoint || d.endpoint;
@@ -2208,7 +2229,7 @@ function applyDevice(s, silent = false) {
                   dts: old[c.ch]?.dts || [], hist: old[c.ch]?.hist || [] };
   }
   d.channels = chs;
-  d.changed = wasOn !== d.connected || prevKeys !== Object.keys(chs).join(",");
+  d.changed = wasOn !== d.connected || prevKeys !== Object.keys(chs).join(",") || prevPlan !== JSON.stringify(d.flangePlan);
   d.slotsChanged = isView && prevSlots !== withTurbine(t, () => slotList().join(","));
   if (isView) bindTurbine(t);
   if (!silent) afterDeviceUpdate(t, false);
@@ -2297,7 +2318,7 @@ function onFrame(f) {
     c.dts.push(dt);
     if (c.dts.length > 20) c.dts.shift();
     // 曲线用服务端算好的值（预紧力，或锚定口径没额定值时的变化量），页面不自己乘系数
-    const v = f.mismatch ? null : trendValue(f);
+    const v = f.mismatch ? null : withTurbine(t, () => trendValueFor(f, chIsDelta(f.ch)));
     if (v != null) c.hist.push({ t: Date.now(), f: v });
     const cut = Date.now() - TREND_MS - 10000;
     while (c.hist.length && c.hist[0].t < cut) c.hist.shift();
@@ -2378,7 +2399,7 @@ function openWs() {
 async function pullState() {
   try {
     const r = await fetch("/api/state", { cache: "no-store" });
-    if (r.ok) applyState(await r.json());
+    if (r.ok) applyState(await r.json(), true);
   } catch { /* 服务还没起来 */ }
 }
 

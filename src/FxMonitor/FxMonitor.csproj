@@ -26,4 +26,11 @@
     <ProjectReference Include="..\FxDevice\FxDevice.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- 和大屏用同一份现场配置与标定文件：直接链接大屏项目里的 farm.json 与 .ucf 输出到 exe 旁，
+         两边永远是同一份，同一颗螺栓两边一个数 -->
+    <None Include="..\BoltPreload.Monitor\wwwroot\farm.json" Link="farm.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\BoltPreload.Monitor\*.ucf" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

@@ -22,6 +22,9 @@
   <ItemGroup>
     <!-- 直接跑 bin 里的 exe（不经 dotnet run）时也要能找到页面 -->
     <Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 现场标定文件（厂家软件做的 .ucf）和 farm.json 一样是现场配置的一部分，进仓库、随 exe 一起输出，
+         发布到哪台机器都不会"忘了拷标定文件"变成未标定。farm.json 里 devices[].flanges[].ucf 写文件名 -->
+    <None Include="*.ucf" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
