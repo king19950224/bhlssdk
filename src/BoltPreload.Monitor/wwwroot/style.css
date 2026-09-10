@@ -501,6 +501,9 @@ canvas { display: block; width: 100%; }
 .bolt.sel { border-color: var(--cyan); box-shadow: 0 0 12px rgba(47, 208, 200, .22), inset 0 0 18px rgba(47, 208, 200, .06); }
 .bolt .brow { display: flex; align-items: center; justify-content: space-between; }
 .bolt .bch { font-family: var(--num); font-size: 17px; color: #cfe3f5; letter-spacing: 1px; }
+/* 温度：通道号和状态牌之间，小字、灰色，不抢力值的戏 */
+.bolt .btemp { margin-left: auto; margin-right: 10px; font-family: var(--num); font-size: 12px; color: var(--muted); }
+.slot .stemp { margin-left: auto; margin-right: 8px; font-family: var(--num); font-size: 11px; color: var(--muted); }
 .bolt .bst { font-size: 13px; padding: 3px 12px; border-radius: 3px; letter-spacing: 2px; }
 .bolt .bst.ok { color: #4be08a; background: rgba(53, 196, 99, .13); border: 1px solid rgba(53, 196, 99, .45); }
 .bolt .bst.warn { color: #f5c34d; background: rgba(240, 180, 41, .12); border: 1px solid rgba(240, 180, 41, .45); }

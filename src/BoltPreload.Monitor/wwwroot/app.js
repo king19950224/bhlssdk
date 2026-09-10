@@ -892,9 +892,9 @@ function updateSlotGrid() {
       d.id = "slot-" + ch;
       const no = Number(cb[ch]);
       const flTag = multi ? `<span class="sno">${fdef.name || ""}</span>` : "";
-      // 槽位卡只有通道 + 状态词和力值，说明进悬停提示
+      // 槽位卡只有通道、温度、状态词和力值，说明进悬停提示
       d.innerHTML = `<div class="srow"><span class="sc">CH${ch}${no ? `<span class="sno">#${no}</span>` : ""}${flTag}</span>
-          <span class="bst pending" id="slot-st-${ch}">--</span></div>
+          <span class="stemp" id="slot-temp-${ch}"></span><span class="bst pending" id="slot-st-${ch}">--</span></div>
         <div class="sv" id="slot-v-${ch}">--<small>kN</small></div>`;
       d.onclick = () => { selected = ch; location.hash = "#/flange/" + fi; };
       grid.appendChild(d);
@@ -926,6 +926,9 @@ function updateSlotGrid() {
     // 在位识别结果只属于绑定机组的设备；别的机组"待接入"就是待接入
     const g = boundT ? sigs[ch] : undefined;
     const tempPart = m && m.temp != null ? `，温度 ${Number(m.temp).toFixed(1)} ℃` : "";
+    const tempEl = $("slot-temp-" + ch);
+    const tempShow = m && m.temp != null && h !== "offline" && h !== "pending" ? `${Number(m.temp).toFixed(1)} ℃` : "";
+    if (tempEl && tempEl.textContent !== tempShow) tempEl.textContent = tempShow;
     // 正文没有副文字；占比、较锚定变化、温度、原因只进悬停提示
     const tip = h === "pending" ? "规划探头位，尚未接入"
       : h === "uncal" ? "未加载标定文件，不计算预紧力"
@@ -990,8 +993,8 @@ function buildBoltCards() {
     const d = document.createElement("div");
     d.className = "bolt";
     d.id = "bolt-" + ch;
-    // 卡片只有三样：通道 + 状态词、力值、占额定的条。没有副文字——解释在卡片的悬停提示里
-    d.innerHTML = `<div class="brow"><span class="bch">CH${ch}</span><span class="bst offline" id="bst-${ch}">--</span></div>
+    // 卡片只有：通道、温度、状态词、力值、占额定的条。没有副文字——解释在卡片的悬停提示里
+    d.innerHTML = `<div class="brow"><span class="bch">CH${ch}</span><span class="btemp" id="btemp-${ch}"></span><span class="bst offline" id="bst-${ch}">--</span></div>
       <div class="bkn" id="bkn-${ch}">--<small>kN</small></div>
       <div class="bbar"><i id="bbar-${ch}" style="width:0%"></i></div>`;
     d.onclick = () => { selected = ch; refreshAll(); };
@@ -1032,7 +1035,11 @@ function updateBoltCard(ch) {
   $("bkn-" + ch).innerHTML = mainKnHtml(mk, 2);
   const rated = ratedOf(ch);
   const tempTxt = m && m.temp != null ? `，温度 ${Number(m.temp).toFixed(1)} ℃` : "";
-  // 卡片正文只有状态词、力值和占额定的条。下面这些（占比、较锚定变化、温度、原因、处置）都只进悬停提示
+  // 温度写在通道号旁边（在测且有数据才有）
+  const tempEl = $("btemp-" + ch);
+  const tempShow = m && m.temp != null && h !== "offline" && h !== "pending" ? `${Number(m.temp).toFixed(1)} ℃` : "";
+  if (tempEl && tempEl.textContent !== tempShow) tempEl.textContent = tempShow;
+  // 其余（占比、较锚定变化、原因、处置）都只进悬停提示
   let detail;
   if (rated > 0 && f != null && h !== "offline" && h !== "badbase") {
     const pct = Math.max(0, f / rated * 100);
