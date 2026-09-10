@@ -2,7 +2,7 @@
   "farmName": "百恒风电场",
   "turbineCount": 20,
   "baseline": "anchor",
-  "thresholds": { "ratedKn": 28, "warnRatio": 0.85, "alarmRatio": 0.7 },
+  "thresholds": { "ratedKn": 0, "warnRatio": 0.85, "alarmRatio": 0.7 },
   "flanges": [
     {
       "name": "塔筒顶段法兰",
@@ -26,8 +26,7 @@
       "flanges": [
         {
           "index": 0,
-          "channels": [1, 2, 3, 4, 8],
-          "channelBolts": { "1": 1, "2": 12, "3": 24, "4": 35, "5": 47, "6": 58, "7": 70, "8": 81 }
+          "channels": [1, 2, 6, 9]
         }
       ]
     }

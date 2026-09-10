@@ -961,6 +961,7 @@ internal sealed class HistoryStore : IDisposable
         "shift" => "基线失配",
         "badbase" => "基线可疑",
         "uncal" => "未标定",
+        "unrated" => "未配额定",
         "rezero" => "基线重置",
         _ => "离线",
     };

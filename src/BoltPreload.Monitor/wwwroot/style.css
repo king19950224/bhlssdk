@@ -279,6 +279,9 @@ canvas { display: block; width: 100%; }
 /* 未标定：设备在测、声时正常，但没有标定文件算不出力值 —— 橙色虚框提醒运维去放 .ucf */
 .slot .bst.uncal, .bolt .bst.uncal, .rtable .bst.uncal { color: #f0b429; background: rgba(240, 180, 41, .08); border: 1px dashed rgba(240, 180, 41, .6); }
 .ev .tag.uncal { color: #f0b429; background: rgba(240, 180, 41, .08); border: 1px dashed rgba(240, 180, 41, .5); }
+/* 未配额定：有标定、在测变化量，但没有额定值判不了偏低/松动 —— 蓝灰虚线，不是绿"正常"也不是黄"未标定" */
+.slot .bst.unrated, .bolt .bst.unrated, .rtable .bst.unrated { color: #9db8d6; background: rgba(120, 150, 190, .1); border: 1px dashed rgba(157, 184, 214, .6); }
+.ev .tag.unrated { color: #9db8d6; background: rgba(120, 150, 190, .1); border: 1px dashed rgba(157, 184, 214, .5); }
 .slot.warn .sv { color: var(--warn); }
 .slot.loose .sv { color: var(--bad); }
 .slot.loose { border-color: rgba(229, 72, 77, .6); }
@@ -466,11 +469,20 @@ canvas { display: block; width: 100%; }
 .flangebox .chip[data-st="uncal"] .bar { fill: var(--warn); }
 .flangebox .chip[data-st="uncal"] .chip-kn { fill: #f0b429; font-size: 12px; font-weight: normal; font-family: inherit; }
 .flangebox .chip[data-st="uncal"] .chip-u { display: none; }
+.flangebox [data-st="unrated"] .stat { stroke: #9db8d6; stroke-dasharray: 4 3; }
+.flangebox [data-st="unrated"] .halo { stroke: #9db8d6; opacity: .3; }
+.flangebox [data-st="unrated"] .led { fill: #9db8d6; filter: drop-shadow(0 0 3px #9db8d6); }
+.flangebox .lead[data-st="unrated"] line { stroke: rgba(157, 184, 214, .5); }
+.flangebox .lead[data-st="unrated"] circle { fill: #9db8d6; }
+.flangebox .chip[data-st="unrated"] rect { stroke-dasharray: 4 3; }
+.flangebox .chip[data-st="unrated"] .bar { fill: #9db8d6; }
+.flangebox .chip[data-st="unrated"] .chip-kn { fill: #9db8d6; }
 /* 锚定口径没额定值时牌子上是带符号的变化量（"Δ+113.4"），字多一截，收一号免得顶出牌子 */
 .flangebox .chip[data-delta="1"] .chip-kn { font-size: 14px; }
 /* 文字状态统一用正文字号（脚本同时把它改成左对齐）；放在各状态规则之后，优先生效 */
 .flangebox .chip .chip-kn[data-textual="true"] { font-size: 11.5px; font-weight: normal; font-family: inherit; letter-spacing: 0; }
 .towerbox .pdot[data-st="uncal"] { fill: var(--warn); }
+.towerbox .pdot[data-st="unrated"] { fill: #9db8d6; }
 /* 图纸编号与基准标记 */
 .flangebox .bno { fill: #8aa2bd; font-size: 8.5px; text-anchor: middle; font-family: var(--num); }
 .flangebox .mark line { stroke: rgba(127, 182, 216, .7); stroke-width: 1; }

@@ -165,8 +165,9 @@ function boltHealth(ch) {
   if (!m.normal || m.deltaTof == null) return "fault";
   if (!calibratedCh(ch)) return "uncal";
   const rated = ratedOf(ch);
+  if (!(rated > 0)) return "unrated";
   const f = liveForce(ch);
-  if (rated > 0 && f != null) {
+  if (f != null) {
     if (f < rated * plan.alarmRatio) return "loose";
     if (f < rated * plan.warnRatio) return "warn";
   }
@@ -176,10 +177,12 @@ function boltHealth(ch) {
 
 const HEALTH_TEXT = {
   ok: "正常", warn: "预紧力偏低", loose: "松动报警", fault: "检测异常", offline: "离线", pending: "待接入",
-  noprobe: "探头无信号", stray: "有信号·未配置", shift: "基线失配", uncal: "未标定", badbase: "基线可疑",
+  noprobe: "探头无信号", stray: "有信号·未配置", shift: "基线失配", uncal: "未标定", unrated: "未配额定", badbase: "基线可疑",
   rezero: "基线重置", unknown: "未知",
 };
 const UNCAL_TEXT = "未加载标定文件（.ucf），不计算预紧力";
+// 有标定没额定：只测得到较锚定的变化量，"正常/偏低/松动"都下不了结论，不能写成"正常"
+const UNRATED_TEXT = "未配置额定预紧力（farm.json 该法兰的 ratedKn），只显示较锚定变化量，不判偏低/松动";
 const BADBASE_TEXT = "力值为负：基线或额定值有误，需现场核对并重新置零";
 const ALARM_HEALTH = new Set(["loose", "fault", "noprobe", "shift", "badbase"]);
 // 卡片/槽位上要带颜色样式的状态
@@ -920,8 +923,8 @@ function updateSlotGrid() {
       : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs，需重新置零`
       : h === "offline" ? (m ? "超过 1 分钟没有新数据" : channels[ch] ? "等待数据" : "已接探头，设备未上报")
       : mk == null ? HEALTH_TEXT[h]
-      : mk.delta ? `${deltaTxt(ch)} · 未配置额定值，无法估算绝对预紧力`
-      : (rated > 0 ? `额定的 ${(liveVal / rated * 100).toFixed(0)}%` : "未配置额定值")
+      : mk.delta ? `${deltaTxt(ch)} · ${UNRATED_TEXT}`
+      : (rated > 0 ? `额定的 ${(liveVal / rated * 100).toFixed(0)}%` : UNRATED_TEXT)
         + (anchored() ? ` · ${deltaTxt(ch)}` : "")
         + (m.temp != null ? ` · ${Number(m.temp).toFixed(1)} ℃` : "") + weak + negativeHint(liveVal);
     const subEl = $("slot-sub-" + ch);
@@ -1039,8 +1042,8 @@ function updateBoltCard(ch) {
       : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs（预紧变化只会有几十 ns）：探头贴到了别的螺栓或重新耦合过，需重新置零`
       : h === "offline" ? (m ? "超过 1 分钟没有新数据" : channels[ch] ? "等待数据" : "已接探头，设备未上报该通道")
       : h === "pending" ? (g && g.presence === "none" ? "规划探头位 · 已确认无探头信号" : "规划探头位，尚未接入")
-      : mk && mk.delta ? `${deltaTxt(ch)} · 未配置额定值，无法估算绝对预紧力`
-      : "未配置额定预紧力" + negativeHint(f);
+      : mk && mk.delta ? `${deltaTxt(ch)} · ${UNRATED_TEXT}`
+      : UNRATED_TEXT + negativeHint(f);
     setSub(ch, ["pending", "noprobe", "stray", "shift", "uncal", "badbase"].includes(h) ? why : why + " · " + tempTxt);
   }
 }
@@ -1222,6 +1225,7 @@ function buildFlangeSvg(fdef, chs) {
   const drawBolt = root ? rootBoltSvg : boltSvg;
   const monIdx = new Map();
   slotBoltIndex(fdef, chs).forEach((idx, ch) => monIdx.set(idx, ch));
+  const cb = boltsOf(FARM.flanges.indexOf(fdef));
   $("flangeTitle").textContent = `${root ? "螺柱布置" : "螺栓布置"} · ${fdef.name}（${n} 颗）`;
 
   // 叶根下面的变桨轴承比叶根筒大一圈，前半圈的文字要绕到轴承下沿以外
@@ -1269,8 +1273,11 @@ function buildFlangeSvg(fdef, chs) {
         <ellipse class="stat" rx="${rs}" ry="${(rs * k).toFixed(1)}"/>
         <ellipse class="selring" rx="${rsel}" ry="${(rsel * k).toFixed(1)}"/>${drawBolt(geoMon, k, true)}
       </g>`;
-    // 引线从探头顶部出发（叶根的探头直接立在衬套上，没有螺母那一段高度）
-    mons.push({ ch: b.ch, no: b.no, x: b.x, y: b.y, top: b.y - (root ? 0 : geoMon.hN) - geoMon.hP - geoMon.pr * k });
+    // 引线从探头顶部出发（叶根的探头直接立在衬套上，没有螺母那一段高度）。
+    // 牌子上只有接线表（channelBolts）里登记过的通道才写螺栓号；没登记的探头在图上只是占个位子，
+    // 那个位置是均匀排开的示意，不能把示意位置的编号写成"这颗螺栓"
+    const known = Number(cb[b.ch]) >= 1;
+    mons.push({ ch: b.ch, no: b.no, known, x: b.x, y: b.y, top: b.y - (root ? 0 : geoMon.hN) - geoMon.hP - geoMon.pr * k });
   }
 
   // 标签牌：按投影 x 分左右两列，列内按 y 排（远的在上），沿整列高度均匀铺开——
@@ -1297,7 +1304,7 @@ function buildFlangeSvg(fdef, chs) {
       <g class="chip" data-ch="${b.ch}" data-st="offline" data-sel="0" transform="translate(${x0},${y.toFixed(1)})">
         <rect width="${chipW}" height="${chipH}" rx="5"/>
         <rect class="bar" x="0" y="0" width="3" height="${chipH}" rx="1.5"/>
-        <text class="chip-ch" x="12" y="16">CH${b.ch}<tspan class="chip-no"> · #${b.no}</tspan></text>
+        <text class="chip-ch" x="12" y="16">CH${b.ch}${b.known ? `<tspan class="chip-no"> · #${b.no}</tspan>` : ""}</text>
         <text class="chip-kn" x="${chipW - 26}" y="36">--</text>
         <text class="chip-u" x="${chipW - 22}" y="36">kN</text>
       </g>`;
@@ -2075,11 +2082,12 @@ function updateReport() {
   const calibratedAny = deviceTurbines().some(t => withTurbine(t, anyCalibrated));
   const anyRated = deviceTurbines().some(t => withTurbine(t, () => deviceFlanges().some(i => flangeRated(i) > 0)));
   // 每一种 boltHealth 可能返回的状态都要有桶，否则那颗螺栓就从统计里消失了，几项加起来对不上总数
-  const counts = { ok: 0, warn: 0, loose: 0, fault: 0, noprobe: 0, shift: 0, badbase: 0, uncal: 0, offline: 0, other: 0 };
+  const counts = { ok: 0, warn: 0, loose: 0, fault: 0, noprobe: 0, shift: 0, badbase: 0, uncal: 0, unrated: 0, offline: 0, other: 0 };
   rows.forEach(r => { counts[r.h in counts ? r.h : "other"]++; });
   const total = rows.length;
-  // 没有标定就没有"健康率"这回事——不能把测得到的都算成正常
-  const pct = total && calibratedAny ? Math.round(counts.ok / total * 100) : null;
+  // 没有标定、或没有一个法兰配了额定值，就没有"健康率"这回事——不能把测得到的都算成正常；
+  // 有额定值时"未配额定"的那些颗也不算正常，只是没判
+  const pct = total && calibratedAny && anyRated ? Math.round(counts.ok / total * 100) : null;
   // 探头无信号、基线可疑也归到"检测异常"里算一颗：都是"测不了/不该信"的螺栓
   const abnormal = counts.fault + counts.noprobe + counts.badbase + counts.other;
   const degraded = counts.warn || abnormal || counts.shift;
@@ -2107,8 +2115,10 @@ function updateReport() {
     <div class="rc"><span class="l">松动报警</span><span class="n" style="color:var(--bad)">${counts.loose}</span></div>
     <div class="rc"><span class="l">检测异常</span><span class="n" style="color:#d8a15c">${abnormal}</span></div>
     <div class="rc"><span class="l">基线失配</span><span class="n" style="color:#e78cff">${counts.shift}</span></div>
+    <div class="rc"><span class="l">未配额定·只测变化</span><span class="n" style="color:#9db8d6">${counts.unrated + counts.uncal}</span></div>
     <div class="rc"><span class="l">离线</span><span class="n" style="color:#5b7089">${counts.offline}</span></div>
-    <div class="rc"><span class="l">区间事件</span><span class="n" style="color:#7d92aa">${evN}</span></div>`;
+    <div class="rc"><span class="l">区间事件</span><span class="n" style="color:#7d92aa">${evN}</span></div>${anyRated ? "" : `
+    <div class="rc" style="grid-column:1/-1;justify-content:center"><span class="l" style="color:#9db8d6">${UNRATED_TEXT}</span></div>`}`;
 
   // 区间统计按 (机组, 通道) 对上
   const byKey = {};

@@ -304,7 +304,9 @@ public sealed class CalPlan
                         Index = index,
                         Name = name,
                         Channels = channels,
-                        Planned = planned.Concat(bolts.Keys).Distinct().OrderBy(c => c).ToArray(),
+                        // 探头位 = 模板规划位 ∪ 实际接线的 channels ∪ 接线表里的键。接了线但不在模板规划里的通道（顶段模板规划 CH1–8，
+                        // 现场却接在 CH9）也必须占一个位子，否则它离线时页面上连"离线"都不显示，人会以为没这颗
+                        Planned = planned.Concat(channels).Concat(bolts.Keys).Distinct().OrderBy(c => c).ToArray(),
                         Bolts = bolts,
                         Cal = cal,
                         CalSource = source,

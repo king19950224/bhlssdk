@@ -14,13 +14,15 @@ internal static class Health
     public const string NoProbe = "noprobe";   // 探头无信号：波形里连续多帧没有像样的回波（拔了/接错/耦合失效）
     public const string Shift = "shift";       // 基线失配：声时偏离置零基线 > 2 µs，探头挪过或重新耦合过
     public const string Uncal = "uncal";       // 未标定：测得到声时差但没有 .ucf，算不出力值
+    public const string Unrated = "unrated";   // 未配额定：有标定、测得到变化量，但没有额定预紧力，判不了偏低/松动
     public const string BadBase = "badbase";   // 基线可疑：算出来的预紧力明显为负，基线或额定值有误
     public const string Rezero = "rezero";     // 事件专用：这一路的参考声时变了（现场重新置零）
 
     /// <summary>
     /// 判定顺序：先看测不测得到（shift / noprobe / fault），再看有没有标定（uncal），
-    /// 再看力值是否物理上可信（badbase），最后才拿力值比阈值（loose / warn / ok）。
-    /// 没有标定文件时绝不给出"正常/偏低/松动"这种需要力值才能下的结论；没有额定值时不判偏低/松动。
+    /// 再看力值是否物理上可信（badbase），再看有没有额定值（unrated），最后才拿力值比阈值（loose / warn / ok）。
+    /// 没有标定文件时绝不给出"正常/偏低/松动"这种需要力值才能下的结论；没有额定值时同样不给"正常"——
+    /// "正常"是一个和阈值比过之后才有的结论，没比过就只能说"在测、未判定"。
     /// </summary>
     /// <param name="normal">设备状态字为 Normal。</param>
     /// <param name="mismatch">声时差超出物理上限（HistoryStore.IsBaselineMismatch）。</param>
@@ -71,6 +73,13 @@ internal static class Health
                     return Warn;
                 }
             }
+        }
+
+        // 没有额定值：锚定口径下算不出绝对预紧力（kn 为空，只有较锚定的变化量），自由口径下有绝对值也没有阈值可比。
+        // 两种情况都下不了"正常"的结论——业主看到"正常"会以为判过了，其实只是在测。
+        if (rated <= 0)
+        {
+            return Unrated;
         }
 
         return Ok;
