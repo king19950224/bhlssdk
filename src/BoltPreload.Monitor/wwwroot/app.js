@@ -315,6 +315,21 @@ document.querySelectorAll("#maintBox a[data-min]").forEach(a => {
   };
 });
 
+// 运维视图：手动重载 farm.json（只能在大屏主机上按；成功后服务端会让页面自己刷新）
+const reloadBtn = $("reloadCfg");
+if (reloadBtn) reloadBtn.onclick = async () => {
+  const msg = $("maintMsg");
+  delete msg.dataset.err;
+  msg.textContent = "正在重新加载配置……";
+  try {
+    const r = await fetch("/api/reload", { method: "POST" });
+    if (r.status === 403) { msg.dataset.err = "1"; msg.textContent = "只能在大屏主机上操作"; return; }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { msg.dataset.err = "1"; msg.textContent = j.error || "重载失败"; return; }
+    msg.textContent = j.message || "已应用";
+  } catch { msg.dataset.err = "1"; msg.textContent = "操作失败"; }
+};
+
 // 当前看的这台机组的提示
 function turbineNotice() {
   return maintenance
@@ -2363,6 +2378,8 @@ function openWs() {
     else if (msg.type === "device") applyDevice(msg.state);
     else if (msg.type === "frame") onFrame(msg);
     else if (msg.type === "log") { if (devices[msg.t]) devices[msg.t].log = msg.text; if (!msg.t || msg.t === viewTurbine) $("log").textContent = msg.text; }
+    // 服务端重载了 farm.json：法兰模板是页面自己读的文件、设备也全换了，整页刷新最干净
+    else if (msg.type === "reload") location.reload();
   };
   ws.onclose = () => setTimeout(openWs, 2000);
 }

@@ -33,28 +33,40 @@ var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
 Console.OutputEncoding = Encoding.UTF8;
 
-// farm.json：全场法兰模板、每台设备（机组、地址、接线、标定、额定）、阈值都在这
+// farm.json：全场法兰模板、每台设备（机组、地址、接线、标定、额定）、阈值都在这。
+// 读它、解析成 FarmPlan；解析失败返回 null 并给出原因（启动时退回默认，运行中重载时保持原配置不动）
 var farmPath = Path.Combine(AppContext.BaseDirectory, "wwwroot", "farm.json");
-JsonElement? farmRoot = null;
-try
+FarmPlan? LoadFarm(Action<string> log, out string? error)
 {
-    if (File.Exists(farmPath))
+    error = null;
+    JsonElement? root = null;
+    try
     {
-        farmRoot = JsonDocument.Parse(File.ReadAllText(farmPath)).RootElement;
+        if (File.Exists(farmPath)) root = JsonDocument.Parse(File.ReadAllText(farmPath)).RootElement;
     }
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"farm.json 读取失败，全部用默认值：{ex.Message}");
+    catch (Exception ex)
+    {
+        error = $"farm.json 解析失败：{ex.Message}";
+        return null;
+    }
+
+    var plan = FarmPlan.Load(root, AppContext.BaseDirectory, log);
+    if (plan.Devices.Count == 0)
+    {
+        error = "farm.json 里没有配置任何设备（devices[] 或老写法的 device）";
+        return null;
+    }
+
+    return plan;
 }
 
 // 一个大屏接很多台设备：每台设备一个采集器（各自连接/保活/巡检/维护），共用一个广播和一个历史库。
 // 标定与口径按各台设备各法兰取 .ucf 和额定值，没配的回落到程序目录里的 .ucf。
 // 没有标定就不算力值——历史里 kn 留空、状态记"未标定"，页面只显示声时差。宁可没数，不能有假数。
-var farm = FarmPlan.Load(farmRoot, AppContext.BaseDirectory, Console.WriteLine);
-if (farm.Devices.Count == 0)
+var farm = LoadFarm(Console.WriteLine, out var farmError);
+if (farm is null)
 {
-    Console.WriteLine("farm.json 里没有配置任何设备（devices[] 或老写法的 device），按默认 192.168.0.7:23 / F01 / CH1–CH4 跑");
+    Console.WriteLine($"{farmError}，按默认 192.168.0.7:23 / F01 / CH1–CH4 跑");
     farm = FarmPlan.Load(JsonDocument.Parse("""{"device":"192.168.0.7:23","bind":{"turbine":1,"flangeIndex":0}}""").RootElement, AppContext.BaseDirectory, Console.WriteLine);
 }
 
@@ -64,24 +76,48 @@ var history = new HistoryStore(Path.Combine(AppContext.BaseDirectory, "data", "h
 history.SetPlans(farm.Devices.Select(d => (d.Turbine, d.Plan)));
 
 var broadcaster = new Broadcaster();
-var hubs = farm.Devices.Select(d => new MonitorHub(d.Turbine, d.Endpoint, d.Plan, d.Guard, broadcaster, history)).ToList();
-var hubByTurbine = hubs.ToDictionary(h => h.Turbine);
-var planMode = farm.Devices[0].Plan;   // 口径/阈值全场统一，取第一台的
+// 当前生效的一代配置（风场方案 + 每台设备的采集器 + 它们的保活循环）。改 farm.json 重载时整代替换：
+// 老的一代先退役（不再重连）、断开设备，新的一代接着连。端点和状态都只看 site，不持有旧引用
+var site = new Site(farm, farm.Devices.Select(d => new MonitorHub(d.Turbine, d.Endpoint, d.Plan, d.Guard, broadcaster, history)).ToList());
 
 // 整站状态：农场级口径 + 每台设备各自的状态。页面开 WebSocket 先收这一份，之后按设备增量更新
-object FullState() => new
+object FullState()
 {
-    farmName = farm.FarmName,
-    turbineCount = farm.TurbineCount,
-    baseline = planMode.Mode == BaselineMode.Anchor ? "anchor" : "free",
-    baselineText = planMode.ModeText,
-    warnRatio = planMode.WarnRatio,
-    alarmRatio = planMode.AlarmRatio,
-    devices = hubs.Select(h => h.State()).ToList(),
-};
+    var s = site;
+    return new
+    {
+        farmName = s.Farm.FarmName,
+        turbineCount = s.Farm.TurbineCount,
+        baseline = s.Mode.Mode == BaselineMode.Anchor ? "anchor" : "free",
+        baselineText = s.Mode.ModeText,
+        warnRatio = s.Mode.WarnRatio,
+        alarmRatio = s.Mode.AlarmRatio,
+        devices = s.Hubs.Select(h => h.State()).ToList(),
+    };
+}
 broadcaster.FullState = FullState;
 
-MonitorHub? HubOf(int? turbine) => turbine is { } t ? hubByTurbine.GetValueOrDefault(t) : hubs.Count == 1 ? hubs[0] : null;
+MonitorHub? HubOf(int? turbine)
+{
+    var s = site;
+    return turbine is { } t ? s.ByTurbine.GetValueOrDefault(t) : s.Hubs.Count == 1 ? s.Hubs[0] : null;
+}
+
+// 保活循环的节拍（StartLoops 用；重载配置会再起一套循环，所以放在端点之前定义）
+// TCP 没断但测量帧停了（设备被切到待机、卡死、链路半开）也算断：超过这个时间没有帧就重连，
+// 不然页面会一直拿最后一帧当"实时"显示。
+var stallAfter = TimeSpan.FromSeconds(90);
+// 连接时没读到参考声时的测点，隔一阵再试（不重连，只短暂停流补读）。补读要停几秒流，
+// 一直读不到的（通道确实没置零）就逐次拉长间隔，最长一小时一次，别老打断业主的实时画面。
+// 例外：缺参考声时但探头在位的测点（刚装上、现场正在置零）两分钟补读一次，桌面端置零完大屏很快接上。
+var retryMissingMin = TimeSpan.FromMinutes(10);
+var retryMissingMax = TimeSpan.FromHours(1);
+var retryWithProbe = TimeSpan.FromMinutes(2);
+// 探头在位巡检：连上先巡一轮，之后每 10 分钟一轮（本机 POST /api/scan 可随时触发），每轮轮宽集 45 秒
+var scanLength = TimeSpan.FromSeconds(45);
+var scanEvery = TimeSpan.FromMinutes(10);
+// 同一时刻只允许一次配置重载（文件监视和手动触发共用）
+var reloadGate = new SemaphoreSlim(1, 1);
 
 app.UseDefaultFiles();
 // 静态文件每次都让浏览器回来核对（ETag 命中就 304，代价很小）。默认不发 Cache-Control 时浏览器按启发式
@@ -136,6 +172,15 @@ app.MapPost("/api/scan", (HttpContext ctx, int? turbine) =>
     return Results.Json(new { ok = true, scanning = hub.ScanActive });
 });
 
+// 重新加载 farm.json（接线/标定/额定/设备改了不用重启服务）。文件一改服务自己也会重载，这个接口给"改完立刻应用"用。
+// 解析不过就拒绝，原配置原样跑。只许大屏主机本地调用
+app.MapPost("/api/reload", async (HttpContext ctx) =>
+{
+    if (!IsLocalCall(ctx)) return Results.StatusCode(403);
+    var (ok, message) = await ReloadAsync("手动触发");
+    return ok ? Results.Json(new { ok = true, message }) : Results.BadRequest(new { error = message });
+});
+
 app.MapGet("/api/state", () => Results.Json(FullState()));
 
 // turbine 不给 = 全场（报告页、报警中心）；给了 = 只这台机组（机组页、法兰页趋势）
@@ -168,60 +213,125 @@ app.Map("/ws", async ctx =>
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {
-    foreach (var h in hubs) h.DisconnectAsync().GetAwaiter().GetResult();
+    foreach (var h in site.Hubs) h.DisconnectAsync().GetAwaiter().GetResult();
     history.Dispose();
 });
 
 Console.WriteLine($"监视服务已启动：http://localhost:{port}/  （局域网访问用本机 IP）");
-Console.WriteLine($"基线口径：{planMode.ModeText}" + (planMode.Mode == BaselineMode.Anchor
+Console.WriteLine($"基线口径：{site.Mode.ModeText}" + (site.Mode.Mode == BaselineMode.Anchor
     ? "——k·Δt 是较锚定时刻的变化量，绝对预紧力按“锚定时 = 额定值”估算"
     : "——k·Δt + b 就是绝对预紧力"));
 Console.WriteLine($"历史库：{history.DbPath}（采样每 5 秒一条保留 90 天，事件保留 2 年）");
-Console.WriteLine($"接入设备 {hubs.Count} 台：");
-foreach (var h in hubs)
+DescribeSite(site);
+
+void DescribeSite(Site s)
 {
-    var p = h.Plan;
-    // 各法兰的接线/标定/额定在 CalPlan.Load 里已逐条打印；这里只补全局兜底和没配到的情况
-    var note = !p.Flanges.Any(f => f.OnDevice)
-        ? "没有任何法兰配置在测通道，按默认 CH1–CH4 监测" + (p.GlobalCal is { } g ? $"，标定用程序目录的 {g.FileName}" : "，且没有 .ucf，不计算预紧力")
-        : p.GlobalCal is null && p.Flanges.Any(f => f.OnDevice && f.Cal is null)
-            ? "有法兰没配 ucf、程序目录里也没有 .ucf：这些法兰不计算预紧力"
-            : p.Mode == BaselineMode.Anchor && p.Flanges.Any(f => f.OnDevice && f.Rated <= 0)
-                ? "有法兰未配置额定预紧力：锚定口径下只显示变化量，不判松动"
-                : string.Empty;
-    var extra = h.Planned.Concat(h.Guard).Except(h.WantedChannels).Distinct().OrderBy(c => c).ToList();
-    Console.WriteLine($"  {h.Label}：测点 {string.Join("、", h.WantedChannels.Select(c => "CH" + c))}"
-                      + (extra.Count > 0 ? $"，在位识别另轮询 {string.Join("、", extra.Select(c => "CH" + c))}" : string.Empty)
-                      + (note.Length > 0 ? $"。{note}" : string.Empty));
+    Console.WriteLine($"接入设备 {s.Hubs.Count} 台：");
+    foreach (var h in s.Hubs)
+    {
+        var p = h.Plan;
+        // 各法兰的接线/标定/额定在 CalPlan.Load 里已逐条打印；这里只补全局兜底和没配到的情况
+        var note = !p.Flanges.Any(f => f.OnDevice)
+            ? "没有任何法兰配置在测通道，按默认 CH1–CH4 监测" + (p.GlobalCal is { } g ? $"，标定用程序目录的 {g.FileName}" : "，且没有 .ucf，不计算预紧力")
+            : p.GlobalCal is null && p.Flanges.Any(f => f.OnDevice && f.Cal is null)
+                ? "有法兰没配 ucf、程序目录里也没有 .ucf：这些法兰不计算预紧力"
+                : p.Mode == BaselineMode.Anchor && p.Flanges.Any(f => f.OnDevice && f.Rated <= 0)
+                    ? "有法兰未配置额定预紧力：锚定口径下只显示变化量，不判松动"
+                    : string.Empty;
+        var extra = h.Planned.Concat(h.Guard).Except(h.WantedChannels).Distinct().OrderBy(c => c).ToList();
+        Console.WriteLine($"  {h.Label}：测点 {string.Join("、", h.WantedChannels.Select(c => "CH" + c))}"
+                          + (extra.Count > 0 ? $"，在位识别另轮询 {string.Join("、", extra.Select(c => "CH" + c))}" : string.Empty)
+                          + (note.Length > 0 ? $"。{note}" : string.Empty));
+    }
 }
 
-// ── 自动连接：展示页上没有连接按钮，由服务自己连设备并保活；每台设备一条循环 ──────────────
-// TCP 没断但测量帧停了（设备被切到待机、卡死、链路半开）也算断：超过这个时间没有帧就重连，
-// 不然页面会一直拿最后一帧当"实时"显示。
-var stallAfter = TimeSpan.FromSeconds(90);
-// 连接时没读到参考声时的测点，隔一阵再试（不重连，只短暂停流补读）。补读要停几秒流，
-// 一直读不到的（通道确实没置零）就逐次拉长间隔，最长一小时一次，别老打断业主的实时画面。
-// 例外：缺参考声时但探头在位的测点（刚装上、现场正在置零）两分钟补读一次，桌面端置零完大屏很快接上。
-var retryMissingMin = TimeSpan.FromMinutes(10);
-var retryMissingMax = TimeSpan.FromHours(1);
-var retryWithProbe = TimeSpan.FromMinutes(2);
-// 探头在位巡检：连上先巡一轮，之后每 10 分钟一轮（本机 POST /api/scan 可随时触发），每轮轮宽集 45 秒
-var scanLength = TimeSpan.FromSeconds(45);
-var scanEvery = TimeSpan.FromMinutes(10);
-foreach (var hub in hubs)
+// ── 重载配置：farm.json 改了（接线/标定/额定/设备）不用重启服务 ──────────────────────────
+// 新配置先解析，解析不过或没有设备就拒绝，原配置原样跑；解析过了才让老的一代退役：不再重连 → 断开设备 →
+// 新的一代建采集器、起保活循环 → 通知页面刷新（页面要重新拿 farm.json 里的法兰模板和新的 state）。
+// 同一时刻只允许一次重载；文件监视和手动触发共用这一个入口
+async Task<(bool Ok, string Message)> ReloadAsync(string trigger)
 {
-    _ = Task.Run(async () =>
+    await reloadGate.WaitAsync();
+    try
+    {
+        var notes = new List<string>();
+        var fresh = LoadFarm(notes.Add, out var error);
+        if (fresh is null)
+        {
+            var msg = $"{error}，配置未改动，继续按原配置监测";
+            Console.WriteLine($"{DateTime.Now:HH:mm:ss} 重新加载配置（{trigger}）失败：{msg}");
+            return (false, msg);
+        }
+
+        Console.WriteLine($"{DateTime.Now:HH:mm:ss} 重新加载配置（{trigger}）……");
+        foreach (var n in notes) Console.WriteLine(n);
+
+        // 老的一代：先退役（保活循环不再重连它），再断开设备。断开要等它手里正在做的连接/补读做完
+        var old = site;
+        foreach (var h in old.Hubs) h.Retire();
+        old.Cts.Cancel();
+        foreach (var h in old.Hubs)
+        {
+            try { await h.DisconnectAsync(); }
+            catch (Exception ex) { Console.WriteLine($"{DateTime.Now:HH:mm:ss} {h.Label} 断开出错：{ex.Message}"); }
+        }
+
+        // 新的一代
+        history.SetPlans(fresh.Devices.Select(d => (d.Turbine, d.Plan)));
+        var next = new Site(fresh, fresh.Devices.Select(d => new MonitorHub(d.Turbine, d.Endpoint, d.Plan, d.Guard, broadcaster, history)).ToList());
+        site = next;
+        DescribeSite(next);
+        StartLoops(next);
+        // 页面自己刷新一遍：法兰模板（颗数/编号/名字）是页面直接读 farm.json 的，state 也全换了
+        broadcaster.Broadcast(new { type = "reload", reason = trigger });
+        var summary = $"已应用：{fresh.Devices.Count} 台设备（{string.Join("、", next.Hubs.Select(h => h.Label))}）";
+        Console.WriteLine($"{DateTime.Now:HH:mm:ss} 重新加载配置完成，{summary}");
+        return (true, summary);
+    }
+    finally
+    {
+        reloadGate.Release();
+    }
+}
+
+// farm.json 一保存就重载（编辑器保存常是"写临时文件再改名"，Created/Renamed 也要接；连着几次写只重载一次）
+var farmWatcher = new FileSystemWatcher(Path.GetDirectoryName(farmPath)!, "farm.json")
+{
+    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.CreationTime,
+};
+var farmChangeDebounce = new System.Timers.Timer(1500) { AutoReset = false };
+farmChangeDebounce.Elapsed += (_, _) => _ = Task.Run(() => ReloadAsync("farm.json 改动"));
+void OnFarmChanged(object? sender, FileSystemEventArgs e)
+{
+    farmChangeDebounce.Stop();
+    farmChangeDebounce.Start();
+}
+farmWatcher.Changed += OnFarmChanged;
+farmWatcher.Created += OnFarmChanged;
+farmWatcher.Renamed += (s, e) => OnFarmChanged(s, e);
+farmWatcher.EnableRaisingEvents = true;
+
+// ── 自动连接：展示页上没有连接按钮，由服务自己连设备并保活；每台设备一条循环（参数见上面 stallAfter 等） ──
+StartLoops(site);
+
+// 这一代配置的保活循环：配置重载时老一代的循环随 Cts 取消退出，退役的采集器也不会再被连上
+void StartLoops(Site s)
+{
+    var ct = s.Cts.Token;
+    foreach (var hub in s.Hubs)
+    {
+        s.Loops.Add(Task.Run(async () =>
     {
         var retryMissingEvery = retryMissingMin;
         var tag = hub.Label;
-        while (true)
+        while (!ct.IsCancellationRequested && !hub.Retired)
         {
             try
             {
                 // 维护中：不连、不重连，把设备留给现场的桌面端；到期自动往下走恢复连接
                 if (hub.InMaintenance)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(5));
+                    await Task.Delay(TimeSpan.FromSeconds(5), ct);
                     continue;
                 }
 
@@ -274,19 +384,50 @@ foreach (var hub in hubs)
                                           : string.Empty));
                 }
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;   // 配置重载，这一代退出
+            }
             catch (Exception ex)
             {
+                if (hub.Retired) break;
                 Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} {(hub.IsConnected ? "保活出错" : "连接失败")}：{ex.Message}，稍后重试");
                 hub.NoteFailure(ex.Message);
             }
 
             // 维护刚结束要马上连回去，别让业主多等 30 秒
-            await Task.Delay(TimeSpan.FromSeconds(hub.IsConnected ? 10 : hub.MaintenanceUntil is null ? 30 : 1));
+            try { await Task.Delay(TimeSpan.FromSeconds(hub.IsConnected ? 10 : hub.MaintenanceUntil is null ? 30 : 1), ct); }
+            catch (OperationCanceledException) { break; }
         }
-    });
+    }, CancellationToken.None));
+    }
 }
 
 app.Run();
+
+/// <summary>一代配置：风场方案、每台设备的采集器、它们的保活循环。farm.json 重载时整代替换。</summary>
+internal sealed class Site
+{
+    public Site(FarmPlan farm, List<MonitorHub> hubs)
+    {
+        Farm = farm;
+        Hubs = hubs;
+        ByTurbine = hubs.ToDictionary(h => h.Turbine);
+        Mode = farm.Devices[0].Plan;   // 口径/阈值全场统一，取第一台的
+    }
+
+    public FarmPlan Farm { get; }
+
+    public List<MonitorHub> Hubs { get; }
+
+    public Dictionary<int, MonitorHub> ByTurbine { get; }
+
+    public CalPlan Mode { get; }
+
+    public CancellationTokenSource Cts { get; } = new();
+
+    public List<Task> Loops { get; } = new();
+}
 
 internal sealed record MaintenanceReq(int? Turbine, int? Minutes, string? Note);
 
@@ -614,6 +755,14 @@ internal sealed class MonitorHub : IDisposable
     /// <summary>TCP 还活着就算连着。帧停了由外面的看门狗按 LastFrameAt 判。</summary>
     public bool IsConnected => _engine is { IsConnected: true };
 
+    /// <summary>
+    /// 配置重载后这台采集器退役：不再连接（保活循环若正好在这一刻要连，进来也直接返回），
+    /// 由重载流程断开它。设备只能让新的一代连，不然新旧两代抢同一台设备。
+    /// </summary>
+    public bool Retired { get; private set; }
+
+    public void Retire() => Retired = true;
+
     /// <summary>最近一帧测量到达的时间（UTC）。连上/补读后先按当时时刻算，免得刚切完模式就被看门狗误判。</summary>
     public DateTime LastFrameAt => new(Interlocked.Read(ref _lastFrameTicks), DateTimeKind.Utc);
 
@@ -677,6 +826,7 @@ internal sealed class MonitorHub : IDisposable
         await _gate.WaitAsync();
         try
         {
+            if (Retired) return;
             if (_engine is not null) await CloseEngineAsync();
 
             var engine = new DeviceEngine();

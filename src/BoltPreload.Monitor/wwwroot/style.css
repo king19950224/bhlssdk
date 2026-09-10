@@ -637,6 +637,8 @@ canvas { display: block; width: 100%; }
 .maint a:hover { background: rgba(240, 180, 41, .18); }
 .maint a.end { border-color: rgba(53, 196, 99, .45); color: #4be08a; background: rgba(53, 196, 99, .08); }
 .maint a.end:hover { background: rgba(53, 196, 99, .18); }
+.maint a.cfg { margin-left: 12px; border-color: rgba(127, 182, 216, .45); color: #9db8d6; background: rgba(127, 182, 216, .08); }
+.maint a.cfg:hover { background: rgba(127, 182, 216, .18); }
 .maint .mm { margin-left: auto; color: #f5c34d; }
 .maint.active .mm { font-weight: 600; }
 #stateText.err { color: var(--bad); }
