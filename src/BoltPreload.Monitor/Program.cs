@@ -201,8 +201,10 @@ foreach (var h in hubs)
 var stallAfter = TimeSpan.FromSeconds(90);
 // 连接时没读到参考声时的测点，隔一阵再试（不重连，只短暂停流补读）。补读要停几秒流，
 // 一直读不到的（通道确实没置零）就逐次拉长间隔，最长一小时一次，别老打断业主的实时画面。
+// 例外：缺参考声时但探头在位的测点（刚装上、现场正在置零）两分钟补读一次，桌面端置零完大屏很快接上。
 var retryMissingMin = TimeSpan.FromMinutes(10);
 var retryMissingMax = TimeSpan.FromHours(1);
+var retryWithProbe = TimeSpan.FromMinutes(2);
 // 探头在位巡检：连上先巡一轮，之后每 10 分钟一轮（本机 POST /api/scan 可随时触发），每轮轮宽集 45 秒
 var scanLength = TimeSpan.FromSeconds(45);
 var scanEvery = TimeSpan.FromMinutes(10);
@@ -257,16 +259,18 @@ foreach (var hub in hubs)
                     Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 巡检开始（{(hub.ScanRequested ? "手动触发" : "定时")}）");
                     await hub.StartScanAsync();
                 }
-                else if (hub.MissingChannels.Count > 0 && DateTime.UtcNow - hub.LastChannelRetryAt > retryMissingEvery)
+                else if (hub.MissingChannels.Count > 0
+                         && DateTime.UtcNow - hub.LastChannelRetryAt > (hub.AnyMissingWithProbe ? retryWithProbe : retryMissingEvery))
                 {
                     var added = await hub.RetryMissingChannelsAsync();
                     retryMissingEvery = added > 0
                         ? retryMissingMin
                         : TimeSpan.FromTicks(Math.Min(retryMissingEvery.Ticks * 2, retryMissingMax.Ticks));
                     var missing = hub.MissingChannels;
+                    var next = hub.AnyMissingWithProbe ? retryWithProbe : retryMissingEvery;
                     Console.WriteLine($"{DateTime.Now:HH:mm:ss} {tag} 补读测点：新增 {added} 个，现在 {hub.ChannelCount} 个在监测"
                                       + (missing.Count > 0
-                                          ? $"；{string.Join("、", missing.Select(c => "CH" + c))} 仍读不到，{retryMissingEvery.TotalMinutes:0} 分钟后再试"
+                                          ? $"；{string.Join("、", missing.Select(c => "CH" + c))} 仍读不到，{next.TotalMinutes:0} 分钟后再试{(hub.AnyMissingWithProbe ? "（有探头信号，等现场置零）" : string.Empty)}"
                                           : string.Empty));
                 }
             }
@@ -627,6 +631,22 @@ internal sealed class MonitorHub : IDisposable
         get
         {
             lock (_stateLock) return WantedChannels.Where(c => !_params.ContainsKey(c)).ToList();
+        }
+    }
+
+    /// <summary>
+    /// 缺参考声时、但探头信号在位的测点：多半是刚装上、现场正拿桌面端置零。这种要勤补读——
+    /// 09-10 现场 16:43 在桌面端把 CH6 置零，大屏按 10→20 分钟的退避到 16:48 才补读到，人在旁边看着"未置零"发呆。
+    /// 没探头信号的缺失测点照旧拉长间隔，别为空口子老打断实时画面。
+    /// </summary>
+    public bool AnyMissingWithProbe
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return WantedChannels.Any(c => !_params.ContainsKey(c) && _signals.TryGetValue(c, out var t) && t.Presence == "probe");
+            }
         }
     }
 
