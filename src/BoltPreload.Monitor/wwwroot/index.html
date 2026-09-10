@@ -87,7 +87,7 @@
         <div class="chtable" id="chtable"></div>
         <!-- 设备只允许一路 TCP：现场要用桌面端置零/调参时，在这里让大屏让出设备，到期自动恢复。只能在大屏主机上操作 -->
         <div class="maint" id="maintBox">
-          <span class="ml">现场维护（让出设备给桌面端）</span>
+          <span class="ml">现场维护</span>
           <a data-min="30">30 分钟</a><a data-min="120">2 小时</a><a data-min="0" class="end">结束维护</a>
           <span class="mm" id="maintMsg"></span>
         </div>
@@ -123,9 +123,8 @@
             <a data-r="7d">7天</a>
             <a data-r="30d">30天</a>
           </span>
-          <span class="hdr">关软件后仍保留</span>
         </div>
-        <div class="evlist" id="evList"><div class="evempty">暂无事件 —— 所有监测螺栓状态正常</div></div>
+        <div class="evlist" id="evList"><div class="evempty">暂无事件</div></div>
     </div>
   </div>
 
@@ -141,7 +140,7 @@
     </div>
     <div class="rmain">
       <div class="panel">
-        <div class="hd">全场螺栓健康度<span class="hdr" id="reportHint">当前快照 · 下表含区间统计</span></div>
+        <div class="hd">全场螺栓健康度<span class="hdr" id="reportHint"></span></div>
         <div class="ringwrap">
           <div class="ring" id="healthRing"><div class="rv"><span id="healthPct">--</span><small>%</small><div class="rk">健康率</div></div></div>
           <div class="rcounts" id="healthCounts"></div>
@@ -158,7 +157,7 @@
       </div>
     </div>
     <div class="panel" style="margin-top:12px">
-      <div class="hd">预紧力历史<span class="hdr" id="histHint">区间内落盘数据</span></div>
+      <div class="hd">预紧力历史<span class="hdr" id="histHint"></span></div>
       <canvas id="hist" height="220"></canvas>
     </div>
   </div>
@@ -169,9 +168,9 @@
   <footer class="foot">
     <span>采集设备 <span id="epShow" class="epshow">--</span></span>
     <span id="stateText">未连接</span>
-    <span id="calText"></span>
-    <span id="archText"></span>
-    <span id="log"></span>
+    <span id="calText" class="opsonly"></span>
+    <span id="archText" class="opsonly"></span>
+    <span id="log" class="opsonly"></span>
   </footer>
 
 <script src="app.js"></script>

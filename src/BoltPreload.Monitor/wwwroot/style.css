@@ -645,6 +645,9 @@ canvas { display: block; width: 100%; }
 #stateText.err { color: var(--bad); }
 #calText { color: var(--blue); }
 #log { margin-left: auto; font-size: 12px; }
+/* 业主视图的底栏只留设备、状态；标定文件名/库容量/服务日志是运维信息，进"运维详情"才显示 */
+.foot .opsonly { display: none; }
+body.ops .foot .opsonly { display: inline; }
 
 @media (max-width: 1100px) {
   .fmain, .tmain { grid-template-columns: 1fr; }

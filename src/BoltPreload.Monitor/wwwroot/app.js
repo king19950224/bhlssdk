@@ -175,15 +175,19 @@ function boltHealth(ch) {
   return "ok";
 }
 
+// 业主视图的文案原则：只给结论和数字，两三个字的状态词 + 力值/百分比/温度。
+// 为什么、该怎么办，进悬停提示（title）和"运维详情"视图，不上大屏正文。
 const HEALTH_TEXT = {
-  ok: "正常", warn: "预紧力偏低", loose: "松动报警", fault: "检测异常", offline: "离线", pending: "待接入",
-  noprobe: "探头无信号", stray: "有信号·未配置", shift: "基线失配", uncal: "未标定", unrated: "未配额定", badbase: "基线可疑",
+  ok: "正常", warn: "偏低", loose: "松动", fault: "异常", offline: "离线", pending: "待接入",
+  noprobe: "无信号", stray: "未配置", shift: "基线失配", uncal: "未标定", unrated: "未配额定", badbase: "基线可疑",
   rezero: "基线重置", unknown: "未知",
 };
-const UNCAL_TEXT = "未加载标定文件（.ucf），不计算预紧力";
+// 状态词。"stray" 分两种：配置了的通道有探头没基线 = 未置零；没配置的通道冒出探头 = 未配置
+const healthLabel = (h, ch) => h === "stray" && sigs[ch] && sigs[ch].configured ? "未置零" : HEALTH_TEXT[h];
+const UNCAL_TEXT = "未标定";
 // 有标定没额定：只测得到较锚定的变化量，"正常/偏低/松动"都下不了结论，不能写成"正常"
-const UNRATED_TEXT = "未配置额定预紧力（farm.json 该法兰的 ratedKn），只显示较锚定变化量，不判偏低/松动";
-const BADBASE_TEXT = "力值为负：基线或额定值有误，需现场核对并重新置零";
+const UNRATED_TEXT = "未配置额定值";
+const BADBASE_TEXT = "基线可疑，需重新置零";
 const ALARM_HEALTH = new Set(["loose", "fault", "noprobe", "shift", "badbase"]);
 // 卡片/槽位上要带颜色样式的状态
 const STYLED_HEALTH = ["loose", "warn", "pending", "noprobe", "stray", "shift", "badbase"];
@@ -233,7 +237,7 @@ function recentFlip(ch) {
   return age >= 0 && age < FLIP_HIGHLIGHT_MS ? { secs: Math.round(age / 1000), to: g.presence } : null;
 }
 // 预紧力物理上不会是负的。超出噪声的负值只有一个解释：基线不对（置零后拧过、探头挪过、或压根没在自由状态置零）
-const negativeHint = f => f != null && f < 0 ? " · 力值为负，基线可能有误，建议核对置零" : "";
+const negativeHint = f => f != null && f < 0 ? " · 基线可疑" : "";
 
 /// 一个法兰当前状态：offline / online / alarm（有松动、检测异常或探头丢失）
 function flangeState(i) {
@@ -251,19 +255,20 @@ function bindState() {
   return sts.includes("alarm") ? "alarm" : sts.includes("online") ? "online" : "offline";
 }
 
-// ── 探头在位提示：根据服务端的在位识别给一句人话 ──────────────────────────
+// ── 探头在位提示：正文一句短的（几号通道、什么状态），原因和处置放 detail，悬停可见 ──────────
 function probeNotice() {
   const slots = slotList();
   const chs = a => a.map(c => "CH" + c).join("、");
-  const parts = [];
+  const parts = [], details = [];
   let level = "info";
   // 接线核对：刚翻转的通道排最前面——现场脱耦一颗，几秒内这里就写出是几号、在哪个法兰
   const flips = slots.map(ch => ({ ch, f: recentFlip(ch) })).filter(x => x.f);
   if (flips.length) {
-    parts.push("接线核对：" + flips.map(({ ch, f }) => {
+    const s = "接线核对：" + flips.map(({ ch, f }) => {
       const fi = chFlange(ch);
-      return `CH${ch}${fi >= 0 ? `（${flangeName(fi)}）` : ""} ${f.secs} 秒前${f.to === "probe" ? "出现探头信号" : "探头信号消失"}`;
-    }).join("，"));
+      return `CH${ch}${fi >= 0 ? `（${flangeName(fi)}）` : ""} ${f.secs} 秒前${f.to === "probe" ? "出现信号" : "信号消失"}`;
+    }).join("，");
+    parts.push(s); details.push(s);
   }
 
   const lost = slots.filter(ch => boltHealth(ch) === "noprobe");
@@ -275,17 +280,18 @@ function probeNotice() {
   const unassigned = stray.filter(ch => chFlange(ch) < 0);
   const strayZeroed = stray.filter(ch => chFlange(ch) >= 0 && sigs[ch] && sigs[ch].zeroed);
   const strayRaw = stray.filter(ch => chFlange(ch) >= 0 && !(sigs[ch] && sigs[ch].zeroed));
-  if (lost.length) parts.push(`${chs(lost)} 探头信号消失（拔出、接错或耦合失效）`);
-  if (unassigned.length) parts.push(`${chs(unassigned)} 有探头信号，但不在任何法兰的接线表里 —— 请在 farm.json 的对应法兰写上 channels/channelBolts`);
-  if (strayZeroed.length) parts.push(`${chs(strayZeroed)} 有探头信号且设备上已有基线 —— 若是新装探头，加进该法兰的 channels 即可监测${lost.length ? "；若是从别处挪来的，请核对接线" : ""}`);
-  if (strayRaw.length) parts.push(`${chs(strayRaw)} 有探头信号但未配置、未置零 —— 可能插错位置${lost.length ? `（${chs(lost)} 的探头？）` : ""}`);
-  if (noBase.length) parts.push(`${chs(noBase)} 有探头信号但本次没读到基线，稍后自动补读`);
+  if (lost.length) { parts.push(`${chs(lost)} 无信号`); details.push(`${chs(lost)} 探头信号消失：拔出、接错或耦合失效`); }
+  if (stray.length) parts.push(`${chs(stray)} 有信号·未配置`);
+  if (unassigned.length) details.push(`${chs(unassigned)} 有探头信号，但不在任何法兰的接线表里`);
+  if (strayZeroed.length) details.push(`${chs(strayZeroed)} 有探头信号且设备上已有基线：若是新装探头，加进该法兰的接线表即可监测${lost.length ? "；若是从别处挪来的，请核对接线" : ""}`);
+  if (strayRaw.length) details.push(`${chs(strayRaw)} 有探头信号但未配置、未置零：可能插错位置${lost.length ? `（${chs(lost)} 的探头？）` : ""}`);
+  if (noBase.length) { parts.push(`${chs(noBase)} 未置零`); details.push(`${chs(noBase)} 有探头信号但读不到基线，需现场置零；服务会定时补读`); }
   // 基线失配：探头还插在原通道，但声时对不上置零基线（贴到别的螺栓上/重新耦合过）
-  if (shifted.length) parts.push(`${chs(shifted)} 声时偏离置零基线超过 2 µs —— 探头位置或耦合已变，需重新置零`);
+  if (shifted.length) { parts.push(`${chs(shifted)} 基线失配`); details.push(`${chs(shifted)} 声时偏离置零基线超过 2 µs：探头位置或耦合已变，需重新置零`); }
   if (lost.length || shifted.length) level = "bad";
   else if (stray.length) level = "warn";
-  if (parts.length === 0) return scanning ? { level: "info", text: "巡检中：正在轮询规划位看有没有探头，测点刷新会慢几十秒" } : null;
-  return { level, text: parts.join("；") };
+  if (parts.length === 0) return scanning ? { level: "info", text: "巡检中", detail: "正在轮询规划位看有没有探头，测点刷新会慢几十秒" } : null;
+  return { level, text: parts.join("；"), detail: details.join("；") };
 }
 
 // ── 维护模式：大屏让出设备给现场桌面端（设备只有一路 TCP），到期自动恢复。按机组，操作的是当前看的这台 ─────
@@ -315,7 +321,8 @@ document.querySelectorAll("#maintBox a[data-min]").forEach(a => {
 // 当前看的这台机组的提示
 function turbineNotice() {
   return maintenance
-    ? { level: "info", text: `现场维护中（${maintenance.note}）：大屏已让出设备给桌面端，预计 ${hhmm(maintenance.until)} 自动恢复监测；期间画面不更新` }
+    ? { level: "info", text: `维护中，${hhmm(maintenance.until)} 恢复`,
+        detail: `现场维护（${maintenance.note}）：大屏已让出设备给桌面端，预计 ${hhmm(maintenance.until)} 自动恢复监测，期间画面不更新` }
     : connected ? probeNotice() : null;
 }
 function refreshNotice() {
@@ -329,6 +336,7 @@ function refreshNotice() {
     n = all.length ? {
       level: all.reduce((w, x) => rank[x.n.level] > rank[w] ? x.n.level : w, "info"),
       text: all.map(x => `${tid(x.t)}：${x.n.text}`).join("　｜　"),
+      detail: all.map(x => `${tid(x.t)}：${x.n.detail || x.n.text}`).join("　｜　"),
     } : null;
   } else {
     n = turbineNotice();
@@ -336,8 +344,10 @@ function refreshNotice() {
   el.hidden = !n;
   if (!n) return;
   el.className = "notice " + n.level;
-  // 窄屏下提示条会被省略号截断，完整内容放 title 悬停可见
-  if (el.textContent !== n.text) { el.textContent = n.text; el.title = n.text; }
+  // 正文只写结论；原因和处置在 title 里悬停可见
+  const title = n.detail || n.text;
+  if (el.textContent !== n.text) el.textContent = n.text;
+  if (el.title !== title) el.title = title;
 }
 
 function minForceOf(chs) {
@@ -577,7 +587,7 @@ function updateFlangeList() {
     if (dot.className !== dotCls) dot.className = dotCls;
     if (!live) {
       const planned = towerSlotsFor(i).length;
-      $("fl-meta-" + i).innerHTML = `螺栓 ${f.boltCount} 颗 · ${planned ? `规划探头 ${planned} 位 · ` : ""}未接入监测`;
+      $("fl-meta-" + i).innerHTML = `螺栓 ${f.boltCount} 颗 · ${planned ? `规划探头 ${planned} 位 · ` : ""}未接入`;
       return;
     }
 
@@ -865,7 +875,7 @@ function updateSlotGrid() {
   if (entries.length === 0) {
     if (slotGridKey !== key) {
       slotGridKey = key;
-      grid.innerHTML = `<div class="slot-empty">${tid(viewTurbine)} 机组尚未规划探头位<br><small>在 farm.json 的 flanges[].plannedChannels 里配置</small></div>`;
+      grid.innerHTML = `<div class="slot-empty">${tid(viewTurbine)} 机组未规划探头位</div>`;
       $("slotHint").textContent = "未接入";
     }
     return;
@@ -903,7 +913,8 @@ function updateSlotGrid() {
     if (card.className !== cls) card.className = cls;
     const st = $("slot-st-" + ch);
     if (st.className !== "bst " + h) st.className = "bst " + h;
-    if (st.textContent !== HEALTH_TEXT[h]) st.textContent = HEALTH_TEXT[h];
+    const stTxt = healthLabel(h, ch);
+    if (st.textContent !== stTxt) st.textContent = stTxt;
     const m = h === "pending" ? null : channels[ch] && channels[ch].last;
     const mk = h === "pending" || h === "offline" ? null : mainKn(ch);
     const liveVal = mk && !mk.delta ? mk.v : null;
@@ -912,21 +923,22 @@ function updateSlotGrid() {
     if (el.innerHTML !== html) el.innerHTML = html;
 
     const rated = ratedOf(ch);
-    // 在位识别结果只属于绑定机组的设备；别的机组"待接入"就是待接入，不能借它写"已确认无探头信号"
+    // 在位识别结果只属于绑定机组的设备；别的机组"待接入"就是待接入
     const g = boundT ? sigs[ch] : undefined;
-    const weak = isWeakSignal(ch) ? " · 信号弱，建议检查耦合" : "";
-    const sub = h === "pending" ? (g && g.presence === "none" ? "规划探头位 · 已确认无探头信号" : "规划探头位，尚未接入")
+    const weak = isWeakSignal(ch) ? " · 信号弱" : "";
+    const tempPart = m && m.temp != null ? ` · ${Number(m.temp).toFixed(1)} ℃` : "";
+    // 副文字只写结论和数字；状态词已经在上面的牌子里，这里不重复解释
+    const sub = h === "pending" ? "规划探头位"
       : h === "uncal" ? UNCAL_TEXT
       : h === "badbase" ? BADBASE_TEXT
-      : h === "noprobe" ? "探头信号消失：可能被拔出或接错"
-      : h === "stray" ? (g && g.configured ? "有探头信号，但未置零" : "未配置通道出现探头信号 —— 可能插错位置")
-      : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs，需重新置零`
-      : h === "offline" ? (m ? "超过 1 分钟没有新数据" : channels[ch] ? "等待数据" : "已接探头，设备未上报")
+      : h === "noprobe" ? "请检查探头"
+      : h === "stray" ? (g && g.configured ? "有信号，待置零" : "有信号，未在配置")
+      : h === "shift" ? "需重新置零"
+      : h === "offline" ? (m ? "1 分钟无数据" : "等待数据")
       : mk == null ? HEALTH_TEXT[h]
-      : mk.delta ? `${deltaTxt(ch)} · ${UNRATED_TEXT}`
-      : (rated > 0 ? `额定的 ${(liveVal / rated * 100).toFixed(0)}%` : UNRATED_TEXT)
-        + (anchored() ? ` · ${deltaTxt(ch)}` : "")
-        + (m.temp != null ? ` · ${Number(m.temp).toFixed(1)} ℃` : "") + weak + negativeHint(liveVal);
+      : mk.delta ? deltaTxt(ch) + tempPart
+      : (rated > 0 ? `${(liveVal / rated * 100).toFixed(0)}%` : UNRATED_TEXT)
+        + (anchored() ? ` · ${deltaTxt(ch)}` : "") + tempPart + weak + negativeHint(liveVal);
     const subEl = $("slot-sub-" + ch);
     if (subEl.textContent !== sub) { subEl.textContent = sub; subEl.title = sub; }
   }
@@ -943,6 +955,8 @@ $("opsToggle").onclick = () => {
 
 function applyOpsMode() {
   $("opsToggle").textContent = opsMode ? "‹ 返回监测视图" : "运维详情 ›";
+  // 底栏里的标定文件/库容量/服务日志只在运维视图露出来（.opsonly）
+  document.body.classList.toggle("ops", opsMode);
   $("flangeGrid").className = "fmain" + (opsMode ? "" : " owner");
   $("ownerPanel").hidden = opsMode;
   $("opsDetail").hidden = !opsMode;
@@ -986,13 +1000,15 @@ function buildBoltCards() {
     g.appendChild(d);
   }
 
-  // 头上的说明按当前法兰：它自己的标定文件、额定值
+  // 头上按当前法兰写一句：额定多少、报警线在哪。标定文件名、斜率、口径这些放悬停提示
   const rated = flangeRated(viewFlange);
   const fc = flangeCal(viewFlange);
-  const calTxt = isBoundFlange() ? (fc ? `标定 ${fc.name} ${Number(fc.k).toFixed(4)} kN/ns · ` : "未标定 · ") : "";
-  $("ratedShow").textContent = calTxt + (rated > 0
-    ? `额定预紧力 ${rated} kN · 低于 ${Math.round(plan.alarmRatio * 100)}% 报警` + (anchored() ? " · 锚定口径：按锚定时 = 额定估算" : "")
-    : "未配置额定预紧力（farm.json 该法兰的 ratedKn）" + (anchored() ? " · 锚定口径下只显示较锚定变化量" : ""));
+  const head = $("ratedShow");
+  head.textContent = !isBoundFlange() ? "" : !fc ? UNCAL_TEXT
+    : rated > 0 ? `额定 ${rated} kN · 报警线 ${Math.round(plan.alarmRatio * 100)}%` : UNRATED_TEXT;
+  head.title = !isBoundFlange() ? "" : `${fc ? `标定 ${fc.name} ${Number(fc.k).toFixed(4)} kN/ns` : "未加载标定文件，不计算预紧力"}`
+    + (rated > 0 ? ` · 额定预紧力 ${rated} kN，低于 ${Math.round(plan.warnRatio * 100)}% 偏低、低于 ${Math.round(plan.alarmRatio * 100)}% 松动` : " · 未配置额定预紧力，只显示较锚定的变化量，不判偏低/松动")
+    + (anchored() ? " · 在役锚定口径：绝对预紧力按锚定时 = 额定估算" : "");
 }
 
 function updateBoltCard(ch) {
@@ -1008,7 +1024,7 @@ function updateBoltCard(ch) {
   const bstCls = "bst " + h;
   if (bst.className !== bstCls) bst.className = bstCls;
   // 配置了的通道有探头却没基线，和"未配置通道冒出探头"是两回事，标签分开写
-  const stTxt = h === "stray" && sigs[ch] && sigs[ch].configured ? "有信号·无基线" : HEALTH_TEXT[h];
+  const stTxt = healthLabel(h, ch);
   if (bst.textContent !== stTxt) bst.textContent = stTxt;
 
   // 没接入的法兰上，channels 里的实时值属于别的法兰，不能拿来显示；基线失配的帧也不能算力值
@@ -1017,12 +1033,15 @@ function updateBoltCard(ch) {
   const f = mk && !mk.delta ? mk.v : null;
   $("bkn-" + ch).innerHTML = mainKnHtml(mk, 2);
   const rated = ratedOf(ch);
-  const tempTxt = m && m.temp != null ? `温度 ${Number(m.temp).toFixed(1)} ℃` : "温度 --";
-  const weakTxt = isWeakSignal(ch) ? ` · 信号弱（${sigs[ch].snr} dB），建议检查耦合` : "";
+  const tempPart = m && m.temp != null ? ` · ${Number(m.temp).toFixed(1)} ℃` : "";
+  const weakTxt = isWeakSignal(ch) ? " · 信号弱" : "";
   if (rated > 0 && f != null && h !== "offline" && h !== "badbase") {
     const pct = Math.max(0, f / rated * 100);
     $("bbar-" + ch).style.width = Math.min(100, pct) + "%";
-    setSub(ch, `额定 ${rated} kN 的 ${pct.toFixed(0)}%` + (anchored() ? ` · ${deltaTxt(ch)}` : "") + ` · ${tempTxt}${weakTxt}${negativeHint(f)}`);
+    // 正文：占额定百分比、较锚定变化、温度；悬停：额定值和口径
+    setSub(ch, `${pct.toFixed(0)}%` + (anchored() ? ` · ${deltaTxt(ch)}` : "") + tempPart + weakTxt + negativeHint(f),
+      `额定 ${rated} kN 的 ${pct.toFixed(0)}%` + (anchored() ? `，${deltaTxt(ch)}（绝对值按锚定时 = 额定估算）` : "")
+      + (isWeakSignal(ch) ? `；信号弱（${sigs[ch].snr} dB），建议检查耦合` : ""));
   } else {
     $("bbar-" + ch).style.width = "0%";
     // 有回波、状态正常却没有声时差 = 会话里没有参考声时（通道没置零或基线没读到），不是信号问题
@@ -1030,28 +1049,41 @@ function updateBoltCard(ch) {
     // 在位识别结果只属于绑定法兰；没接入的法兰（叶根 12 位等）一律"尚未接入"
     const g = isBoundFlange() ? sigs[ch] : undefined;
     const snrTxt = g && g.snr != null ? `信噪比 ${g.snr} dB` : "";
-    const why = h === "fault" ? (noBase ? "有回波但无基线（通道未置零）" : "信号异常，等待恢复")
-      : h === "uncal" ? `${UNCAL_TEXT}；声时差 ${m && m.deltaTof != null ? fmt(m.deltaTof, 1) + " ns" : "--"}`
-      : h === "badbase" ? `${BADBASE_TEXT}（算得 ${f == null ? "--" : f.toFixed(1)} kN，${deltaTxt(ch) || "声时差 " + fmt(m && m.deltaTof, 1) + " ns"}）`
-      : h === "noprobe" ? `探头信号消失（${snrTxt}）：可能被拔出或接到了别的通道`
+    // 正文一句结论，原因和处置进 title
+    const text = h === "fault" ? (noBase ? "未置零" : "等待恢复")
+      : h === "uncal" ? `${UNCAL_TEXT} · 声时差 ${m && m.deltaTof != null ? fmt(m.deltaTof, 1) + " ns" : "--"}`
+      : h === "badbase" ? BADBASE_TEXT
+      : h === "noprobe" ? "请检查探头"
+      : h === "stray" ? (g && g.configured ? "有信号，待置零" : "有信号，未在配置")
+      : h === "shift" ? "需重新置零"
+      : h === "offline" ? (m ? "1 分钟无数据" : "等待数据")
+      : h === "pending" ? "规划探头位"
+      : mk && mk.delta ? deltaTxt(ch) + tempPart
+      : UNRATED_TEXT + negativeHint(f);
+    const detail = h === "fault" ? (noBase ? "有回波但无基线：通道未置零" : "设备这帧没解出声时，等待恢复")
+      : h === "uncal" ? "未加载标定文件，不计算预紧力，只显示声时差"
+      : h === "badbase" ? `力值为负（算得 ${f == null ? "--" : f.toFixed(1)} kN）：基线或额定值有误，需现场核对并重新置零`
+      : h === "noprobe" ? `探头信号消失（${snrTxt}）：可能被拔出、接错或耦合失效`
       : h === "stray" ? (g && g.configured
           ? `有探头信号（${snrTxt}），但该通道未置零，无法测力`
           : g && g.zeroed
-            ? `检测到探头信号（${snrTxt}），设备上已有基线 —— 确认已安装就把它加进 channels 配置`
-            : `检测到探头信号（${snrTxt}），此通道未配置/未置零 —— 探头可能插错位置`)
+            ? `检测到探头信号（${snrTxt}），设备上已有基线：确认已安装就加进该法兰的接线表`
+            : `检测到探头信号（${snrTxt}），此通道未配置、未置零：探头可能插错位置`)
       : h === "shift" ? `声时偏离置零基线 ${m && m.deltaTof != null ? (Math.abs(Number(m.deltaTof)) / 1000).toFixed(1) : "--"} µs（预紧变化只会有几十 ns）：探头贴到了别的螺栓或重新耦合过，需重新置零`
       : h === "offline" ? (m ? "超过 1 分钟没有新数据" : channels[ch] ? "等待数据" : "已接探头，设备未上报该通道")
-      : h === "pending" ? (g && g.presence === "none" ? "规划探头位 · 已确认无探头信号" : "规划探头位，尚未接入")
-      : mk && mk.delta ? `${deltaTxt(ch)} · ${UNRATED_TEXT}`
-      : UNRATED_TEXT + negativeHint(f);
-    setSub(ch, ["pending", "noprobe", "stray", "shift", "uncal", "badbase"].includes(h) ? why : why + " · " + tempTxt);
+      : h === "pending" ? (g && g.presence === "none" ? "规划探头位，已确认无探头信号" : "规划探头位，尚未接入")
+      : "未配置额定预紧力：只显示较锚定的变化量，不判偏低/松动";
+    setSub(ch, text, detail);
   }
 }
 
-// 副文字两行截断，完整内容进 title；内容没变就不碰 DOM
-function setSub(ch, text) {
+// 副文字两行截断；title 放完整解释（没给就用正文）。内容没变就不碰 DOM
+function setSub(ch, text, detail) {
   const el = $("bsub-" + ch);
-  if (el && el.textContent !== text) { el.textContent = text; el.title = text; }
+  if (!el) return;
+  if (el.textContent !== text) el.textContent = text;
+  const title = detail || text;
+  if (el.title !== title) el.title = title;
 }
 
 function updateBoltCards() {
@@ -1519,8 +1551,8 @@ function drawFlange() {
       b.kn.style.textAnchor = textual ? "start" : "end";   // text-anchor 被样式表定着，要用 style 覆盖
     }
     const kn = h === "pending" ? "待接入"
-      : h === "stray" ? (sigs[b.ch] && sigs[b.ch].configured ? "有信号·无基线" : "有信号·未配置")
-      : h === "noprobe" ? "探头无信号"
+      : h === "stray" ? (sigs[b.ch] && sigs[b.ch].configured ? "未置零" : "未配置")
+      : h === "noprobe" ? "无信号"
       : h === "shift" ? "基线失配"
       : h === "uncal" ? "未标定"
       : h === "badbase" ? "基线可疑"
@@ -1697,10 +1729,10 @@ function drawDist() {
   const vals = chs.map(ch => liveForce(ch));
   if (chs.length === 0 || vals.every(v => v == null)) {
     dctx.fillStyle = "#44566e"; dctx.textAlign = "center"; dctx.font = "12px sans-serif";
-    dctx.fillText(!isBoundFlange() ? "本法兰尚未接入监测"
+    dctx.fillText(!isBoundFlange() ? "未接入"
       : !flangeCal(viewFlange) ? UNCAL_TEXT
-      : anchored() && flangeRated(viewFlange) === 0 ? "未配置额定值：锚定口径下估不出绝对预紧力，轴力分布不画"
-      : "等待数据……", rc.x + rc.w / 2, rc.y + rc.h / 2 + 4);
+      : anchored() && flangeRated(viewFlange) === 0 ? UNRATED_TEXT
+      : "等待数据", rc.x + rc.w / 2, rc.y + rc.h / 2 + 4);
     return;
   }
 
@@ -1818,7 +1850,7 @@ function axisLabel(spanMs, i, n) {
 }
 
 // marks：基线重置事件 [{t, ch}]——现场重新置零后曲线会跳一截，画条竖虚线标出来，别让人以为是螺栓动了
-function drawForceChart(cv, ctx, series, spanMs, emptyText = "这段时间还没有落盘数据……", marks = []) {
+function drawForceChart(cv, ctx, series, spanMs, emptyText = "暂无数据", marks = []) {
   const w = cv.clientWidth, h = cv.clientHeight || cv.height;
   if (!w) return;
   if (cv.width !== w) cv.width = w;
@@ -1909,7 +1941,7 @@ const tcv = $("trend"), tctx = tcv.getContext("2d");
 function drawTrend() {
   const span = RANGE_MS[trendRange] || TREND_MS;
   // 没接入的法兰没有历史，画空图说明；接入的只画本法兰的通道
-  if (!isBoundFlange()) { drawForceChart(tcv, tctx, {}, span, "本法兰尚未接入监测"); return; }
+  if (!isBoundFlange()) { drawForceChart(tcv, tctx, {}, span, "未接入"); return; }
   const chs = viewChannels();
   const series = trendRange === "5m" ? seriesFromLive(span, chs) : seriesFromArchive(histPoints, chs, viewTurbine);
   drawForceChart(tcv, tctx, series, span, flangeCal(viewFlange) ? undefined : UNCAL_TEXT, rezeroMarks);
@@ -1920,7 +1952,7 @@ function drawHist() {
   if (!hcv) return;
   const calibratedAny = deviceTurbines().some(t => withTurbine(t, anyCalibrated));
   drawForceChart(hcv, hctx, seriesFromArchive(histPoints), RANGE_MS[reportRange] || RANGE_MS["24h"],
-    calibratedAny ? undefined : UNCAL_TEXT + "，这段时间没有力值曲线", rezeroMarks);
+    calibratedAny ? undefined : UNCAL_TEXT, rezeroMarks);
 }
 
 // 基线重置事件（现场重新置零）：和历史曲线一起拉，画在趋势图上。法兰页只拉当前机组的
@@ -2040,14 +2072,14 @@ function renderAlarms() {
   const stat = (cls, v, k) =>
     `<div class="stat ${cls}"><div><span class="v">${v}</span><span class="u">颗</span></div><div class="k">${k}</div></div>`;
   $("alarmStats").innerHTML =
-    stat(looseNow ? "bad" : "", looseNow, "当前松动报警")
-    + stat(warnNow ? "" : "", warnNow, "当前预紧力偏低")
-    + stat(abnormalNow ? "bad" : "", abnormalNow, "当前检测异常")
+    stat(looseNow ? "bad" : "", looseNow, "松动报警")
+    + stat(warnNow ? "" : "", warnNow, "预紧力偏低")
+    + stat(abnormalNow ? "bad" : "", abnormalNow, "检测异常")
     + stat("", archiveEvents.length, "区间事件");
 
   const list = $("evList");
   if (archiveEvents.length === 0) {
-    list.innerHTML = `<div class="evempty">这段时间没有状态变化 —— 或历史库还在积累</div>`;
+    list.innerHTML = `<div class="evempty">暂无事件</div>`;
     return;
   }
 
@@ -2090,7 +2122,8 @@ function updateReport() {
     const m = channels[ch] && channels[ch].last;
     const mk = mainKn(ch);
     const fi = chFlange(ch);
-    return { t, ch, h, m, mk, d: liveDelta(ch), rated: ratedOf(ch), where: fi >= 0 ? flangeName(fi) : "未分配" };
+    // 状态词在这台机组的上下文里算好（"未置零"要查它的在位识别结果），渲染时直接用
+    return { t, ch, h, label: healthLabel(h, ch), m, mk, d: liveDelta(ch), rated: ratedOf(ch), where: fi >= 0 ? flangeName(fi) : "未分配" };
   })));
   const calibratedAny = deviceTurbines().some(t => withTurbine(t, anyCalibrated));
   const anyRated = deviceTurbines().some(t => withTurbine(t, () => deviceFlanges().some(i => flangeRated(i) > 0)));
@@ -2120,18 +2153,16 @@ function updateReport() {
     <div class="rc"><span class="l">检测异常</span><span class="n" style="color:#d8a15c">${abnormal}</span></div>
     <div class="rc"><span class="l">基线失配</span><span class="n" style="color:#e78cff">${counts.shift}</span></div>
     <div class="rc"><span class="l">离线</span><span class="n" style="color:#5b7089">${counts.offline}</span></div>
-    <div class="rc"><span class="l">区间事件</span><span class="n" style="color:#7d92aa">${evN}</span></div>
-    <div class="rc" style="grid-column:1/-1;justify-content:center"><span class="l" style="color:var(--warn)">${UNCAL_TEXT}，把 .ucf 放到程序目录后重启</span></div>` : `
+    <div class="rc"><span class="l">区间事件</span><span class="n" style="color:#7d92aa">${evN}</span></div>` : `
     <div class="rc"><span class="l">监测螺栓</span><span class="n" style="color:#cfe3f5">${total || "--"}</span></div>
     <div class="rc"><span class="l">正常</span><span class="n" style="color:var(--ok)">${counts.ok}</span></div>
     <div class="rc"><span class="l">预紧力偏低</span><span class="n" style="color:var(--warn)">${counts.warn}</span></div>
     <div class="rc"><span class="l">松动报警</span><span class="n" style="color:var(--bad)">${counts.loose}</span></div>
     <div class="rc"><span class="l">检测异常</span><span class="n" style="color:#d8a15c">${abnormal}</span></div>
     <div class="rc"><span class="l">基线失配</span><span class="n" style="color:#e78cff">${counts.shift}</span></div>
-    <div class="rc"><span class="l">未配额定·只测变化</span><span class="n" style="color:#9db8d6">${counts.unrated + counts.uncal}</span></div>
+    <div class="rc"><span class="l">未配额定</span><span class="n" style="color:#9db8d6">${counts.unrated + counts.uncal}</span></div>
     <div class="rc"><span class="l">离线</span><span class="n" style="color:#5b7089">${counts.offline}</span></div>
-    <div class="rc"><span class="l">区间事件</span><span class="n" style="color:#7d92aa">${evN}</span></div>${anyRated ? "" : `
-    <div class="rc" style="grid-column:1/-1;justify-content:center"><span class="l" style="color:#9db8d6">${UNRATED_TEXT}</span></div>`}`;
+    <div class="rc"><span class="l">区间事件</span><span class="n" style="color:#7d92aa">${evN}</span></div>`;
 
   // 区间统计按 (机组, 通道) 对上
   const byKey = {};
@@ -2159,7 +2190,7 @@ function updateReport() {
           <td>${r.d == null ? "--" : fmtSigned(r.d, 2)}</td>
           <td>${knTxt(mn)}</td><td>${knTxt(mx)}</td><td>${knTxt(av)}</td>
           <td>${tempTxt}</td><td>${pctTxt}</td>
-          <td><span class="bst ${r.h}">${HEALTH_TEXT[r.h]}</span></td></tr>`;
+          <td><span class="bst ${r.h}">${r.label}</span></td></tr>`;
       }).join("");
 }
 
@@ -2269,11 +2300,14 @@ function refreshHeader() {
   const n = chList().length;
   const healthy = connected && n > 0;
   const noDev = !d;
+  // 底栏状态一句话；失败原因（服务端的最后一条日志）放 title 和运维视图，不铺在业主眼前
   $("stateText").textContent = noDev ? `${tid(viewTurbine)} 未接入设备`
-    : maintenance ? `${tid(viewTurbine)} 维护中（${maintenance.note}），预计 ${hhmm(maintenance.until)} 自动恢复监测`
+    : maintenance ? `${tid(viewTurbine)} 维护中，${hhmm(maintenance.until)} 恢复`
     : healthy ? `${tid(viewTurbine)} 监测中，${n} 个测点`
-    : connected ? `${tid(viewTurbine)} 已连接，等待设备上报（自动重试中）`
-    : `${tid(viewTurbine)} 未连接（服务自动重连中）` + (d && d.log ? ` · ${d.log.replace(/^\d\d:\d\d:\d\d /, "")}` : "");
+    : connected ? `${tid(viewTurbine)} 已连接，等待数据`
+    : `${tid(viewTurbine)} 未连接，自动重连中`;
+  $("stateText").title = maintenance ? `现场维护（${maintenance.note}），预计 ${hhmm(maintenance.until)} 自动恢复监测`
+    : d && d.log ? d.log : "";
   $("stateText").className = maintenance ? "maint" : healthy ? "ok" : "";
   // 右上角小灯：全场有一台在测就算监测中
   const anyOn = deviceTurbines().some(t => withTurbine(t, () => connected && chList().length > 0));
@@ -2294,6 +2328,8 @@ function refreshHeader() {
     : `标定：${c && Number(c.k) > 0 ? `${c.name}（${c.points} 点） ${Number(c.k).toFixed(4)} ${c.unit}/ns · ${plan.baselineText}` : UNCAL_TEXT}`;
   $("calText").title = $("calText").textContent;
   $("calText").style.color = noDev || anyCalibrated() ? "" : "var(--warn)";
+  // 标定文件名/斜率/口径是运维信息，只在运维视图显示；没标定是业主也该知道的事，照常显示
+  $("calText").classList.toggle("opsonly", noDev || anyCalibrated());
 }
 
 function onFrame(f) {
@@ -2425,5 +2461,7 @@ async function refreshArchive() {
     const loss = (s.dropped ? ` · 丢帧 ${s.dropped}` : "") + (s.writeErrors ? ` · 写入失败 ${s.writeErrors}` : "");
     $("archText").textContent = `历史 ${s.samples} 点 · 事件 ${s.events} · 最早 ${oldest} · ${s.dbMb} MB${loss}`;
     $("archText").style.color = loss ? "var(--bad)" : "";
+    // 库容量是运维信息，业主视图不显示；历史不完整（丢帧/写入失败）例外，必须亮出来
+    $("archText").classList.toggle("opsonly", !loss);
   } catch { /* 服务未起 */ }
 }

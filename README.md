@@ -88,6 +88,9 @@ dotnet run --project src/BoltPreload.Monitor    # 默认 http://0.0.0.0:5080
 
 页面路由：`#/farm` 总览、`#/turbine/N` 任一机组、`#/flange/i` 当前机组任一法兰（没接入的也能看画面，只是没数据）、`#/alarms`、`#/report`。
 
+**页面文案的规矩**：业主视图只有状态词（正常/偏低/松动/无信号/未置零/待接入……）和数字，不写句子、不出现配置文件名和运维术语；
+为什么、该怎么办放在悬停提示（title）里，标定文件名/斜率/库容量/服务日志只在法兰页的"运维详情"视图露出来。
+
 机组结构页是 Three.js 三维场景（`wwwroot/tower3d.js`，库文件 vendored 在 `wwwroot/vendor/three`，MIT，随 exe 一起发布，不依赖外网）；浏览器没有 WebGL 时自动退回 SVG 版。
 
 ## 仓库结构
