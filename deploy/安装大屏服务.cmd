@@ -15,9 +15,7 @@ if not exist "%EXE%" (
   exit /b 1
 )
 
-rem 之前用计划任务/控制台方式跑过的，先清掉，免得两份抢 5080 端口
-schtasks /Delete /TN "螺栓预紧力大屏" /F >nul 2>&1
-schtasks /Delete /TN "螺栓预紧力大屏-守护" /F >nul 2>&1
+rem 之前双击控制台方式跑着的先关掉，免得两份抢 5080 端口
 taskkill /IM BoltPreload.Monitor.exe /F >nul 2>&1
 
 sc query BoltPreloadMonitor >nul 2>&1

@@ -10,6 +10,7 @@ BoltPreload — Third-Party Notices
 ----
 - .NET 8 / ASP.NET Core                 MIT（Microsoft .NET Library）
 - Microsoft.Data.Sqlite                 MIT
+- Microsoft.Extensions.Hosting.WindowsServices  MIT（大屏按 Windows 服务运行）
 - 厂家 FxSDK 1.6（`bhls1.6/sdk16/FxSDK`） 专有/厂商授权，非开源
 
 业主大屏前端（随 exe 发布，不依赖外网）
