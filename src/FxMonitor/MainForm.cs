@@ -45,6 +45,8 @@ public sealed class MainForm : Form
     private readonly Button _btnZero = new() { Text = "通道置零...", AutoSize = true, MinimumSize = new Size(92, 30), Enabled = false };
     // 现场配置不要求连着设备：没连也能改法兰/标定/额定；连着时扫到的通道会列出来供逐路接线
     private readonly Button _btnConfig = new() { Text = "现场配置...", AutoSize = true, MinimumSize = new Size(92, 30) };
+    // 打开业主大屏网页；本机大屏服务没在跑、exe 又在手边（同一个文件夹发布）就先把它拉起来
+    private readonly Button _btnDash = new() { Text = "打开大屏", AutoSize = true, MinimumSize = new Size(92, 30) };
     private readonly ListView _list = new()
     {
         View = View.Details,
@@ -100,9 +102,14 @@ public sealed class MainForm : Form
 
         /// <summary>大屏程序目录（现场配置对话框里选的）；本机跑着大屏时会自动找到，不用填。</summary>
         public string? DashboardDir { get; set; }
+
+        /// <summary>大屏网页地址。不填 = 本机 http://localhost:5080/；大屏在别的机器上就填它的地址。</summary>
+        public string? DashboardUrl { get; set; }
     }
 
     private string? _dashboardDir;
+    private string? _dashboardUrl;
+    private const string LocalDashboardUrl = "http://localhost:5080/";
 
     private static readonly System.Text.Json.JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static string SettingsPath => Path.Combine(AppContext.BaseDirectory, "settings.json");
@@ -149,6 +156,7 @@ public sealed class MainForm : Form
         _btnParams.Click += (_, _) => ShowParamsDialog();
         _btnZero.Click += (_, _) => ShowZeroDialog();
         _btnConfig.Click += (_, _) => ShowConfigDialog();
+        _btnDash.Click += async (_, _) => await OpenDashboardAsync();
         _btnScan.Click += async (_, _) => await RescanAsync();
 
         LoadPlan();
@@ -214,6 +222,9 @@ public sealed class MainForm : Form
         row2.Controls.Add(_btnParams);
         row2.Controls.Add(_btnZero);
         row2.Controls.Add(_btnConfig);
+        _btnDash.Margin = new Padding(0, 1, 8, 0);
+        _tip.SetToolTip(_btnDash, "在浏览器里打开业主大屏。本机的大屏服务没在运行且 BoltPreload.Monitor.exe 就在旁边时，先把服务启动起来");
+        row2.Controls.Add(_btnDash);
         row2.Controls.Add(_lblCal);
         top.Controls.Add(row2);
         top.Controls.Add(row1);
@@ -695,6 +706,81 @@ public sealed class MainForm : Form
         LoadPlan();
     }
 
+    /// <summary>
+    /// 打开大屏网页。地址：settings.json 里填了就用填的（大屏在别的机器），没填按本机 5080。
+    /// 本机地址不通时，看旁边（或现场配置里选的大屏目录）有没有 BoltPreload.Monitor.exe，有就问一句、拉起来再开网页——
+    /// 两个程序发布在同一个文件夹里，业主机上双击桌面端也能把大屏带起来。
+    /// </summary>
+    private async Task OpenDashboardAsync()
+    {
+        _btnDash.Enabled = false;
+        try
+        {
+            var url = string.IsNullOrWhiteSpace(_dashboardUrl) ? LocalDashboardUrl : _dashboardUrl!.Trim();
+            var isLocal = url.Contains("localhost", StringComparison.OrdinalIgnoreCase) || url.Contains("127.0.0.1");
+            if (!await DashboardAliveAsync(url) && isLocal)
+            {
+                var exe = FindDashboardExe();
+                if (exe is null)
+                {
+                    MessageBox.Show(this, $"本机 {url} 没有大屏服务在运行，旁边也没找到 BoltPreload.Monitor.exe。\n\n大屏在别的机器上的话，在 settings.json 里填 DashboardUrl（如 http://192.168.1.20:5080/）。",
+                        "打开大屏", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                var answer = MessageBox.Show(this, $"本机的大屏服务没在运行。现在启动它？\n\n{exe}", "打开大屏", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (answer != DialogResult.Yes) return;
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe)
+                {
+                    WorkingDirectory = Path.GetDirectoryName(exe)!,
+                    UseShellExecute = true,
+                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Minimized,
+                });
+                OpsLog.Append($"启动大屏服务 {exe}");
+                _lblLog.Text = "大屏服务启动中……";
+                for (var i = 0; i < 20 && !await DashboardAliveAsync(url); i++) await Task.Delay(500);
+                _lblLog.Text = await DashboardAliveAsync(url) ? "大屏服务已启动" : "大屏服务还没响应，浏览器里稍后刷新";
+            }
+
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "打开大屏失败：" + ex.Message, "打开大屏", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _btnDash.Enabled = true;
+        }
+    }
+
+    private static async Task<bool> DashboardAliveAsync(string url)
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(1200) };
+            using var r = await http.GetAsync(new Uri(new Uri(url), "/api/state"));
+            return r.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>大屏 exe：优先自己旁边（同一个文件夹发布），其次现场配置里选过的大屏目录。</summary>
+    private string? FindDashboardExe()
+    {
+        foreach (var dir in new[] { AppContext.BaseDirectory, _dashboardDir })
+        {
+            if (dir is null) continue;
+            var exe = Path.Combine(dir, "BoltPreload.Monitor.exe");
+            if (File.Exists(exe)) return exe;
+        }
+
+        return null;
+    }
+
     private void ShowParamsDialog()
     {
         if (_engine == null || !_engine.IsConnected)
@@ -923,6 +1009,7 @@ public sealed class MainForm : Form
             var s = System.Text.Json.JsonSerializer.Deserialize<Settings>(File.ReadAllText(SettingsPath), JsonOptions);
             if (s != null && !string.IsNullOrWhiteSpace(s.Endpoint)) _ipBox.Text = s.Endpoint;
             if (s != null && !string.IsNullOrWhiteSpace(s.DashboardDir) && Directory.Exists(s.DashboardDir)) _dashboardDir = s.DashboardDir;
+            if (s != null && !string.IsNullOrWhiteSpace(s.DashboardUrl)) _dashboardUrl = s.DashboardUrl;
         }
         catch (Exception)
         {
@@ -933,7 +1020,7 @@ public sealed class MainForm : Form
     {
         try
         {
-            var s = new Settings { Endpoint = _ipBox.Text.Trim(), DashboardDir = _dashboardDir };
+            var s = new Settings { Endpoint = _ipBox.Text.Trim(), DashboardDir = _dashboardDir, DashboardUrl = _dashboardUrl };
             File.WriteAllText(SettingsPath, System.Text.Json.JsonSerializer.Serialize(s, JsonOptions));
         }
         catch (Exception)

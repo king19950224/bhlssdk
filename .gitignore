@@ -73,3 +73,6 @@ tools/*.docx
 tools/cur_imgs/
 tools/pptx_*.py
 tools/pdf_pages.py
+
+# 一键发布产物（publish.ps1）
+dist/

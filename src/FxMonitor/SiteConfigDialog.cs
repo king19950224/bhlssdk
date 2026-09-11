@@ -61,7 +61,7 @@ internal sealed class SiteConfigDialog : Form
         MinimizeBox = false;
         ShowInTaskbar = false;
 
-        _dashDir.Text = dashboardDir ?? DetectDashboardDir() ?? string.Empty;
+        _dashDir.Text = dashboardDir ?? DetectDashboardDir(ownDir) ?? string.Empty;
         _cfg = LoadConfig(endpoint);
 
         BuildUi();
@@ -110,8 +110,10 @@ internal sealed class SiteConfigDialog : Form
         return dir is null ? null : Path.Combine(dir, "wwwroot", "farm.json");
     }
 
-    /// <summary>大屏就在这台机器上跑的话，直接找到它的目录，保存时顺手写过去。</summary>
-    private static string? DetectDashboardDir()
+    /// <summary>
+    /// 大屏就在这台机器上跑的话，直接找到它的目录，保存时顺手写过去；没在跑但 exe 就在自己旁边（两个程序发布在同一个文件夹）也算找到。
+    /// </summary>
+    private static string? DetectDashboardDir(string ownDir)
     {
         try
         {
@@ -132,8 +134,11 @@ internal sealed class SiteConfigDialog : Form
         {
         }
 
-        return null;
+        return File.Exists(Path.Combine(ownDir, "BoltPreload.Monitor.exe")) ? ownDir : null;
     }
+
+    private bool SameFolderAsDashboard => DashboardDir is { } d
+        && string.Equals(Path.GetFullPath(d).TrimEnd('\\', '/'), Path.GetFullPath(_ownDir).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
 
     // ── 界面 ─────────────────────────────────────────────────────────────────
 
@@ -534,9 +539,14 @@ internal sealed class SiteConfigDialog : Form
         var written = new List<string>();
         try
         {
+            // 和大屏在同一个文件夹时只留 wwwroot\farm.json 这一份（桌面端也会去那读），免得两份各改各的；
+            // 目录里原来就有一份根目录 farm.json 的话保持同步
             var ownPath = Path.Combine(_ownDir, "farm.json");
-            WriteAtomic(ownPath, json);
-            written.Add(ownPath);
+            if (!SameFolderAsDashboard || File.Exists(ownPath))
+            {
+                WriteAtomic(ownPath, json);
+                written.Add(ownPath);
+            }
 
             if (DashboardDir is { } dash && Directory.Exists(dash))
             {

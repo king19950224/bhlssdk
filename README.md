@@ -25,9 +25,11 @@
 **没有加载标定文件就不显示夹紧力**（只显示声时差）——软件里没有任何"默认斜率"，没有出处的数不上界面。
 置零、参数下发、加载标定文件、现场配置保存都记在 exe 旁的 `操作记录.log`。
 
+**「打开大屏」**：在浏览器里打开业主大屏。本机没有大屏服务在跑、`BoltPreload.Monitor.exe` 又在旁边（一键发布的文件夹）时，先问一句把服务拉起来再开网页。
+大屏在别的机器上就在 `settings.json` 里填 `DashboardUrl`。
+
 ```powershell
 dotnet run --project src/FxMonitor              # 或 FxMonitor.exe [ip:port] [--auto] [--demo]
-dotnet publish src/FxMonitor -c Release         # 自包含单文件 exe，拷走就能跑
 ```
 
 ### 2. BoltPreload.Monitor（业主网页大屏）
@@ -106,6 +108,19 @@ dotnet run --project src/BoltPreload.Monitor    # 默认 http://0.0.0.0:5080
 为什么、该怎么办放在悬停提示（title）里，标定文件名/斜率/库容量/服务日志只在法兰页的"运维详情"视图露出来。
 
 机组结构页是 Three.js 三维场景（`wwwroot/tower3d.js`，库文件 vendored 在 `wwwroot/vendor/three`，MIT，随 exe 一起发布，不依赖外网）；浏览器没有 WebGL 时自动退回 SVG 版。
+
+## 发布与部署
+
+```powershell
+.\publish.ps1                      # → dist\螺栓预紧力监测\，整个文件夹拷走
+```
+
+一个文件夹装下全部：`FxMonitor.exe`、`BoltPreload.Monitor.exe`（都是自包含单文件，目标机不用装 .NET）、`wwwroot\`（页面 + `farm.json`）、
+标定文件 `.ucf`、`启动大屏.cmd`、`设置大屏开机自启.cmd`。两个程序在同一个文件夹里共用 `wwwroot\farm.json` 和 `.ucf`——桌面端旁边没有 `farm.json` 时读 `wwwroot\farm.json`，
+现场配置对话框也只写这一份；两个程序不合成一个进程：大屏是业主机上 24 小时跑的服务，桌面端是运维偶尔开的工具，合在一起谁手一滑关了窗口大屏就黑。
+
+业主电脑：整个文件夹拷过去，双击一次「设置大屏开机自启.cmd」（登记一个登录时运行的计划任务），以后开机大屏自己起来；`启动大屏.cmd` 手动起一次并开网页。
+现场调试：`FxMonitor.exe` 连设备置零/调参/现场配置，「打开大屏」按钮能把服务拉起来并打开网页。
 
 ## 仓库结构
 
