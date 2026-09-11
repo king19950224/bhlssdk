@@ -715,7 +715,12 @@ internal sealed class MonitorHub : IDisposable
         lock (_stateLock) _polled = set;
     }
 
-    /// <summary>开始一轮巡检：把规划位/巡检位都带上轮 45 秒左右，抓插到别处的探头。</summary>
+    /// <summary>
+    /// 开始一轮巡检：把规划位/巡检位都带上轮 45 秒左右，抓插到别处的探头。
+    /// 顺带把在测各路的基线从设备重读一遍：现场用桌面端重新置零（或改了增益/回波窗再置零）后，设备上的参考声时变了，
+    /// 而声时差是按本会话里的参考声时算的——不重读，页面会一直拿旧基线算出几百 kN 的假"松动"（09-11 CH6 实证，−529 ns）。
+    /// 反正巡检要停一次流切轮询集，这时候读最省事，每 10 分钟一次。
+    /// </summary>
     public async Task StartScanAsync()
     {
         await _gate.WaitAsync();
@@ -724,6 +729,8 @@ internal sealed class MonitorHub : IDisposable
             if (_engine is not { IsConnected: true } engine || ScanActive) return;
             List<ushort> wide;
             lock (_stateLock) wide = _reachable.ToList();
+            await engine.StopStreamAsync();
+            await RefreshBaselinesAsync(engine);
             await SwitchPollSetAsync(engine, wide);
             ScanActive = true;
             ScanStartedAt = DateTime.UtcNow;
@@ -737,6 +744,55 @@ internal sealed class MonitorHub : IDisposable
         {
             _gate.Release();
         }
+    }
+
+    /// <summary>
+    /// 重读在测各路设备上的参考声时/温度（流已停）。变了的：重读整路参数和参考波形、更新会话（下一次 Resume 会按新基线算声时差）、
+    /// 交历史库记"基线重置"。没变的什么都不动。读失败的跳过，下一轮再读。
+    /// </summary>
+    private async Task RefreshBaselinesAsync(DeviceEngine engine)
+    {
+        List<ushort> monitored;
+        Dictionary<ushort, string> oldRef;
+        lock (_stateLock)
+        {
+            monitored = _params.Keys.OrderBy(c => c).ToList();
+            oldRef = _params.ToDictionary(kv => kv.Key, kv => kv.Value.FirstOrDefault(p => p.Key == "参考声时 ns").Value ?? "");
+        }
+
+        if (monitored.Count == 0) return;
+        var changed = new SortedDictionary<ushort, List<KeyValuePair<string, string>>>();
+        var waves = new SortedDictionary<ushort, object>();
+        var baselines = new Dictionary<ushort, (decimal? RefTime, decimal? RefTemp)>();
+        foreach (var ch in monitored)
+        {
+            try
+            {
+                var storage = await engine.ReadStorageAsync(ch, CancellationToken.None);
+                if (storage.Count == 0 || !DeviceEngine.IsZeroed(storage)) continue;
+                var newRef = DeviceEngine.Raw(storage, "RefTime");
+                if (ParseDec(newRef) is not { } n || ParseDec(oldRef.GetValueOrDefault(ch, "")) is { } o && o == n) continue;
+                // 基线变了：整路重读（参考波形也换了），会话按新参数灌
+                await ReadChannelIntoAsync(engine, ch, changed, waves, baselines);
+            }
+            catch (Exception ex)
+            {
+                _lastLog = $"{DateTime.Now:HH:mm:ss} CH{ch} 重读基线失败：{ex.Message}";
+            }
+        }
+
+        if (changed.Count == 0) return;
+        lock (_stateLock)
+        {
+            foreach (var kv in changed) _params[kv.Key] = kv.Value;
+            foreach (var kv in waves) _refWaves[kv.Key] = kv.Value;
+        }
+
+        var msg = $"{DateTime.Now:HH:mm:ss} 基线已变（现场重新置零）：{string.Join("、", changed.Keys.Select(c => $"CH{c} → {baselines[c].RefTime} ns"))}，按新基线算声时差";
+        Console.WriteLine(msg);
+        _lastLog = msg;
+        Broadcast(new { type = "log", t = Turbine, text = _lastLog });
+        _history.RecordBaselines(Turbine, baselines);
     }
 
     /// <summary>结束巡检：收窄到常态轮询集。返回这轮发现的、未在配置中却有探头信号的通道。</summary>

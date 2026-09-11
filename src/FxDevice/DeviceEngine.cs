@@ -765,8 +765,11 @@ public sealed class DeviceEngine
 
             var strong = s.Snrs.Count(v => v >= ProbeSnrDb);
             var majority = Math.Ceiling(s.Frames * 0.6);
-            var hasProbe = strong >= majority || s.Echo >= majority;
             var avg = s.Snrs.Average();
+            // "帧帧解出回波"这条路只在波形里确有信号（平均信噪比过噪声门）时才算：空通道的门内纯噪声也会被自动法
+            // 判成"正常"解出一个声时（09-11 CH14：信噪比 2 dB，帧帧有回波，扫成了"有探头"）。真探头耦合差到 12 dB 以下的，
+            // 写进 farm.json 接线表就照常列出来，不靠扫描猜
+            var hasProbe = strong >= majority || (s.Echo >= majority && avg >= NoiseSnrDb);
             result.Add(new ProbeScan
             {
                 Channel = ch,

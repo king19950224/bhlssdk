@@ -15,7 +15,7 @@ internal static class Health
     public const string Shift = "shift";       // 基线失配：声时偏离置零基线 > 2 µs，探头挪过或重新耦合过
     public const string Uncal = "uncal";       // 未标定：测得到声时差但没有 .ucf，算不出力值
     public const string Unrated = "unrated";   // 未配额定：有标定、测得到变化量，但没有额定预紧力，判不了偏低/松动
-    public const string BadBase = "badbase";   // 基线可疑：算出来的预紧力明显为负，基线或额定值有误
+    public const string BadBase = "badbase";   // 基线可疑：算出来的预紧力明显为负或远超额定，基线/参数/额定值有误
     public const string Rezero = "rezero";     // 事件专用：这一路的参考声时变了（现场重新置零）
 
     /// <summary>
@@ -61,6 +61,14 @@ internal static class Health
                 return BadBase;
             }
 
+            // 另一头也一样：预紧力高出额定 30% 以上物理上不可信（M64 1780 kN 的 130% 已到屈服的 92%）。
+            // 09-11 实证：CH9 改了增益/回波窗没重新置零，声时差 +369 ns 算出 2639 kN（148%）——之前这里判"正常"。
+            // 这是基线或参数改过，不是螺栓真的紧了 1000 kN
+            if (rated > 0 && f > rated * OverRangeRatio)
+            {
+                return BadBase;
+            }
+
             if (rated > 0)
             {
                 if (f < rated * plan.AlarmRatio)
@@ -86,6 +94,9 @@ internal static class Health
     }
 
     public static decimal NegativeTolerance(decimal rated) => rated > 0 ? rated * 0.1m : 10m;
+
+    /// <summary>估算预紧力超过额定的这个倍数就当基线可疑（拧过头 10–20% 有可能，30% 以上没见过）。</summary>
+    public const decimal OverRangeRatio = 1.3m;
 
     /// <summary>需要立刻记事件、不做 10 秒去抖的状态：恶化成报警/异常的一刻就得留痕。</summary>
     public static bool IsUrgent(string health) => health is Loose or Fault or Shift or NoProbe or BadBase;

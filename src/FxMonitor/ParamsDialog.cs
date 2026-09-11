@@ -55,6 +55,18 @@ internal sealed class ParamsDialog : Form
 
     public IReadOnlyDictionary<ushort, Dictionary<string, string>> DeviceValues => _original;
 
+    /// <summary>
+    /// 这次成功改过"会挪动检出回波"的参数（增益、回波窗、回波宽度、阈值、测量模式、脉冲、探头频率）的通道。
+    /// 这些一改，检出的回波声时就变了，原来置零时记的参考声时不再成立——必须重新置零，否则声时差是假的
+    /// （09-11 实证：CH9 增益 30→1、回波窗 23000→28000 后声时差从 −90 ns 变成 +369 ns，按 M64 系数是 +1000 kN）。
+    /// </summary>
+    public HashSet<ushort> NeedsRezero { get; } = new();
+
+    private static readonly HashSet<string> EchoAffecting = new()
+    {
+        "Gain", "EchoWin", "EchoWidth", "Threshold", "MeasMode", "Duty", "Forward", "Reverse", "ProbeFreq",
+    };
+
     private readonly HashSet<ushort> _dead = new();
 
     private CancellationTokenSource? _cts;
@@ -504,6 +516,10 @@ internal sealed class ParamsDialog : Form
                     OpsLog.Append($"CH{ch} 参数下发：" + string.Join("，", rows.Where(r => !r.Implicit)
                                       .Select(r => $"{r.Cn} {r.BeforeValue}->{r.Wrote}（{(r.Verdict == Verdict.StoredOk ? "成功" : Describe(r))}）"))
                                   + (notes.Count > 0 ? "；" + string.Join("；", notes) : string.Empty));
+                    if (rows.Any(r => !r.Implicit && r.Verdict == Verdict.StoredOk && EchoAffecting.Contains(r.Name) && r.BeforeValue != r.Wrote))
+                    {
+                        NeedsRezero.Add(ch);
+                    }
 
                     if (wrong.Count == 0 && blind.Count == 0)
                     {

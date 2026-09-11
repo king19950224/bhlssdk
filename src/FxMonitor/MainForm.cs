@@ -19,6 +19,16 @@ public sealed class MainForm : Form
     private const int ChannelCount = 48;
 
     private readonly Dictionary<ushort, ChLive> _channels = new();
+
+    /// <summary>改过增益/回波窗等参数、还没重新置零的通道：声时差按旧基线算是假的，列表里标出来直到置零。</summary>
+    private readonly HashSet<ushort> _needRezero = new();
+
+    /// <summary>
+    /// 收到过、但不是本程序在轮询的通道（另一个客户端——通常是大屏巡检——的回包串过来了）。
+    /// 串口服务器会把仪器回包发给每一路 TCP，这些帧不建行、不显示，只在状态栏点名，免得没接探头的 CH3/4/5 一排红。
+    /// </summary>
+    private readonly Dictionary<ushort, DateTime> _foreign = new();
+
     private DeviceEngine? _engine;
     private CancellationTokenSource _cts = new();
     private bool _connected;
@@ -38,6 +48,7 @@ public sealed class MainForm : Form
     private readonly ToolTip _tip = new();
     private bool _scanning;
     private List<ushort> _unheard = new();
+    private List<string> _weakSkipped = new();
     private readonly Label _lblState = new() { AutoSize = true, Text = "未连接", ForeColor = Color.Gray };
     private readonly Label _lblCal = new() { AutoSize = true, Text = "标定：未加载标定文件（不显示夹紧力，请加载 .ucf）", ForeColor = Color.DarkOrange };
     private readonly Button _btnCal = new() { Text = "标定文件...", AutoSize = true, MinimumSize = new Size(92, 30) };
@@ -417,10 +428,15 @@ public sealed class MainForm : Form
             var scan = await _engine!.ScanProbesAsync(ChannelCount,
                 text => Post(() => _lblState.Text = text),
                 _cts.Token);
-            var probes = scan.Where(s => s.HasProbe || s.Suspect).Select(s => s.Channel).ToList();
+            // 有 farm.json 接线表时：接线表里的通道 + 扫到强信号的通道。信号弱的（信噪比在噪声门以上、探头门以下，
+            // 像 CH14 那种 2 dB 的串扰）只有写进接线表才列出来，否则光在状态栏提一句——没接的通道不该占一行红字
+            var configured = _plan.HasFarm ? _plan.WantedChannels.ToHashSet() : new HashSet<ushort>();
+            var probes = scan.Where(s => s.HasProbe || configured.Contains(s.Channel) || (s.Suspect && !_plan.HasFarm)).Select(s => s.Channel).ToList();
+            _weakSkipped = scan.Where(s => s.Suspect && !probes.Contains(s.Channel)).Select(s => $"CH{s.Channel}（{s.SnrAvg:0} dB）").ToList();
             _unheard = scan.Where(s => !s.Heard).Select(s => s.Channel).ToList();
 
             _channels.Clear();
+            _foreign.Clear();
             _list.Items.Clear();
             _selected = 0;
             if (probes.Count == 0)
@@ -560,8 +576,14 @@ public sealed class MainForm : Form
         if (unread.Count > 0) text += $"，{string.Join("、", unread)} 参数未读到";
         if (_unheard.Count > 0) text += $"，扫描时 CH{FormatChannels(_unheard)} 未响应";
         if (unread.Count > 0 || _unheard.Count > 0) text += "，可点“扫描通道”重试";
+        if (_weakSkipped.Count > 0) text += $"；{string.Join("、", _weakSkipped)} 有微弱信号，未纳入";
+        if (_needRezero.Count > 0) text += $"；{string.Join("、", _needRezero.OrderBy(c => c).Select(c => "CH" + c))} 改过参数，需重新置零";
+        var foreign = _foreign.Where(kv => DateTime.UtcNow - kv.Value < TimeSpan.FromMinutes(2)).Select(kv => kv.Key).OrderBy(c => c).ToList();
+        if (foreign.Count > 0) text += $"；另有程序在轮询 CH{FormatChannels(foreign)}（大屏巡检？），其回包已忽略";
         _lblState.Text = text;
-        _lblState.ForeColor = unread.Count > 0 || _unheard.Count > 0 ? Color.DarkOrange : Color.ForestGreen;
+        _lblState.ForeColor = _needRezero.Count > 0 ? Color.Firebrick
+            : unread.Count > 0 || _unheard.Count > 0 || foreign.Count > 0 ? Color.DarkOrange : Color.ForestGreen;
+        _tip.SetToolTip(_lblState, text);
     }
 
     private static string FormatChannels(IReadOnlyList<ushort> channels)
@@ -651,6 +673,7 @@ public sealed class MainForm : Form
 
         foreach (var ch in zeroed)
         {
+            _needRezero.Remove(ch);
             if (!_channels.TryGetValue(ch, out var c)) continue;
             var snap = _engine.Snapshot(ch);
             foreach (var kv in snap)
@@ -663,6 +686,7 @@ public sealed class MainForm : Form
         {
             UpdateParams();
             RefreshSelected();
+            foreach (var c in _channels.Values) UpdateRow(c);
         }
 
         ShowMonitorState();
@@ -823,6 +847,7 @@ public sealed class MainForm : Form
         }
 
         var monitored = _channels.Keys.OrderBy(c => c).ToArray();
+        HashSet<ushort> needsRezero;
         using (var dlg = new ParamsDialog(_engine, monitored, _selected))
         {
             dlg.ShowDialog(this);
@@ -835,6 +860,19 @@ public sealed class MainForm : Form
                     c.Cfg[item.Key] = item.Value;
                 }
             }
+
+            needsRezero = dlg.NeedsRezero;
+        }
+
+        if (needsRezero.Count > 0)
+        {
+            foreach (var ch in needsRezero) _needRezero.Add(ch);
+            foreach (var c in _channels.Values) UpdateRow(c);
+            var list = string.Join("、", needsRezero.OrderBy(c => c).Select(ChannelLabel));
+            OpsLog.Append($"参数改动使基线失效，待重新置零：{list}");
+            MessageBox.Show(this,
+                $"{list} 改了增益/回波窗/阈值这类参数，检出的回波声时会跟着变，原来置零时记的基线不再成立——现在显示的声时差和夹紧力是假的。\n\n请马上对这些通道「通道置零」。大屏那边也会在下一轮巡检时读到新基线。",
+                "需重新置零", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         UpdateParams();
@@ -884,8 +922,11 @@ public sealed class MainForm : Form
         if (_scanning) return;
         if (!_channels.TryGetValue(m.Channel, out var c))
         {
-            c = new ChLive { Ch = m.Channel, Row = NewRow(m.Channel) };
-            _channels[m.Channel] = c;
+            // 不是本程序在轮询的通道：是另一路 TCP 客户端（大屏）的回包串过来了。记一下、状态栏提一句，不建行
+            var first = !_foreign.ContainsKey(m.Channel);
+            _foreign[m.Channel] = DateTime.UtcNow;
+            if (first) ShowMonitorState();
+            return;
         }
 
         c.Last = m;
@@ -915,7 +956,9 @@ public sealed class MainForm : Form
     {
         if (!_plan.HasFarm)
         {
-            return (_plan.GlobalCal is { } c ? deltaTof * c.K + c.B : null, false);
+            // 没有 farm.json 就不知道口径：k·Δt 只能确定是"较置零时的变化量"，标 Δ。写成绝对值会把在役锚定的螺栓
+            // 显示成 98 kN（实为 1780 + 98），业主一看就是"松了"
+            return (_plan.GlobalCal is { } c ? deltaTof * c.K : null, true);
         }
 
         if (_plan.ForceKn(ch, deltaTof) is { } f) return (f, false);
@@ -983,8 +1026,13 @@ public sealed class MainForm : Form
         c.Row.SubItems[5].Text = c.Snr.HasValue ? c.Snr.Value.ToString("0") : "--";
         var normal = c.Last.StatusCode == MeasStatusCode.Normal;
         var weak = c.Snr.HasValue && c.Snr.Value < DeviceEngine.ProbeSnrDb;
-        c.Row.SubItems[6].Text = normal ? (weak ? "信号弱" : "正常") : DeviceEngine.DescribeStatus(c.Last.StatusCode);
-        c.Row.ForeColor = !normal ? Color.Firebrick : weak ? Color.DarkOrange : Color.Black;
+        var rezero = _needRezero.Contains(c.Ch);
+        // 和大屏同一条口径：估算预紧力为负或超出额定 30%，物理上不可信——基线或参数改过，不能写"正常"
+        var rated = _plan.RatedFor(c.Ch);
+        var suspicious = dt is { } d && Force(c.Ch, d) is { Value: { } f, IsDelta: false } && rated > 0 && (f > rated * 1.3m || f < -rated * 0.1m);
+        c.Row.SubItems[6].Text = !normal ? DeviceEngine.DescribeStatus(c.Last.StatusCode)
+            : rezero ? "需重新置零" : suspicious ? "基线可疑" : weak ? "信号弱" : "正常";
+        c.Row.ForeColor = !normal || rezero ? Color.Firebrick : suspicious || weak ? Color.DarkOrange : Color.Black;
     }
 
     private void RefreshSelected()
@@ -1128,10 +1176,8 @@ public sealed class MainForm : Form
         }
         else if (_plan.GlobalCal is { } g)
         {
-            text = $"标定：{g.FileName}（{g.Points} 点） {g.K:F4} {g.Unit}/ns"
-                   + (g.B != 0 ? $" {(g.B > 0 ? "+" : "-")} {Math.Abs(g.B):F2}" : string.Empty)
-                   + " · 未找到 farm.json，按自由置零口径显示 k·Δt+b（在役锚定的螺栓这是较锚定的变化量）";
-            color = Color.FromArgb(0, 110, 200);
+            text = $"未找到 farm.json：不知道接线和口径，只显示较置零的变化量 Δ（{g.FileName} {g.K:F4} {g.Unit}/ns）。请把 exe 放回发布文件夹（有 wwwroot\\farm.json）再用";
+            color = Color.DarkOrange;
         }
         else
         {
