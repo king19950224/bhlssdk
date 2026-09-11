@@ -250,7 +250,10 @@ app.Map("/ws", async ctx =>
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {
-    foreach (var h in site.Hubs) h.DisconnectAsync().GetAwaiter().GetResult();
+    // 停服务：把设备恢复到监测模式并断开。SDK 的收尾（切模式、等回包）在设备不配合时会拖很久，
+    // 最多等 8 秒——服务控制器只给 30 秒，超了会被硬杀，历史库还没来得及合上
+    var all = Task.WhenAll(site.Hubs.Select(h => h.DisconnectAsync()));
+    if (!all.Wait(TimeSpan.FromSeconds(8))) Console.WriteLine("停服务：设备断开未在 8 秒内完成，继续退出");
     history.Dispose();
 });
 
