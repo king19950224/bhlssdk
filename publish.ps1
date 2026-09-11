@@ -8,8 +8,21 @@ param([string]$Out = (Join-Path $PSScriptRoot "dist\螺栓预紧力监测"))
 $ErrorActionPreference = "Stop"
 $dotnet = if (Get-Command dotnet -ErrorAction SilentlyContinue) { "dotnet" } else { "C:\Program Files\dotnet\dotnet.exe" }
 
-if (Test-Path $Out) { Remove-Item $Out -Recurse -Force }
-New-Item -ItemType Directory $Out | Out-Null
+# 这台机器上如果大屏服务正跑着发布目录里的 exe，先停下来（文件锁着删不掉），发完再起
+$svc = Get-Service BoltPreloadMonitor -ErrorAction SilentlyContinue
+$restartService = $false
+if ($svc -and $svc.Status -eq "Running") {
+    Write-Host "大屏服务在运行，先停止……"
+    Stop-Service BoltPreloadMonitor -ErrorAction Stop
+    $restartService = $true
+}
+
+if (Test-Path $Out) {
+    # 历史库和日志是现场数据，不随发布清掉
+    Get-ChildItem $Out -Force | Where-Object { $_.Name -notin @("data", "logs") } | Remove-Item -Recurse -Force
+} else {
+    New-Item -ItemType Directory $Out | Out-Null
+}
 
 Write-Host "发布大屏 BoltPreload.Monitor ..."
 & $dotnet publish (Join-Path $PSScriptRoot "src\BoltPreload.Monitor") -c Release -r win-x64 --self-contained true `
@@ -28,6 +41,11 @@ Get-ChildItem $Out -Include *.pdb, settings.json, appsettings*.json, web.config,
 # 业主机上装/卸 Windows 服务的两个脚本
 foreach ($f in "安装大屏服务.cmd", "卸载大屏服务.cmd") {
     Copy-Item (Join-Path $PSScriptRoot "deploy\$f") $Out
+}
+
+if ($restartService) {
+    Write-Host "重新启动大屏服务……"
+    Start-Service BoltPreloadMonitor
 }
 
 Write-Host ""
