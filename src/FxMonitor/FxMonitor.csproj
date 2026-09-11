@@ -11,8 +11,9 @@
     <Product>螺栓预紧力监视器</Product>
     <Company>青岛百恒新能源技术有限公司</Company>
     <Copyright>Copyright © 2026 青岛百恒新能源技术有限公司</Copyright>
-    <!-- 1.6：和大屏共用 farm.json/.ucf（按 IP 选设备接线、按法兰标定与额定）。窗口标题带版本号，现场一眼分清新旧 exe -->
-    <Version>1.6.0</Version>
+    <!-- 1.6：和大屏共用 farm.json/.ucf（按 IP 选设备接线、按法兰标定与额定）；1.7：现场配置对话框，不用手改 farm.json。
+         窗口标题带版本号，现场一眼分清新旧 exe -->
+    <Version>1.7.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>

@@ -43,6 +43,8 @@ public sealed class MainForm : Form
     private readonly Button _btnCal = new() { Text = "标定文件...", AutoSize = true, MinimumSize = new Size(92, 30) };
     private readonly Button _btnParams = new() { Text = "参数下发...", AutoSize = true, MinimumSize = new Size(92, 30), Enabled = false };
     private readonly Button _btnZero = new() { Text = "通道置零...", AutoSize = true, MinimumSize = new Size(92, 30), Enabled = false };
+    // 现场配置不要求连着设备：没连也能改法兰/标定/额定；连着时扫到的通道会列出来供逐路接线
+    private readonly Button _btnConfig = new() { Text = "现场配置...", AutoSize = true, MinimumSize = new Size(92, 30) };
     private readonly ListView _list = new()
     {
         View = View.Details,
@@ -95,7 +97,12 @@ public sealed class MainForm : Form
     private sealed class Settings
     {
         public string? Endpoint { get; set; }
+
+        /// <summary>大屏程序目录（现场配置对话框里选的）；本机跑着大屏时会自动找到，不用填。</summary>
+        public string? DashboardDir { get; set; }
     }
+
+    private string? _dashboardDir;
 
     private static readonly System.Text.Json.JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static string SettingsPath => Path.Combine(AppContext.BaseDirectory, "settings.json");
@@ -141,6 +148,7 @@ public sealed class MainForm : Form
         };
         _btnParams.Click += (_, _) => ShowParamsDialog();
         _btnZero.Click += (_, _) => ShowZeroDialog();
+        _btnConfig.Click += (_, _) => ShowConfigDialog();
         _btnScan.Click += async (_, _) => await RescanAsync();
 
         LoadPlan();
@@ -200,9 +208,12 @@ public sealed class MainForm : Form
         _btnParams.Margin = new Padding(0, 1, 8, 0);
         _lblCal.Margin = new Padding(0, 8, 0, 0);
         _btnZero.Margin = new Padding(0, 1, 8, 0);
+        _btnConfig.Margin = new Padding(0, 1, 8, 0);
+        _tip.SetToolTip(_btnConfig, "接线（哪路探头在哪个法兰的几号螺栓）、每个法兰的标定文件和额定值、法兰名称/螺栓数/编号。保存写 farm.json，大屏在本机时同时生效");
         row2.Controls.Add(_btnCal);
         row2.Controls.Add(_btnParams);
         row2.Controls.Add(_btnZero);
+        row2.Controls.Add(_btnConfig);
         row2.Controls.Add(_lblCal);
         top.Controls.Add(row2);
         top.Controls.Add(row1);
@@ -641,6 +652,49 @@ public sealed class MainForm : Form
         ShowMonitorState();
     }
 
+    /// <summary>
+    /// 现场配置：扫到的通道带着"有没有信号、置没置零"进对话框，人只需要选法兰、填螺栓号、选标定文件、填额定。
+    /// 保存后重读 farm.json，列表的"位置"列和力值口径立刻按新配置走；大屏那边盯着文件自己重载。
+    /// </summary>
+    private void ShowConfigDialog()
+    {
+        var connected = _engine is { IsConnected: true } && !_scanning;
+        var detected = connected
+            ? _channels.Values.OrderBy(c => c.Ch).Select(c => new SiteConfigDialog.Detected(
+                c.Ch,
+                DeviceEngine.IsZeroed(c.Cfg),
+                c.Snr,
+                c.Snr is { } s && s < DeviceEngine.ProbeSnrDb)).ToList()
+            : new List<SiteConfigDialog.Detected>();
+
+        SiteConfigDialog dlg;
+        try
+        {
+            dlg = new SiteConfigDialog(_ipBox.Text.Trim(), connected, detected, AppContext.BaseDirectory, _dashboardDir);
+        }
+        catch (Exception)
+        {
+            return;   // farm.json 读不了，对话框自己已经提示过
+        }
+
+        using (dlg)
+        {
+            var result = dlg.ShowDialog(this);
+            if (dlg.DashboardDir != _dashboardDir)
+            {
+                _dashboardDir = dlg.DashboardDir;
+                SaveSettings();
+            }
+
+            if (result != DialogResult.OK) return;
+            OpsLog.Append($"现场配置保存：{dlg.Summary}");
+            _lblLog.Text = "现场配置已保存" + (dlg.DashboardDir is not null ? "，大屏自动重载" : "");
+        }
+
+        // 地址栏可能在对话框里改成了别的设备；按对话框里的地址重选方案
+        LoadPlan();
+    }
+
     private void ShowParamsDialog()
     {
         if (_engine == null || !_engine.IsConnected)
@@ -868,6 +922,7 @@ public sealed class MainForm : Form
             if (!File.Exists(SettingsPath)) return;
             var s = System.Text.Json.JsonSerializer.Deserialize<Settings>(File.ReadAllText(SettingsPath), JsonOptions);
             if (s != null && !string.IsNullOrWhiteSpace(s.Endpoint)) _ipBox.Text = s.Endpoint;
+            if (s != null && !string.IsNullOrWhiteSpace(s.DashboardDir) && Directory.Exists(s.DashboardDir)) _dashboardDir = s.DashboardDir;
         }
         catch (Exception)
         {
@@ -878,7 +933,7 @@ public sealed class MainForm : Form
     {
         try
         {
-            var s = new Settings { Endpoint = _ipBox.Text.Trim() };
+            var s = new Settings { Endpoint = _ipBox.Text.Trim(), DashboardDir = _dashboardDir };
             File.WriteAllText(SettingsPath, System.Text.Json.JsonSerializer.Serialize(s, JsonOptions));
         }
         catch (Exception)
