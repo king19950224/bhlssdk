@@ -32,6 +32,9 @@ var app = builder.Build();
 var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
 Console.OutputEncoding = Encoding.UTF8;
+// 控制台上写的每一行同时落到 exe 旁 logs\monitor-yyyyMMdd.log：业主机上大屏是最小化/开机自启跑的，
+// 窗口一关或一重启，昨晚为什么断了、什么时候重载过配置就没处查了。保留 30 天
+Console.SetOut(new TeeLog(Console.Out, Path.Combine(AppContext.BaseDirectory, "logs"), keepDays: 30));
 
 // farm.json：全场法兰模板、每台设备（机组、地址、接线、标定、额定）、阈值都在这。
 // 读它、解析成 FarmPlan；解析失败返回 null 并给出原因（启动时退回默认，运行中重载时保持原配置不动）
@@ -276,9 +279,14 @@ async Task<(bool Ok, string Message)> ReloadAsync(string trigger)
             catch (Exception ex) { Console.WriteLine($"{DateTime.Now:HH:mm:ss} {h.Label} 断开出错：{ex.Message}"); }
         }
 
-        // 新的一代
+        // 新的一代。同一台机组还在维护期的，维护状态带过去，别一重载就把设备从桌面端手里抢回来
         history.SetPlans(fresh.Devices.Select(d => (d.Turbine, d.Plan)));
         var next = new Site(fresh, fresh.Devices.Select(d => new MonitorHub(d.Turbine, d.Endpoint, d.Plan, d.Guard, broadcaster, history)).ToList());
+        foreach (var h in next.Hubs)
+        {
+            if (old.ByTurbine.TryGetValue(h.Turbine, out var prev)) h.InheritMaintenance(prev);
+        }
+
         site = next;
         DescribeSite(next);
         StartLoops(next);
@@ -404,6 +412,77 @@ void StartLoops(Site s)
 }
 
 app.Run();
+
+/// <summary>
+/// 控制台输出同时写进按天分的日志文件。写文件失败不能影响程序（磁盘满、目录只读就只剩控制台）。
+/// 多线程同时 WriteLine 用一把锁串起来，行不会交错。
+/// </summary>
+internal sealed class TeeLog : TextWriter
+{
+    private readonly TextWriter _console;
+    private readonly string _dir;
+    private readonly int _keepDays;
+    private readonly object _gate = new();
+    private StreamWriter? _file;
+    private DateTime _fileDay;
+
+    public TeeLog(TextWriter console, string dir, int keepDays)
+    {
+        _console = console;
+        _dir = dir;
+        _keepDays = keepDays;
+    }
+
+    public override Encoding Encoding => _console.Encoding;
+
+    public override void Write(char value) => _console.Write(value);
+
+    public override void Write(string? value) => _console.Write(value);
+
+    public override void WriteLine(string? value)
+    {
+        _console.WriteLine(value);
+        lock (_gate)
+        {
+            try
+            {
+                var today = DateTime.Now.Date;
+                if (_file is null || _fileDay != today)
+                {
+                    _file?.Dispose();
+                    Directory.CreateDirectory(_dir);
+                    _file = new StreamWriter(Path.Combine(_dir, $"monitor-{today:yyyyMMdd}.log"), append: true, new UTF8Encoding(false)) { AutoFlush = true };
+                    _fileDay = today;
+                    Prune();
+                }
+
+                // 控制台上大多行自带 HH:mm:ss，文件里只补日期；没带时间的行补全日期时间
+                var stamped = value is { Length: >= 9 } && value[2] == ':' && value[5] == ':' && value[8] == ' ';
+                _file.WriteLine($"{DateTime.Now:yyyy-MM-dd}{(stamped ? " " : $" {DateTime.Now:HH:mm:ss} ")}{value}");
+            }
+            catch
+            {
+                // 日志写不进去就只剩控制台，不能因为这个把服务弄死
+            }
+        }
+    }
+
+    public override void WriteLine() => WriteLine(string.Empty);
+
+    private void Prune()
+    {
+        try
+        {
+            foreach (var f in Directory.GetFiles(_dir, "monitor-*.log"))
+            {
+                if (File.GetLastWriteTime(f) < DateTime.Now.AddDays(-_keepDays)) File.Delete(f);
+            }
+        }
+        catch
+        {
+        }
+    }
+}
 
 /// <summary>一代配置：风场方案、每台设备的采集器、它们的保活循环。farm.json 重载时整代替换。</summary>
 internal sealed class Site
@@ -792,12 +871,20 @@ internal sealed class MonitorHub : IDisposable
     {
         get
         {
+            // 勤补读只在探头刚出现的半小时内：这是"有人正在装、正在置零"的窗口。探头挂了几个小时还没基线的，
+            // 多半是没人管它，按普通退避——每次补读都要停几秒流，不能为它永远两分钟打断一次业主画面
+            var fresh = DateTime.UtcNow - TimeSpan.FromMinutes(30);
             lock (_stateLock)
             {
-                return WantedChannels.Any(c => !_params.ContainsKey(c) && _signals.TryGetValue(c, out var t) && t.Presence == "probe");
+                return WantedChannels.Any(c => !_params.ContainsKey(c)
+                                               && _signals.TryGetValue(c, out var t) && t.Presence == "probe"
+                                               && (t.ChangedAt ?? _connectedAt) > fresh);
             }
         }
     }
+
+    /// <summary>这条连接建立的时刻（UTC）：连上时探头就在位的，按连上算"刚出现"。</summary>
+    private DateTime _connectedAt = DateTime.MinValue;
 
     private static readonly (string Key, string Cn)[] ParamOrder =
     {
@@ -1000,6 +1087,7 @@ internal sealed class MonitorHub : IDisposable
 
             Interlocked.Exchange(ref _lastFrameTicks, DateTime.UtcNow.Ticks);
             LastChannelRetryAt = DateTime.UtcNow;
+            _connectedAt = DateTime.UtcNow;
             _engine = engine;
             _endpoint = ConfiguredEndpoint;
             // 读到的基线交历史库比对：和上次记的不一样就是现场重新置零过，记流水 + "基线重置"事件
@@ -1046,6 +1134,18 @@ internal sealed class MonitorHub : IDisposable
         _lastLog = $"{DateTime.Now:HH:mm:ss} 维护结束，恢复连接设备";
         Console.WriteLine(_lastLog);
         BroadcastState();
+    }
+
+    /// <summary>
+    /// 配置重载时把维护状态从老一代带过来：现场正在用桌面端置零、顺手在现场配置里保存了一下，
+    /// 新一代要是立刻连上设备，就和桌面端抢起来了。
+    /// </summary>
+    public void InheritMaintenance(MonitorHub from)
+    {
+        if (!from.InMaintenance) return;
+        MaintenanceUntil = from.MaintenanceUntil;
+        MaintenanceNote = from.MaintenanceNote;
+        _lastLog = $"{DateTime.Now:HH:mm:ss} 维护中（{MaintenanceNote}），配置重载后继续让出设备，{MaintenanceUntil!.Value.ToLocalTime():HH:mm} 恢复";
     }
 
     public async Task DisconnectAsync()

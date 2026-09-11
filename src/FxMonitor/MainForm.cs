@@ -109,6 +109,9 @@ public sealed class MainForm : Form
 
     private string? _dashboardDir;
     private string? _dashboardUrl;
+
+    /// <summary>当前这条连接连的是哪个地址（地址栏随时可以改，扫描结果只属于这一台）。</summary>
+    private string _connectedEndpoint = string.Empty;
     private const string LocalDashboardUrl = "http://localhost:5080/";
 
     private static readonly System.Text.Json.JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
@@ -370,6 +373,8 @@ public sealed class MainForm : Form
             {
                 throw new InvalidOperationException("设备已断开连接，请检查 IP 或设备是否被其他程序占用");
             }
+
+            _connectedEndpoint = opt.Endpoint;
 
             SaveSettings();
             if (!await ScanAndStartAsync())
@@ -669,7 +674,8 @@ public sealed class MainForm : Form
     /// </summary>
     private void ShowConfigDialog()
     {
-        var connected = _engine is { IsConnected: true } && !_scanning;
+        // 扫描结果属于当前连着的那台设备；地址栏已经改成别的地址就不能拿这台的探头去配那台
+        var connected = _engine is { IsConnected: true } && !_scanning && SiteConfig.SameHost(_connectedEndpoint, _ipBox.Text);
         var detected = connected
             ? _channels.Values.OrderBy(c => c.Ch).Select(c => new SiteConfigDialog.Detected(
                 c.Ch,

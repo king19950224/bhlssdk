@@ -328,7 +328,12 @@ internal sealed class SiteConfigDialog : Form
         var probe = _detected.TryGetValue(w.Ch, out var d)
             ? (d.Zeroed ? "有信号 · 已置零" : "有信号 · 未置零") + (d.Weak ? "（信号弱）" : "") + (d.Snr is { } s ? $"  {s:0} dB" : "")
             : _connected ? "本次扫描没检测到" : "—";
-        var row = _wires.Rows.Add($"CH{w.Ch}", probe, FlangeChoice(w.FlangeIndex), w.Bolt?.ToString() ?? "");
+        // 按通道号插到该在的位置（按字符串排会把 CH10 排到 CH2 前面）
+        var at = _wires.Rows.Cast<DataGridViewRow>().TakeWhile(r => (ushort)r.Tag! < w.Ch).Count();
+        var newRow = new DataGridViewRow();
+        newRow.CreateCells(_wires, $"CH{w.Ch}", probe, FlangeChoice(w.FlangeIndex), w.Bolt?.ToString() ?? "");
+        _wires.Rows.Insert(at, newRow);
+        var row = at;
         _wires.Rows[row].Tag = w.Ch;
         if (_detected.TryGetValue(w.Ch, out var dd) && !dd.Zeroed) _wires.Rows[row].Cells["probe"].Style.ForeColor = Color.DarkOrange;
         if (!_detected.ContainsKey(w.Ch) && _connected) _wires.Rows[row].Cells["probe"].Style.ForeColor = Color.Gray;
@@ -343,7 +348,6 @@ internal sealed class SiteConfigDialog : Form
         }
 
         AddWireRow(new SiteConfig.Wire { Ch = ch });
-        _wires.Sort(_wires.Columns["ch"]!, System.ComponentModel.ListSortDirection.Ascending);
         _status.Text = $"已添加 CH{ch}，请选它接在哪个法兰";
     }
 

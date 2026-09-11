@@ -32,6 +32,9 @@ public sealed class SiteConfig
         internal JsonObject? Template { get; set; }
 
         internal JsonObject? Wiring { get; set; }
+
+        /// <summary>读进来时在模板数组里的下标；新加的为 -1。删法兰后别的设备接线里的 index 要按它重排。</summary>
+        internal int OriginalIndex { get; set; } = -1;
     }
 
     /// <summary>一路通道接在哪：FlangeIndex 为法兰模板下标；None = 不接入；Guard = 巡检位（只判有没有探头）。</summary>
@@ -49,8 +52,11 @@ public sealed class SiteConfig
     }
 
     private readonly JsonObject _root;
-    private readonly JsonObject? _device;
     private readonly bool _legacy;
+    private JsonObject? _deviceCurrent;
+
+    /// <summary>文件里代表这台设备的那个对象（写回后指向新写的对象）。</summary>
+    private JsonObject? _device => _deviceCurrent;
 
     public string FarmName { get; set; } = string.Empty;
 
@@ -73,9 +79,33 @@ public sealed class SiteConfig
     private SiteConfig(JsonObject root, JsonObject? device, bool legacy, IReadOnlyList<(int, string)> others)
     {
         _root = root;
-        _device = device;
+        _deviceCurrent = device;
         _legacy = legacy;
         OtherDevices = others;
+    }
+
+    /// <summary>别的设备接线里引用了哪些法兰模板：(机组, index 或空, 模板名)。</summary>
+    private IEnumerable<(int Turbine, int? Index, string Name)> OtherDeviceFlangeRefs()
+    {
+        if (_root["devices"] is not JsonArray devs) yield break;
+        // 名字按文件里原来的模板数组查（被删掉的模板已不在 Flanges 里了）
+        var names = new Dictionary<int, string>();
+        if (_root["flanges"] is JsonArray tmpl)
+        {
+            for (var i = 0; i < tmpl.Count; i++) names[i] = Str((tmpl[i] as JsonObject)?["name"]) ?? $"#{i}";
+        }
+
+        foreach (var node in devs)
+        {
+            if (node is not JsonObject od || ReferenceEquals(od, _device) || od["flanges"] is not JsonArray ofl) continue;
+            var t = Int(od["turbine"]) ?? 0;
+            foreach (var w in ofl)
+            {
+                if (w is not JsonObject wo) continue;
+                var idx = Int(wo["index"]);
+                yield return (t, idx, idx is { } i && names.TryGetValue(i, out var n) ? n : Str(wo["name"]) ?? $"#{idx}");
+            }
+        }
     }
 
     /// <summary>只比 IP，端口可以不写。</summary>
@@ -113,6 +143,7 @@ public sealed class SiteConfig
                     TopBolt = Math.Max(1, Int(numbering?["topBolt"]) ?? 1),
                     Clockwise = numbering?["clockwise"]?.GetValue<bool>() ?? true,
                     Template = f,
+                    OriginalIndex = i,
                 });
                 i++;
             }
@@ -215,6 +246,14 @@ public sealed class SiteConfig
         foreach (var (t, ep) in OtherDevices)
         {
             if (t == Turbine) errors.Add($"F{Turbine:00} 已经接了设备 {ep}，一台机组只能接一台");
+            if (SameHost(ep, Endpoint)) errors.Add($"地址 {Host(Endpoint)} 已经是 F{t:00} 的设备，两台设备不能同一个地址");
+        }
+
+        // 删掉的法兰模板若还被别的设备的接线引用，不能删——那台设备的探头会失去归属
+        var kept = new HashSet<int>(Flanges.Where(f => f.OriginalIndex >= 0).Select(f => f.OriginalIndex));
+        foreach (var (t, idx, name) in OtherDeviceFlangeRefs())
+        {
+            if (idx is { } i && !kept.Contains(i)) errors.Add($"F{t:00} 的接线还引用着被删掉的法兰「{name}」，先改那台设备");
         }
 
         if (Flanges.Count == 0) errors.Add("至少要有一个法兰");
@@ -301,10 +340,29 @@ public sealed class SiteConfig
         else dev.Remove("guardChannels");
 
         var devices = _root["devices"] as JsonArray ?? new JsonArray();
+        // 模板增删后下标变了：别的设备接线里按 index 引用的要跟着改（按 name 引用的不动）
+        var remap = new Dictionary<int, int>();
+        for (var i = 0; i < Flanges.Count; i++)
+        {
+            if (Flanges[i].OriginalIndex >= 0) remap[Flanges[i].OriginalIndex] = i;
+        }
+
+        foreach (var node in devices)
+        {
+            if (node is not JsonObject od || ReferenceEquals(od, _device) || od["flanges"] is not JsonArray ofl) continue;
+            for (var k = ofl.Count - 1; k >= 0; k--)
+            {
+                if (ofl[k] is not JsonObject w || Int(w["index"]) is not { } oi) continue;
+                if (remap.TryGetValue(oi, out var ni)) w["index"] = ni;
+                else ofl.RemoveAt(k);   // 引用的模板已删（Validate 会拦，这里兜底）
+            }
+        }
+
+        // 这台设备：原来就在文件里的按对象替换（地址改了也认得是它），新加的追加
         var replaced = false;
         for (var i = 0; i < devices.Count; i++)
         {
-            if (devices[i] is JsonObject od && SameHost(Str(od["device"]), Endpoint))
+            if (devices[i] is JsonObject od && (ReferenceEquals(od, _device) || (_device is null && SameHost(Str(od["device"]), Endpoint))))
             {
                 devices[i] = dev;
                 replaced = true;
@@ -314,6 +372,9 @@ public sealed class SiteConfig
 
         if (!replaced) devices.Add(dev);
         _root["devices"] = devices;
+        // 写回后这台设备就是 dev 这个对象了；再调用一次 ToJson 仍能按对象找到它
+        _deviceCurrent = dev;
+        for (var i = 0; i < Flanges.Count; i++) Flanges[i].OriginalIndex = i;
 
         // 老写法的顶层字段转成 devices[] 后就多余了
         foreach (var k in new[] { "device", "bind", "channels", "plannedChannels", "guardChannels" }) _root.Remove(k);
