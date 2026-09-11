@@ -32,6 +32,8 @@ builder.Logging.SetMinimumLevel(LogLevel.Warning);
 // 业主机上按 Windows 服务跑（安装大屏服务.cmd）：没有窗口、开机即起、意外退出由系统按恢复策略重启。
 // 由服务控制器启动时这里自动切到服务模式；双击 exe 就是普通控制台，调试方便
 builder.Host.UseWindowsService(o => o.ServiceName = "BoltPreloadMonitor");
+// 停机上限 12 秒（默认 30）：断设备最多 8 秒，页面长连接随停机令牌立刻掐断，不该再有等的
+builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(12));
 var app = builder.Build();
 
 // Web 默认规则：字段名大小写不敏感（页面发的是小写 endpoint）
@@ -245,7 +247,10 @@ app.Map("/ws", async ctx =>
     }
 
     using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-    await broadcaster.ServeSocketAsync(ws, ctx.RequestAborted);
+    // 停服务时要把页面的长连接一起掐断：Kestrel 优雅停机会等在途请求结束，WebSocket 永远"在途"，
+    // 不掐就等满 30 秒超时才退——服务控制器那边也是 30 秒，正好被判成停不下来、硬杀
+    using var linked = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, app.Lifetime.ApplicationStopping);
+    await broadcaster.ServeSocketAsync(ws, linked.Token);
 });
 
 app.Lifetime.ApplicationStopping.Register(() =>

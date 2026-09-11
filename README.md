@@ -27,8 +27,8 @@
 **没有加载标定文件就不显示夹紧力**（只显示声时差）——软件里没有任何"默认斜率"，没有出处的数不上界面。
 置零、参数下发、加载标定文件、现场配置保存都记在 exe 旁的 `操作记录.log`。
 
-**「打开大屏」**：在浏览器里打开业主大屏。本机没有大屏服务在跑、`BoltPreload.Monitor.exe` 又在旁边（一键发布的文件夹）时，先问一句把服务拉起来再开网页。
-大屏在别的机器上就在 `settings.json` 里填 `DashboardUrl`。
+**「打开大屏」**：在浏览器里打开业主大屏。本机大屏服务没在跑就问一句、以管理员身份启动服务（没装服务就用旁边的「安装大屏服务.cmd」装上），
+再开网页——不会再拉起带黑窗口的控制台实例。大屏在别的机器上就在 `settings.json` 里填 `DashboardUrl`。
 
 ```powershell
 dotnet run --project src/FxMonitor              # 或 FxMonitor.exe [ip:port] [--auto] [--demo]

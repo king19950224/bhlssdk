@@ -47,7 +47,7 @@ if %errorlevel%==0 (
   echo 已安装并启动。以后开机自动运行，不需要登录，也没有窗口。
   echo 本机网页：http://localhost:5080/   局域网用本机 IP 代替 localhost。
   echo 运行日志：%~dp0logs\
-  start "" http://localhost:5080/
+  if /I not "%~1"=="nobrowser" start "" http://localhost:5080/
 ) else (
   echo.
   echo 服务已安装但没有进入运行状态，请查看 %~dp0logs\ 里今天的日志。

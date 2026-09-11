@@ -739,8 +739,8 @@ public sealed class MainForm : Form
 
     /// <summary>
     /// 打开大屏网页。地址：settings.json 里填了就用填的（大屏在别的机器），没填按本机 5080。
-    /// 本机地址不通时，看旁边（或现场配置里选的大屏目录）有没有 BoltPreload.Monitor.exe，有就问一句、拉起来再开网页——
-    /// 两个程序发布在同一个文件夹里，业主机上双击桌面端也能把大屏带起来。
+    /// 本机地址不通时不会再拉起一个带黑窗口的控制台实例——大屏只以 Windows 服务的形式跑。
+    /// 装了服务没在跑就启动服务，没装就用旁边的「安装大屏服务.cmd」装（都要管理员权限，会弹 UAC 确认）。
     /// </summary>
     private async Task OpenDashboardAsync()
     {
@@ -751,34 +751,41 @@ public sealed class MainForm : Form
             var isLocal = url.Contains("localhost", StringComparison.OrdinalIgnoreCase) || url.Contains("127.0.0.1");
             if (!await DashboardAliveAsync(url) && isLocal)
             {
-                // 装成了 Windows 服务的机器：不能再起一个控制台实例（服务一恢复就抢 5080 端口），让人去启动服务
                 if (DashboardServiceInstalled())
                 {
-                    MessageBox.Show(this, "本机的大屏已安装为 Windows 服务，但现在没在运行。\n\n请以管理员身份运行「安装大屏服务.cmd」重装启动，或在“服务”里启动“螺栓预紧力大屏服务”。\n日志在大屏程序目录的 logs 文件夹。",
-                        "打开大屏", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    return;
+                    var go = MessageBox.Show(this, "本机的大屏服务没在运行。现在启动它？（需要管理员权限，会弹出确认）",
+                        "打开大屏", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    if (go != DialogResult.Yes) return;
+                    if (!RunElevated("sc.exe", "start BoltPreloadMonitor", null)) return;
+                    OpsLog.Append("启动大屏服务（sc start BoltPreloadMonitor）");
+                }
+                else
+                {
+                    var installer = FindDashboardFile("安装大屏服务.cmd");
+                    if (installer is null)
+                    {
+                        MessageBox.Show(this, $"本机 {url} 没有大屏在运行，旁边也没找到「安装大屏服务.cmd」。\n\n大屏在别的机器上的话，在 settings.json 里填 DashboardUrl（如 http://192.168.1.20:5080/）。",
+                            "打开大屏", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
+
+                    var go = MessageBox.Show(this, $"本机还没有安装大屏服务。现在安装并启动？（需要管理员权限，会弹出确认）\n\n{installer}",
+                        "打开大屏", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    if (go != DialogResult.Yes) return;
+                    if (!RunElevated("cmd.exe", $"/c \"\"{installer}\" nobrowser < nul\"", Path.GetDirectoryName(installer))) return;
+                    OpsLog.Append($"安装并启动大屏服务：{installer}");
                 }
 
-                var exe = FindDashboardExe();
-                if (exe is null)
-                {
-                    MessageBox.Show(this, $"本机 {url} 没有大屏服务在运行，旁边也没找到 BoltPreload.Monitor.exe。\n\n大屏在别的机器上的话，在 settings.json 里填 DashboardUrl（如 http://192.168.1.20:5080/）。",
-                        "打开大屏", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    return;
-                }
-
-                var answer = MessageBox.Show(this, $"本机的大屏服务没在运行。现在启动它？\n\n{exe}", "打开大屏", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                if (answer != DialogResult.Yes) return;
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe)
-                {
-                    WorkingDirectory = Path.GetDirectoryName(exe)!,
-                    UseShellExecute = true,
-                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Minimized,
-                });
-                OpsLog.Append($"启动大屏服务 {exe}");
                 _lblLog.Text = "大屏服务启动中……";
-                for (var i = 0; i < 20 && !await DashboardAliveAsync(url); i++) await Task.Delay(500);
-                _lblLog.Text = await DashboardAliveAsync(url) ? "大屏服务已启动" : "大屏服务还没响应，浏览器里稍后刷新";
+                for (var i = 0; i < 30 && !await DashboardAliveAsync(url); i++) await Task.Delay(500);
+                if (!await DashboardAliveAsync(url))
+                {
+                    _lblLog.Text = "大屏服务还没响应";
+                    MessageBox.Show(this, "大屏服务还没有响应，请看大屏程序目录 logs 文件夹里今天的日志。", "打开大屏", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                _lblLog.Text = "大屏服务已启动";
             }
 
             System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
@@ -793,18 +800,26 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>大屏网页服务在不在：问两次 /api/state，各 2.5 秒。刚起来那几秒它在连设备、开库，第一次没回不算死。</summary>
     private static async Task<bool> DashboardAliveAsync(string url)
     {
-        try
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(1200) };
-            using var r = await http.GetAsync(new Uri(new Uri(url), "/api/state"));
-            return r.IsSuccessStatusCode;
+            try
+            {
+                using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(2500) };
+                using var r = await http.GetAsync(new Uri(new Uri(url), "/api/state"));
+                if (r.IsSuccessStatusCode) return true;
+            }
+            catch
+            {
+                // 连不上/超时：再试一次
+            }
+
+            if (attempt == 0) await Task.Delay(500);
         }
-        catch
-        {
-            return false;
-        }
+
+        return false;
     }
 
     /// <summary>本机有没有装大屏的 Windows 服务（sc query 的退出码：0 有，1060 没有）。</summary>
@@ -826,17 +841,39 @@ public sealed class MainForm : Form
         }
     }
 
-    /// <summary>大屏 exe：优先自己旁边（同一个文件夹发布），其次现场配置里选过的大屏目录。</summary>
-    private string? FindDashboardExe()
+    /// <summary>大屏目录里的某个文件：优先自己旁边（同一个文件夹发布），其次现场配置里选过的大屏目录。</summary>
+    private string? FindDashboardFile(string name)
     {
         foreach (var dir in new[] { AppContext.BaseDirectory, _dashboardDir })
         {
             if (dir is null) continue;
-            var exe = Path.Combine(dir, "BoltPreload.Monitor.exe");
-            if (File.Exists(exe)) return exe;
+            var path = Path.Combine(dir, name);
+            if (File.Exists(path)) return path;
         }
 
         return null;
+    }
+
+    /// <summary>以管理员身份运行一个命令并等它结束（UAC 弹窗）；用户取消或失败返回 false。窗口隐藏，不闪黑框。</summary>
+    private bool RunElevated(string file, string args, string? workDir)
+    {
+        try
+        {
+            using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(file, args)
+            {
+                UseShellExecute = true,
+                Verb = "runas",
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+                WorkingDirectory = workDir ?? AppContext.BaseDirectory,
+            });
+            p?.WaitForExit(60_000);
+            return true;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            _lblLog.Text = "已取消（需要管理员权限）";
+            return false;
+        }
     }
 
     private void ShowParamsDialog()
