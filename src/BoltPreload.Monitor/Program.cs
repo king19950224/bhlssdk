@@ -3,12 +3,15 @@
 // 用法：BoltPreload.Monitor.exe [--port 5080]，然后浏览器开 http://本机IP:5080/
 
 using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using FxDevice;
 using FxSDK.Models;
+using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Net.Http.Headers;
 
 var port = 5080;
@@ -26,15 +29,37 @@ var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 });
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 builder.Logging.SetMinimumLevel(LogLevel.Warning);
+// 业主机上按 Windows 服务跑（安装大屏服务.cmd）：没有窗口、开机即起、意外退出由系统按恢复策略重启。
+// 由服务控制器启动时这里自动切到服务模式；双击 exe 就是普通控制台，调试方便
+builder.Host.UseWindowsService(o => o.ServiceName = "BoltPreloadMonitor");
 var app = builder.Build();
 
 // Web 默认规则：字段名大小写不敏感（页面发的是小写 endpoint）
 var jsonOpts = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
-Console.OutputEncoding = Encoding.UTF8;
-// 控制台上写的每一行同时落到 exe 旁 logs\monitor-yyyyMMdd.log：业主机上大屏是最小化/开机自启跑的，
-// 窗口一关或一重启，昨晚为什么断了、什么时候重载过配置就没处查了。保留 30 天
+var asService = WindowsServiceHelpers.IsWindowsService();
+if (!asService) Console.OutputEncoding = Encoding.UTF8;
+// 控制台上写的每一行同时落到 exe 旁 logs\monitor-yyyyMMdd.log：服务模式根本没有控制台，
+// 控制台模式窗口一关也没了，昨晚为什么断了、什么时候重载过配置全靠这个文件。保留 30 天
 Console.SetOut(new TeeLog(Console.Out, Path.Combine(AppContext.BaseDirectory, "logs"), keepDays: 30));
+
+if (!asService)
+{
+    // 双击起来的控制台：先说清楚这是什么、别关、网页在哪。下面滚的是运行日志，不是报错
+    Console.Title = "螺栓预紧力大屏服务（请勿关闭此窗口）";
+    var ips = NetworkInterface.GetAllNetworkInterfaces()
+        .Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+        .SelectMany(n => n.GetIPProperties().UnicastAddresses)
+        .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork)
+        .Select(a => a.Address.ToString()).Distinct().ToList();
+    Console.WriteLine("═══════════════════════════════════════════════════════════════");
+    Console.WriteLine("  螺栓预紧力在线监测 · 大屏服务");
+    Console.WriteLine($"  本机打开：http://localhost:{port}/");
+    foreach (var ip in ips) Console.WriteLine($"  局域网打开：http://{ip}:{port}/");
+    Console.WriteLine("  这个窗口是服务本体，关了网页就没数据。业主机请用「安装大屏服务.cmd」装成后台服务，不再有窗口。");
+    Console.WriteLine($"  运行日志同时写在 {Path.Combine(AppContext.BaseDirectory, "logs")}");
+    Console.WriteLine("═══════════════════════════════════════════════════════════════");
+}
 
 // farm.json：全场法兰模板、每台设备（机组、地址、接线、标定、额定）、阈值都在这。
 // 读它、解析成 FarmPlan；解析失败返回 null 并给出原因（启动时退回默认，运行中重载时保持原配置不动）

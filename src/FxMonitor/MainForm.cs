@@ -726,6 +726,14 @@ public sealed class MainForm : Form
             var isLocal = url.Contains("localhost", StringComparison.OrdinalIgnoreCase) || url.Contains("127.0.0.1");
             if (!await DashboardAliveAsync(url) && isLocal)
             {
+                // 装成了 Windows 服务的机器：不能再起一个控制台实例（服务一恢复就抢 5080 端口），让人去启动服务
+                if (DashboardServiceInstalled())
+                {
+                    MessageBox.Show(this, "本机的大屏已安装为 Windows 服务，但现在没在运行。\n\n请以管理员身份运行「安装大屏服务.cmd」重装启动，或在“服务”里启动“螺栓预紧力大屏服务”。\n日志在大屏程序目录的 logs 文件夹。",
+                        "打开大屏", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
                 var exe = FindDashboardExe();
                 if (exe is null)
                 {
@@ -767,6 +775,25 @@ public sealed class MainForm : Form
             using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(1200) };
             using var r = await http.GetAsync(new Uri(new Uri(url), "/api/state"));
             return r.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>本机有没有装大屏的 Windows 服务（sc query 的退出码：0 有，1060 没有）。</summary>
+    private static bool DashboardServiceInstalled()
+    {
+        try
+        {
+            using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("sc.exe", "query BoltPreloadMonitor")
+            {
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
+            });
+            if (p is null) return false;
+            p.WaitForExit(3000);
+            return p.HasExited && p.ExitCode == 0;
         }
         catch
         {

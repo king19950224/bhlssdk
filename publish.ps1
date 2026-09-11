@@ -25,13 +25,14 @@ Remove-Item (Join-Path $Out "farm.json") -ErrorAction SilentlyContinue
 Get-ChildItem $Out -Include *.pdb, settings.json, appsettings*.json, web.config, *.staticwebassets.endpoints.json -Recurse -Depth 0 |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 业主机上的两个小脚本
-Copy-Item (Join-Path $PSScriptRoot "deploy\启动大屏.cmd") $Out
-Copy-Item (Join-Path $PSScriptRoot "deploy\设置大屏开机自启.cmd") $Out
+# 业主机上的几个小脚本：装/卸 Windows 服务（推荐），没有管理员权限时的控制台启动与登录自启
+foreach ($f in "安装大屏服务.cmd", "卸载大屏服务.cmd", "启动大屏.cmd", "设置大屏开机自启.cmd") {
+    Copy-Item (Join-Path $PSScriptRoot "deploy\$f") $Out
+}
 
 Write-Host ""
 Write-Host "发布完成：$Out"
 Get-ChildItem $Out | ForEach-Object { "  {0,-32} {1,8:N1} MB" -f $_.Name, ($_.Length / 1MB) }
 Write-Host ""
-Write-Host "现场：整个文件夹拷到大屏电脑。双击「设置大屏开机自启.cmd」一次，以后开机自动起大屏；"
-Write-Host "      调试/置零/配置用 FxMonitor.exe，里面的「打开大屏」能把服务拉起来并打开网页。"
+Write-Host "现场：整个文件夹拷到大屏电脑，右键「安装大屏服务.cmd」以管理员身份运行一次——开机自起、没有窗口、崩了自动重启。"
+Write-Host "      没有管理员权限就用「设置大屏开机自启.cmd」。调试/置零/配置用 FxMonitor.exe，「打开大屏」按钮开网页。"

@@ -17,6 +17,8 @@
   <ItemGroup>
     <ProjectReference Include="..\FxDevice\FxDevice.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
+    <!-- 业主机上按 Windows 服务跑：没有窗口、开机即起、崩了系统自动重启。双击 exe 仍是控制台模式（调试用） -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
   </ItemGroup>
 
   <ItemGroup>
