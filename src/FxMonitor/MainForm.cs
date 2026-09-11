@@ -687,6 +687,7 @@ public sealed class MainForm : Form
             UpdateParams();
             RefreshSelected();
             foreach (var c in _channels.Values) UpdateRow(c);
+            _ = NotifyDashboardResyncAsync($"桌面端已对 {string.Join("、", zeroed.OrderBy(c => c).Select(c => "CH" + c))} 置零");
         }
 
         ShowMonitorState();
@@ -862,6 +863,7 @@ public sealed class MainForm : Form
             }
 
             needsRezero = dlg.NeedsRezero;
+            if (dlg.WroteAnything) _ = NotifyDashboardResyncAsync("桌面端下发了参数");
         }
 
         if (needsRezero.Count > 0)
@@ -1140,12 +1142,14 @@ public sealed class MainForm : Form
         {
             _plan = dev.Plan;
             _planLabel = $"F{dev.Turbine:00} 机组";
+            _planTurbine = dev.Turbine;
             if (farm.Devices.Count > 1) notes.Add($"farm.json 有 {farm.Devices.Count} 台设备，按地址 {_ipBox.Text.Trim()} 选中 {dev.Label}");
         }
         else
         {
             _plan = CalPlan.Load(null, AppContext.BaseDirectory, notes.Add);
             _planLabel = string.Empty;
+            _planTurbine = 0;
             if (farm.HasFarm && farm.Devices.Count > 0)
             {
                 notes.Add($"farm.json 里没有地址为 {_ipBox.Text.Trim()} 的设备（有：{string.Join("、", farm.Devices.Select(d => d.Label))}），按无 farm.json 处理");
@@ -1160,6 +1164,29 @@ public sealed class MainForm : Form
 
     /// <summary>"F01 机组"：当前方案属于哪台机组，标签上带着，免得连错设备还拿别台的接线表看。</summary>
     private string _planLabel = string.Empty;
+
+    /// <summary>当前方案的机组号（farm.json 里这台设备的 turbine），通知大屏重读基线时用；0 = 不知道。</summary>
+    private int _planTurbine;
+
+    /// <summary>
+    /// 置零/下发参数后通知大屏：设备上的基线或参数已经变了，让它立刻重读，别拿旧基线算出几百 kN 的假松动挂 10 分钟。
+    /// 大屏地址按 settings.json 的 DashboardUrl（没填是本机 5080）。通知不到就算了——大屏自己每 10 分钟也会重读。
+    /// </summary>
+    private async Task NotifyDashboardResyncAsync(string why)
+    {
+        var url = string.IsNullOrWhiteSpace(_dashboardUrl) ? LocalDashboardUrl : _dashboardUrl!.Trim();
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+            var q = $"/api/resync?why={Uri.EscapeDataString(why)}" + (_planTurbine > 0 ? $"&turbine={_planTurbine}" : string.Empty);
+            using var r = await http.PostAsync(new Uri(new Uri(url), q), null);
+            _lblLog.Text = r.IsSuccessStatusCode ? $"已通知大屏重读基线（{why}）" : $"大屏未接受通知（HTTP {(int)r.StatusCode}），它会在 10 分钟内自行重读";
+        }
+        catch
+        {
+            _lblLog.Text = $"大屏 {url} 未响应，它会在 10 分钟内自行重读基线";
+        }
+    }
 
     private void ShowPlan()
     {

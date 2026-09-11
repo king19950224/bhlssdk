@@ -209,6 +209,15 @@ app.MapPost("/api/reload", async (HttpContext ctx) =>
     return ok ? Results.Json(new { ok = true, message }) : Results.BadRequest(new { error = message });
 });
 
+// 桌面端置零/下发参数后通知大屏重读基线。局域网内都可调用（桌面端常在别的电脑上）：它只会让服务重读一次设备上的参数，
+// 改不了任何配置，最坏是被人反复调用多停几秒流
+app.MapPost("/api/resync", (int? turbine, string? why) =>
+{
+    if (HubOf(turbine) is not { } hub) return Results.BadRequest(new { error = "turbine 不对或没写" });
+    hub.RequestResync(string.IsNullOrWhiteSpace(why) ? "桌面端通知基线/参数已改" : why!.Trim());
+    return Results.Json(new { ok = true });
+});
+
 app.MapGet("/api/state", () => Results.Json(FullState()));
 
 // turbine 不给 = 全场（报告页、报警中心）；给了 = 只这台机组（机组页、法兰页趋势）
@@ -391,6 +400,11 @@ void StartLoops(Site s)
                     await hub.DisconnectAsync();
                     continue;
                 }
+                else if (hub.ResyncRequested)
+                {
+                    // 声时差跳变：几秒内重读设备上的基线/存储参数，别让假松动在页面上挂 10 分钟
+                    await hub.ResyncBaselinesAsync();
+                }
                 else if (hub.ScanActive && DateTime.UtcNow - hub.ScanStartedAt > scanLength)
                 {
                     var strays = await hub.EndScanAsync();
@@ -428,8 +442,8 @@ void StartLoops(Site s)
                 hub.NoteFailure(ex.Message);
             }
 
-            // 维护刚结束要马上连回去，别让业主多等 30 秒
-            try { await Task.Delay(TimeSpan.FromSeconds(hub.IsConnected ? 10 : hub.MaintenanceUntil is null ? 30 : 1), ct); }
+            // 维护刚结束要马上连回去，别让业主多等 30 秒；连着时每 2 秒看一眼有没有跳变要处理，其余节拍靠各自的时间戳
+            try { await Task.Delay(TimeSpan.FromSeconds(hub.IsConnected ? 2 : hub.MaintenanceUntil is null ? 30 : 1), ct); }
             catch (OperationCanceledException) { break; }
         }
     }, CancellationToken.None));
@@ -747,20 +761,21 @@ internal sealed class MonitorHub : IDisposable
     }
 
     /// <summary>
-    /// 重读在测各路设备上的参考声时/温度（流已停）。变了的：重读整路参数和参考波形、更新会话（下一次 Resume 会按新基线算声时差）、
-    /// 交历史库记"基线重置"。没变的什么都不动。读失败的跳过，下一轮再读。
+    /// 重读在测各路设备上的存储参数（参考声时/温度、测量模式、阈值；流已停）。和本会话缓存的不一样的：整路重读参数和参考波形、
+    /// 更新会话（下一次 Resume 会按新基线/新算法算声时差）、交历史库记"基线重置"。没变的什么都不动。读失败的跳过，下一轮再读。
+    /// 返回变了的路数。
     /// </summary>
-    private async Task RefreshBaselinesAsync(DeviceEngine engine)
+    private async Task<int> RefreshBaselinesAsync(DeviceEngine engine)
     {
         List<ushort> monitored;
-        Dictionary<ushort, string> oldRef;
+        Dictionary<ushort, List<KeyValuePair<string, string>>> old;
         lock (_stateLock)
         {
             monitored = _params.Keys.OrderBy(c => c).ToList();
-            oldRef = _params.ToDictionary(kv => kv.Key, kv => kv.Value.FirstOrDefault(p => p.Key == "参考声时 ns").Value ?? "");
+            old = _params.ToDictionary(kv => kv.Key, kv => kv.Value);
         }
 
-        if (monitored.Count == 0) return;
+        if (monitored.Count == 0) return 0;
         var changed = new SortedDictionary<ushort, List<KeyValuePair<string, string>>>();
         var waves = new SortedDictionary<ushort, object>();
         var baselines = new Dictionary<ushort, (decimal? RefTime, decimal? RefTemp)>();
@@ -770,9 +785,15 @@ internal sealed class MonitorHub : IDisposable
             {
                 var storage = await engine.ReadStorageAsync(ch, CancellationToken.None);
                 if (storage.Count == 0 || !DeviceEngine.IsZeroed(storage)) continue;
-                var newRef = DeviceEngine.Raw(storage, "RefTime");
-                if (ParseDec(newRef) is not { } n || ParseDec(oldRef.GetValueOrDefault(ch, "")) is { } o && o == n) continue;
-                // 基线变了：整路重读（参考波形也换了），会话按新参数灌
+                // 参考声时、测量模式、阈值任一变了都算：测量模式/阈值是客户端算回波的输入，桌面端改了本会话不跟着改，两边算出的声时就不一样
+                var same = StorageKeysToCompare.All(k =>
+                {
+                    var cn = ParamOrder.First(p => p.Key == k).Cn;
+                    var was = old.GetValueOrDefault(ch)?.FirstOrDefault(p => p.Key == cn).Value ?? "";
+                    var now = Render(k, storage);
+                    return k == "RefTime" ? ParseDec(was) == ParseDec(now) : was == now;
+                });
+                if (same) continue;
                 await ReadChannelIntoAsync(engine, ch, changed, waves, baselines);
             }
             catch (Exception ex)
@@ -781,18 +802,20 @@ internal sealed class MonitorHub : IDisposable
             }
         }
 
-        if (changed.Count == 0) return;
+        if (changed.Count == 0) return 0;
         lock (_stateLock)
         {
             foreach (var kv in changed) _params[kv.Key] = kv.Value;
             foreach (var kv in waves) _refWaves[kv.Key] = kv.Value;
+            _lastDt.Clear();   // 基线换了，声时差从头比，别把换基线本身当成一次跳变
         }
 
-        var msg = $"{DateTime.Now:HH:mm:ss} 基线已变（现场重新置零）：{string.Join("、", changed.Keys.Select(c => $"CH{c} → {baselines[c].RefTime} ns"))}，按新基线算声时差";
+        var msg = $"{DateTime.Now:HH:mm:ss} 设备上的基线/存储参数变了（现场重新置零或改了测量模式）：{string.Join("、", changed.Keys.Select(c => $"CH{c} 参考声时 {baselines[c].RefTime} ns"))}，本会话已按新值算";
         Console.WriteLine(msg);
         _lastLog = msg;
         Broadcast(new { type = "log", t = Turbine, text = _lastLog });
         _history.RecordBaselines(Turbine, baselines);
+        return changed.Count;
     }
 
     /// <summary>结束巡检：收窄到常态轮询集。返回这轮发现的、未在配置中却有探头信号的通道。</summary>
@@ -929,6 +952,87 @@ internal sealed class MonitorHub : IDisposable
     /// <summary>上次补读缺失测点的时间（UTC），连接成功也算一次。</summary>
     public DateTime LastChannelRetryAt { get; private set; } = DateTime.MinValue;
 
+    // ── 基线跳变 → 立刻重读 ──────────────────────────────────────────────
+    // 声时差是本会话按自己缓存的参考声时算出来的（SDK 在客户端算，见 MultiChIotProtocolHandler.CalculateDeltaTof）。
+    // 现场用桌面端重新置零，设备上的参考声时变了，本会话不知道，声时差瞬间跳几百 ns，页面立刻冒出几百 kN 的假"松动"。
+    // 螺栓预紧力不会在一两秒内变几十 ns，所以相邻两帧声时差跳变超过门限就当"有人动了基线/参数"：
+    // 先停这路的历史落库，几秒内重读设备上的参考声时和存储参数，按新的算。10 分钟一次的巡检重读只是兜底。
+    private const decimal JumpNs = 50m;
+    private static readonly string[] StorageKeysToCompare = { "RefTime", "MeasMode", "Threshold" };
+    private readonly Dictionary<ushort, (decimal Dt, DateTime At)> _lastDt = new();
+    private readonly HashSet<ushort> _resyncPending = new();
+
+    /// <summary>有测点的声时差跳变，或桌面端通知"我刚置零/改参数了"，等保活循环来做一次基线重读。</summary>
+    public bool ResyncRequested { get; private set; }
+
+    /// <summary>
+    /// 桌面端置零/下发参数后打来的通知（POST /api/resync）。单纯的重新置零在帧里看不出来——原始波形没变，
+    /// 只是设备上存的参考声时换了，本会话的声时差会一直按旧基线算；靠通知能在几秒内追平，不用等 10 分钟一次的巡检重读。
+    /// </summary>
+    public void RequestResync(string why)
+    {
+        ResyncRequested = true;
+        _lastLog = $"{DateTime.Now:HH:mm:ss} {why}，重读基线中";
+        Console.WriteLine(_lastLog);
+    }
+
+    private void NoteJump(ChannelResult m)
+    {
+        if (m.StatusCode != MeasStatusCode.Normal || m.DeltaTof is not { } dt) return;
+        var now = DateTime.UtcNow;
+        lock (_stateLock)
+        {
+            if (_lastDt.TryGetValue(m.Channel, out var last) && now - last.At < TimeSpan.FromSeconds(30)
+                && Math.Abs(dt - last.Dt) > JumpNs && !_resyncPending.Contains(m.Channel))
+            {
+                _resyncPending.Add(m.Channel);
+                ResyncRequested = true;
+                _lastLog = $"{DateTime.Now:HH:mm:ss} CH{m.Channel} 声时差瞬间跳了 {dt - last.Dt:+0;-0} ns，像是现场重新置零/改了参数，重读基线中";
+                Console.WriteLine(_lastLog);
+            }
+
+            _lastDt[m.Channel] = (dt, now);
+        }
+    }
+
+    private bool IsResyncPending(ushort ch)
+    {
+        lock (_stateLock) return _resyncPending.Contains(ch);
+    }
+
+    /// <summary>跳变后的重读：停流 → 重读在测各路的存储参数/基线（变了的整路重读）→ 恢复轮询。</summary>
+    public async Task ResyncBaselinesAsync()
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            ResyncRequested = false;
+            if (_engine is not { IsConnected: true } engine) return;
+            List<ushort> set;
+            lock (_stateLock) set = _polled.ToList();
+            await engine.StopStreamAsync();
+            var changed = await RefreshBaselinesAsync(engine);
+            await SwitchPollSetAsync(engine, set);
+            lock (_stateLock)
+            {
+                _resyncPending.Clear();
+                _lastDt.Clear();   // 按新基线从头比
+            }
+
+            if (changed == 0)
+            {
+                _lastLog = $"{DateTime.Now:HH:mm:ss} 重读基线：设备上的参考声时没变，声时差跳变是真实变化或参数改动（未重新置零）";
+                Console.WriteLine(_lastLog);
+            }
+
+            BroadcastState();
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public int ChannelCount { get { lock (_stateLock) return _params.Count; } }
 
     /// <summary>要监测的测点：各法兰 channels 之并；一个都没配按默认 CH1–CH4。</summary>
@@ -1006,7 +1110,14 @@ internal sealed class MonitorHub : IDisposable
             };
             engine.OnMeasurement += m =>
             {
+                // 不是本会话轮询的通道：串口服务器把另一个客户端（桌面端扫描/调参）的回包也发给了我们。
+                // 不是我们的问题也不是我们的数据——不判在位、不记日志、不落库，静静丢掉
+                bool mine;
+                lock (_stateLock) mine = _polled.Contains(m.Channel);
+                if (!mine) return;
+
                 Interlocked.Exchange(ref _lastFrameTicks, DateTime.UtcNow.Ticks);
+                NoteJump(m);
                 var flip = TrackSignal(m);
                 // 只有配置在监测的通道才算测点帧，才落历史；规划位/巡检位的帧只带 monitored=false 给页面做在位识别
                 bool zeroed;
@@ -1036,8 +1147,9 @@ internal sealed class MonitorHub : IDisposable
                 var health = zeroed ? Health.Judge(m.StatusCode == MeasStatusCode.Normal, mismatch, presence, Plan, m.Channel, kn) : null;
 
                 Broadcast(FrameJson(m, snr, zeroed, mismatch, kn, dkn, health));
-                // 刚连上、在位判定还没定下来的那几帧不进历史：空通道会先记"检测异常"再改"探头无信号"，每次重连都多两条假事件
-                if (zeroed && settled) _history.Ingest(Turbine, m, health!, kn, dkn);
+                // 刚连上、在位判定还没定下来的那几帧不进历史：空通道会先记"检测异常"再改"探头无信号"，每次重连都多两条假事件。
+                // 声时差刚跳变、基线正在重读的那几秒也不进：按旧基线算出来的几百 kN 假松动不能写进历史和事件
+                if (zeroed && settled && !IsResyncPending(m.Channel)) _history.Ingest(Turbine, m, health!, kn, dkn);
                 if (flip is { } f)
                 {
                     var configured = WantedChannels.Contains(m.Channel);
@@ -1336,7 +1448,11 @@ internal sealed class MonitorHub : IDisposable
             _signals.Clear();
             _zeroedExtra.Clear();
             _polled = new List<ushort>();
+            _lastDt.Clear();
+            _resyncPending.Clear();
         }
+
+        ResyncRequested = false;
     }
 
     public object State()

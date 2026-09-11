@@ -62,6 +62,9 @@ internal sealed class ParamsDialog : Form
     /// </summary>
     public HashSet<ushort> NeedsRezero { get; } = new();
 
+    /// <summary>这次有没有成功写过任何参数（写了就该通知大屏重读）。</summary>
+    public bool WroteAnything { get; private set; }
+
     private static readonly HashSet<string> EchoAffecting = new()
     {
         "Gain", "EchoWin", "EchoWidth", "Threshold", "MeasMode", "Duty", "Forward", "Reverse", "ProbeFreq",
@@ -516,6 +519,7 @@ internal sealed class ParamsDialog : Form
                     OpsLog.Append($"CH{ch} 参数下发：" + string.Join("，", rows.Where(r => !r.Implicit)
                                       .Select(r => $"{r.Cn} {r.BeforeValue}->{r.Wrote}（{(r.Verdict == Verdict.StoredOk ? "成功" : Describe(r))}）"))
                                   + (notes.Count > 0 ? "；" + string.Join("；", notes) : string.Empty));
+                    if (rows.Any(r => !r.Implicit && r.Verdict == Verdict.StoredOk)) WroteAnything = true;
                     if (rows.Any(r => !r.Implicit && r.Verdict == Verdict.StoredOk && EchoAffecting.Contains(r.Name) && r.BeforeValue != r.Wrote))
                     {
                         NeedsRezero.Add(ch);
