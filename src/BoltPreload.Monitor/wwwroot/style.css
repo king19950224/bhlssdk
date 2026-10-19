@@ -52,7 +52,7 @@ body { font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; font-si
 .dot.on { background: var(--ok); box-shadow: 0 0 9px var(--ok); }
 .dot.err { background: var(--bad); box-shadow: 0 0 9px var(--bad); }
 
-/* 面包屑固定宽度、副标题固定宽度，中间的提示条吃剩余空间并可收缩——窄屏下不再把副标题顶出视口 */
+/* 面包屑和副标题固定宽度，中间的提示条占剩余空间并可收缩，窄屏下副标题不会被挤出视口 */
 .subbar { display: flex; align-items: center; padding: 7px 26px; color: var(--muted); min-width: 0; }
 .crumb { flex: none; white-space: nowrap; }
 .crumb a { color: var(--blue); text-decoration: none; cursor: pointer; }
@@ -118,7 +118,7 @@ body { font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; font-si
 .ev .tag.warn { color: #f5c34d; background: rgba(240, 180, 41, .12); border: 1px solid rgba(240, 180, 41, .45); }
 .ev .tag.fault { color: #d8a15c; background: rgba(214, 138, 60, .12); border: 1px solid rgba(214, 138, 60, .45); }
 .ev .tag.shift { color: #e78cff; background: rgba(190, 90, 230, .12); border: 1px solid rgba(190, 90, 230, .45); }
-/* 基线可疑（力值为负）：和基线失配同一色系——都是"基线不可信、要重新置零"的运维问题 */
+/* 基线可疑（力值为负）：和基线失配同色系，都是需要重新置零的运维问题 */
 .ev .tag.badbase { color: #e78cff; background: rgba(190, 90, 230, .12); border: 1px dashed rgba(190, 90, 230, .6); }
 .ev .tag.noprobe { color: #ff8a5c; background: rgba(255, 106, 61, .12); border: 1px solid rgba(255, 106, 61, .45); }
 .ev .tag.uncal { color: #9db8d6; background: rgba(120, 150, 190, .12); border: 1px dashed rgba(120, 150, 190, .5); }
@@ -170,6 +170,8 @@ body { font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; font-si
 .panel .hd::before { content: ""; width: 4px; height: 14px; margin-right: -2px;
   background: linear-gradient(180deg, var(--cyan), var(--blue)); border-radius: 2px;
   box-shadow: 0 0 8px rgba(47, 208, 200, .8); }
+.narrative { margin-bottom: 14px; }
+.narrative p { padding: 4px 16px 14px; font-size: 15px; line-height: 1.75; }
 canvas { display: block; width: 100%; }
 
 /* ══ 视图1：统计条 ══ */
@@ -275,10 +277,10 @@ canvas { display: block; width: 100%; }
 .slot .bst.fault { color: #d8a15c; background: rgba(214, 138, 60, .12); border: 1px solid rgba(214, 138, 60, .45); }
 .slot .bst.offline { color: #7d92aa; background: rgba(90, 110, 135, .12); border: 1px solid #3a4c63; }
 .slot .bst.pending { color: #6c839e; border: 1px dashed #3a4c63; }
-/* 未标定：设备在测、声时正常，但没有标定文件算不出力值 —— 橙色虚框提醒运维去放 .ucf */
+/* 未标定：在测、声时正常，但没有标定文件算不出力值。橙色虚框 */
 .slot .bst.uncal, .bolt .bst.uncal, .rtable .bst.uncal { color: #f0b429; background: rgba(240, 180, 41, .08); border: 1px dashed rgba(240, 180, 41, .6); }
 .ev .tag.uncal { color: #f0b429; background: rgba(240, 180, 41, .08); border: 1px dashed rgba(240, 180, 41, .5); }
-/* 未配额定：有标定、在测变化量，但没有额定值判不了偏低/松动 —— 蓝灰虚线，不是绿"正常"也不是黄"未标定" */
+/* 未配额定：有标定、在测变化量，但没有额定值判不了偏低/松动。蓝灰虚线 */
 .slot .bst.unrated, .bolt .bst.unrated, .rtable .bst.unrated { color: #9db8d6; background: rgba(120, 150, 190, .1); border: 1px dashed rgba(157, 184, 214, .6); }
 .ev .tag.unrated { color: #9db8d6; background: rgba(120, 150, 190, .1); border: 1px dashed rgba(157, 184, 214, .5); }
 .slot.warn .sv { color: var(--warn); }
@@ -516,7 +518,7 @@ canvas { display: block; width: 100%; }
 .bolt .bst.noprobe { color: #ff8a5c; background: rgba(255, 106, 61, .14); border: 1px solid rgba(255, 106, 61, .6);
                      animation: stPulse 1.6s ease-in-out infinite; }
 .bolt .bst.stray { color: #f5c34d; background: rgba(240, 180, 41, .12); border: 1px dashed rgba(240, 180, 41, .7); }
-/* 基线失配：声时对不上置零基线，探头位置/耦合已变 —— 紫红，和"松动"红区分开 */
+/* 基线失配：声时偏离置零基线，探头位置或耦合变了。紫红，和松动的红色区分 */
 .bolt .bst.shift, .slot .bst.shift { color: #e78cff; background: rgba(190, 90, 230, .14); border: 1px solid rgba(190, 90, 230, .6); }
 .bolt.shift, .slot.shift { border-color: rgba(190, 90, 230, .6); }
 .bolt.shift .bkn, .slot.shift .sv { color: #b26bd8; text-shadow: none; }
@@ -529,7 +531,7 @@ canvas { display: block; width: 100%; }
 .flangebox .chip[data-st="shift"] .chip-kn { fill: #e78cff; font-size: 12px; font-weight: normal; font-family: inherit; }
 .flangebox .chip[data-st="shift"] .chip-u { display: none; }
 .towerbox .pdot[data-st="shift"] { fill: #c46ee6; filter: drop-shadow(0 0 3px #c46ee6); }
-/* 基线可疑：算出来的预紧力为负，基线或额定值有误 —— 和基线失配同色系，虚线边框区分 */
+/* 基线可疑：算出的预紧力为负，基线或额定值有误。和基线失配同色系，虚线边框区分 */
 .bolt .bst.badbase, .slot .bst.badbase { color: #e78cff; background: rgba(190, 90, 230, .14); border: 1px dashed rgba(190, 90, 230, .7); }
 .bolt.badbase, .slot.badbase { border-color: rgba(190, 90, 230, .6); border-style: dashed; }
 .bolt.badbase .bkn, .slot.badbase .sv { color: #b26bd8; text-shadow: none; }
@@ -626,7 +628,7 @@ canvas { display: block; width: 100%; }
         color: var(--muted); flex-wrap: wrap; }
 .epshow { color: #9db8d6; font-family: var(--num); letter-spacing: 1px; }
 #stateText.ok { color: var(--ok); }
-/* 维护模式：大屏让出设备给现场桌面端。黄色——不是故障，是有人在干活 */
+/* 维护模式：大屏让出设备给桌面端。黄色，表示有人在操作，不是故障 */
 #stateText.maint { color: #f5c34d; }
 .dot.maint { background: #f0b429; box-shadow: 0 0 9px #f0b429; }
 .maint { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px;

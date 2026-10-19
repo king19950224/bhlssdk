@@ -26,6 +26,9 @@ public sealed class DevicePlan
 /// </summary>
 public sealed class FarmPlan
 {
+    /// <summary>没有设备时的空方案。读不到 farm.json 时用它，只提供网页。</summary>
+    public static FarmPlan Empty { get; } = new();
+
     public IReadOnlyList<DevicePlan> Devices { get; private init; } = Array.Empty<DevicePlan>();
 
     public bool HasFarm { get; private init; }
@@ -69,8 +72,9 @@ public sealed class FarmPlan
             if (root.TryGetProperty("turbineCount", out var tc) && tc.TryGetInt32(out var n)) turbineCount = n;
             if (root.TryGetProperty("farmName", out var fn) && fn.ValueKind == JsonValueKind.String) farmName = fn.GetString() ?? string.Empty;
 
-            if (root.TryGetProperty("devices", out var arr) && arr.ValueKind == JsonValueKind.Array && arr.GetArrayLength() > 0)
+            if (root.TryGetProperty("devices", out var arr) && arr.ValueKind == JsonValueKind.Array)
             {
+                // 写了 devices[]（哪怕是空数组）就按新写法：空 = 一台都不接，绝不退到虚构的默认 IP
                 var seenTurbines = new HashSet<int>();
                 foreach (var dev in arr.EnumerateArray())
                 {
@@ -100,17 +104,23 @@ public sealed class FarmPlan
             }
             else
             {
-                // 老写法：顶层 device / bind / flanges[].channels —— 只有一台设备
+                // 老写法：顶层 device / bind / flanges[].channels，只有一台设备。地址缺了就不连，不编造 IP
                 var endpoint = root.TryGetProperty("device", out var ep) && ep.ValueKind == JsonValueKind.String ? ep.GetString()?.Trim() ?? string.Empty : string.Empty;
                 var turbine = root.TryGetProperty("bind", out var bind) && bind.TryGetProperty("turbine", out var bt) && bt.TryGetInt32(out var btv) ? btv : 1;
-                if (endpoint.Length == 0) endpoint = "192.168.0.7:23";
-                devices.Add(new DevicePlan
+                if (endpoint.Length == 0)
                 {
-                    Turbine = turbine,
-                    Endpoint = endpoint,
-                    Guard = CalPlan.ReadChannels(root, "guardChannels"),
-                    Plan = CalPlan.Load(root, null, baseDir, s => log($"F{turbine:00} {s}")),
-                });
+                    log("老写法缺顶层 device 地址，不按默认 IP 去连");
+                }
+                else
+                {
+                    devices.Add(new DevicePlan
+                    {
+                        Turbine = turbine,
+                        Endpoint = endpoint,
+                        Guard = CalPlan.ReadChannels(root, "guardChannels"),
+                        Plan = CalPlan.Load(root, null, baseDir, s => log($"F{turbine:00} {s}")),
+                    });
+                }
             }
         }
 

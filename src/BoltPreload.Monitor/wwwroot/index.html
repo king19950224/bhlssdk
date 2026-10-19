@@ -74,7 +74,7 @@
       </div>
       <div class="panel" id="opsDetail" hidden>
         <div class="hd" id="detailTitle">测点详情</div>
-        <div class="big"><div class="v" id="bigForce">--<small>kN</small></div><div class="k">预 紧 力</div></div>
+        <div class="big"><div class="v" id="bigForce">--<small>kN</small></div><div class="k">夹 紧 力</div></div>
         <div class="mrow" id="mrow"></div>
         <canvas id="wave" height="190"></canvas>
         <div class="wavefoot">
@@ -100,11 +100,11 @@
         <canvas id="dist" height="150"></canvas>
       </div>
       <div class="panel">
-        <div class="hd">预紧力趋势
+        <div class="hd">夹紧力趋势
           <span class="chips" id="trendRange">
             <a data-r="5m" class="on">5分钟</a>
             <a data-r="1h">1小时</a>
-            <a data-r="24h">今天</a>
+            <a data-r="24h">24小时</a>
             <a data-r="7d">7天</a>
             <a data-r="30d">30天</a>
           </span>
@@ -117,10 +117,14 @@
   <!-- 视图 4：报警中心 -->
   <div class="view" id="view-alarms" hidden>
     <div class="statbar alarmbar" id="alarmStats"></div>
+    <div class="panel narrative" id="alarmNarrative" hidden>
+      <div class="hd">本期说明<span class="hdr" id="alarmNarrativeAsOf"></span></div>
+      <p id="alarmNarrativeText"></p>
+    </div>
     <div class="panel">
         <div class="hd">报警与事件记录
           <span class="chips" id="alarmRange">
-            <a data-r="24h" class="on">今天</a>
+            <a data-r="24h" class="on">24小时</a>
             <a data-r="7d">7天</a>
             <a data-r="30d">30天</a>
           </span>
@@ -133,11 +137,15 @@
   <div class="view" id="view-report" hidden>
     <div class="subtools">
       <span class="chips" id="reportRange">
-        <a data-r="24h" class="on">今天</a>
+        <a data-r="24h" class="on">24小时</a>
         <a data-r="7d">7天</a>
         <a data-r="30d">30天</a>
       </span>
-      <a class="btn" id="exportCsv" href="/api/export.csv?range=24h">导出 CSV</a>
+      <a class="btn" id="exportCsv" href="api/export.csv?range=24h">导出 CSV</a>
+    </div>
+    <div class="panel narrative" id="reportNarrative" hidden>
+      <div class="hd">本期说明<span class="hdr" id="reportNarrativeAsOf"></span></div>
+      <p id="reportNarrativeText"></p>
     </div>
     <div class="rmain">
       <div class="panel">
@@ -151,14 +159,14 @@
         <div class="hd">测点明细<span class="hdr" id="reportTime"></span></div>
         <div class="rtwrap">
           <table class="rtable">
-            <thead><tr><th>测点</th><th>位置</th><th id="thKn">当前 kN</th><th>较基线 Δ kN</th><th>最低</th><th>最高</th><th>平均</th><th>温度 ℃</th><th>占额定</th><th>状态</th></tr></thead>
+            <thead><tr><th>测点</th><th>位置</th><th id="thKn">夹紧力 kN</th><th>较基线 Δ kN</th><th>最低</th><th>最高</th><th>平均</th><th>温度 ℃</th><th>占额定</th><th>状态</th></tr></thead>
             <tbody id="reportRows"><tr><td colspan="10" class="revempty">等待数据……</td></tr></tbody>
           </table>
         </div>
       </div>
     </div>
     <div class="panel" style="margin-top:12px">
-      <div class="hd">预紧力历史<span class="hdr" id="histHint"></span></div>
+      <div class="hd">夹紧力历史<span class="hdr" id="histHint"></span></div>
       <canvas id="hist" height="220"></canvas>
     </div>
   </div>
@@ -167,7 +175,8 @@
   </div><!-- /shell -->
 
   <footer class="foot">
-    <span>采集设备 <span id="epShow" class="epshow">--</span></span>
+    <!-- 设备地址只在运维视图显示 -->
+    <span class="opsonly">采集设备 <span id="epShow" class="epshow">--</span></span>
     <span id="stateText">未连接</span>
     <span id="calText" class="opsonly"></span>
     <span id="archText" class="opsonly"></span>

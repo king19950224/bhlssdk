@@ -1,6 +1,7 @@
 using FxSDK;
 using FxSDK.Codec;
 using FxSDK.Models;
+using FxSDK.Utility;
 
 namespace FxDevice;
 
@@ -10,6 +11,22 @@ public sealed class DeviceOptions
     public ushort Address { get; set; } = 1;
     public int Gap { get; set; } = 400;
     public string Resume { get; set; } = "standby";
+    /// <summary>0 不温补 / 1 材料系数 / 2 自定义系数。和厂家 iFastApp、SDK ChannelConfig.TcMode 同一套。</summary>
+    public ushort TcMode { get; set; } = 1;
+    /// <summary>温补系数；空则用 SDK 默认碳钢 0.00010269。厂家项目里常见 0.000101。</summary>
+    public decimal? TempCoefficient { get; set; }
+
+    /// <summary>
+    /// 温度平滑档位（SDK 一阶 Tau：Direct 0 s / Fast 60 s / Balanced 180 s / Stable 480 s / Conservative 900 s）。
+    /// 厂家软件默认 Fast；SDK 自己的缺省是 Balanced。开着温补时两边温度不一样，声时差就差零点几纳秒。进程级全局。
+    /// </summary>
+    public TempTauProfile TempTau { get; set; } = TempTauProfile.Fast;
+
+    /// <summary>温度借用：键是通道，值是"用哪一路的温度"。这一路 Pt1000 坏了或探头没温感时用。空 = 各用各的。</summary>
+    public IReadOnlyDictionary<ushort, ushort> TempFrom { get; set; } = new Dictionary<ushort, ushort>();
+
+    /// <summary>自动法置零锚点（refEnvNs / refPeriodNs）存盘；空 = 不持久化，SDK 每次会话自己重新捕获。</summary>
+    public AnchorStore? Anchors { get; set; }
 }
 
 public enum Verdict
@@ -39,13 +56,13 @@ public sealed class ParamRow
     public bool IsChannelParam { get; set; }
 
     /// <summary>
-    /// 不是用户改的，是同一帧里连带被重写的参数（写增益时 SDK 顺带写回波窗、全配置帧写整组寄存器、
-    /// 存储区整块写）。预期值就是原值，读回不一致才需要告诉用户。
+    /// 同一帧里被连带重写的参数（写增益时 SDK 顺带写回波窗、全配置帧写整组寄存器、存储区整块写）。
+    /// 预期值等于原值，读回不一致才提示。
     /// </summary>
     public bool Implicit { get; set; }
 }
 
-public sealed class DeviceEngine
+public sealed class DeviceEngine : IDisposable
 {
     private readonly FxClient _client = new();
     private readonly Dictionary<ushort, Dictionary<string, string>> _got = new();
@@ -61,7 +78,7 @@ public sealed class DeviceEngine
     private static readonly string[] RegisterBatchOrder = { "ProbeFreq", "EchoWin", "EchoWidth", "Gain", "Duty", "Forward", "Reverse" };
     private static readonly string[] PulseParams = { "Duty", "Forward", "Reverse" };
 
-    // 寄存器读回应只有几个字节，600 ms 没来基本就是丢了；存储区回包带整条参考波形，来得慢（现场实测）
+    // 寄存器应答只有几个字节，600 ms 没到基本就是丢了；存储区回包带整条参考波形，要等更久
     private const int RegisterReplyTimeoutMs = 600;
     private const int StorageReplyTimeoutMs = 1500;
     // 写命令等设备应答的上限；超时就把老的定长等待补足，总时长不比以前长
@@ -73,16 +90,43 @@ public sealed class DeviceEngine
     private volatile bool _acksSeen;
     private int _batchReadMisses;
     private volatile bool _batchReadOk = true;
+    private long _rxResults;
+
+    /// <summary>
+    /// 本次连接以来解出的回包条数（参数应答、写应答、测量帧都算）。宿主拿它判断"连上就被断"是哪一种：
+    /// 一条都没有 = 握手通了但设备从没说过话（到设备的网络路径不通、被代理 TUN 接管等），有过回包 = 链路中途断的。
+    /// </summary>
+    public long ReceivedResults => Interlocked.Read(ref _rxResults);
 
     public event Action<string>? OnLog;
+
+    /// <summary>
+    /// 链路断开（对端关闭、网络中断、心跳超时等），参数是可读的原因。
+    /// OnLog 是调试流水，这个事件宿主应当记进日志。
+    /// </summary>
+    public event Action<string>? OnDisconnected;
 
     public bool IsConnected { get; private set; }
 
     public string? LastDisconnect { get; private set; }
 
+    /// <summary>最近一次断开的原因（不带时间前缀），给宿主拼自己的日志用。</summary>
+    public string? LastDisconnectReason { get; private set; }
+
     private DeviceOptions _opt = new();
     private DeviceConfig _device = new();
     private string _sessionId = string.Empty;
+    private readonly SemaphoreSlim _io = new(1, 1);
+    private int _ioDisposed;
+
+    /// <summary>扫波结束后回波窗有没有写回原值。空 = 这次没放大窗口或写回成功；有字 = 设备上可能还留着大窗口。</summary>
+    public string? EchoWinRestoreNote { get; private set; }
+
+    /// <summary>桌面端刚存了锚点后调用：下次灌会话用磁盘上的新文件，不要继续用连接时读进内存的那份。</summary>
+    public void ReloadAnchors(string? baseDir = null)
+    {
+        _opt.Anchors = AnchorStore.Open(baseDir ?? AppContext.BaseDirectory, _opt.Endpoint);
+    }
 
     public DeviceEngine()
     {
@@ -91,20 +135,32 @@ public sealed class DeviceEngine
         _client.OnConnected += (_, _) =>
         {
             IsConnected = true;
+            Interlocked.Exchange(ref _rxResults, 0);
             Log("已连接");
         };
         _client.OnDisconnected += (_, e) =>
         {
             IsConnected = false;
-            LastDisconnect = $"{DateTime.Now:HH:mm:ss} {e.Reason}";
-            Log($"连接断开：{e.Reason}");
+            var reason = DescribeClose(e);
+            LastDisconnect = $"{DateTime.Now:HH:mm:ss} {reason}";
+            LastDisconnectReason = reason;
+            Log($"连接断开：{reason}");
+            OnDisconnected?.Invoke(reason);
         };
         _client.OnResultReceived += (_, e) =>
         {
             foreach (var result in e.Results)
             {
+                Interlocked.Increment(ref _rxResults);
                 if (result is ChannelResult m)
                 {
+                    // 全波扫描的结果只给"找回波窗"用，不是测量帧
+                    if (m.EchoWaveKind == EchoWaveKind.LongitudinalFull)
+                    {
+                        _fullWaveSink?.Invoke(m);
+                        continue;
+                    }
+
                     if (_scanning) lock (_scan) AbsorbScan(m);
                     if (_streaming) OnMeasurement?.Invoke(m);
                     continue;
@@ -129,10 +185,28 @@ public sealed class DeviceEngine
 
     private readonly HashSet<ushort> _sessionChannels = new();
 
+    /// <summary>SDK 的关闭原因翻成现场看得懂的话。对端关闭最常见的两个原因是串口服务器断电/重启和另一个客户端连了进来。</summary>
+    private static string DescribeClose(SessionDisconnectedEventArgs e)
+    {
+        var why = e.Reason switch
+        {
+            SessionCloseReason.Normal => "本端主动关闭",
+            SessionCloseReason.RemoteClosed => "对端关闭了连接（串口服务器/设备断开或重启，或另一个客户端连了进来）",
+            SessionCloseReason.ConnectionLost => "网络中断（连接被重置或超时）",
+            SessionCloseReason.HeartbeatTimeout => "心跳超时（链路半开，设备长时间没有回应）",
+            SessionCloseReason.ProtocolError => "协议错误（收到无法解析的数据）",
+            _ => e.Reason.ToString(),
+        };
+        return e.Exception is { } ex ? $"{why}：{ex.Message}" : why;
+    }
+
     public async Task OpenAsync(DeviceOptions opt, CancellationToken ct)
     {
         _opt = opt;
         _device = BuildDevice(opt);
+        // SDK 的温度平滑是进程级全局：按 farm.json 的档位设，和厂家软件（默认 Fast 60 s）对齐
+        FxUtility.TempTauProfile = opt.TempTau;
+        if (opt.Anchors is { Count: > 0 } anchors) Log($"读到 {anchors.Count} 路自动法锚点（{anchors.Path}）");
         await _client.ConnectAsync(_device, ct).ConfigureAwait(false);
         _sessionId = _client.GetSessionId(_device);
 
@@ -140,6 +214,148 @@ public sealed class DeviceEngine
 
         await _client.SetDeviceModeAsync(_sessionId, WorkMode.Standby, 0, opt.Address).ConfigureAwait(false);
         await Task.Delay(800, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>会话中改温补：显示立刻按新公式算；下次组通道配置也带上。</summary>
+    public void SetTempComp(ushort tcMode, decimal? tempCoefficient)
+    {
+        _opt.TcMode = tcMode;
+        _opt.TempCoefficient = tempCoefficient;
+    }
+
+    /// <summary>会话中改温度平滑档位：SDK 每帧都按当前档位算，立刻生效。</summary>
+    public void SetTempTau(TempTauProfile profile)
+    {
+        _opt.TempTau = profile;
+        FxUtility.TempTauProfile = profile;
+    }
+
+    /// <summary>会话中改温度借用表：已建会话的通道立刻按新表重配（不发命令，只改 SDK 会话里的通道配置）。</summary>
+    public async Task SetTempFromAsync(IReadOnlyDictionary<ushort, ushort> tempFrom)
+    {
+        _opt.TempFrom = tempFrom;
+        foreach (var ch in _sessionChannels.ToArray())
+        {
+            if (Snapshot(ch).Count > 0) await ApplySessionConfigAsync(ch).ConfigureAwait(false);
+        }
+    }
+
+    private Action<ChannelResult>? _fullWaveSink;
+
+    /// <summary>
+    /// 全波扫描（找回波窗）：让设备把这一路从 0 到 rangeNs 的整段波形分段发上来，SDK 拼成一条。
+    /// 现在的回波窗比 rangeNs 小时先临时把回波窗写到 rangeNs，扫完写回原值并读回核对。
+    /// 调用方要先停流、结束后自己恢复监测。设备不支持全波模式就超时返回空。
+    /// </summary>
+    public async Task<EchoWave?> FullWaveAsync(ushort ch, uint rangeNs, TimeSpan timeout, CancellationToken ct)
+    {
+        await _io.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+        EchoWinRestoreNote = null;
+        _streaming = false;
+        await _client.SetDeviceModeAsync(_sessionId, WorkMode.Standby, 0, _opt.Address).ConfigureAwait(false);
+        await Task.Delay(500, ct).ConfigureAwait(false);
+        await EnsureChannelSessionAsync(ch).ConfigureAwait(false);
+        await PumpReadsAsync(ch, RegisterReads, ct).ConfigureAwait(false);
+
+        var before = Snapshot(ch);
+        var cfg = BuildConfig(ch, before);
+        if (cfg.ProbeFreq <= 0) cfg.ProbeFreq = 2m;
+        var origWin = Num(before, "EchoWin");
+        if (origWin is null) throw new InvalidOperationException($"CH{ch} 回波窗未读到，不能扫波（扫完无法把回波窗写回去）");
+
+        var widened = false;
+        if (rangeNs > origWin.Value)
+        {
+            cfg.EchoWin = rangeNs;
+            await SendAsync(ch, cfg, ParamGroup.Register, EchoWinWriteNames, ct, quiet: true).ConfigureAwait(false);
+            widened = true;
+            Log($"CH{ch} 扫波：回波窗临时 {Fmt(origWin.Value)} -> {rangeNs} ns");
+        }
+        else
+        {
+            await _client.ConfigureChannelAsync(_sessionId, cfg, null, false).ConfigureAwait(false);
+        }
+
+        var tcs = new TaskCompletionSource<EchoWave>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _fullWaveSink = m =>
+        {
+            if (m.Channel == ch && m.EchoWave is { WaveData.Count: > 1 } w) tcs.TrySetResult(w);
+        };
+
+        EchoWave? wave = null;
+        try
+        {
+            await _client.SetDeviceModeAsync(_sessionId, WorkMode.FullWaveRead, ch, _opt.Address).ConfigureAwait(false);
+            using var timer = new CancellationTokenSource(timeout);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timer.Token);
+            try
+            {
+                wave = await tcs.Task.WaitAsync(linked.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                Log($"CH{ch} 扫波 {timeout.TotalSeconds:0} 秒内没有收到完整波形（设备可能不支持全波模式）");
+            }
+        }
+        finally
+        {
+            _fullWaveSink = null;
+            await _client.SetDeviceModeAsync(_sessionId, WorkMode.Standby, 0, _opt.Address).ConfigureAwait(false);
+            await Task.Delay(500, CancellationToken.None).ConfigureAwait(false);
+            if (widened)
+            {
+                cfg.EchoWin = origWin.Value;
+                await SendAsync(ch, cfg, ParamGroup.Register, EchoWinWriteNames, CancellationToken.None, quiet: true).ConfigureAwait(false);
+                lock (_got)
+                {
+                    if (_got.TryGetValue(ch, out var bag0)) bag0.Remove("EchoWin");
+                }
+
+                await PumpReadsAsync(ch, EchoWinReadSet, CancellationToken.None).ConfigureAwait(false);
+                var back = Raw(Snapshot(ch), "EchoWin");
+                var restored = SameNum(back, Fmt(origWin.Value));
+                EchoWinRestoreNote = restored ? null : $"回波窗读回 {back}，应为 {Fmt(origWin.Value)} ns，请到「参数下发」核对（设备可能还留着扫波时的大窗口）";
+                Log(restored
+                    ? $"CH{ch} 扫波结束，回波窗已写回 {back} ns"
+                    : $"CH{ch} 扫波结束，{EchoWinRestoreNote}");
+            }
+        }
+
+        if (wave is not null)
+        {
+            Log($"CH{ch} 全波 {wave.WaveData!.Count} 点，{wave.ClockInt} ns/点，覆盖 0～{(long)wave.WaveData.Count * wave.ClockInt} ns");
+        }
+
+        return wave;
+        }
+        finally
+        {
+            _io.Release();
+        }
+    }
+
+    /// <summary>
+    /// 置零成功后记自动法锚点：包络时间 = 波形起点 + Fx × 点间隔，周期取 SDK 给的中位周期。
+    /// 只有自动法（MeasMode=0）用得上；没有 Assist（阈值法/位置法或这一帧没解出）就不记。
+    /// </summary>
+    public bool RecordAnchor(ushort ch, decimal refTime, EchoWave wave, EchoAssist? assist)
+    {
+        if (_opt.Anchors is not { } store || assist?.Fx is not { } fx || assist.PeriodNs is not { } period || period <= 0) return false;
+        var env = wave.EchoStart + fx * wave.ClockInt;
+        try
+        {
+            store.Save(ch, new AnchorStore.Anchor(refTime, env, period, DateTime.Now));
+        }
+        catch (Exception ex)
+        {
+            Log($"CH{ch} 设备已置零，自动法锚点没存上：{ex.Message}（{store.Path}）。大屏可能按下一帧重新捕获");
+            return false;
+        }
+
+        Log($"CH{ch} 自动法锚点已存：包络 {env:F1} ns，周期 {period:F2} ns（{store.Path}）");
+        return true;
     }
 
     public Task CloseAsync() => ShutdownAsync();
@@ -179,17 +395,48 @@ public sealed class DeviceEngine
     public async Task<Dictionary<string, string>> ReadStorageAsync(ushort ch, CancellationToken ct)
     {
         await EnsureChannelSessionAsync(ch).ConfigureAwait(false);
-        lock (_got) _got.Remove(ch);
-        await PumpReadsAsync(ch, StorageReadSet, ct).ConfigureAwait(false);
-
-        var bag = Snapshot(ch);
-        var result = new Dictionary<string, string>();
-        foreach (var key in bag.Keys)
+        // 只丢掉存储区旧值，逼这一次真的去读参考声时。探头频率、回波窗、增益留下：
+        // 整袋删掉的话，没变化的通道不会把寄存器读回来，恢复监测就会按缺省 2 MHz 重建会话。
+        Dictionary<string, string>? kept;
+        lock (_got)
         {
-            result[key] = Raw(bag, key);
+            kept = _got.TryGetValue(ch, out var old) ? new Dictionary<string, string>(old) : null;
+            _got.Remove(ch);
         }
 
-        if (bag.ContainsKey("WaveStart")) result["LEchoWave"] = WaveCell(bag);
+        await PumpReadsAsync(ch, StorageReadSet, ct).ConfigureAwait(false);
+
+        var produced = Snapshot(ch);
+        var gotStorage = produced.ContainsKey("RefTime");
+        lock (_got)
+        {
+            if (kept is not null)
+            {
+                if (!_got.TryGetValue(ch, out var bag))
+                {
+                    _got[ch] = kept;
+                }
+                else
+                {
+                    foreach (var kv in kept)
+                    {
+                        if (!bag.ContainsKey(kv.Key)) bag[kv.Key] = kv.Value;
+                    }
+                }
+            }
+        }
+
+        // 存储区没读到：调用方按失败处理。缓存里仍是上一次的寄存器和旧基线，不把缺省频率写进会话。
+        if (!gotStorage) return new Dictionary<string, string>();
+
+        var bagNow = Snapshot(ch);
+        var result = new Dictionary<string, string>();
+        foreach (var key in bagNow.Keys)
+        {
+            result[key] = Raw(bagNow, key);
+        }
+
+        if (bagNow.ContainsKey("WaveStart")) result["LEchoWave"] = WaveCell(bagNow);
         return result;
     }
 
@@ -203,6 +450,8 @@ public sealed class DeviceEngine
     };
 
     private static readonly string[] StorageReadSet = { nameof(ChannelConfig.RefTime) };
+    private static readonly string[] EchoWinReadSet = { nameof(ChannelConfig.EchoWin) };
+    private static readonly string[] EchoWinWriteNames = { "EchoWin" };
 
     private static readonly string[] ZeroWriteNames = { "RefTime", "RefTemp" };
 
@@ -233,6 +482,8 @@ public sealed class DeviceEngine
     {
         for (var round = 0; round < rounds; round++)
         {
+            // SDK 在会话断开后发送不报错，这里不查的话，连接流程会在死链路上逐条等超时，约 2 分钟才失败
+            if (!IsConnected) return;
             var missing = reads.Where(n => !HasReply(Snapshot(ch), n)).ToArray();
             if (missing.Length == 0) return;
             if (verbose && round > 0)
@@ -283,7 +534,7 @@ public sealed class DeviceEngine
         {
             var bag = Snapshot(ch);
             if (names.All(n => HasReply(bag, n))) return true;
-            if (Environment.TickCount64 >= deadline) return false;
+            if (!IsConnected || Environment.TickCount64 >= deadline) return false;
             await Task.Delay(20, ct).ConfigureAwait(false);
         }
     }
@@ -337,6 +588,9 @@ public sealed class DeviceEngine
     public async Task<List<ParamRow>> WriteRegistersAsync(ushort ch,
         IReadOnlyList<(string Name, decimal Value)> items, CancellationToken ct)
     {
+        await _io.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
         var rows = new List<ParamRow>();
         var todo = new List<(ParamSpec Spec, ParamRow Row, decimal Value)>();
         foreach (var item in items)
@@ -365,8 +619,7 @@ public sealed class DeviceEngine
         var hwTodo = todo.Where(t => t.Spec.Group != ParamGroup.Storage).ToList();
         var storageTodo = todo.Where(t => t.Spec.Group == ParamGroup.Storage).ToList();
 
-        // 硬件寄存器不是单独写的：全配置帧写整组 5 个，写增益时 SDK 也会连带写回波窗。
-        // 没读到的项会以默认值（回波窗是 0）写进设备，所以有硬件寄存器改动就把 5 个都读齐。
+        // 硬件寄存器按 5 个一帧写。没读到的项会按默认值写进去（回波窗默认 0），改之前先读齐。
         var needReads = todo.Select(t => ReadNameOf(t.Spec.Name)).ToList();
         if (hwTodo.Count > 0) needReads.AddRange(RegisterReads);
         var missingReads = needReads.Distinct().Where(n => !HasReply(Snapshot(ch), n)).ToArray();
@@ -479,11 +732,15 @@ public sealed class DeviceEngine
         var targets = sent.Select(t => (t.Row, t.Value)).Concat(implicitRows).ToList();
         await ReadBackAndJudgeAsync(ch, targets, reads.Distinct().ToArray(), ct).ConfigureAwait(false);
         return rows;
+        }
+        finally
+        {
+            _io.Release();
+        }
     }
 
     /// <summary>
-    /// 写后读回并判定。读回值和原值一样时隔半秒再读一次——设备可能先回应答再落盘，
-    /// 不能把"还没生效"判成"写入无效"。
+    /// 写后读回并判定。读回值仍等于原值时隔半秒再读一次，设备可能先应答后落盘。
     /// </summary>
     private async Task ReadBackAndJudgeAsync(ushort ch, IReadOnlyList<(ParamRow Row, decimal Value)> targets,
         string[] readSet, CancellationToken ct)
@@ -543,6 +800,9 @@ public sealed class DeviceEngine
             throw new ArgumentException("缺少当前回波波形", nameof(liveWave));
         }
 
+        await _io.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
         await EnsureChannelSessionAsync(ch).ConfigureAwait(false);
 
         if (!HasReply(Snapshot(ch), nameof(ChannelConfig.RefTime)))
@@ -588,6 +848,11 @@ public sealed class DeviceEngine
         await ReadBackAndJudgeAsync(ch, rows.Select(r => (r, wanted[r.Name])).ToList(), StorageReadSet, ct)
             .ConfigureAwait(false);
         return rows;
+        }
+        finally
+        {
+            _io.Release();
+        }
     }
 
     public async Task ResumeMonitorAsync(IReadOnlyList<ushort> channels, CancellationToken ct)
@@ -766,9 +1031,7 @@ public sealed class DeviceEngine
             var strong = s.Snrs.Count(v => v >= ProbeSnrDb);
             var majority = Math.Ceiling(s.Frames * 0.6);
             var avg = s.Snrs.Average();
-            // "帧帧解出回波"这条路只在波形里确有信号（平均信噪比过噪声门）时才算：空通道的门内纯噪声也会被自动法
-            // 判成"正常"解出一个声时（09-11 CH14：信噪比 2 dB，帧帧有回波，扫成了"有探头"）。真探头耦合差到 12 dB 以下的，
-            // 写进 farm.json 接线表就照常列出来，不靠扫描猜
+            // 平均信噪比过噪声门才算有探头，空通道的噪声也可能被解出声时
             var hasProbe = strong >= majority || (s.Echo >= majority && avg >= NoiseSnrDb);
             result.Add(new ProbeScan
             {
@@ -875,7 +1138,7 @@ public sealed class DeviceEngine
 
     public static string? Validate(string name, decimal value) => name switch
     {
-        // 这些参数按整数写进设备（小数会被直接截掉），不接受小数，免得读回核对时误报不一致
+        // 设备按整数存，小数会被截掉。
         "EchoWidth" or "Duty" or "Forward" or "Reverse" or "MeasMode" or "Threshold"
             when value != decimal.Truncate(value) => "必须是整数",
         "ProbeFreq" when value <= 0 || value > 65 => "探头频率范围 0~65 MHz",
@@ -965,10 +1228,7 @@ public sealed class DeviceEngine
             .ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// 发一条写命令并等设备的写应答（每帧一个）。应答齐了稍停即返回；超时则把老的定长等待补足，
-    /// 所以设备不回应答时总时长和以前一样，不会更慢。写入成功与否仍由随后的读回判定。
-    /// </summary>
+    /// <summary>等写应答。超时则补足原来的定长等待。成不成功看随后的读回。</summary>
     private async Task WriteFramesAsync(ushort ch, ChannelConfig cfg, string? property, int frames,
         int ackTimeoutMs, int fallbackMs, CancellationToken ct)
     {
@@ -981,6 +1241,7 @@ public sealed class DeviceEngine
             return;
         }
 
+        if (!IsConnected) return;   
         if (_acksSeen)
         {
             Log($"CH{ch} 写 {property ?? "全部寄存器"} 未收到设备应答，按定长等待继续");
@@ -998,7 +1259,7 @@ public sealed class DeviceEngine
         var deadline = Environment.TickCount64 + timeoutMs;
         while (Interlocked.Read(ref _acks) - acks0 < frames)
         {
-            if (Environment.TickCount64 >= deadline) return false;
+            if (!IsConnected || Environment.TickCount64 >= deadline) return false;
             await Task.Delay(10, ct).ConfigureAwait(false);
         }
 
@@ -1031,6 +1292,16 @@ public sealed class DeviceEngine
         {
             Log($"恢复设备模式失败：{ex.Message}");
         }
+        finally
+        {
+            Dispose();
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _ioDisposed, 1) != 0) return;
+        _io.Dispose();
     }
 
     public static string Expect(string name, decimal v) => name switch
@@ -1110,7 +1381,13 @@ public sealed class DeviceEngine
         if (cfg.ProbeFreq <= 0) cfg.ProbeFreq = 2m;
         if (cfg.EchoWin <= 0 && Num(bag, "WaveStart") is decimal ws) cfg.EchoWin = ws;
         await _client.ConfigureChannelAsync(_sessionId, cfg, null, false).ConfigureAwait(false);
-        Log($"CH{ch} 会话参数：探头频率 {cfg.ProbeFreq} MHz，参考声时 {cfg.RefTime?.ToString() ?? "-"} ns");
+        // 自动法且已置零却没有存盘锚点（别的软件置的零，或锚点文件丢了）：SDK 会用下一帧重新捕获，
+        // 螺栓较置零时松紧超过半个周期就可能锁到相邻上升沿。写进日志，出了整周期的偏差能对回来。
+        var noAnchor = Num(bag, "MeasMode") == 0 && cfg.RefTime.HasValue && cfg.RefEnvTime is null;
+        Log($"CH{ch} 会话参数：探头频率 {cfg.ProbeFreq} MHz，参考声时 {cfg.RefTime?.ToString() ?? "-"} ns，温补 TcMode={cfg.TcMode}"
+            + (cfg.UseTempChannel > 0 ? $"，温度取自 CH{cfg.UseTempChannel}" : string.Empty)
+            + (cfg.RefEnvTime is { } env ? $"，自动法锚点 {env:F0} ns / 周期 {cfg.RefPeriodNs:F1} ns"
+                : noAnchor ? "，自动法锚点：无存盘记录，SDK 按下一帧重新捕获" : string.Empty));
     }
 
     private ChannelConfig BuildConfig(ushort ch, Dictionary<string, string> bag)
@@ -1124,6 +1401,18 @@ public sealed class DeviceEngine
         if (Num(bag, "Threshold") is decimal th) cfg.Threshold = (short)th;
         if (Num(bag, "RefTime") is decimal rt) cfg.RefTime = rt;
         if (Num(bag, "RefTemp") is decimal rtp) cfg.RefTemp = rtp;
+        // 和厂家 iFastApp 同一套：0 不温补 / 1 材料系数 / 2 自定义。farm.json tcMode，默认 1（厂家项目开着温补）。
+        cfg.TcMode = _opt.TcMode;
+        if (_opt.TempCoefficient is { } tcoef) cfg.TempCoefficient = tcoef;
+        // 温度借用（厂家 UseTempChannel）：这一路的温度用另一路的。被借的那一路也得在轮询里，不然借不到
+        if (_opt.TempFrom.TryGetValue(ch, out var src) && src > 0 && src != ch) cfg.UseTempChannel = src;
+        // 自动法锚点：只在设备上的参考声时和存锚点时一致才用，否则让 SDK 自己重新捕获
+        if (_opt.Anchors?.Get(ch, cfg.RefTime) is { } anchor)
+        {
+            cfg.RefEnvTime = anchor.EnvNs;
+            cfg.RefPeriodNs = anchor.PeriodNs;
+        }
+
         if (Num(bag, "Duty") is decimal du) cfg.PulseConfig.Duty = (byte)du;
         if (Num(bag, "Forward") is decimal fw) cfg.PulseConfig.Forward = (byte)fw;
         if (Num(bag, "Reverse") is decimal rv) cfg.PulseConfig.Reverse = (byte)rv;
@@ -1182,12 +1471,45 @@ public sealed class DeviceEngine
         return start == "未写入" ? "未写入" : $"{Raw(bag, "WavePts")}点@{start}ns";
     }
 
-    private static decimal? Num(Dictionary<string, string> bag, string name)
+    public static decimal? Num(Dictionary<string, string> bag, string name)
     {
         var v = Raw(bag, name);
         return v == "-" || v == "未写入" ? null
             : decimal.TryParse(v, out var d) ? d : null;
     }
+
+    /// <summary>声时差。tcMode=0：回波声时 − 参考声时；>0：先把回波声时温补到参考温度再减，和 SDK CalcDeltaTof / 厂家同一条。</summary>
+    public static decimal? DeltaTof(decimal? echoTime, decimal? refTime) =>
+        echoTime is { } e && refTime is { } r ? e - r : null;
+
+    /// <summary>
+    /// 温补用的温度：原始温度（和置零写下的参考温度是同一种数）；超出 SDK 有效范围（Pt1000 开路/短路）时用 SDK 越界保护后的业务温度。
+    /// </summary>
+    public static decimal? CompTemp(ChannelResult? m)
+    {
+        if (m is null) return null;
+        return m.RawTemp is { } raw && raw >= FxUtility.MinTemp && raw <= FxUtility.MaxTemp ? raw : m.SpTemp;
+    }
+
+    public static decimal? DeltaTof(
+        decimal? echoTime, decimal? refTime, decimal? temp, decimal? refTemp,
+        ushort tcMode, decimal? tempCoefficient = null)
+    {
+        if (echoTime is not { } e || refTime is not { } r) return null;
+        if (tcMode == 0) return e - r;
+        var tRef = refTemp ?? CalculateExtensions.StandardTemperature;
+        var tNow = temp ?? tRef;
+        var tc = tempCoefficient ?? CalculateExtensions.DefaultTempCoeff;
+        return CalculateExtensions.CalcDeltaTof(r, tRef, e, tNow, tcMode, tc);
+    }
+
+    public static decimal? DeltaTof(Dictionary<string, string> bag, decimal? echoTime) =>
+        DeltaTof(echoTime, Num(bag, "RefTime"));
+
+    public static decimal? DeltaTof(
+        Dictionary<string, string> bag, decimal? echoTime, decimal? temp,
+        ushort tcMode, decimal? tempCoefficient = null) =>
+        DeltaTof(echoTime, Num(bag, "RefTime"), temp, Num(bag, "RefTemp"), tcMode, tempCoefficient);
 
     public static string Fmt(decimal v) => v.ToString("0.####");
 

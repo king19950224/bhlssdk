@@ -107,7 +107,7 @@ public sealed class EchoWave
     /// <summary>
     /// 时钟间隔(ns)
     /// </summary>
-    public ushort ClockInt { get; set; } = 10;//默认10ns
+    public ushort ClockInt { get; set; } = 10;
     /// <summary>
     /// 回波数据点数组
     /// </summary>

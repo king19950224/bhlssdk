@@ -2,21 +2,70 @@
   "farmName": "百恒风电场",
   "turbineCount": 20,
   "baseline": "anchor",
-  "thresholds": { "ratedKn": 0, "warnRatio": 0.85, "alarmRatio": 0.7 },
+  "tcMode": 1,
+  "tempTau": "fast",
+  "thresholds": {
+    "ratedKn": 0,
+    "warnRatio": 0.85,
+    "alarmRatio": 0.7
+  },
   "flanges": [
     {
       "name": "塔筒顶段法兰",
       "boltCount": 92,
-      "numbering": { "topBolt": 1, "clockwise": true },
-      "plannedChannels": [1, 2, 3, 4, 5, 6, 7, 8]
+      "numbering": {
+        "topBolt": 1,
+        "clockwise": true
+      },
+      "plannedChannels": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
     },
-    { "name": "塔筒中段法兰", "boltCount": 80 },
-    { "name": "塔筒底段法兰", "boltCount": 96 },
+    {
+      "name": "塔筒中段法兰",
+      "boltCount": 80,
+      "numbering": {
+        "topBolt": 1,
+        "clockwise": true
+      }
+    },
+    {
+      "name": "塔筒底段法兰",
+      "boltCount": 96,
+      "numbering": {
+        "topBolt": 1,
+        "clockwise": true
+      }
+    },
     {
       "name": "叶根法兰 · 叶片1",
       "kind": "root",
       "boltCount": 54,
-      "plannedChannels": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      "plannedChannels": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "numbering": {
+        "topBolt": 1,
+        "clockwise": true
+      }
     }
   ],
   "devices": [
@@ -26,11 +75,87 @@
       "flanges": [
         {
           "index": 0,
-          "channels": [1, 2, 6, 9],
-          "ucf": "标定文件-M64-180加持.ucf",
-          "ratedKn": 1780
+          "channels": [
+            1,
+            2,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ],
+          "ucf": "m36实验室.ucf",
+          "ratedKn": 0,
+          "channelSpecs": {
+            "2": "塔筒顶段法兰1",
+            "6": "塔筒顶段法兰3",
+            "7": "塔筒顶段法兰",
+            "8": "塔筒顶段法兰4",
+            "9": "塔筒顶段法兰5",
+            "10": "塔筒顶段法兰6"
+          }
         }
       ]
+    }
+  ],
+  "boltSpecs": [
+    {
+      "name": "塔筒顶段法兰3",
+      "areaMm2": 816.72,
+      "grade": "10.9",
+      "lengthMm": 240,
+      "effectiveMm": 193,
+      "ucf": "m36实验室.ucf"
+    },
+    {
+      "name": "塔筒顶段法兰1",
+      "areaMm2": 816.72,
+      "grade": "10.9",
+      "lengthMm": 240,
+      "effectiveMm": 193,
+      "ucf": "m36实验室.ucf"
+    },
+    {
+      "name": "塔筒顶段法兰2",
+      "areaMm2": 816.72,
+      "grade": "10.9",
+      "lengthMm": 240,
+      "effectiveMm": 212.63,
+      "ucf": "m36实验室.ucf"
+    },
+    {
+      "name": "塔筒顶段法兰",
+      "areaMm2": 816.72,
+      "grade": "10.9",
+      "lengthMm": 240,
+      "effectiveMm": 193,
+      "ucf": "m36实验室.ucf"
+    },
+    {
+      "name": "塔筒顶段法兰4",
+      "areaMm2": 816.72,
+      "grade": "10.9",
+      "lengthMm": 240,
+      "effectiveMm": 193,
+      "ucf": "m36实验室.ucf"
+    },
+    {
+      "name": "塔筒顶段法兰5",
+      "areaMm2": 816.72,
+      "grade": "10.9",
+      "lengthMm": 240,
+      "effectiveMm": 193,
+      "ucf": "m36实验室.ucf"
+    },
+    {
+      "name": "塔筒顶段法兰6",
+      "areaMm2": 816.72,
+      "grade": "10.9",
+      "lengthMm": 240,
+      "effectiveMm": 193,
+      "ucf": "m36实验室.ucf"
     }
   ]
 }

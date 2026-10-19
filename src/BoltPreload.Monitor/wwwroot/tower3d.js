@@ -1,9 +1,8 @@
 // 机组结构三维场景（Three.js，程序化建模，不依赖模型文件）。
 // app.js 通过 window.Tower3D 调用：
-//   mount(box, opts)  在 #tower 里建场景；WebGL 不可用返回 false，app.js 退回 SVG 版
-//   update(state)     { bound, live, states[], subs[], names[], probes:[{fi, angle, health}] }
-//                     probes 可以分布在多个法兰上（fi 是法兰序号）：绑定法兰的真实探头 + 其他法兰规划的影子探头
-//   setVisible(bool)  视图切走时停渲染，省 GPU
+//   mount(box, opts)  建场景。WebGL 不可用时返回 false，app.js 用 SVG
+//   update(state)     { bound, live, layout:{towers, root}, states[], subs[], names[], probes:[{fi, angle, health}] }
+//   setVisible(bool)  视图切走时停渲染
 // 单位按米的量级：塔高 60，风轮直径 52。
 import * as THREE from "three";
 import { OrbitControls } from "./vendor/three/OrbitControls.js";
@@ -20,22 +19,42 @@ const STATUS_COLOR = {
   noprobe: 0xff6a3d, stray: 0xf0b429, shift: 0xc46ee6, uncal: 0xf0b429, unrated: 0x9db8d6, badbase: 0xc46ee6,
 };
 
-let renderer, scene, camera, controls, clock;
+let renderer, scene, camera, controls;
+let lastFrameAt = 0;   // 上一帧的时间戳（ms），算帧间隔用；不用 THREE.Clock（新版已弃用）
+let elapsed = 0;       // 累计渲染时间（s），驱动呼吸/闪烁动画
 let rotor, host, labelsEl, linesEl, ro;
 let visible = false, running = false, live = false;
-let flanges = [];     // {i, y, r, ring, glow, halo, anchor(Vector3), label, dot, line}
+// 三处塔筒 + 叶根。i 为 farm.json 法兰序号，-1 表示配置里没有
+let flanges = [];     // {kind, i, y, r, ring, glow, halo, anchor(Vector3), label, dot, line}
 let probeMeshes = []; // 各法兰上的探头小球（顺序与 state.probes 一致）
-let probesKey = "";   // 当前小球的分布（每个球在哪个法兰），变了才重建
-let state = { bound: 0, live: false, states: [], subs: [], names: [], probes: [] };
+let probesKey = "";   // 当前小球的分布（每个球在哪个法兰、什么角度），变了才重建
+let state = { bound: 0, live: false, layout: { towers: [0, 1, 2], root: 3 }, states: [], subs: [], names: [], probes: [] };
 let onPick = null;
 let lastBound = null;
 let focus = null;      // 镜头聚焦目标 {target, dist}：绑定点变化时平滑推过去，用户一拖动就作废
 
+const flangeOf = fi => flanges.find(f => f.i === fi);
+const isRootBound = () => { const f = flangeOf(state.bound); return !!f && f.kind === "root"; };
+
 // 监测点在哪，镜头就框哪：叶根法兰推近轮毂（叶片 1 竖直朝上），塔筒法兰保持整机构图
 function focusOn(bound) {
-  focus = bound === 3
+  const f = flangeOf(bound);
+  focus = f && f.kind === "root"
     ? { target: new THREE.Vector3(0, HUB_Y + 3, 3.2), dist: 78 }
     : { target: new THREE.Vector3(0, 40, 0), dist: 138 };
+}
+
+// 法兰序号变了就重建探头小球（按 fi 归属）
+function applyLayout(layout) {
+  const lay = layout || { towers: [0, 1, 2], root: 3 };
+  let changed = false;
+  let k = 0;
+  for (const f of flanges) {
+    const fi = f.kind === "root" ? (lay.root ?? -1) : (lay.towers[k++] ?? -1);
+    if (f.i !== fi) { f.i = fi; changed = true; }
+    f.ring.userData.flange = fi;
+  }
+  if (changed) probesKey = "";
 }
 
 const towerRadiusAt = y => R_TOP + (R_BOT - R_TOP) * (1 - y / H);
@@ -43,7 +62,7 @@ const towerRadiusAt = y => R_TOP + (R_BOT - R_TOP) * (1 - y / H);
 // 叶根：圆柱段 + 叶根法兰环的尺寸（叶片局部坐标，y 沿展向）
 const ROOT_R = 0.95, ROOT_Y0 = 0.5, ROOT_Y1 = 2.6, ROOT_FLANGE_Y = 2.15, ROOT_FLANGE_R = 1.12;
 
-// ── 叶片：沿展向扫一串截面——根部是圆（接叶根法兰），到 1/4 处过渡成最宽的翼型，往叶尖收尖，
+// ── 叶片：沿展向扫一串截面，根部是圆（接叶根法兰），到 1/4 处过渡成最宽的翼型，往叶尖收尖，
 //    带扭角和向前的预弯 ──
 function bladeGeometry() {
   const N = 26, K = 18;
@@ -135,7 +154,7 @@ function buildScene() {
     const ring = new THREE.Mesh(new THREE.CylinderGeometry(r + 0.55, r + 0.55, 0.75, 72), steelDark);
     ring.position.y = y;
     ring.castShadow = true;
-    ring.userData.flange = i;
+    ring.userData.flange = -1;   // 对应哪个配置法兰由 applyLayout 填
     scene.add(ring);
 
     const glow = new THREE.Mesh(new THREE.TorusGeometry(r + 1.0, 0.14, 10, 96),
@@ -149,7 +168,7 @@ function buildScene() {
     halo.position.y = y;
     scene.add(halo);
 
-    flanges.push({ i, y, r, ring, glow, halo, anchor: new THREE.Vector3(r + 1.2, y, 0) });
+    flanges.push({ kind: "tower", i: -1, y, r, ring, glow, halo, anchor: new THREE.Vector3(r + 1.2, y, 0) });
   });
 
   // 机舱（胶囊）+ 散热罩 + 整流罩
@@ -183,7 +202,7 @@ function buildScene() {
     const ring = new THREE.Mesh(rootFlangeGeo, steelDark);
     ring.position.y = ROOT_FLANGE_Y;
     ring.castShadow = true;
-    ring.userData.flange = b === 0 ? 3 : -1;
+    ring.userData.flange = -1;   // 叶片 1 的这一环由 applyLayout 对到叶根法兰的序号，另两片始终 -1
     const blade = new THREE.Mesh(bladeGeo, paintWhite);
     blade.castShadow = true;
     g.add(root, ring, blade);
@@ -203,7 +222,7 @@ function buildScene() {
   rHalo.position.y = ROOT_FLANGE_Y;
   blade1Group.add(rGlow, rHalo);
   flanges.push({
-    i: 3, y: HUB_Y, r: ROOT_FLANGE_R, ring: blade1Ring, glow: rGlow, halo: rHalo, group: blade1Group,
+    kind: "root", i: -1, y: HUB_Y, r: ROOT_FLANGE_R, ring: blade1Ring, glow: rGlow, halo: rHalo, group: blade1Group,
     anchorObj: blade1Ring, anchorLocal: new THREE.Vector3(ROOT_FLANGE_R + 0.2, ROOT_FLANGE_Y, 0),
     anchor: new THREE.Vector3(2.6, HUB_Y + 0.4, 3.2),   // 叶轮转着的时候标签牌锚在轮毂，别跟着叶片画圈
   });
@@ -237,10 +256,11 @@ function setProbes(probes) {
   }
   probeMeshes = [];
   for (const p of probes) {
-    const f = flanges.find(x => x.i === p.fi);
-    const mesh = new THREE.Mesh(new THREE.SphereGeometry(f.i === 3 ? 0.22 : 0.42, 16, 12),
+    const f = flangeOf(p.fi);
+    const root = f.kind === "root";
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(root ? 0.22 : 0.42, 16, 12),
       new THREE.MeshStandardMaterial({ color: 0x3a4c63, emissive: 0x000000, metalness: 0.2, roughness: 0.4 }));
-    if (f.i === 3) {
+    if (root) {
       // 叶根法兰：探头绕叶根轴排在法兰环面上，挂在叶片 1 的组里跟着转
       const rr = ROOT_FLANGE_R - 0.05;
       mesh.position.set(rr * Math.sin(p.angle), ROOT_FLANGE_Y + 0.28, rr * Math.cos(p.angle));
@@ -260,9 +280,10 @@ function applyState() {
   const st = state;
   live = !!st.live;
   controls.autoRotate = true;
+  applyLayout(st.layout);
   if (st.bound !== lastBound) { focusOn(st.bound); lastBound = st.bound; }
   flanges.forEach(f => {
-    const s = st.states[f.i] || "na";
+    const s = (f.i >= 0 && st.states[f.i]) || "na";
     const col = STATUS_COLOR[s] ?? STATUS_COLOR.na;
     if (f.glow) {
       f.glow.material.color.setHex(col);
@@ -280,9 +301,9 @@ function applyState() {
     }
   });
 
-  // 场景里没有对应法兰的探头（配置里多出来的法兰）画不了，先丢掉，剩下的和小球一一对应
-  const probes = st.probes.filter(p => flanges.some(f => f.i === p.fi));
-  const key = probes.map(p => p.fi).join(",");
+  // 没有对应法兰的探头丢掉。key 含角度，换通道但数量不变时位置也要重建
+  const probes = st.probes.filter(p => p.fi >= 0 && flangeOf(p.fi));
+  const key = probes.map(p => `${p.fi}:${p.angle.toFixed(3)}`).join(",");
   if (key !== probesKey) {
     setProbes(probes);
     probesKey = key;
@@ -342,7 +363,8 @@ function placeLabels() {
 
     v.project(camera);
     const x = (v.x + 1) / 2 * w, y = (1 - v.y) / 2 * h;
-    const behind = v.z > 1;
+    // 镜头背面或没有对应法兰时不画标签
+    const behind = v.z > 1 || f.i < 0;
     f.dot.style.display = f.label.style.display = behind ? "none" : "";
     if (behind) { f.line.setAttribute("x1", 0); f.line.setAttribute("x2", 0); return; }
     f.dot.style.transform = `translate(${x}px, ${y}px)`;
@@ -356,10 +378,13 @@ function placeLabels() {
 }
 
 function frame() {
-  if (!running) return;
+  if (!running || !renderer) return;
   requestAnimationFrame(frame);
-  const dt = Math.min(clock.getDelta(), 0.1);
-  if (state.bound === 3) {
+  const now = performance.now();
+  const dt = Math.min((now - lastFrameAt) / 1000, 0.1);
+  lastFrameAt = now;
+  elapsed += dt;
+  if (isRootBound()) {
     // 监测叶根法兰：停桨，叶片 1 缓缓转到正上方（rotation 0）停住，法兰和探头看得清
     const a = THREE.MathUtils.euclideanModulo(rotor.rotation.z, Math.PI * 2);
     const d = a > Math.PI ? Math.PI * 2 - a : -a;
@@ -379,9 +404,9 @@ function frame() {
     if (controls.target.distanceTo(focus.target) < 0.05 && Math.abs(nl - focus.dist) < 0.05) focus = null;
   }
 
-  const t = clock.elapsedTime;
+  const t = elapsed;
   flanges.forEach(f => {
-    if (f.halo && state.states[f.i] === "alarm") f.halo.material.opacity = 0.2 + 0.25 * (0.5 + 0.5 * Math.sin(t * 4));
+    if (f.halo && f.i >= 0 && state.states[f.i] === "alarm") f.halo.material.opacity = 0.2 + 0.25 * (0.5 + 0.5 * Math.sin(t * 4));
   });
   probeMeshes.forEach(m => {
     if (m.userData.health === "loose" || m.userData.health === "noprobe") {
@@ -394,7 +419,7 @@ function frame() {
 }
 
 function resize() {
-  if (!host) return;
+  if (!host || !renderer) return;
   const w = host.clientWidth, h = host.clientHeight;
   if (!w || !h) return;
   renderer.setSize(w, h, false);
@@ -408,7 +433,7 @@ function resize() {
 function start() {
   if (running || !visible) return;
   running = true;
-  clock.getDelta();
+  lastFrameAt = performance.now();
   frame();
 }
 
@@ -424,56 +449,70 @@ function onClick(ev) {
   if (hit && onPick) onPick(hit.object.userData.flange);
 }
 
+// WebGL 不可用时拆掉场景，通知 app.js 改用 SVG
+let dead = false;
+function teardown(reason, err) {
+  console.warn(`Tower3D: ${reason}，退回 SVG`, err ?? "");
+  running = false;
+  dead = true;
+  try { ro?.disconnect(); } catch { /* 还没建 */ }
+  try { renderer?.dispose(); } catch { /* 上下文已丢 */ }
+  if (host?.parentNode) host.parentNode.removeChild(host);
+  renderer = scene = camera = controls = host = labelsEl = linesEl = ro = null;
+  flanges = []; probeMeshes = []; probesKey = "";
+  window.dispatchEvent(new Event("tower3d-lost"));
+}
+
 window.Tower3D = {
   mount(box, opts = {}) {
     if (renderer) return true;
+    if (dead) return false;
+    // 建场景全程放在 try 里，中途失败不能留下已赋值的 renderer
     try {
       const canvas = document.createElement("canvas");
       const gl = canvas.getContext("webgl2", { antialias: true, alpha: true }) || canvas.getContext("webgl", { antialias: true, alpha: true });
       if (!gl) return false;
       renderer = new THREE.WebGLRenderer({ canvas, context: gl, antialias: true, alpha: true });
+      onPick = opts.onPick || null;
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setClearColor(0x000000, 0);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 0.95;
+      canvas.addEventListener("webglcontextlost", ev => { ev.preventDefault(); teardown("WebGL 上下文丢失"); });
+
+      box.innerHTML = "";
+      host = document.createElement("div");
+      host.className = "t3d";
+      host.appendChild(renderer.domElement);
+      box.appendChild(host);
+
+      camera = new THREE.PerspectiveCamera(36, 1, 0.5, 800);
+      camera.position.set(62, 58, 128);
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 40, 0);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.06;
+      controls.minDistance = 70;
+      controls.maxDistance = 260;
+      controls.maxPolarAngle = Math.PI / 2 - 0.04;
+      controls.enablePan = false;
+      controls.autoRotate = true;
+      controls.autoRotateSpeed = 0.35;
+      controls.addEventListener("start", () => { focus = null; });
+
+      buildScene();
+      buildLabels(host);
+      renderer.domElement.addEventListener("click", onClick);
+      ro = new ResizeObserver(resize);
+      ro.observe(host);
+      resize();
+      return true;
     } catch (e) {
-      console.warn("Tower3D: WebGL 不可用，退回 SVG", e);
-      renderer = null;
+      teardown("三维场景建不起来", e);
       return false;
     }
-
-    onPick = opts.onPick || null;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    renderer.setClearColor(0x000000, 0);
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 0.95;
-
-    box.innerHTML = "";
-    host = document.createElement("div");
-    host.className = "t3d";
-    host.appendChild(renderer.domElement);
-    box.appendChild(host);
-
-    camera = new THREE.PerspectiveCamera(36, 1, 0.5, 800);
-    camera.position.set(62, 58, 128);
-    controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 40, 0);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.06;
-    controls.minDistance = 70;
-    controls.maxDistance = 260;
-    controls.maxPolarAngle = Math.PI / 2 - 0.04;
-    controls.enablePan = false;
-    controls.autoRotate = true;
-    controls.autoRotateSpeed = 0.35;
-    controls.addEventListener("start", () => { focus = null; });
-    clock = new THREE.Clock();
-
-    buildScene();
-    buildLabels(host);
-    renderer.domElement.addEventListener("click", onClick);
-    ro = new ResizeObserver(resize);
-    ro.observe(host);
-    resize();
-    return true;
   },
 
   update(s) {

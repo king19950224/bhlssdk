@@ -11,9 +11,18 @@
     <Product>螺栓预紧力监视器</Product>
     <Company>青岛百恒新能源技术有限公司</Company>
     <Copyright>Copyright © 2026 青岛百恒新能源技术有限公司</Copyright>
-    <!-- 1.6：和大屏共用 farm.json/.ucf（按 IP 选设备接线、按法兰标定与额定）；1.7：现场配置对话框，不用手改 farm.json。
-         窗口标题带版本号，现场一眼分清新旧 exe -->
-    <Version>1.7.0</Version>
+    <!-- 1.6：和大屏共用 farm.json/.ucf（按 IP 选设备接线、按法兰标定与额定）；1.7：现场配置对话框，不用手改 farm.json；
+         1.8：右侧「试件规格 / 硬件调节 / 计算参数」三页照厂家做（一路一个试件，规格库 + 材料库存 farm.json），
+         波形可缩放/拖拽/框选，工具栏收成两排；
+         1.9：全面对齐厂家软件的操作口径——去掉自动增益按钮，改参数不再催置零/不标红，设备回帧数字一律照显，
+         试件规格页只留厂家同样的七项、近似总长保存即按厂家公式写回波窗，卡片顺序照厂家顶栏；
+         波形照厂家画（mm 横轴、主回波区绿带、标记点、悬停读数、SNR/DL），波形下加通道/测量模式/◀▶/停止/测回一排，
+         底部「手动测量结果」表（测回记行、筛选、备注、删行、导出 CSV，存 data\手动测量结果.csv）；
+         「硬件调节」改成可直接改的数字框，「计算参数」改成厂家那一套（温度通道/平滑/温补/结果计算+标定文件），材料常数进材料库，
+         所有框显示实际生效值不留空。去重：工具栏「标定文件...」（会话级全局覆盖）、硬件页第二个「参数下发…」、现场配置「温度取自」列、
+         规格库里的「材料库…」入口都删了，每件事只留一个地方做。窗口标题带版本号，现场一眼分清新旧 exe；
+         2.1：测量中自动把每一帧读数写入 data\连续记录.db（不存波形），可按日期导出中文 Excel -->
+    <Version>2.1</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
@@ -26,6 +35,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\FxDevice\FxDevice.csproj" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
   </ItemGroup>
 
   <ItemGroup>

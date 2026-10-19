@@ -15,6 +15,8 @@ internal sealed class SiteConfigDialog : Form
     public sealed record Detected(ushort Ch, bool Zeroed, double? Snr, bool Weak);
 
     private const string NoUcf = "（无）";
+    private const string NoSpec = "（无）";
+    private const string SameSpec = "同法兰";
     private const string FlangeNone = "（不接入）";
     private const string FlangeGuard = "巡检位（只判有没有探头）";
 
@@ -23,6 +25,7 @@ internal sealed class SiteConfigDialog : Form
     private readonly IReadOnlyDictionary<ushort, Detected> _detected;
     private SiteConfig _cfg;
     private string _sourcePath = string.Empty;
+    private string _copyNote = string.Empty;
 
     private readonly NumericUpDown _turbine = new() { Minimum = 1, Maximum = 999, Width = 70 };
     private readonly TextBox _endpoint = new() { Width = 170 };
@@ -90,6 +93,7 @@ internal sealed class SiteConfigDialog : Form
             {
                 var cfg = SiteConfig.Load(File.ReadAllText(p), endpoint);
                 _sourcePath = p;
+                _copyNote = DifferNote(p, candidates);
                 return cfg;
             }
             catch (Exception ex)
@@ -102,6 +106,37 @@ internal sealed class SiteConfigDialog : Form
 
         _sourcePath = string.Empty;
         return SiteConfig.Load(null, endpoint);
+    }
+
+    /// <summary>选中的这份和旁边另一份内容不同就说一声。保存会按编辑结果把写到的那几份改成一样。</summary>
+    private static string DifferNote(string chosen, IEnumerable<string> candidates)
+    {
+        string chosenText;
+        try
+        {
+            chosenText = File.ReadAllText(chosen);
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+
+        foreach (var p in candidates)
+        {
+            if (!File.Exists(p)) continue;
+            if (string.Equals(Path.GetFullPath(p), Path.GetFullPath(chosen), StringComparison.OrdinalIgnoreCase)) continue;
+            try
+            {
+                if (!string.Equals(File.ReadAllText(p), chosenText, StringComparison.Ordinal))
+                    return $"另有一份 {p} 内容和这份不一致";
+            }
+            catch (Exception)
+            {
+                // 读不了的那份留给打开它的人
+            }
+        }
+
+        return string.Empty;
     }
 
     private string? DashboardFarmPath()
@@ -185,10 +220,19 @@ internal sealed class SiteConfigDialog : Form
         var flangeBar = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 34, WrapContents = false, Padding = new Padding(0, 4, 0, 0) };
         var btnAddFlange = new Button { Text = "添加法兰", AutoSize = true };
         var btnDelFlange = new Button { Text = "删除选中法兰", AutoSize = true };
+        var btnLib = new Button { Text = "规格库…", AutoSize = true, Margin = new Padding(18, 3, 3, 3) };
         btnAddFlange.Click += (_, _) => AddFlange();
         btnDelFlange.Click += (_, _) => DeleteFlange();
+        btnLib.Click += (_, _) => OpenLibrary();
         flangeBar.Controls.Add(btnAddFlange);
         flangeBar.Controls.Add(btnDelFlange);
+        flangeBar.Controls.Add(btnLib);
+        var libHint = new Label
+        {
+            Text = "试件规格：一种螺栓在规格库里填一次（直径/螺距/夹持/材料），法兰选默认，个别通道装的不是这种螺栓就在接线表里单独选。",
+            AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(10, 7, 0, 0),
+        };
+        flangeBar.Controls.Add(libHint);
         flangeBox.Controls.Add(_flanges);
         flangeBox.Controls.Add(flangeBar);
         root.Controls.Add(flangeBox, 0, 1);
@@ -197,7 +241,8 @@ internal sealed class SiteConfigDialog : Form
         _flanges.Columns.Add(new DataGridViewTextBoxColumn { Name = "bolts", HeaderText = "螺栓数", FillWeight = 12 });
         _flanges.Columns.Add(new DataGridViewTextBoxColumn { Name = "top", HeaderText = "正上方是几号", FillWeight = 14 });
         _flanges.Columns.Add(new DataGridViewCheckBoxColumn { Name = "cw", HeaderText = "顺时针编号", FillWeight = 12 });
-        _flanges.Columns.Add(new DataGridViewComboBoxColumn { Name = "ucf", HeaderText = "标定文件", FillWeight = 34, FlatStyle = FlatStyle.Flat });
+        _flanges.Columns.Add(new DataGridViewComboBoxColumn { Name = "spec", HeaderText = "试件规格", FillWeight = 26, FlatStyle = FlatStyle.Flat, ToolTipText = "这个法兰默认装的哪种螺栓（规格库）。没有标定文件时按它的理论斜率算力，额定也可以从它带出来" });
+        _flanges.Columns.Add(new DataGridViewComboBoxColumn { Name = "ucf", HeaderText = "标定文件", FillWeight = 30, FlatStyle = FlatStyle.Flat });
         _flanges.Columns.Add(new DataGridViewTextBoxColumn { Name = "rated", HeaderText = "额定预紧力 kN", FillWeight = 16 });
         _flanges.CellValueChanged += (_, e) =>
         {
@@ -229,7 +274,9 @@ internal sealed class SiteConfigDialog : Form
         _wires.Columns.Add(new DataGridViewTextBoxColumn { Name = "ch", HeaderText = "通道", FillWeight = 10, ReadOnly = true });
         _wires.Columns.Add(new DataGridViewTextBoxColumn { Name = "probe", HeaderText = "探头（本次扫描）", FillWeight = 26, ReadOnly = true });
         _wires.Columns.Add(new DataGridViewComboBoxColumn { Name = "flange", HeaderText = "接在哪个法兰", FillWeight = 40, FlatStyle = FlatStyle.Flat });
-        _wires.Columns.Add(new DataGridViewTextBoxColumn { Name = "bolt", HeaderText = "螺栓号", FillWeight = 12 });
+        _wires.Columns.Add(new DataGridViewTextBoxColumn { Name = "bolt", HeaderText = "螺栓号", FillWeight = 10 });
+        _wires.Columns.Add(new DataGridViewComboBoxColumn { Name = "spec", HeaderText = "规格", FillWeight = 22, FlatStyle = FlatStyle.Flat, ToolTipText = "这一路装的不是法兰默认那种螺栓时单独选（实验室一路一种）。选了就按它自己的标定/理论/额定算" });
+        // 温度借用（厂家 UseTempChannel）不在这张表里：选中一路在右侧「计算参数」页填温度通道，同一个 tempFrom
         _wires.CurrentCellDirtyStateChanged += (_, _) => { if (_wires.IsCurrentCellDirty) _wires.CommitEdit(DataGridViewDataErrorContexts.Commit); };
         _wires.DataError += (_, e) => e.ThrowException = false;
 
@@ -255,19 +302,22 @@ internal sealed class SiteConfigDialog : Form
         DescribeDashboard();
         _lblSource.Text = _sourcePath.Length > 0
             ? $"读取自 {_sourcePath}{(_cfg.IsExisting ? "" : "（这台设备还没配过，按新设备添加）")}"
+              + (_copyNote.Length > 0 ? "。" + _copyNote : "")
             : "没有找到 farm.json，这是一份新配置";
 
         var ucfCol = (DataGridViewComboBoxColumn)_flanges.Columns["ucf"]!;
         ucfCol.Items.Clear();
         ucfCol.Items.Add(NoUcf);
         foreach (var f in UcfFiles()) ucfCol.Items.Add(f);
+        RefreshSpecChoices();
 
         _flanges.Rows.Clear();
         foreach (var f in _cfg.Flanges)
         {
             var ucf = f.Ucf is { Length: > 0 } u ? u : NoUcf;
             if (ucf != NoUcf && !ucfCol.Items.Contains(ucf)) ucfCol.Items.Add(ucf);   // 配置里写了但目录里没有：也列出来，校验时再说
-            _flanges.Rows.Add(f.Name, f.BoltCount.ToString(), f.TopBolt.ToString(), f.Clockwise, ucf, f.Rated > 0 ? f.Rated.ToString("0.##") : "");
+            var spec = f.SpecName is { Length: > 0 } sn && _cfg.Library.Find(sn) is { } found ? found.Name : NoSpec;
+            _flanges.Rows.Add(f.Name, f.BoltCount.ToString(), f.TopBolt.ToString(), f.Clockwise, spec, ucf, f.Rated > 0 ? f.Rated.ToString("0.##") : "");
         }
 
         RefreshFlangeChoices();
@@ -323,6 +373,65 @@ internal sealed class SiteConfigDialog : Form
         }
     }
 
+    /// <summary>规格库变了（改名/增删）：两张表的规格下拉框选项跟着刷，每行保住原选择。</summary>
+    private void RefreshSpecChoices()
+    {
+        var names = _cfg.Library.Specs.Select(s => s.Name.Trim()).Where(n => n.Length > 0).ToList();
+        var fcol = (DataGridViewComboBoxColumn)_flanges.Columns["spec"]!;
+        var fkeep = _flanges.Rows.Cast<DataGridViewRow>().Select(r => r.Cells["spec"].Value as string).ToList();
+        fcol.Items.Clear();
+        fcol.Items.Add(NoSpec);
+        foreach (var n in names) fcol.Items.Add(n);
+        for (var r = 0; r < _flanges.Rows.Count; r++)
+            _flanges.Rows[r].Cells["spec"].Value = fkeep[r] is { } k && fcol.Items.Contains(k) ? k : NoSpec;
+
+        var wcol = (DataGridViewComboBoxColumn)_wires.Columns["spec"]!;
+        var wkeep = _wires.Rows.Cast<DataGridViewRow>().Select(r => r.Cells["spec"].Value as string).ToList();
+        wcol.Items.Clear();
+        wcol.Items.Add(SameSpec);
+        foreach (var n in names) wcol.Items.Add(n);
+        for (var r = 0; r < _wires.Rows.Count; r++)
+            _wires.Rows[r].Cells["spec"].Value = wkeep[r] is { } k && wcol.Items.Contains(k) ? k : SameSpec;
+    }
+
+    /// <summary>规格库对话框：编辑库本身；改了名把两张表里的引用一起改。</summary>
+    private void OpenLibrary()
+    {
+        var usage = SpecUsage();
+        using var dlg = new SpecLibraryDialog(_cfg.Library, UcfFiles().ToList(), usage);
+        var renames = new List<(string From, string To)>();
+        dlg.Renamed += (from, to) => renames.Add((from, to));
+        dlg.ShowDialog(this);
+        // 取消也可能已经改了内存里的库（对话框直接编辑 _cfg.Library）；按现状刷新下拉框，改名的引用跟着走
+        foreach (var (from, to) in renames)
+        {
+            foreach (DataGridViewRow r in _flanges.Rows)
+                if (string.Equals(r.Cells["spec"].Value as string, from, StringComparison.OrdinalIgnoreCase)) r.Cells["spec"].Value = to;
+            foreach (DataGridViewRow r in _wires.Rows)
+                if (string.Equals(r.Cells["spec"].Value as string, from, StringComparison.OrdinalIgnoreCase)) r.Cells["spec"].Value = to;
+        }
+
+        RefreshSpecChoices();
+        _status.Text = $"规格库 {_cfg.Library.Specs.Count} 条，材料 {_cfg.Library.Materials.Count} 条";
+        _status.ForeColor = Color.DimGray;
+    }
+
+    /// <summary>每条规格被哪些法兰/通道引用着（删规格前拦一下）。</summary>
+    private Dictionary<string, string> SpecUsage()
+    {
+        var usage = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        void Add(string? name, string who)
+        {
+            if (string.IsNullOrEmpty(name) || name == NoSpec || name == SameSpec) return;
+            if (!usage.TryGetValue(name, out var list)) usage[name] = list = new List<string>();
+            list.Add(who);
+        }
+
+        foreach (DataGridViewRow r in _flanges.Rows) Add(r.Cells["spec"].Value as string, $"法兰「{(r.Cells["name"].Value as string ?? "").Trim()}」");
+        foreach (DataGridViewRow r in _wires.Rows) Add(r.Cells["spec"].Value as string, r.Cells["ch"].Value as string ?? "");
+        return usage.ToDictionary(kv => kv.Key, kv => string.Join("、", kv.Value), StringComparer.OrdinalIgnoreCase);
+    }
+
     private void AddWireRow(SiteConfig.Wire w)
     {
         var probe = _detected.TryGetValue(w.Ch, out var d)
@@ -330,8 +439,12 @@ internal sealed class SiteConfigDialog : Form
             : _connected ? "本次扫描没检测到" : "—";
         // 按通道号插到该在的位置（按字符串排会把 CH10 排到 CH2 前面）
         var at = _wires.Rows.Cast<DataGridViewRow>().TakeWhile(r => (ushort)r.Tag! < w.Ch).Count();
+        var specCol = (DataGridViewComboBoxColumn)_wires.Columns["spec"]!;
+        if (!specCol.Items.Contains(SameSpec)) specCol.Items.Add(SameSpec);
+        var specChoice = w.SpecName is { Length: > 0 } sn && _cfg.Library.Find(sn) is { } found ? found.Name : SameSpec;
+        if (!specCol.Items.Contains(specChoice)) specCol.Items.Add(specChoice);
         var newRow = new DataGridViewRow();
-        newRow.CreateCells(_wires, $"CH{w.Ch}", probe, FlangeChoice(w.FlangeIndex), w.Bolt?.ToString() ?? "");
+        newRow.CreateCells(_wires, $"CH{w.Ch}", probe, FlangeChoice(w.FlangeIndex), w.Bolt?.ToString() ?? "", specChoice);
         _wires.Rows.Insert(at, newRow);
         var row = at;
         _wires.Rows[row].Tag = w.Ch;
@@ -357,7 +470,7 @@ internal sealed class SiteConfigDialog : Form
     {
         var f = new SiteConfig.Flange { Name = $"法兰 {_flanges.Rows.Count + 1}", BoltCount = 96, TopBolt = 1, Clockwise = true };
         _cfg.Flanges.Add(f);
-        _flanges.Rows.Add(f.Name, f.BoltCount.ToString(), f.TopBolt.ToString(), f.Clockwise, NoUcf, "");
+        _flanges.Rows.Add(f.Name, f.BoltCount.ToString(), f.TopBolt.ToString(), f.Clockwise, NoSpec, NoUcf, "");
         RefreshFlangeChoices();
     }
 
@@ -483,6 +596,8 @@ internal sealed class SiteConfigDialog : Form
             f.Clockwise = r.Cells["cw"].Value is true;
             var ucf = r.Cells["ucf"].Value as string;
             f.Ucf = string.IsNullOrEmpty(ucf) || ucf == NoUcf ? null : ucf;
+            var spec = r.Cells["spec"].Value as string;
+            f.SpecName = string.IsNullOrEmpty(spec) || spec == NoSpec ? null : spec;
             var ratedTxt = (r.Cells["rated"].Value as string ?? "").Trim();
             if (ratedTxt.Length == 0) f.Rated = 0;
             else if (decimal.TryParse(ratedTxt, NumberStyles.Number, CultureInfo.InvariantCulture, out var rated)) f.Rated = rated;
@@ -503,11 +618,17 @@ internal sealed class SiteConfigDialog : Form
                 else errors.Add($"CH{ch} 的螺栓号不是整数");
             }
 
-            wires.Add(new SiteConfig.Wire { Ch = ch, FlangeIndex = idx, Bolt = idx >= 0 ? bolt : null });
+            var specChoice = r.Cells["spec"].Value as string;
+            var specName = idx >= 0 && !string.IsNullOrEmpty(specChoice) && specChoice != SameSpec ? specChoice : null;
+            wires.Add(new SiteConfig.Wire { Ch = ch, FlangeIndex = idx, Bolt = idx >= 0 ? bolt : null, SpecName = specName });
         }
 
         _cfg.Wires.Clear();
         _cfg.Wires.AddRange(wires);
+        // 温度借用在「计算参数」页改，这里原样保留；接线里已经没有的通道其借用关系一起去掉（被借的一路不在轮询里校验会拦）
+        var polled = wires.Select(w => w.Ch).ToHashSet();
+        foreach (var ch in _cfg.TempFrom.Keys.Where(ch => !polled.Contains(ch)).ToList()) _cfg.TempFrom.Remove(ch);
+        foreach (var ch in _cfg.TempFrom.Where(kv => !polled.Contains(kv.Value)).Select(kv => kv.Key).ToList()) _cfg.TempFrom.Remove(ch);
         return errors;
     }
 
@@ -543,13 +664,20 @@ internal sealed class SiteConfigDialog : Form
         var written = new List<string>();
         try
         {
-            // 和大屏在同一个文件夹时只留 wwwroot\farm.json 这一份（桌面端也会去那读），免得两份各改各的；
-            // 目录里原来就有一份根目录 farm.json 的话保持同步
+            // 和大屏同一目录时只写 wwwroot\farm.json。根目录已经有一份就一起改。
             var ownPath = Path.Combine(_ownDir, "farm.json");
+            var ownWww = Path.Combine(_ownDir, "wwwroot", "farm.json");
             if (!SameFolderAsDashboard || File.Exists(ownPath))
             {
                 WriteAtomic(ownPath, json);
                 written.Add(ownPath);
+            }
+
+            if (File.Exists(ownWww) || Directory.Exists(Path.GetDirectoryName(ownWww)))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(ownWww)!);
+                WriteAtomic(ownWww, json);
+                written.Add(ownWww);
             }
 
             if (DashboardDir is { } dash && Directory.Exists(dash))
@@ -559,14 +687,17 @@ internal sealed class SiteConfigDialog : Form
                 var dashPath = Path.Combine(www, "farm.json");
                 WriteAtomic(dashPath, json);
                 written.Add(dashPath);
-                // 标定文件也得在大屏 exe 旁，不然它那边是"未标定"
-                foreach (var name in _cfg.Flanges.Select(f => f.Ucf).Where(u => u is { Length: > 0 }).Distinct()!)
+                // 标定文件也得在大屏 exe 旁，不然它那边是"未标定"。同名文件要覆盖：现场用新标定换掉旧文件时，大屏不能留着旧斜率。
+                var ucfNames = _cfg.Flanges.Select(f => f.Ucf)
+                    .Concat(_cfg.Library.Specs.Select(s => s.Ucf))
+                    .Where(u => u is { Length: > 0 })
+                    .Distinct(StringComparer.OrdinalIgnoreCase);
+                foreach (var name in ucfNames)
                 {
-                    var src = FindUcf(name!)!;
-                    var dst = Path.Combine(dash, name!);
-                    if (!File.Exists(dst)) { File.Copy(src, dst); written.Add(dst); }
-                    var own = Path.Combine(_ownDir, name!);
-                    if (!File.Exists(own)) File.Copy(src, own);
+                    var src = FindUcf(name!);
+                    if (src is null) continue;
+                    CopyCal(src, Path.Combine(dash, name!), written);
+                    CopyCal(src, Path.Combine(_ownDir, name!), written);
                 }
             }
         }
@@ -579,8 +710,11 @@ internal sealed class SiteConfigDialog : Form
 
         var wired = _cfg.Wires.Where(w => w.FlangeIndex >= 0).ToList();
         Summary = $"F{_cfg.Turbine:00} {_cfg.Endpoint}：接线 {string.Join("、", wired.Select(w => $"CH{w.Ch}→{_cfg.Flanges[w.FlangeIndex].Name}{(w.Bolt is { } b ? $"#{b}" : "")}"))}"
-                  + string.Concat(_cfg.Flanges.Where(f => f.Ucf is { Length: > 0 } || f.Rated > 0)
-                      .Select(f => $"；{f.Name} 标定 {f.Ucf ?? "无"} 额定 {(f.Rated > 0 ? f.Rated + " kN" : "未配")}"))
+                  + string.Concat(_cfg.Flanges.Where(f => f.Ucf is { Length: > 0 } || f.Rated > 0 || f.SpecName is { Length: > 0 })
+                      .Select(f => $"；{f.Name} 标定 {f.Ucf ?? "无"} 额定 {(f.Rated > 0 ? f.Rated + " kN" : "未配")}"
+                                   + (f.SpecName is { Length: > 0 } ? $" 规格 {f.SpecName}" : "")))
+                  + string.Concat(wired.Where(w => w.SpecName is { Length: > 0 }).Select(w => $"；CH{w.Ch} 单独规格 {w.SpecName}"))
+                  + (_cfg.TempFrom.Count > 0 ? $"；温度借用 {string.Join("、", _cfg.TempFrom.OrderBy(kv => kv.Key).Select(kv => $"CH{kv.Key}←CH{kv.Value}"))}" : string.Empty)
                   + $"。写入 {string.Join("、", written)}";
         DialogResult = DialogResult.OK;
         Close();
@@ -601,6 +735,14 @@ internal sealed class SiteConfigDialog : Form
         {
             MessageBox.Show(this, $"写文件失败：{ex.Message}", "另存为", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    /// <summary>源和目标是同一个文件就不动。不是同一个就覆盖，避免大屏留着同名旧标定。</summary>
+    private static void CopyCal(string src, string dst, List<string> written)
+    {
+        if (string.Equals(Path.GetFullPath(src), Path.GetFullPath(dst), StringComparison.OrdinalIgnoreCase)) return;
+        File.Copy(src, dst, overwrite: true);
+        written.Add(dst);
     }
 
     /// <summary>先写临时文件再改名：大屏盯着这个文件，不能让它读到半截。</summary>

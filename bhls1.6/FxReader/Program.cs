@@ -106,7 +106,7 @@ async Task StatusLoopAsync(CancellationToken token)
     }
 }
 
-// 等设备连上并把启动流程走完再动
+// 等连上并完成启动流程
 async Task WhenOnlineAsync(CancellationToken token)
 {
     try

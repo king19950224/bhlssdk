@@ -5,9 +5,9 @@ using System.Text.Json.Nodes;
 namespace FxDevice;
 
 /// <summary>
-/// 现场配置：farm.json 的可编辑视图——全场法兰模板（名字、螺栓数、编号）+ 一台设备的接线/标定/额定。
-/// 桌面端的"现场配置"对话框拿它读进来、改完写回：文件里其它不认识的字段（kind、marks、plannedChannels、thresholds、
-/// 别的设备……）原样保留，只动这里管的几项。老写法（顶层 device/bind、接线写在模板上）读得进来，写回时转成 devices[] 新写法。
+/// farm.json 的可编辑视图：全场法兰模板（名字、螺栓数、编号）加一台设备的接线、标定、额定。
+/// 现场配置对话框读进来改完写回，不认识的字段（kind、marks、plannedChannels、thresholds、其它设备等）原样保留。
+/// 老写法（顶层 device/bind、接线写在模板上）可以读，写回时转成 devices[]。
 /// </summary>
 public sealed class SiteConfig
 {
@@ -29,6 +29,9 @@ public sealed class SiteConfig
         /// <summary>额定预紧力 kN；0 = 没配。</summary>
         public decimal Rated { get; set; }
 
+        /// <summary>法兰默认的试件规格：规格库里的名字（devices[].flanges[].boltSpec）；空 = 没配。</summary>
+        public string? SpecName { get; set; }
+
         internal JsonObject? Template { get; set; }
 
         internal JsonObject? Wiring { get; set; }
@@ -49,6 +52,9 @@ public sealed class SiteConfig
 
         /// <summary>装在几号螺栓上；空 = 没登记。</summary>
         public int? Bolt { get; set; }
+
+        /// <summary>这一路单独指定的规格名（channelSpecs）；空 = 同法兰默认。实验室一路一种螺栓时用。</summary>
+        public string? SpecName { get; set; }
     }
 
     private readonly JsonObject _root;
@@ -69,6 +75,12 @@ public sealed class SiteConfig
     public List<Flange> Flanges { get; } = new();
 
     public List<Wire> Wires { get; } = new();
+
+    /// <summary>温度借用：通道 → 用哪一路的温度（devices[].tempFrom）。这一路探头没温感或 Pt1000 坏了时用。</summary>
+    public Dictionary<ushort, ushort> TempFrom { get; } = new();
+
+    /// <summary>规格库 + 材料库（顶层 boltSpecs / materials），全场共用；保存时整体写回。</summary>
+    public SpecLibrary Library { get; private set; } = new();
 
     /// <summary>文件里其它设备的（机组号, 地址），校验"一台机组只能接一台"用。</summary>
     public IReadOnlyList<(int Turbine, string Endpoint)> OtherDevices { get; }
@@ -120,8 +132,8 @@ public sealed class SiteConfig
     public static bool SameHost(string? a, string? b) => string.Equals(Host(a), Host(b), StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// 从 farm.json 文本读出当前设备（按地址）的配置；文本为空/没有这个文件就是一份空配置。
-    /// 解析失败抛 JsonException——对话框要把原因给人看，不能悄悄当成空文件把老配置覆盖掉。
+    /// 从 farm.json 文本读出当前设备（按地址）的配置，文本为空时返回空配置。
+    /// 解析失败抛 JsonException，由对话框提示，避免把坏文件当空配置写回、覆盖老配置。
     /// </summary>
     public static SiteConfig Load(string? json, string endpoint)
     {
@@ -185,6 +197,7 @@ public sealed class SiteConfig
             TurbineCount = Int(root["turbineCount"]) ?? 0,
             Endpoint = device is not null ? Str(device["device"]) ?? endpoint : endpoint,
             Turbine = turbine > 0 ? turbine : (others.Count > 0 ? others.Max(o => o.Item1) + 1 : 1),
+            Library = SpecLibrary.Load(root),
         };
         cfg.Flanges.AddRange(flanges);
 
@@ -211,6 +224,17 @@ public sealed class SiteConfig
             f.Wiring = w;
             f.Ucf = Str(w["ucf"]);
             f.Rated = Dec(w["ratedKn"]) ?? 0;
+            // 法兰默认规格：boltSpec 引用规格库。老写法 bolt 内嵌对象 → 收进规格库、改成引用，保存时统一成新写法
+            f.SpecName = Str(w["boltSpec"]);
+            if (string.IsNullOrWhiteSpace(f.SpecName) && BoltSpec.FromNode(w["bolt"]) is { } inline)
+            {
+                inline.Name = cfg.Library.UniqueName(inline.Name.Trim().Length > 0 ? inline.Name : $"{f.Name} 规格");
+                cfg.Library.Specs.Add(inline);
+                f.SpecName = inline.Name;
+            }
+
+            if (f.SpecName is { } sn && cfg.Library.Find(sn) is null) f.SpecName = null;   // 引用的规格不存在，当没配
+
             var bolts = new Dictionary<ushort, int>();
             if (w["channelBolts"] is JsonObject cb)
             {
@@ -220,10 +244,24 @@ public sealed class SiteConfig
                 }
             }
 
-            foreach (var ch in Channels(w["channels"]).Concat(bolts.Keys).Distinct().OrderBy(c => c))
+            var chSpecs = new Dictionary<ushort, string>();
+            if (w["channelSpecs"] is JsonObject cs)
+            {
+                foreach (var p in cs)
+                {
+                    if (ushort.TryParse(p.Key, out var ch) && Str(p.Value) is { } name && cfg.Library.Find(name) is { } found) chSpecs[ch] = found.Name;
+                }
+            }
+
+            foreach (var ch in Channels(w["channels"]).Concat(bolts.Keys).Concat(chSpecs.Keys).Distinct().OrderBy(c => c))
             {
                 if (cfg.Wires.Any(x => x.Ch == ch)) continue;   // 一路只能在一个法兰上，先出现的算
-                cfg.Wires.Add(new Wire { Ch = ch, FlangeIndex = idx, Bolt = bolts.TryGetValue(ch, out var b) ? b : null });
+                cfg.Wires.Add(new Wire
+                {
+                    Ch = ch, FlangeIndex = idx,
+                    Bolt = bolts.TryGetValue(ch, out var b) ? b : null,
+                    SpecName = chSpecs.TryGetValue(ch, out var s) ? s : null,
+                });
             }
         }
 
@@ -231,6 +269,17 @@ public sealed class SiteConfig
         {
             if (cfg.Wires.Any(x => x.Ch == ch)) continue;
             cfg.Wires.Add(new Wire { Ch = ch, FlangeIndex = Wire.Guard });
+        }
+
+        if ((device ?? (legacy ? root : null))?["tempFrom"] is JsonObject tf)
+        {
+            foreach (var p in tf)
+            {
+                if (ushort.TryParse(p.Key, out var ch) && Int(p.Value) is { } from && from > 0 && from <= ushort.MaxValue && from != ch)
+                {
+                    cfg.TempFrom[ch] = (ushort)from;
+                }
+            }
         }
 
         cfg.Wires.Sort((a, b) => a.Ch.CompareTo(b.Ch));
@@ -249,7 +298,7 @@ public sealed class SiteConfig
             if (SameHost(ep, Endpoint)) errors.Add($"地址 {Host(Endpoint)} 已经是 F{t:00} 的设备，两台设备不能同一个地址");
         }
 
-        // 删掉的法兰模板若还被别的设备的接线引用，不能删——那台设备的探头会失去归属
+        // 还被其它设备接线引用的法兰模板不能删，否则那台设备的探头没有归属
         var kept = new HashSet<int>(Flanges.Where(f => f.OriginalIndex >= 0).Select(f => f.OriginalIndex));
         foreach (var (t, idx, name) in OtherDeviceFlangeRefs())
         {
@@ -276,6 +325,44 @@ public sealed class SiteConfig
 
         if (Flanges.Count > 0 && Flanges.Select(f => f.Name.Trim()).Distinct().Count() != Flanges.Count) errors.Add("法兰名字有重复");
         foreach (var w in Wires.Where(w => w.FlangeIndex >= Flanges.Count)) errors.Add($"CH{w.Ch} 指向不存在的法兰");
+
+        // 规格库：名字唯一、引用得存在、数值像样
+        var specNames = Library.Specs.Select(s => s.Name.Trim()).ToList();
+        if (specNames.Any(n => n.Length == 0)) errors.Add("规格库里有一条没有名字");
+        if (specNames.Distinct(StringComparer.OrdinalIgnoreCase).Count() != specNames.Count) errors.Add("规格库里有重名的规格");
+        foreach (var s in Library.Specs)
+        {
+            var label = $"规格「{s.DisplayName}」";
+            if (s.NominalMm is { } d && d <= 0) errors.Add($"{label}公称直径要 > 0");
+            if (s.PitchMm is { } p && (p <= 0 || (s.NominalMm is { } dd && p >= dd))) errors.Add($"{label}螺距不合理");
+            if (s.NominalMm is { } d2 && s.PitchMm is { } p2 && BoltSpec.StressArea(d2, p2) is null) errors.Add($"{label}直径和螺距算不出截面积");
+            if (s.LengthMm is { } L && L <= 0) errors.Add($"{label}总长要 > 0");
+            if (s.ClampMm is { } c && s.LengthMm is { } L2 && c >= L2) errors.Add($"{label}夹持长度比总长还长");
+            if (s.EffectiveMm is { } e && s.LengthMm is { } L3 && e > L3) errors.Add($"{label}有效长度比总长还长");
+            if (s.LowerKn is { } lo && s.UpperKn is { } up && lo > up) errors.Add($"{label}下限大于上限");
+            if (s.RatedKn is { } r && r < 0) errors.Add($"{label}额定不能为负");
+        }
+
+        foreach (var f in Flanges.Where(f => f.SpecName is { Length: > 0 } && Library.Find(f.SpecName) is null))
+            errors.Add($"法兰「{f.Name}」引用的规格「{f.SpecName}」不在规格库里");
+        foreach (var w in Wires.Where(w => w.SpecName is { Length: > 0 } && Library.Find(w.SpecName) is null))
+            errors.Add($"CH{w.Ch} 引用的规格「{w.SpecName}」不在规格库里");
+        var mats = Library.Materials.Select(m => m.Grade.Trim()).ToList();
+        if (mats.Distinct(StringComparer.OrdinalIgnoreCase).Count() != mats.Count) errors.Add("材料库里有重复的等级");
+        foreach (var m in Library.Materials)
+        {
+            if (m.Grade.Trim().Length == 0) errors.Add("材料库里有一条没有等级");
+            if (m.YieldMpa <= 0 || m.Velocity <= 0 || m.ElasticGpa <= 0) errors.Add($"材料「{m.Grade}」的屈服/声速/弹模要 > 0");
+        }
+
+        // 温度借用：被借的那一路必须在轮询里（接在法兰上或巡检位），否则会话里根本没有它的温度
+        var polled = Wires.Where(w => w.FlangeIndex != Wire.None).Select(w => w.Ch).ToHashSet();
+        foreach (var (ch, from) in TempFrom)
+        {
+            if (from == ch) errors.Add($"CH{ch} 的温度不能借自己");
+            else if (!polled.Contains(from)) errors.Add($"CH{ch} 借用 CH{from} 的温度，但 CH{from} 不在接线表里（没接法兰也不是巡检位），大屏不会轮询它，借不到");
+        }
+
         return errors;
     }
 
@@ -304,6 +391,9 @@ public sealed class SiteConfig
 
         _root["flanges"] = tmpl;
 
+        // 规格库 / 材料库：全场共用，顶层数组
+        Library.WriteTo(_root);
+
         // 这台设备
         var dev = _device is { } d ? (JsonObject)d.DeepClone() : new JsonObject();
         dev["turbine"] = Turbine;
@@ -314,10 +404,11 @@ public sealed class SiteConfig
             var f = Flanges[i];
             var onIt = Wires.Where(w => w.FlangeIndex == i).OrderBy(w => w.Ch).ToList();
             var hasUcf = !string.IsNullOrWhiteSpace(f.Ucf);
-            if (onIt.Count == 0 && !hasUcf && f.Rated <= 0) continue;
+            var hasSpec = f.SpecName is { Length: > 0 } && Library.Find(f.SpecName) is { };
+            if (onIt.Count == 0 && !hasUcf && f.Rated <= 0 && !hasSpec) continue;
 
             var o = f.Wiring is { } w0 && !_legacy ? (JsonObject)w0.DeepClone() : new JsonObject();
-            foreach (var k in new[] { "name", "channels", "channelBolts", "ucf", "ratedKn" }) o.Remove(k);
+            foreach (var k in new[] { "name", "channels", "channelBolts", "ucf", "ratedKn", "bolt", "boltSpec", "channelSpecs" }) o.Remove(k);
             var ordered = new JsonObject { ["index"] = i };
             ordered["channels"] = new JsonArray(onIt.Select(w => (JsonNode)w.Ch).ToArray());
             var bolts = onIt.Where(w => w.Bolt is { }).ToList();
@@ -330,6 +421,14 @@ public sealed class SiteConfig
 
             if (hasUcf) ordered["ucf"] = f.Ucf!.Trim();
             if (f.Rated > 0) ordered["ratedKn"] = f.Rated;
+            if (hasSpec) ordered["boltSpec"] = Library.Find(f.SpecName)!.Name;
+            var chSpecs = onIt.Where(w => w.SpecName is { Length: > 0 } && Library.Find(w.SpecName) is { }).ToList();
+            if (chSpecs.Count > 0)
+            {
+                var cs = new JsonObject();
+                foreach (var w in chSpecs) cs[w.Ch.ToString()] = Library.Find(w.SpecName)!.Name;
+                ordered["channelSpecs"] = cs;
+            }
             foreach (var kv in o) ordered[kv.Key] = kv.Value?.DeepClone();
             dfl.Add(ordered);
         }
@@ -338,6 +437,19 @@ public sealed class SiteConfig
         var guard = Wires.Where(w => w.FlangeIndex == Wire.Guard).Select(w => (JsonNode)w.Ch).ToArray();
         if (guard.Length > 0) dev["guardChannels"] = new JsonArray(guard);
         else dev.Remove("guardChannels");
+
+        var polledNow = Wires.Where(w => w.FlangeIndex != Wire.None).Select(w => w.Ch).ToHashSet();
+        var tempFrom = TempFrom.Where(kv => polledNow.Contains(kv.Key)).OrderBy(kv => kv.Key).ToList();
+        if (tempFrom.Count > 0)
+        {
+            var tf = new JsonObject();
+            foreach (var (ch, from) in tempFrom) tf[ch.ToString()] = from;
+            dev["tempFrom"] = tf;
+        }
+        else
+        {
+            dev.Remove("tempFrom");
+        }
 
         var devices = _root["devices"] as JsonArray ?? new JsonArray();
         // 模板增删后下标变了：别的设备接线里按 index 引用的要跟着改（按 name 引用的不动）
@@ -384,6 +496,36 @@ public sealed class SiteConfig
             WriteIndented = true,
             Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
         });
+    }
+
+    /// <summary>只改温度补偿开关，其它字段原样保留。桌面端「温度补偿」三个按钮写 farm.json 用。</summary>
+    public static void PatchTempComp(string path, ushort tcMode, decimal? tempCoefficient) => PatchRoot(path, root =>
+    {
+        root["tcMode"] = tcMode;
+        if (tcMode == 2 && tempCoefficient is { } c && c > 0) root["tempCoefficient"] = c;
+        else root.Remove("tempCoefficient");
+    });
+
+    /// <summary>只改温度平滑档位（顶层 tempTau），其它字段原样保留。</summary>
+    public static void PatchTempTau(string path, string tempTauKey) => PatchRoot(path, root => root["tempTau"] = tempTauKey);
+
+    /// <summary>改 farm.json 顶层：写临时文件再改名，避免大屏读到半截。</summary>
+    public static void PatchRoot(string path, Action<JsonObject> edit)
+    {
+        var root = File.Exists(path)
+            ? JsonNode.Parse(File.ReadAllText(path)) as JsonObject ?? new JsonObject()
+            : new JsonObject();
+        edit(root);
+        var json = root.ToJsonString(new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, json, new System.Text.UTF8Encoding(false));
+        File.Move(tmp, path, overwrite: true);
     }
 
     private static string? Str(JsonNode? n) => n is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;

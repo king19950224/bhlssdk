@@ -35,7 +35,7 @@ sealed class DeviceRunner : IDisposable
     private const decimal ZeroSpreadNs = 20M;
     private static readonly TimeSpan ScanTimeout = TimeSpan.FromSeconds(5);
 
-    // 48 通道跑完一轮要十几秒，不看满这个时长不敢断定设备只测一个通道
+    // 48 通道一轮要十几秒，短于这个不能判成单通道
     private static readonly TimeSpan ObserveWindow = TimeSpan.FromSeconds(30);
 
     private const decimal AgcTargetPeak = 350M;
@@ -265,7 +265,7 @@ sealed class DeviceRunner : IDisposable
         }
         finally
         {
-            // 出什么岔子都不能把设备丢在待机
+            // 失败也要恢复原来的模式
             try
             {
                 await _client.SetDeviceModeAsync(sessionId, resume.Mode, resume.Channel, _device.Address);
@@ -282,7 +282,7 @@ sealed class DeviceRunner : IDisposable
         }
     }
 
-    // 逐通道扫波取参考声时，写进设备并存盘，之后 SDK 才会算声时差
+    // 扫波取参考声时，写入设备并落盘。没有参考声时 SDK 不算声时差
     public async Task ZeroAsync(CancellationToken token)
     {
         if (!Online)
@@ -343,8 +343,7 @@ sealed class DeviceRunner : IDisposable
         {
             try
             {
-                // 刚从扫波切回待机，不等一下设备来不及处理恢复命令，会卡在最后那个通道上。
-                // 故意不吃取消令牌：就算用户按了退出，设备的模式也得先恢复回去，不然它停在扫波态
+                // 扫波切回待机后等 500ms 再发恢复，连发会卡在最后那个通道。这段不跟取消走
                 await Task.Delay(500, CancellationToken.None);
                 await _client.SetDeviceModeAsync(sessionId, resume.Mode, resume.Channel, _device.Address);
                 Log(resume.Mode == WorkMode.SingleMeas
@@ -417,7 +416,7 @@ sealed class DeviceRunner : IDisposable
         finally
         {
             await _client.SetDeviceModeAsync(sessionId, WorkMode.Standby, channel.Channel, channel.Address);
-            // 同上，回待机后的缓冲不受取消影响——命令连着发设备会漏收
+            // 回待机后等一下再发下一条，连发设备会漏。不跟取消走
             await Task.Delay(300, CancellationToken.None);
         }
     }
@@ -427,7 +426,7 @@ sealed class DeviceRunner : IDisposable
         var frames = new List<ChannelResult>();
         var misses = 0;
 
-        // 多给几次机会，头几帧经常还没稳
+        // 头几帧经常不稳，多采几轮
         for (var i = 0; i < ZeroFrames * 4 && frames.Count < ZeroFrames; i++)
         {
             ChannelResult frame;
@@ -475,7 +474,7 @@ sealed class DeviceRunner : IDisposable
             return (_setMode.Value, 0);
         }
 
-        // 看得不够久就猜单通道，会把设备锁死在一个通道上，宁可恢复轮询
+        // 观察不足就恢复多通道，避免锁在单通道
         var observed = _firstDataAt == default ? TimeSpan.Zero : DateTime.Now - _firstDataAt;
         var channels = _seenChannels.Keys.ToArray();
 
@@ -617,6 +616,5 @@ sealed class DeviceRunner : IDisposable
         };
     }
 
-    // runner 跟进程一起存在，这里只是把命令锁按规矩收掉
     public void Dispose() => _commandLock.Dispose();
 }

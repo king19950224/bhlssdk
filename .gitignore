@@ -33,6 +33,8 @@ appsettings.Development.json
 appsettings.Local.json
 appsettings.json.bak*
 secrets.json
+# 旧的说明配置，程序已不再读取。留在忽略名单里，避免现场残留的密钥被提交
+ai.json
 *.pfx
 *.pem
 license.json
@@ -76,3 +78,14 @@ tools/pdf_pages.py
 
 # 一键发布产物（publish.ps1）
 dist/
+
+# 临时编译目录
+.tmp-build/
+
+# tools/ 下的缓存和 dump 文本
+tools/__pycache__/
+tools/dump_*.txt
+tools/enh_log.txt
+
+# 现场数据表
+/连续记录-*.xlsx

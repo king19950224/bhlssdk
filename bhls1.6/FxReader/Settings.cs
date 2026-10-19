@@ -18,16 +18,16 @@ sealed class AppSettings
     public int StatusSeconds { get; set; } = 30;
     public double PrintIntervalSeconds { get; set; } = 1;
 
-    // 原始帧落盘目录，留空不记录
+    // 空则不记
     public string RawDir { get; set; } = string.Empty;
 
-    // 原始报文只有打开 SDK 开发者模式才会解出来
+    // 原始报文要开 SDK 开发者模式才解得出
     public bool RawHex { get; set; } = true;
 
-    // 控制台每帧显示原始报文的前多少字节，0 不显示；够大就整条按 hexdump 排版
+    // 0 不显示。够大就整条按 hexdump 排
     public int HexPreviewBytes { get; set; } = 32;
 
-    // 置零结果存这里，启动时自动回灌
+    // 空则不存，启动也不回灌
     public string ZeroFile { get; set; } = "zero.json";
 
     public static AppSettings Load(string path)
@@ -63,7 +63,7 @@ sealed class DeviceSettings
 
     public ushort ChannelCount { get; set; } = 8;
 
-    // false 时只收数据，不下发参数也不切工作模式
+    // false：只收数据，不下发、不切模式
     public bool ApplyConfigOnConnect { get; set; } = true;
 
     public double ConnectTimeout { get; set; } = 20;

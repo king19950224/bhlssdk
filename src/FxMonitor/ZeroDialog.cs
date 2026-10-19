@@ -22,10 +22,26 @@ internal sealed class ZeroDialog : Form
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 500 };
 
     private readonly object _lock = new();
-    private readonly Queue<(DateTime At, decimal Echo, decimal? Temp)> _samples = new();
+
+    /// <summary>稳定窗口里的一帧。置零取声时中位数附近的这一帧，声时、原始温度、波形、锚点来自同一次测量。</summary>
+    private sealed class Shot
+    {
+        public DateTime At;
+        public decimal Echo;
+        public decimal? Raw;
+        public decimal? Smooth;
+        public EchoWave? Wave;
+        public EchoAssist? Assist;
+    }
+
+    private readonly Queue<Shot> _samples = new();
     private EchoWave? _lastWave;
     private decimal? _lastEcho;
-    private decimal? _lastTemp;
+    private decimal? _lastRaw;
+    private decimal? _lastSmooth;
+
+    /// <summary>这一帧的自动法辅助点（Fx 包络锚点、中位周期）：置零成功后存成锚点，下次会话不用重新捕获。</summary>
+    private EchoAssist? _lastAssist;
 
     private readonly Action<ChannelResult> _onMeasurement;
     private bool _busy;
@@ -37,6 +53,9 @@ internal sealed class ZeroDialog : Form
     private volatile int _currentCh;
 
     public HashSet<ushort> ZeroedChannels { get; } = new();
+
+    /// <summary>写入成功、恢复监测之前通知主窗口：换上新的参考声时，并清掉显示平均队列。</summary>
+    public event Action<ushort>? Committed;
 
     /// <summary>通道 → "CH3（塔筒顶段法兰 #24）"：下拉框和操作记录里都用它，现场知道拧的是哪颗。</summary>
     private readonly Func<ushort, string> _label;
@@ -183,8 +202,18 @@ internal sealed class ZeroDialog : Form
             {
                 var echo = m.EchoTime.Value;
                 _lastEcho = echo;
-                _lastTemp = m.SpTemp ?? m.RawTemp ?? _lastTemp;
-                _samples.Enqueue((DateTime.UtcNow, echo, m.SpTemp ?? m.RawTemp));
+                if (m.RawTemp is { } raw) _lastRaw = raw;
+                if (m.SpTemp is { } smooth) _lastSmooth = smooth;
+                _lastAssist = m.Assist ?? _lastAssist;
+                _samples.Enqueue(new Shot
+                {
+                    At = DateTime.UtcNow,
+                    Echo = echo,
+                    Raw = m.RawTemp,
+                    Smooth = m.SpTemp,
+                    Wave = _lastWave,
+                    Assist = _lastAssist,
+                });
             }
 
             var cutoff = DateTime.UtcNow - Window;
@@ -202,7 +231,9 @@ internal sealed class ZeroDialog : Form
             _samples.Clear();
             _lastWave = null;
             _lastEcho = null;
-            _lastTemp = null;
+            _lastRaw = null;
+            _lastSmooth = null;
+            _lastAssist = null;
         }
 
         ShowBaseline();
@@ -238,17 +269,20 @@ internal sealed class ZeroDialog : Form
             return;
         }
 
-        decimal? echo, temp;
+        decimal? echo, raw, smooth;
         bool hasWave;
+        var usable = 0;
         lock (_lock)
         {
             echo = _lastEcho;
-            temp = _lastTemp;
+            raw = _lastRaw;
+            smooth = _lastSmooth;
             hasWave = _lastWave != null;
+            usable = _samples.Count(s => s.Wave?.WaveData is { Count: > 0 } && (s.Raw ?? s.Smooth) is not null);
         }
 
         _lblNow.Text = echo.HasValue
-            ? $"当前：声时 {echo.Value.ToString("F1")} ns，温度 {temp?.ToString("F2") ?? "-"} ℃" + (hasWave ? "" : "（无波形）")
+            ? $"当前：声时 {echo.Value.ToString("F1")} ns，平滑 {smooth?.ToString("F2") ?? "-"} ℃，原始 {raw?.ToString("F2") ?? "-"} ℃" + (hasWave ? "" : "（无波形）")
             : "当前：无有效回波";
 
         var (count, std) = StableStat();
@@ -257,35 +291,51 @@ internal sealed class ZeroDialog : Form
                           + (stable ? "，可以置零" : count < MinSamples ? "，样本不足" : "，波动偏大");
         _lblStable.ForeColor = stable ? Color.ForestGreen : Color.DarkOrange;
 
-        _btnZero.Enabled = echo != null && temp != null && hasWave && (stable || _force.Checked);
+        _btnZero.Enabled = usable > 0 && hasWave && (stable || _force.Checked);
+    }
+
+    /// <summary>样本不足两帧时用最后一帧。否则取声时中位数，用最接近它的那一帧。</summary>
+    private Shot? SelectBaseline()
+    {
+        lock (_lock)
+        {
+            var shots = _samples
+                .Where(s => s.Wave?.WaveData is { Count: > 0 } && (s.Raw ?? s.Smooth) is not null)
+                .ToArray();
+            if (shots.Length == 0) return null;
+            if (shots.Length < 2) return shots[^1];
+            var echoes = shots.Select(s => s.Echo).OrderBy(e => e).ToArray();
+            var mid = echoes.Length / 2;
+            var median = echoes.Length % 2 == 1
+                ? echoes[mid]
+                : (echoes[mid - 1] + echoes[mid]) / 2m;
+            return shots.MinBy(s => Math.Abs(s.Echo - median));
+        }
     }
 
     private async Task ZeroAsync()
     {
-        decimal echo, temp;
-        EchoWave wave;
-        lock (_lock)
+        var shot = SelectBaseline();
+        var wave = shot?.Wave;
+        var temp = shot?.Raw ?? shot?.Smooth;
+        if (shot is null || wave is null || temp is null)
         {
-            if (_lastEcho == null || _lastTemp == null || _lastWave == null)
-            {
-                _status.Text = "尚未收到完整的测量数据";
-                return;
-            }
-
-            echo = _lastEcho.Value;
-            temp = _lastTemp.Value;
-            wave = _lastWave;
+            _status.Text = "尚未收到完整的测量数据";
+            return;
         }
 
+        var echo = shot.Echo;
+        var assist = shot.Assist;
         var ch = Current;
         var bag = _engine.Snapshot(ch);
         var oldRef = DeviceEngine.Raw(bag, "RefTime");
         var (count, std) = StableStat();
 
         var msg = $"将对 CH{ch} 置零：\n\n"
-                  + $"参考声时：{oldRef} -> {echo.ToString("F1")} ns\n"
-                  + $"参考温度：{DeviceEngine.Raw(bag, "RefTemp")} -> {temp.ToString("F2")} ℃\n"
-                  + $"参考波形：替换为当前帧（{count} 帧，标准差 {std.ToString("F2")} ns）\n\n"
+                  + $"参考声时：{oldRef} -> {echo.ToString("F1")} ns（窗口中位数附近的一帧）\n"
+                  + $"参考温度：{DeviceEngine.Raw(bag, "RefTemp")} -> {temp.Value.ToString("F2")} ℃（原始温度）\n"
+                  + $"这一帧平滑温度：{shot.Smooth?.ToString("F2") ?? "-"} ℃\n"
+                  + $"参考波形：替换为这一帧（{count} 帧，标准差 {std.ToString("F2")} ns）\n\n"
                   + "置零后该通道之前的读数不再可比，是否继续？";
         if (MessageBox.Show(this, msg, "确认置零", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning)
             != DialogResult.OK)
@@ -298,19 +348,29 @@ internal sealed class ZeroDialog : Form
         {
             _status.Text = "正在写入基线...";
             await _engine.StopStreamAsync();
-            var rows = await _engine.ZeroChannelAsync(ch, echo, temp, wave, CancellationToken.None);
+            var rows = await _engine.ZeroChannelAsync(ch, echo, temp.Value, wave, CancellationToken.None);
 
             var ok = rows.All(r => r.Verdict == Verdict.StoredOk);
             var detail = string.Join("；", rows.Select(r =>
                 $"{r.Cn} {r.BeforeValue} -> {r.ReadBack}" + (r.Verdict == Verdict.StoredOk ? "" : $"（{r.Detail}）")));
             _status.Text = (ok ? "置零成功：" : "置零失败：") + detail;
             _status.ForeColor = ok ? Color.ForestGreen : Color.Firebrick;
+            var anchored = false;
             if (ok)
             {
                 ZeroedChannels.Add(ch);
+                if (Committed is { } committed)
+                {
+                    if (InvokeRequired) Invoke(() => committed(ch));
+                    else committed(ch);
+                }
+
+                var written = rows.FirstOrDefault(r => r.Name == "RefTime");
+                var refTime = written is { } w && decimal.TryParse(w.ReadBack, out var rb) ? rb : Math.Round(echo);
+                anchored = _engine.RecordAnchor(ch, refTime, wave, assist);
             }
 
-            OpsLog.Append($"{_label(ch)} 置零{(ok ? "成功" : "失败")} {detail} 标准差={std:F2}ns 帧数={count}{(_force.Checked ? " 强制" : "")}");
+            OpsLog.Append($"{_label(ch)} 置零{(ok ? "成功" : "失败")} {detail} 标准差={std:F2}ns 帧数={count}{(_force.Checked ? " 强制" : "")}{(anchored ? " 已存自动法锚点" : "")}");
             ShowBaseline();
             ResetStatsAfterZero();
         }

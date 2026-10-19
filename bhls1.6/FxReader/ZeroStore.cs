@@ -3,7 +3,7 @@ using FxSDK.Models;
 
 namespace FxReader;
 
-// 置零结果必须应用自己存着，重建会话后要原样灌回 ChannelConfig，否则自动法会漂
+// 置零结果落盘，重建会话时灌回 ChannelConfig，否则自动法会偏移
 sealed class ZeroStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new()

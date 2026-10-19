@@ -13,10 +13,10 @@ internal sealed class ParamsDialog : Form
         ("Duty", "占空比\n%", "范围 0~100", false),
         ("Forward", "正向\n脉冲", "范围 0~15", false),
         ("Reverse", "反向\n脉冲", "范围 0~15", false),
-        ("MeasMode", "测量\n模式", "0 自动，1 位置，2 阈值。存储区参数，修改后该通道重新置零", true),
-        ("Threshold", "检波\n阈值", "范围 -32768~32767。存储区参数，修改后该通道重新置零", true),
-        ("RefTime", "参考声时\nns", "存储区参数，修改后该通道重新置零；未置零的通道不能写入", true),
-        ("RefTemp", "参考温度\n℃", "范围 0~327 ℃。存储区参数，修改后该通道重新置零", true),
+        ("MeasMode", "测量\n模式", "0 自动，1 位置，2 阈值。存储区参数，改完由操作员按波形决定要不要重新置零", true),
+        ("Threshold", "检波\n阈值", "范围 -32768~32767。存储区参数，改完由操作员按波形决定要不要重新置零", true),
+        ("RefTime", "参考声时\nns", "存储区参数；未置零的通道不能写入", true),
+        ("RefTemp", "参考温度\n℃", "范围 0~327 ℃。存储区参数", true),
     };
 
     private static bool IsStorageCol(string key) => Cols.First(c => c.Key == key).Storage;
@@ -25,8 +25,7 @@ internal sealed class ParamsDialog : Form
     private readonly IReadOnlyList<ushort> _monitored;
 
     /// <summary>
-    /// 主窗口是否真有在测的通道。没有时对话框兜底看一个通道的参数，但关闭后不能顺手把设备切成
-    /// 只轮询那一路的监测模式——用户什么都没做，设备状态却变了。
+    /// 主窗口是否有在测的通道。没有时对话框临时看一个通道的参数，关闭后不能把设备留在只轮询那一路的模式。
     /// </summary>
     private readonly bool _hadMonitored;
 
@@ -55,20 +54,11 @@ internal sealed class ParamsDialog : Form
 
     public IReadOnlyDictionary<ushort, Dictionary<string, string>> DeviceValues => _original;
 
-    /// <summary>
-    /// 这次成功改过"会挪动检出回波"的参数（增益、回波窗、回波宽度、阈值、测量模式、脉冲、探头频率）的通道。
-    /// 这些一改，检出的回波声时就变了，原来置零时记的参考声时不再成立——必须重新置零，否则声时差是假的
-    /// （09-11 实证：CH9 增益 30→1、回波窗 23000→28000 后声时差从 −90 ns 变成 +369 ns，按 M64 系数是 +1000 kN）。
-    /// </summary>
-    public HashSet<ushort> NeedsRezero { get; } = new();
+    /// <summary>读回值相对原值有变化的通道。主窗体用来清这些通道的显示平均。</summary>
+    public HashSet<ushort> ChangedChannels { get; } = new();
 
     /// <summary>这次有没有成功写过任何参数（写了就该通知大屏重读）。</summary>
     public bool WroteAnything { get; private set; }
-
-    private static readonly HashSet<string> EchoAffecting = new()
-    {
-        "Gain", "EchoWin", "EchoWidth", "Threshold", "MeasMode", "Duty", "Forward", "Reverse", "ProbeFreq",
-    };
 
     private readonly HashSet<ushort> _dead = new();
 
@@ -311,7 +301,7 @@ internal sealed class ParamsDialog : Form
                 }
 
                 _status.Text = IsStorageCol(col)
-                    ? $"{HeaderOf(col)} 已整列填为 {text}，存储区参数下发后所有通道将重新置零"
+                    ? $"{HeaderOf(col)} 已整列填为 {text}，存储区参数下发后请按波形判断要不要重新置零"
                     : $"{HeaderOf(col)} 已整列填为 {text}";
             }
 
@@ -337,7 +327,7 @@ internal sealed class ParamsDialog : Form
         }
         else if (IsStorageCol(col))
         {
-            _status.Text = $"CH{ch} {HeaderOf(col)} 为存储区参数，下发后该通道将重新置零";
+            _status.Text = $"CH{ch} {HeaderOf(col)} 为存储区参数，下发后请按波形判断要不要重新置零";
         }
 
         MarkCell(rowIndex, col, ch);
@@ -449,7 +439,7 @@ internal sealed class ParamsDialog : Form
             .Select(kv => kv.Key).OrderBy(c => c).ToList();
         if (storageChannels.Count > 0)
         {
-            confirm += $"\n\n注意：本次包含存储区参数，CH{string.Join("、CH", storageChannels)} 将重新置零，之前的声时差读数不再可比。";
+            confirm += $"\n\n注意：本次包含存储区参数。程序不会自动置零，CH{string.Join("、CH", storageChannels)} 改完请按波形判断要不要重新置零，否则声时差可能不可比。";
         }
 
         if (MessageBox.Show(this, confirm, "确认下发", MessageBoxButtons.OKCancel,
@@ -488,6 +478,7 @@ internal sealed class ParamsDialog : Form
                     var wrong = new List<ParamRow>();
                     var blind = new List<ParamRow>();
                     var unverified = 0;
+                    var changed = new HashSet<string>();
                     foreach (var r in rows)
                     {
                         if (r.Implicit)
@@ -506,6 +497,7 @@ internal sealed class ParamsDialog : Form
                         var actual = r.ReadBack != "-" ? r.ReadBack : r.DeviceValue;
                         row.Cells[r.Name].Value = actual;
                         _original[ch][r.Name] = actual;
+                        if (r.ReadBack != "-" && !DeviceEngine.SameNum(r.BeforeValue, actual)) changed.Add(r.Name);
                         var bad = r.Verdict == Verdict.Ignored || r.Verdict == Verdict.Rewritten;
                         row.Cells[r.Name].Style.BackColor = r.Verdict == Verdict.StoredOk ? Ok : bad ? Bad : Blind;
                         if (bad) wrong.Add(r);
@@ -520,10 +512,7 @@ internal sealed class ParamsDialog : Form
                                       .Select(r => $"{r.Cn} {r.BeforeValue}->{r.Wrote}（{(r.Verdict == Verdict.StoredOk ? "成功" : Describe(r))}）"))
                                   + (notes.Count > 0 ? "；" + string.Join("；", notes) : string.Empty));
                     if (rows.Any(r => !r.Implicit && r.Verdict == Verdict.StoredOk)) WroteAnything = true;
-                    if (rows.Any(r => !r.Implicit && r.Verdict == Verdict.StoredOk && EchoAffecting.Contains(r.Name) && r.BeforeValue != r.Wrote))
-                    {
-                        NeedsRezero.Add(ch);
-                    }
+                    if (changed.Count > 0) ChangedChannels.Add(ch);
 
                     if (wrong.Count == 0 && blind.Count == 0)
                     {
